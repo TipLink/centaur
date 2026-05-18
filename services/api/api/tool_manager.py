@@ -88,9 +88,8 @@ class HttpSecret:
     value resolved from ``secret_ref`` (env var or 1Password item).
     ``match_headers`` names the exact headers iron-proxy scans — each entry is a
     literal header name or a ``/.../``-delimited regex. ``match_path`` also
-    scans the URL path. iron-proxy always scans the query string, so
-    ``match_query`` carries no extra config; it just records that the secret
-    rides in the query and lets such a secret skip ``match_headers``.
+    scans the URL path. ``match_query`` also scans the query string. At least
+    one of the three must be set.
 
     Inject mode: iron-proxy adds the credential itself and the tool never sees
     it. Set ``inject_header`` (optionally with a Go-template ``inject_formatter``

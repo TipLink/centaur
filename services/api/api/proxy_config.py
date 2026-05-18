@@ -99,9 +99,9 @@ def _secret_action_block(secret: HttpSecret) -> tuple[str, dict[str, Any]]:
     """Return the ``replace``/``inject`` block iron-proxy expects for *secret*.
 
     Replace mode emits the ``proxy_value`` placeholder plus the scan locations
-    (``match_headers``, optional ``match_path``; iron-proxy always scans the
-    query string). Inject mode emits the target iron-proxy writes itself — a
-    header (with an optional Go-template ``formatter``) or a query parameter.
+    (``match_headers``, optional ``match_path``, optional ``match_query``).
+    Inject mode emits the target iron-proxy writes itself — a header (with an
+    optional Go-template ``formatter``) or a query parameter.
     """
     if secret.mode is SecretMode.REPLACE:
         block: dict[str, Any] = {
@@ -110,6 +110,8 @@ def _secret_action_block(secret: HttpSecret) -> tuple[str, dict[str, Any]]:
         }
         if secret.match_path:
             block["match_path"] = True
+        if secret.match_query:
+            block["match_query"] = True
         return "replace", block
     if secret.inject_query_param:
         return "inject", {"query_param": secret.inject_query_param}

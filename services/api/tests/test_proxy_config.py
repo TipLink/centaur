@@ -457,6 +457,7 @@ def test_render_emits_header_and_gcp_auth_transforms(
     assert entry["replace"]["proxy_value"] == "OPENAI_API_KEY"
     assert entry["replace"]["match_headers"] == ["Authorization"]
     assert "match_path" not in entry["replace"]
+    assert "match_query" not in entry["replace"]
     assert entry["rules"] == [{"host": "api.openai.com"}]
 
 
@@ -478,9 +479,9 @@ def test_render_replace_secret_emits_query_and_path_locations(
     entry = secrets_block["config"]["secrets"][0]
     replace_block = entry["replace"]
     assert replace_block["proxy_value"] == "ETHERSCAN_API_KEY"
-    # Query-only secrets carry no headers — iron-proxy always scans the query.
     assert replace_block["match_headers"] == []
     assert replace_block["match_path"] is True
+    assert replace_block["match_query"] is True
     assert entry["rules"] == [{"host": "api.etherscan.io"}]
 
 
