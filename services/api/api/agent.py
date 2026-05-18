@@ -1796,11 +1796,21 @@ async def stop_session(thread_key: str) -> bool:
     if not session:
         return False
 
+    return await stop_session_by_id(session.sandbox_id, thread_key=thread_key)
+
+
+async def stop_session_by_id(sandbox_id: str, *, thread_key: str | None = None) -> bool:
+    """Stop a sandbox by runtime id without relying on the current thread mapping."""
     backend = get_backend()
-    await backend.stop(session)
-    _drop_runtime(session.sandbox_id)
-    await _db_update_state(thread_key, "stopped")
-    log.info("pipe_session_stopped", thread_key=thread_key)
+    await backend.stop_by_id(sandbox_id)
+    _drop_runtime(sandbox_id)
+    pool = _get_pool()
+    await pool.execute(
+        "UPDATE sandbox_sessions SET state = 'stopped', updated_at = NOW() "
+        "WHERE sandbox_id = $1",
+        sandbox_id,
+    )
+    log.info("pipe_session_stopped", thread_key=thread_key, sandbox=sandbox_id[:12])
     return True
 
 

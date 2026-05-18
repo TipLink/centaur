@@ -566,6 +566,7 @@ async def test_slack_thread_turn_derives_persona_and_releases_assignment(db_pool
         thread_key=thread_key,
         release_id="prompt-switch:slack:current",
         cancel_inflight=True,
+        stop_runtime_background=True,
     )
     assert do_agent_turn_mock.await_args.kwargs["harness"] is None
     assert do_agent_turn_mock.await_args.kwargs["persona"] == "invest"
@@ -681,12 +682,13 @@ async def test_prompt_switch_clears_old_session_replay_state(db_pool):
 
     release_assignment_mock.assert_awaited_once()
     row = await db_pool.fetchrow(
-        "SELECT agent_thread_id, last_delivered_id, inflight_turn_id, inflight_turn_input, "
+        "SELECT state, agent_thread_id, last_delivered_id, inflight_turn_id, inflight_turn_input, "
         "inflight_attempts, last_result, last_result_at "
         "FROM sandbox_sessions WHERE thread_key = $1",
         thread_key,
     )
     assert row is not None
+    assert row["state"] == "stopped"
     assert row["agent_thread_id"] is None
     assert row["last_delivered_id"] is None
     assert row["inflight_turn_id"] is None

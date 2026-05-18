@@ -10,6 +10,7 @@ import os
 import re
 import secrets as _secrets
 import time
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -998,7 +999,8 @@ class KubernetesExecutorBackend(SandboxBackend):
         if repo and not repos_path:
             raise ValueError("REPOS_PATH is required when AGENT_REPO is set")
 
-        pod_name = _resource_name("centaur-centaur-sandbox", thread_key)
+        runtime_key = f"{thread_key}:{uuid.uuid4().hex[:8]}"
+        pod_name = _resource_name("centaur-centaur-sandbox", runtime_key)
         secret_name = _prompt_secret_name(pod_name)
         firewall_host = _proxy_service_name(pod_name)
 

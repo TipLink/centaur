@@ -1510,6 +1510,8 @@ async def release_assignment(
     thread_key: str,
     release_id: str,
     cancel_inflight: bool,
+    stop_runtime: bool = True,
+    stop_runtime_background: bool = False,
 ) -> dict[str, Any]:
     payload = {
         "thread_key": thread_key,
@@ -1582,9 +1584,32 @@ async def release_assignment(
                 req_hash,
                 canonical_json(response),
             )
-    if response.get("released"):
+    if response.get("released") and stop_runtime:
         with contextlib.suppress(Exception):
-            await stop_session(thread_key)
+            runtime_id = response.get("runtime_id")
+            if isinstance(runtime_id, str) and runtime_id:
+                if stop_runtime_background:
+                    from api.agent import stop_session_by_id
+
+                    async def _stop_released_runtime() -> None:
+                        try:
+                            await stop_session_by_id(runtime_id, thread_key=thread_key)
+                        except Exception:
+                            log.warning(
+                                "released_runtime_stop_failed",
+                                thread_key=thread_key,
+                                runtime_id=runtime_id,
+                                release_id=release_id,
+                                exc_info=True,
+                            )
+
+                    asyncio.create_task(_stop_released_runtime())
+                else:
+                    from api.agent import stop_session_by_id
+
+                    await stop_session_by_id(runtime_id, thread_key=thread_key)
+            else:
+                await stop_session(thread_key)
     log.info(
         "thread_released",
         thread_key=thread_key,

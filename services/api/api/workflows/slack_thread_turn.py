@@ -261,9 +261,11 @@ async def _release_for_prompt_switch(
         thread_key=thread_key,
         release_id=release_id,
         cancel_inflight=True,
+        stop_runtime_background=True,
     )
     await ctx._pool.execute(
         "UPDATE sandbox_sessions SET "
+        "state = 'stopped', "
         "agent_thread_id = NULL, last_delivered_id = NULL, "
         "inflight_turn_id = NULL, inflight_turn_input = NULL, inflight_attempts = 0, "
         "last_result = NULL, last_result_at = NULL, updated_at = NOW() "

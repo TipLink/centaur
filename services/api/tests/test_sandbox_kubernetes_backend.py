@@ -646,6 +646,9 @@ async def test_create_builds_per_sandbox_proxy_resources(
         "centaur.ai/sandbox-id": session.sandbox_id,
     }
 
+    replacement = await backend.create("slack:C123:123.456", "amp", "amp")
+    assert replacement.sandbox_id != session.sandbox_id
+
 
 @pytest.mark.asyncio
 async def test_per_sandbox_proxy_uses_bootstrap_secret_for_onepassword(
