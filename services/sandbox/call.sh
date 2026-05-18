@@ -111,7 +111,7 @@ agent_execute() {
     }
     + (if .harness != null then {harness: .harness} else {} end)
     + (if .engine != null then {engine: .engine} else {} end)
-    + (if .persona_id != null then {persona_id: .persona_id} else {} end)
+    + (if .persona_id != null then {persona_id: .persona_id} elif .harness == null and (env.AGENT_PERSONA // "") != "" then {persona_id: env.AGENT_PERSONA} else {} end)
     + (if .agents_md_override != null then {agents_md_override: .agents_md_override} else {} end)
   ')"
 

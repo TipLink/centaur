@@ -67,6 +67,56 @@ async def test_spawn_assignment_defaults_to_codex_when_no_selector(db_pool):
 
 
 @pytest.mark.asyncio
+async def test_spawn_assignment_treats_harness_persona_selector_as_persona(db_pool):
+    from api.runtime_control import spawn_assignment
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:persona-harness-selector"
+    session = SandboxSession(
+        sandbox_id=f"rt-{uuid.uuid4().hex[:8]}",
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+    get_or_spawn = AsyncMock(return_value=session)
+    tool_manager = SimpleNamespace(
+        get_persona=lambda name: SimpleNamespace(
+            name="legal",
+            engine="codex",
+            default_repo=None,
+        )
+        if name == "legal"
+        else None
+    )
+
+    with (
+        patch("api.runtime_control.get_or_spawn", new=get_or_spawn),
+        patch("api.app.get_tool_manager", return_value=tool_manager),
+    ):
+        result = await spawn_assignment(
+            db_pool,
+            thread_key=thread_key,
+            spawn_id="spawn-legal",
+            harness="legal",
+            engine=None,
+            persona_id=None,
+            agents_md_override=None,
+        )
+
+    get_or_spawn.assert_awaited_once_with(thread_key, "codex", engine=None, persona="legal")
+    assert result["persona_id"] == "legal"
+    assert result["prompt_ref"] == "persona:legal"
+    assignment = await db_pool.fetchrow(
+        "SELECT harness, engine, persona_id, prompt_ref FROM agent_runtime_assignments WHERE thread_key = $1",
+        thread_key,
+    )
+    assert assignment is not None
+    assert assignment["harness"] == "codex"
+    assert assignment["engine"] == "codex"
+    assert assignment["persona_id"] == "legal"
+    assert assignment["prompt_ref"] == "persona:legal"
+
+
+@pytest.mark.asyncio
 async def test_db_insert_session_initial_state_tracks_inflight_turn(db_pool):
     from api.agent import _db_insert_session
 

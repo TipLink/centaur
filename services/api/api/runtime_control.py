@@ -345,10 +345,20 @@ async def spawn_assignment(
     agents_md_override: str | None,
 ) -> dict[str, Any]:
     persona_info = None
+    harness_selector = (harness or "").strip() or None
+    if harness_selector and persona_id is None:
+        from api.app import get_tool_manager
+
+        harness_persona = get_tool_manager().get_persona(harness_selector)
+        if harness_persona is not None:
+            persona_id = harness_persona.name
+            harness = None
+            persona_info = harness_persona
+
     if persona_id:
         from api.app import get_tool_manager
 
-        persona_info = get_tool_manager().get_persona(persona_id)
+        persona_info = persona_info or get_tool_manager().get_persona(persona_id)
         if persona_info is None:
             raise ControlPlaneError(
                 "UNKNOWN_PERSONA_ID",
