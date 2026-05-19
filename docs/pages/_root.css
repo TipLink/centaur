@@ -615,10 +615,11 @@ a.home-lockup-link {
 }
 
 /* Tempo's wordmark sits taller per em than Paradigm's — pull it down so the
- * two read at the same optical weight. */
+ * two read at the same optical weight, then trim another 7% so it
+ * doesn't visually outweigh the Paradigm lockup on the same row. */
 .home-brand-tempo img {
-  height: 32px;
-  max-width: min(30vw, 180px);
+  height: 30px;
+  max-width: min(28vw, 168px);
 }
 
 .home-thread-demo {
@@ -721,6 +722,17 @@ a.home-lockup-link {
   grid-template-columns: minmax(220px, 0.38fr) minmax(0, 1fr);
 }
 
+/* The Overview section's list items already render a bottom-border between
+ * the list and the next section. Stacking another border-top on the
+ * media-section heading produced a visible double divider above
+ * "Extensible by default" (and a redundant rule above "Architecture").
+ * Drop the heading's border-top inside media sections so the list's own
+ * trailing rule is the single divider. */
+.home-media-section .home-overview-heading {
+  border-top: 0;
+  padding-top: 0;
+}
+
 .home-overview h2 {
   color: #f7f7f2;
   font-family: var(--centaur-manual-display);
@@ -733,6 +745,7 @@ a.home-lockup-link {
 .home-overview-heading p {
   color: #edede7;
   font-size: 1.22rem;
+  letter-spacing: -0.01em;
   line-height: 1.5;
   margin: 0;
   max-width: 780px;
