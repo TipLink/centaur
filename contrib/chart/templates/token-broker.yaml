@@ -1,6 +1,9 @@
 {{- if .Values.tokenBroker.enabled }}
+{{- $fileStoreEnabled := .Values.tokenBroker.fileStore.enabled -}}
+{{- $fileStoreBootstrapKeys := .Values.tokenBroker.fileStore.bootstrapKeys | default list -}}
+{{- $fileStoreBootstrapSecretName := default (include "centaur.secretEnvName" .) .Values.tokenBroker.fileStore.bootstrapSecretName -}}
 # iron-token-broker — owns the OAuth refresh-token state machine for any
-# OAuthTokenSecret with grant=refresh_token. Single-writer process; the API
+# brokered_token credential. Single-writer process; the API
 # reconciles the ConfigMap content (one credentials[] entry per registered
 # refresh-token secret) at startup and triggers a rolling restart via a pod
 # annotation when the rendered content changes. The chart owns the Deployment
@@ -73,6 +76,33 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
+{{- if and $fileStoreEnabled (gt (len $fileStoreBootstrapKeys) 0) }}
+      initContainers:
+        - name: seed-token-broker-store
+          image: {{ printf "%s:%s" .Values.tokenBroker.image.repository .Values.tokenBroker.image.tag | quote }}
+          imagePullPolicy: {{ .Values.tokenBroker.image.pullPolicy }}
+          command:
+            - sh
+            - -ec
+            - |
+              mkdir -p /store
+              for key in{{ range $fileStoreBootstrapKeys }} "{{ . }}"{{ end }}; do
+                if [ -f "/bootstrap/${key}" ] && [ ! -s "/store/${key}.json" ]; then
+                  cp "/bootstrap/${key}" "/store/${key}.json"
+                fi
+              done
+          volumeMounts:
+            - name: token-broker-store
+              mountPath: /store
+            - name: token-broker-store-bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+{{- end }}
       containers:
         - name: iron-token-broker
           image: {{ printf "%s:%s" .Values.tokenBroker.image.repository .Values.tokenBroker.image.tag | quote }}
@@ -86,6 +116,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_BROKER_TOKEN" .Values.secretManager.envPrefix }}
+{{- if eq .Values.ironProxy.secretSource "env" }}
+          envFrom:
+            - secretRef:
+                name: {{ include "centaur.secretEnvName" . }}
+{{- end }}
 {{- if eq .Values.ironProxy.secretSource "onepassword-connect" }}
             - name: OP_CONNECT_HOST
               value: {{ include "centaur.onepasswordConnectUrl" . | quote }}
@@ -110,6 +145,10 @@ spec:
             - name: config
               mountPath: /etc/iron-token-broker
               readOnly: true
+{{- if $fileStoreEnabled }}
+            - name: token-broker-store
+              mountPath: {{ .Values.tokenBroker.fileStore.mountPath | quote }}
+{{- end }}
           securityContext:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
             readOnlyRootFilesystem: true
@@ -121,11 +160,22 @@ spec:
         - name: config
           configMap:
             # The API process creates this ConfigMap at startup with one
-            # credentials[] entry per registered refresh-token OAuthTokenSecret.
+            # credentials[] entry per registered brokered_token credential.
             # Until then the pod stays Pending — that's intentional: an empty
             # broker is useless, and ordering resolves itself once the API
             # reconciles.
             name: {{ include "centaur.tokenBrokerName" . }}-config
+{{- if $fileStoreEnabled }}
+        - name: token-broker-store
+          hostPath:
+            path: {{ .Values.tokenBroker.fileStore.hostPath | quote }}
+            type: DirectoryOrCreate
+{{- if gt (len $fileStoreBootstrapKeys) 0 }}
+        - name: token-broker-store-bootstrap
+          secret:
+            secretName: {{ $fileStoreBootstrapSecretName | quote }}
+{{- end }}
+{{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
 apiVersion: networking.k8s.io/v1

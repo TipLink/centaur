@@ -135,6 +135,7 @@ def test_render_broker_yaml_rejects_env_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "env")
+    monkeypatch.delenv("FIREWALL_MANAGER_TOKEN_BROKER_STORE_SOURCE", raising=False)
     secrets = [
         BrokeredTokenSecret(
             name="codex", hosts=("h",),
@@ -144,6 +145,31 @@ def test_render_broker_yaml_rejects_env_source(
     ]
     with pytest.raises(ValueError, match="iron-token-broker store"):
         render_broker_yaml(secrets)
+
+
+def test_render_broker_yaml_uses_file_store_with_env_read_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "env")
+    monkeypatch.setenv("FIREWALL_MANAGER_TOKEN_BROKER_STORE_SOURCE", "file")
+    monkeypatch.setenv(
+        "FIREWALL_MANAGER_TOKEN_BROKER_STORE_DIR",
+        "/var/lib/iron-token-broker/store",
+    )
+    secrets = [
+        BrokeredTokenSecret(
+            name="codex", hosts=("h",),
+            fields=_FIELDS,
+            token_endpoint="https://h/token",
+        ),
+    ]
+    cfg = yaml.safe_load(render_broker_yaml(secrets))
+    cred = cfg["credentials"][0]
+    assert cred["client_id"] == {"type": "env", "var": "CODEX_CLIENT_ID"}
+    assert cred["store"] == {
+        "type": "file",
+        "path": "/var/lib/iron-token-broker/store/CODEX_BLOB.json",
+    }
 
 
 def test_render_broker_yaml_requires_token_endpoint(

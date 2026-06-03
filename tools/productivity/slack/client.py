@@ -1597,7 +1597,11 @@ class SlackClient:
 
         try:
             kwargs = {
-                "channel": resolved_channel,
+                # Slack accepts both channel_id and channels on
+                # files.completeUploadExternal, but in this workspace the SDK's
+                # single-channel path created private orphan files. Passing the
+                # one destination via channels produces a real file share.
+                "channels": [resolved_channel],
             }
             upload_bytes: bytes | None = None
             effective_filename = filename

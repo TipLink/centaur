@@ -43,11 +43,10 @@ toolServer:
   port: 8001
 
 # iron-token-broker — race-free OAuth refresh-token coordinator. Enable when
-# any tool's `oauth_token` secret uses `grant=refresh_token` against an IdP
-# that rotates refresh tokens with strict reuse detection (OpenAI Codex,
-# Anthropic Claude Code OAuth). Requires ironProxy.secretSource to be a
-# writable backend (onepassword or onepassword-connect) because the broker
-# rewrites the refresh-token blob on every rotation.
+# any tool uses `brokered_token` against an IdP that rotates refresh tokens
+# with strict reuse detection (OpenAI Codex, Anthropic Claude Code OAuth).
+# With ironProxy.secretSource=env, enable fileStore so the broker has a
+# writable place to persist refresh-token rotations.
 tokenBroker:
   enabled: false
   image:
@@ -61,6 +60,12 @@ tokenBroker:
   # re-fetching. Must be strictly less than the IdP's token lifetime or the
   # broker resolver rejects the response.
   ttl: 1m
+  fileStore:
+    enabled: false
+    mountPath: /var/lib/iron-token-broker/store
+    hostPath: /var/lib/centaur/token-broker
+    bootstrapSecretName: ""
+    bootstrapKeys: []
   resources: {}
 
 # iron-control — Rails control plane for authenticated API access + encrypted

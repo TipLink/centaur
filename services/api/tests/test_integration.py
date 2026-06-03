@@ -559,6 +559,18 @@ class TestBuildSessionContext:
         assert "their real Slack mention" not in ctx
         assert "Do not @-mention or tag the requester" in ctx
 
+    def test_slack_workspace_link_rule_uses_configured_host(self, monkeypatch):
+        from api.agent import _build_session_context
+
+        monkeypatch.setenv("SLACK_WORKSPACE_URL", "findottech.slack.com")
+
+        ctx = _build_session_context("test:1", platform="slack")
+
+        assert (
+            "`https://findottech.slack.com/archives/{CHANNEL_ID}/p{TS_WITHOUT_DOT}`"
+            in ctx
+        )
+
     def test_slack_bot_user_id_not_mentioned(self):
         from api.agent import _build_session_context
 

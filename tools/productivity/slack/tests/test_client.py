@@ -88,8 +88,9 @@ class _FakeWebClient:
             entry: dict = {"ts": "1.1", "channel_name": "paradigm-pulse"}
             if kwargs.get("thread_ts"):
                 entry["thread_ts"] = kwargs["thread_ts"]
+            upload_channel = (kwargs.get("channels") or [kwargs.get("channel", "C123")])[0]
             self._shares_by_file[file_id] = {
-                "public": {kwargs.get("channel", "C123"): [entry]}
+                "public": {upload_channel: [entry]}
             }
         else:
             self._shares_by_file[file_id] = {}
@@ -552,7 +553,7 @@ def test_upload_file_accepts_channel_id_alias_and_returns_preview() -> None:
     )
 
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channel"] == "C123"
+    assert fake_web_client.last_kwargs["channels"] == ["C123"]
     assert fake_web_client.last_kwargs["filename"] == "data.csv"
     assert fake_web_client.last_kwargs["file"] == b"a,b\n1,2\n"
     assert result["preview"] == {
@@ -578,7 +579,7 @@ def test_upload_file_infers_slack_thread_from_tool_context() -> None:
         reset_tool_context(token)
 
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channel"] == "C123"
+    assert fake_web_client.last_kwargs["channels"] == ["C123"]
     assert fake_web_client.last_kwargs["thread_ts"] == "1777910337.403889"
     assert fake_web_client.last_kwargs["initial_comment"] == "Uploaded `chart.png`."
 
@@ -601,7 +602,7 @@ def test_upload_file_infers_destination_from_team_scoped_thread_key() -> None:
         reset_tool_context(token)
 
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channel"] == "C123"
+    assert fake_web_client.last_kwargs["channels"] == ["C123"]
     assert fake_web_client.last_kwargs["thread_ts"] == "1780035646.228899"
 
 
@@ -735,7 +736,7 @@ def test_upload_file_can_infer_destination_without_channel_arg() -> None:
         reset_tool_context(token)
 
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channel"] == "C123"
+    assert fake_web_client.last_kwargs["channels"] == ["C123"]
     assert fake_web_client.last_kwargs["thread_ts"] == "1777910337.403889"
 
 

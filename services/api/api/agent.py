@@ -1002,6 +1002,15 @@ def _build_session_context(
     """
     from datetime import datetime, timezone
 
+    slack_base_url = (
+        os.getenv("SLACK_WORKSPACE_URL")
+        or os.getenv("SLACK_WORKSPACE_DOMAIN")
+        or "https://slack.com"
+    ).strip()
+    if "://" not in slack_base_url:
+        slack_base_url = f"https://{slack_base_url}"
+    slack_base_url = slack_base_url.rstrip("/")
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "# Session Context",
@@ -1072,7 +1081,9 @@ def _build_session_context(
                 "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
                 "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
                 "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
-                "- For links to Slack threads or messages, always use the canonical `https://slack.com/archives/{CHANNEL_ID}/p{TS_WITHOUT_DOT}` form. Slack redirects this to the correct workspace. Do not invent or hardcode a `<workspace>.slack.com` subdomain.",
+                "- For links to Slack threads or messages, use "
+                f"`{slack_base_url}/archives/{{CHANNEL_ID}}/p{{TS_WITHOUT_DOT}}`. "
+                "Use the configured workspace host; do not use bare `https://slack.com/archives/...` when a workspace host is available.",
                 "- Do not @-mention or tag the requester when replying; reply naturally in the thread.",
             ]
         )
