@@ -28,6 +28,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  # Fineas fork publishes patched Centaur images under the TipLink GHCR namespace.
   IMAGE_NAMESPACE: tiplink/centaur
   IMAGE_SOURCE: https://github.com/TipLink/centaur
 
