@@ -335,6 +335,14 @@ spec:
               value: {{ include "centaur.tokenBrokerName" . | quote }}
             - name: KUBERNETES_TOKEN_BROKER_URL
               value: {{ include "centaur.tokenBrokerUrl" . | quote }}
+{{- if .Values.tokenBroker.githubApp.enabled }}
+            - name: FIREWALL_MANAGER_TOKEN_BROKER_LISTEN_PORT
+              value: {{ .Values.tokenBroker.githubApp.upstreamPort | quote }}
+            - name: GITHUB_APP_TOKEN_BROKER_ENABLED
+              value: "1"
+            - name: GITHUB_APP_TOKEN_BROKER_CREDENTIAL_ID
+              value: {{ .Values.tokenBroker.githubApp.credentialId | quote }}
+{{- end }}
 {{- if .Values.tokenBroker.fileStore.enabled }}
             - name: FIREWALL_MANAGER_TOKEN_BROKER_STORE_SOURCE
               value: "file"

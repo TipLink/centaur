@@ -28,6 +28,7 @@ import yaml
 from api.tool_manager import (
     BrokeredTokenSecret,
     GcpAuthSecret,
+    GitHubAppTokenSecret,
     HmacSignSecret,
     HttpSecret,
     OAuthFieldSource,
@@ -198,28 +199,33 @@ def _build_secret_transform(
     return {"name": "secrets", "config": {"secrets": entries}}
 
 
-def _build_token_broker_entries(
-    secrets: list[SecretDef],
-) -> list[dict[str, Any]]:
-    """One ``secrets`` entry per ``BrokeredTokenSecret``.
+def _build_token_broker_entries(secrets: list[SecretDef]) -> list[dict[str, Any]]:
+    """One ``secrets`` entry per broker-resolved access-token credential.
 
-    Hosts declared across multiple secrets with the same name are unioned
-    into a single entry so the broker only sees one ``credential_id`` per
-    refresh family.
+    ``BrokeredTokenSecret`` entries inject an Authorization header because the
+    tool usually does not hold a placeholder. ``GitHubAppTokenSecret`` entries
+    replace the existing ``GITHUB_TOKEN`` placeholder so GitHub traffic keeps
+    the old opt-in behavior while sourcing the real value from the broker.
     """
-    by_name: dict[str, set[str]] = {}
+    by_brokered_credential_id: dict[str, set[str]] = {}
+    by_github_credential: dict[tuple[str, str], set[str]] = {}
     for secret in secrets:
         if isinstance(secret, BrokeredTokenSecret):
-            by_name.setdefault(secret.name, set()).update(secret.hosts)
+            by_brokered_credential_id.setdefault(secret.name, set()).update(
+                secret.hosts
+            )
+        elif isinstance(secret, GitHubAppTokenSecret):
+            key = (secret.credential_id, secret.name)
+            by_github_credential.setdefault(key, set()).update(secret.hosts)
 
     ttl = _token_broker_ttl()
     entries: list[dict[str, Any]] = []
-    for name in sorted(by_name):
+    for credential_id in sorted(by_brokered_credential_id):
         entries.append(
             {
                 "source": {
                     "type": "token_broker",
-                    "credential_id": name,
+                    "credential_id": credential_id,
                     "ttl": ttl,
                 },
                 # Double-brace template is what iron-proxy's secrets transform
@@ -229,7 +235,25 @@ def _build_token_broker_entries(
                     "header": "Authorization",
                     "formatter": "Bearer {{.Value}}",
                 },
-                "rules": [{"host": h} for h in sorted(by_name[name])],
+                "rules": [
+                    {"host": h}
+                    for h in sorted(by_brokered_credential_id[credential_id])
+                ],
+            }
+        )
+    for (credential_id, placeholder), host_set in sorted(by_github_credential.items()):
+        entries.append(
+            {
+                "source": {
+                    "type": "token_broker",
+                    "credential_id": credential_id,
+                    "ttl": ttl,
+                },
+                "replace": {
+                    "proxy_value": placeholder,
+                    "match_headers": ["Authorization"],
+                },
+                "rules": [{"host": h} for h in sorted(host_set)],
             }
         )
     return entries

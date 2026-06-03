@@ -81,6 +81,14 @@ def _broker_file_store_dir() -> str:
     return value or DEFAULT_FILE_STORE_DIR
 
 
+def _broker_listen_port() -> int:
+    raw = (
+        os.environ.get("FIREWALL_MANAGER_TOKEN_BROKER_LISTEN_PORT")
+        or str(DEFAULT_BROKER_LISTEN_PORT)
+    ).strip()
+    return int(raw or DEFAULT_BROKER_LISTEN_PORT)
+
+
 def _op_vault() -> str:
     return os.environ.get("OP_VAULT", "ai-agents").strip()
 
@@ -193,7 +201,7 @@ def render_broker_yaml(secrets: list[SecretDef]) -> str:
     """
     credentials = [_credential_entry(s) for s in collect_broker_credentials(secrets)]
     cfg = {
-        "listen": f":{DEFAULT_BROKER_LISTEN_PORT}",
+        "listen": f":{_broker_listen_port()}",
         "metrics_listen": f":{DEFAULT_BROKER_METRICS_PORT}",
         "bearer_auth_env": BROKER_BEARER_AUTH_ENV,
         "log": {"level": "info", "format": "json"},

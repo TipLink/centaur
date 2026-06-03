@@ -66,6 +66,19 @@ tokenBroker:
     hostPath: /var/lib/centaur/token-broker
     bootstrapSecretName: ""
     bootstrapKeys: []
+  # GitHub App installation tokens are not OAuth refresh tokens. When enabled,
+  # a small API-image sidecar fronts iron-token-broker and serves this
+  # credential id while forwarding all other broker credentials upstream.
+  githubApp:
+    enabled: false
+    credentialId: github-app
+    existingSecretName: ""
+    appIdSecretKey: app-id
+    installationIdSecretKey: installation-id
+    privateKeySecretKey: private-key
+    upstreamPort: 8182
+    refreshSkewSeconds: 300
+    resources: {}
   resources: {}
 
 # iron-control — Rails control plane for authenticated API access + encrypted

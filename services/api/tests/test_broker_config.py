@@ -12,6 +12,7 @@ from api.broker_config import (
 )
 from api.tool_manager import (
     BrokeredTokenSecret,
+    GitHubAppTokenSecret,
     HttpSecret,
     OAuthFieldSource,
     OAuthTokenSecret,
@@ -75,6 +76,17 @@ def test_render_broker_yaml_empty_secrets_emits_valid_skeleton(
     assert cfg["bearer_auth_env"] == BROKER_BEARER_AUTH_ENV
     assert cfg["log"] == {"level": "info", "format": "json"}
     assert cfg["credentials"] == []
+
+
+def test_render_broker_yaml_allows_listen_port_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
+    monkeypatch.setenv("FIREWALL_MANAGER_TOKEN_BROKER_LISTEN_PORT", "8182")
+
+    cfg = yaml.safe_load(render_broker_yaml([]))
+
+    assert cfg["listen"] == ":8182"
 
 
 def test_render_broker_yaml_emits_credential(
@@ -274,6 +286,11 @@ def test_render_broker_yaml_skips_non_brokered_secrets(
                 ("refresh_token", OAuthFieldSource("B", "refresh_token")),
             ),
             token_endpoint="https://h/token",
+        ),
+        GitHubAppTokenSecret(
+            name="GITHUB_TOKEN",
+            hosts=("github.com", "api.github.com"),
+            credential_id="github-app",
         ),
         BrokeredTokenSecret(
             name="codex", hosts=("h",), fields=_FIELDS,

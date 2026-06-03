@@ -2,6 +2,8 @@
 {{- $fileStoreEnabled := .Values.tokenBroker.fileStore.enabled -}}
 {{- $fileStoreBootstrapKeys := .Values.tokenBroker.fileStore.bootstrapKeys | default list -}}
 {{- $fileStoreBootstrapSecretName := default (include "centaur.secretEnvName" .) .Values.tokenBroker.fileStore.bootstrapSecretName -}}
+{{- $githubAppEnabled := .Values.tokenBroker.githubApp.enabled -}}
+{{- $brokerListenPort := ternary .Values.tokenBroker.githubApp.upstreamPort .Values.tokenBroker.service.httpPort $githubAppEnabled -}}
 # iron-token-broker — owns the OAuth refresh-token state machine for any
 # brokered_token credential. Single-writer process; the API
 # reconciles the ConfigMap content (one credentials[] entry per registered
@@ -24,7 +26,7 @@ metadata:
 {{ include "centaur.componentLabels" (dict "root" . "component" "token-broker") | nindent 4 }}
 data:
   iron-token-broker.yaml: |
-    listen: ":{{ .Values.tokenBroker.service.httpPort }}"
+    listen: ":{{ $brokerListenPort }}"
     metrics_listen: ":{{ .Values.tokenBroker.service.metricsPort }}"
     bearer_auth_env: IRON_BROKER_TOKEN
     log:
@@ -137,8 +139,8 @@ spec:
                   key: {{ printf "%sOP_SERVICE_ACCOUNT_TOKEN" .Values.secretManager.envPrefix }}
 {{- end }}
           ports:
-            - containerPort: {{ .Values.tokenBroker.service.httpPort }}
-              name: http
+            - containerPort: {{ $brokerListenPort }}
+              name: {{ ternary "broker" "http" $githubAppEnabled }}
             - containerPort: {{ .Values.tokenBroker.service.metricsPort }}
               name: metrics
           volumeMounts:
@@ -156,6 +158,57 @@ spec:
               type: RuntimeDefault
           resources:
 {{ toYaml .Values.tokenBroker.resources | nindent 12 }}
+{{- if $githubAppEnabled }}
+        - name: github-app-token-broker
+          image: {{ printf "%s:%s" .Values.api.image.repository .Values.api.image.tag | quote }}
+          imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+          command:
+            - /app/.venv/bin/uvicorn
+          args:
+            - api.github_app_token_broker:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - {{ .Values.tokenBroker.service.httpPort | quote }}
+          env:
+            - name: IRON_BROKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_BROKER_TOKEN" .Values.secretManager.envPrefix }}
+            - name: TOKEN_BROKER_UPSTREAM_URL
+              value: {{ printf "http://127.0.0.1:%v" .Values.tokenBroker.githubApp.upstreamPort | quote }}
+            - name: GITHUB_APP_BROKER_CREDENTIAL_ID
+              value: {{ .Values.tokenBroker.githubApp.credentialId | quote }}
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "tokenBroker.githubApp.existingSecretName is required when tokenBroker.githubApp.enabled=true" .Values.tokenBroker.githubApp.existingSecretName | quote }}
+                  key: {{ .Values.tokenBroker.githubApp.appIdSecretKey | quote }}
+            - name: GITHUB_APP_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "tokenBroker.githubApp.existingSecretName is required when tokenBroker.githubApp.enabled=true" .Values.tokenBroker.githubApp.existingSecretName | quote }}
+                  key: {{ .Values.tokenBroker.githubApp.installationIdSecretKey | quote }}
+            - name: GITHUB_APP_PRIVATE_KEY_FILE
+              value: /github-app/private-key
+            - name: GITHUB_APP_TOKEN_REFRESH_SKEW_SECONDS
+              value: {{ .Values.tokenBroker.githubApp.refreshSkewSeconds | quote }}
+          ports:
+            - containerPort: {{ .Values.tokenBroker.service.httpPort }}
+              name: http
+          volumeMounts:
+            - name: github-app-private-key
+              mountPath: /github-app
+              readOnly: true
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+{{ toYaml .Values.tokenBroker.githubApp.resources | nindent 12 }}
+{{- end }}
       volumes:
         - name: config
           configMap:
@@ -175,6 +228,14 @@ spec:
           secret:
             secretName: {{ $fileStoreBootstrapSecretName | quote }}
 {{- end }}
+{{- end }}
+{{- if $githubAppEnabled }}
+        - name: github-app-private-key
+          secret:
+            secretName: {{ required "tokenBroker.githubApp.existingSecretName is required when tokenBroker.githubApp.enabled=true" .Values.tokenBroker.githubApp.existingSecretName | quote }}
+            items:
+              - key: {{ .Values.tokenBroker.githubApp.privateKeySecretKey | quote }}
+                path: private-key
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
