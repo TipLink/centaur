@@ -13,6 +13,8 @@ from fastapi import FastAPI
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.tool_manager import (  # noqa: E402
+    GitHubAppTokenSecret,
+    HttpSecret,
     _LIFECYCLE_METHODS,
     _describe_method_docstring,
     _friendly_type_name,
@@ -737,6 +739,42 @@ class TestHarnessSecretSelection:
         assert slack_etl.secret_ref == "SLACK_ETL_TOKEN"
         assert slack_etl.hosts == ("*.slack.com",)
         assert slack_etl.match_headers == ("Authorization",)
+
+    def test_github_token_defaults_to_http_secret(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("GITHUB_APP_TOKEN_BROKER_ENABLED", raising=False)
+        tm = ToolManager.__new__(ToolManager)
+        tm.tools = {}
+
+        github = next(
+            s for s in tm.collect_secrets() if getattr(s, "name", None) == "GITHUB_TOKEN"
+        )
+
+        assert isinstance(github, HttpSecret)
+        assert github.secret_ref == "GITHUB_TOKEN"
+        assert github.hosts == ("github.com", "api.github.com")
+
+    def test_github_token_can_use_github_app_broker(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("GITHUB_APP_TOKEN_BROKER_ENABLED", "1")
+        monkeypatch.setenv(
+            "GITHUB_APP_TOKEN_BROKER_CREDENTIAL_ID",
+            "fineas-github-app",
+        )
+        tm = ToolManager.__new__(ToolManager)
+        tm.tools = {}
+
+        github = next(
+            s for s in tm.collect_secrets() if getattr(s, "name", None) == "GITHUB_TOKEN"
+        )
+
+        assert isinstance(github, GitHubAppTokenSecret)
+        assert github.credential_id == "fineas-github-app"
+        assert github.hosts == ("github.com", "api.github.com")
 
     def test_collect_secrets_returns_union_of_all_harness_variants(self) -> None:
         """The shared API-side proxy and token broker need every harness

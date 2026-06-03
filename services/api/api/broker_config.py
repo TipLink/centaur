@@ -24,6 +24,7 @@ Tools that need a coordinated refresh-token rotation opt in by declaring
 from __future__ import annotations
 
 import os
+from pathlib import PurePosixPath
 from typing import Any
 
 import yaml
@@ -42,6 +43,7 @@ DEFAULT_BROKER_METRICS_PORT = 9091
 # Env var the broker reads its bearer auth from. iron-proxy reads the same
 # token from ``IRON_BROKER_TOKEN`` on its end.
 BROKER_BEARER_AUTH_ENV = "IRON_BROKER_TOKEN"
+DEFAULT_FILE_STORE_DIR = "/var/lib/iron-token-broker/store"
 
 
 # Per the broker README: ``env`` is read-only and cannot back the store. For
@@ -62,6 +64,29 @@ _READ_SOURCES: dict[str, str] = {
 
 def _secret_source_kind() -> str:
     return os.environ.get("FIREWALL_MANAGER_SECRET_SOURCE", "env").strip().lower()
+
+
+def _broker_store_source_kind() -> str:
+    return (
+        os.environ.get("FIREWALL_MANAGER_TOKEN_BROKER_STORE_SOURCE", "")
+        .strip()
+        .lower()
+    )
+
+
+def _broker_file_store_dir() -> str:
+    value = os.environ.get(
+        "FIREWALL_MANAGER_TOKEN_BROKER_STORE_DIR", DEFAULT_FILE_STORE_DIR
+    ).strip()
+    return value or DEFAULT_FILE_STORE_DIR
+
+
+def _broker_listen_port() -> int:
+    raw = (
+        os.environ.get("FIREWALL_MANAGER_TOKEN_BROKER_LISTEN_PORT")
+        or str(DEFAULT_BROKER_LISTEN_PORT)
+    ).strip()
+    return int(raw or DEFAULT_BROKER_LISTEN_PORT)
 
 
 def _op_vault() -> str:
@@ -101,10 +126,20 @@ def _build_store_source(field: OAuthFieldSource) -> dict[str, Any]:
     kind = _secret_source_kind()
     iron_proxy_type = _STORE_SOURCES.get(kind)
     if iron_proxy_type is None:
+        if _broker_store_source_kind() in {"file", "filesystem"}:
+            return {
+                "type": "file",
+                "path": str(
+                    PurePosixPath(_broker_file_store_dir())
+                    / f"{field.secret_ref}.json"
+                ),
+            }
         raise ValueError(
             f"iron-token-broker store cannot use secret source {kind!r}; "
             "configure FIREWALL_MANAGER_SECRET_SOURCE=onepassword or "
-            "onepassword-connect (refresh tokens must be writable)"
+            "onepassword-connect, or set "
+            "FIREWALL_MANAGER_TOKEN_BROKER_STORE_SOURCE=file with a writable "
+            "FIREWALL_MANAGER_TOKEN_BROKER_STORE_DIR"
         )
     return {
         "type": iron_proxy_type,
@@ -166,7 +201,7 @@ def render_broker_yaml(secrets: list[SecretDef]) -> str:
     """
     credentials = [_credential_entry(s) for s in collect_broker_credentials(secrets)]
     cfg = {
-        "listen": f":{DEFAULT_BROKER_LISTEN_PORT}",
+        "listen": f":{_broker_listen_port()}",
         "metrics_listen": f":{DEFAULT_BROKER_METRICS_PORT}",
         "bearer_auth_env": BROKER_BEARER_AUTH_ENV,
         "log": {"level": "info", "format": "json"},

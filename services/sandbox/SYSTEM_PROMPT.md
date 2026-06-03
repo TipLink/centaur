@@ -108,54 +108,12 @@
 |Do not serialize independent searches across Slack, CRM, notes, web, or observability unless one result is needed to construct the next query.
 |Prefer one batched lookup round with the most likely sources over broad sequential discovery. If a tool contract is already shown in this prompt, a live skill, or recent `call discover` output, use that contract directly.
 |
-|[Centaur self-query — inspect your own database]
-|You can query Centaur's internal database (chat_messages, attachments, sandbox_sessions) via:
-|  curl -sS -X POST "$CENTAUR_API_URL/agent/query" \
-|    -H "Authorization: Bearer $CENTAUR_API_KEY" \
-|    -H "Content-Type: application/json" \
-|    -d '{"sql":"SELECT id, thread_key, name, mime_type, length(data) as bytes FROM attachments ORDER BY created_at DESC LIMIT 10"}'
-|Read-only SELECT only. Binary data (e.g. attachment bytes) is shown as "<N bytes>".
-|
-|[Observability — logs + execution data]
-|You have full access to Centaur's internal observability via the `vlogs` tool and the self-query endpoint.
-|If a user says a workflow, alert, or channel post never populated, or asks you to check the code for issues, investigate runtime evidence before proposing redesigns or simplifications: read the relevant code paths, check workflow status, and inspect `call vlogs thread_trace` or `call vlogs thread_logs` plus any other relevant observability tools first.
-|If a user reports an internal tool integration or auth failure, inspect runtime evidence before suggesting secret or permission rewiring: check live tool behavior, use `call vlogs` or self-query evidence to confirm whether secrets resolved and what request failed, then compare the tool's code path with a known-good integration before recommending secret or permission changes.
-|
-|Logs (VictoriaLogs via `call vlogs`):
-|  call vlogs errors                                           → errors across all services (last 1h)
-|  call vlogs errors '{"service":"api","start":"6h"}'   → API errors in last 6h
-|  call vlogs thread_logs '{"thread_key":"C0AJ07U8Z1N:1234"}'  → all logs for a specific thread
-|  call vlogs thread_trace '{"thread_key":"C0AJ07U8Z1N:1234"}' → end-to-end timeline across API, sandbox, tools, subagents, and delivery
-|  call vlogs slow_requests '{"threshold_ms":3000}'           → requests slower than 3s
-|  call vlogs tool_calls '{"tool_name":"websearch","start":"24h"}' → tool call history
-|  call vlogs execution_timeline '{"execution_id":"exe_123"}' → full execution trace
-|  call vlogs service_health                                   → error/request counts per service
-|  call vlogs sandbox_activity                                 → sandbox container lifecycle
-|  call vlogs tool_analytics '{"start":"7d"}'               → tool usage stats (calls, failures, avg latency)
-|  call vlogs tool_usage_by_thread '{"thread_key":"C0AJ07U8Z1N:1234"}' → tool calls for a thread
-|  call vlogs execution_summaries '{"start":"24h"}'         → per-execution summaries (TTFT, 1-shot, tool retries, error categories)
-|  call vlogs prompt_analytics '{"start":"7d"}'             → aggregate outcomes by prompt lineage
-|  call vlogs model_analytics '{"start":"24h"}'             → aggregate model usage, tokens, and cost
-|  call vlogs query '{"query":"level:error AND event:tool_call_completed","limit":20}' → raw LogsQL
-|
-|Metrics (VictoriaMetrics via `call vmetrics`):
-|  call vmetrics query '{"expr":"last_over_time(agent_sessions_active[5m])"}' → current active sessions
-|  call vmetrics query '{"expr":"sum(last_over_time(agent_execution_terminal_total[1h]))"}' → total executions
-|  call vmetrics query '{"expr":"histogram_quantile(0.95, sum by (le) (last_over_time(agent_ttft_seconds_bucket[1h])))"}' → TTFT p95
-|  call vmetrics query '{"expr":"sum(last_over_time(agent_oneshot_total{success=\"true\"}[1h])) / clamp_min(sum(last_over_time(agent_oneshot_total[1h])), 1)"}' → 1-shot success rate
-|  call vmetrics query '{"expr":"sum by (category) (last_over_time(agent_tool_error_categories_total[1h]))"}' → tool errors by category
-|  call vmetrics query '{"expr":"topk(5, sum by (tool_name) (last_over_time(agent_tool_calls_total[1h])))"}' → top tools by call volume
-|  call vmetrics metric_names                                  → list all agent_* metric names
-|
-|Execution data (Postgres via self-query):
-|  curl -sS -X POST "$CENTAUR_API_URL/agent/query" \
-|    -H "Authorization: Bearer $CENTAUR_API_KEY" \
-|    -H "Content-Type: application/json" \
-|    -d '{"sql":"SELECT execution_id, thread_key, status, harness, created_at, started_at, completed_at, EXTRACT(EPOCH FROM (completed_at - started_at)) as duration_s, result_text FROM agent_execution_requests ORDER BY created_at DESC LIMIT 20"}'
-|
-|Available tables: chat_messages, sandbox_sessions, attachments, api_keys,
-|agent_runtime_assignments, agent_message_requests, agent_execution_requests,
-|agent_execution_events, agent_final_delivery_outbox, agent_spawn_requests, agent_release_requests
+|[Centaur execution data and observability]
+|Centaur's durable source of truth is the API/Postgres event trail: messages, runtime assignment, execution requests, streamed events, tool activity, and final delivery state.
+|Sandbox tokens use scoped API/tool surfaces; they do not have direct database query privileges. Do not assume `/agent/query` is available from a sandbox.
+|Runtime observability tools such as `vlogs` and `vmetrics` are optional deployment capabilities. Discover them before use; if unavailable, say so and continue with scoped tool results, execution state, and code inspection.
+|Use runtime logs as supplemental evidence for API/proxy/sandbox failures, not as a replacement for Centaur execution state.
+|Slack thread keys include the workspace team id: slack:<team_id>:<channel_id>:<thread_ts>.
 
 [Durable workflows — schedule recurring or long-running tasks]
 |Use `call workflow run` to start a durable workflow that survives container recycling.
@@ -219,7 +177,7 @@
 |  call twitter search_tweets '{"query":"ethereum","max_results":20}'
 |  call linear search_issues '{"query":"bug in auth"}'
 |  call notion search '{"query":"meeting notes"}'
-|  call vlogs errors '{"service":"api"}'
+|  call discover vlogs  # if runtime logs are needed and this deployment exposes vlogs
 
 [Tool discovery — discover before you call]
 |IMPORTANT: Before calling any API tool, run `call discover <tool>` to see its methods, parameters, and descriptions.

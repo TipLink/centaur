@@ -246,6 +246,23 @@ class BrokeredTokenSecret:
 
 
 @dataclass(frozen=True)
+class GitHubAppTokenSecret:
+    """GitHub App installation token minted through the token broker.
+
+    GitHub App installation tokens are not OAuth refresh-token credentials, so
+    they are not rendered into iron-token-broker's OAuth config. Instead, the
+    chart can place a small GitHub App broker shim in front of iron-token-broker
+    and route this credential id to that shim. iron-proxy still sees the same
+    ``token_broker`` source shape and swaps the ``GITHUB_TOKEN`` placeholder at
+    the network boundary.
+    """
+
+    name: str
+    hosts: tuple[str, ...]
+    credential_id: str = "github-app"
+
+
+@dataclass(frozen=True)
 class HmacHeader:
     """One header injected by iron-proxy's ``hmac_sign`` transform.
 
@@ -296,6 +313,7 @@ SecretDef = (
     | PgDsnSecret
     | OAuthTokenSecret
     | BrokeredTokenSecret
+    | GitHubAppTokenSecret
     | HmacSignSecret
 )
 
@@ -1836,13 +1854,40 @@ class ToolManager:
         )
         return loaded
 
+    @staticmethod
+    def _github_app_token_broker_enabled() -> bool:
+        return (os.environ.get("GITHUB_APP_TOKEN_BROKER_ENABLED") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @classmethod
+    def _github_infra_secret(cls) -> SecretDef:
+        if cls._github_app_token_broker_enabled():
+            credential_id = (
+                os.environ.get("GITHUB_APP_TOKEN_BROKER_CREDENTIAL_ID") or "github-app"
+            ).strip() or "github-app"
+            return GitHubAppTokenSecret(
+                name="GITHUB_TOKEN",
+                credential_id=credential_id,
+                hosts=("github.com", "api.github.com"),
+            )
+        return HttpSecret(
+            name="GITHUB_TOKEN",
+            secret_ref="GITHUB_TOKEN",
+            hosts=("github.com", "api.github.com"),
+            match_headers=("Authorization",),
+        )
+
     # Global proxy secrets — credentials the shared API-side proxy and sandbox
-    # proxies may need regardless of which harness is running. Each
-    # ``HttpSecret`` carries the hosts iron-proxy attaches it to.
+    # proxies may need regardless of which harness is running. Each secret
+    # carries the hosts iron-proxy attaches it to.
     # Harness-specific provider credentials (Anthropic, OpenAI) live in
     # ``_HARNESS_SECRETS`` below because the right credential depends on the
     # sandbox's harness and auth mode.
-    _INFRA_SECRETS: ClassVar[list[HttpSecret]] = [
+    _BASE_INFRA_SECRETS: ClassVar[tuple[SecretDef, ...]] = (
         HttpSecret(
             name="XAI_API_KEY",
             secret_ref="XAI_API_KEY",
@@ -1862,12 +1907,6 @@ class ToolManager:
             match_headers=("Authorization",),
         ),
         HttpSecret(
-            name="GITHUB_TOKEN",
-            secret_ref="GITHUB_TOKEN",
-            hosts=("github.com", "api.github.com"),
-            match_headers=("Authorization",),
-        ),
-        HttpSecret(
             name="SLACK_BOT_TOKEN",
             secret_ref="SLACK_BOT_TOKEN",
             hosts=("*.slack.com",),
@@ -1879,7 +1918,15 @@ class ToolManager:
             hosts=("*.slack.com",),
             match_headers=("Authorization",),
         ),
-    ]
+    )
+
+    @classmethod
+    def _infra_secrets(cls) -> list[SecretDef]:
+        secrets = list(cls._BASE_INFRA_SECRETS)
+        # Keep GITHUB_TOKEN in the same relative position as the old static
+        # list: after AMP_API_KEY and before the Slack tokens.
+        secrets.insert(3, cls._github_infra_secret())
+        return secrets
 
     # Harness-specific credentials, keyed by ``(engine, auth_mode)``. The
     # per-sandbox iron-proxy gets exactly the tuple that matches the
@@ -1970,7 +2017,7 @@ class ToolManager:
         engines (e.g. ``amp``, ``pi-mono``) get no harness extras — they
         authenticate through entries that already live in ``_INFRA_SECRETS``.
         """
-        out: list[SecretDef] = list(self._INFRA_SECRETS)
+        out: list[SecretDef] = self._infra_secrets()
         for lt in self.tools.values():
             out.extend(lt.all_secrets)
         out.extend(self._harness_secrets_for(engine, auth_modes))
@@ -1985,7 +2032,7 @@ class ToolManager:
         regardless of which sandboxes are currently running. Per-sandbox
         proxies should call :meth:`secrets_for_sandbox` instead.
         """
-        out: list[SecretDef] = list(self._INFRA_SECRETS)
+        out: list[SecretDef] = self._infra_secrets()
         for lt in self.tools.values():
             out.extend(lt.all_secrets)
         for harness_set in self._HARNESS_SECRETS.values():

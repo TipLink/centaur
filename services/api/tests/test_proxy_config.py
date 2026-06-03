@@ -13,6 +13,7 @@ from api.proxy_config import (
 from api.tool_manager import (
     DEFAULT_MATCH_HEADERS,
     GcpAuthSecret,
+    GitHubAppTokenSecret,
     HmacHeader,
     HmacSignSecret,
     HttpSecret,
@@ -1494,7 +1495,10 @@ def test_render_emits_postgres_listeners_with_env_refs(
     ]
     cfg = yaml.safe_load(render_proxy_yaml(secrets))
     listeners = cfg["postgres"]
-    assert [l["name"] for l in listeners] == ["analytics_pg", "database_url"]
+    assert [listener["name"] for listener in listeners] == [
+        "analytics_pg",
+        "database_url",
+    ]
     assert listeners[0]["listen"] == "0.0.0.0:5432"
     assert listeners[1]["listen"] == "0.0.0.0:5433"
     # upstream.dsn uses the secret_ref directly so iron-proxy can resolve it
@@ -1802,3 +1806,35 @@ def test_render_brokered_token_merges_hosts_across_duplicate_names(
         "api.anthropic.com",
         "console.anthropic.com",
     }
+
+
+def test_render_github_app_token_uses_broker_credential_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIREWALL_MANAGER_TOKEN_BROKER_TTL", "45s")
+    secrets = [
+        GitHubAppTokenSecret(
+            name="GITHUB_TOKEN",
+            credential_id="fineas-github-app",
+            hosts=("github.com", "api.github.com"),
+        ),
+    ]
+
+    cfg = yaml.safe_load(render_proxy_yaml(secrets))
+    secrets_block = next(t for t in cfg["transforms"] if t["name"] == "secrets")
+    entries = secrets_block["config"]["secrets"]
+
+    assert entries == [
+        {
+            "source": {
+                "type": "token_broker",
+                "credential_id": "fineas-github-app",
+                "ttl": "45s",
+            },
+            "replace": {
+                "proxy_value": "GITHUB_TOKEN",
+                "match_headers": ["Authorization"],
+            },
+            "rules": [{"host": "api.github.com"}, {"host": "github.com"}],
+        }
+    ]
