@@ -1039,7 +1039,7 @@ def _slackbot_streamed_answer_chars(value: Any) -> int:
 def _slackbot_live_delivery_covers_result(result_text: str, streamed_chars: int) -> bool:
     text = result_text.strip()
     if not text:
-        return True
+        return False
     return streamed_chars >= len(text)
 
 
@@ -1950,12 +1950,10 @@ async def _mark_execution_terminal(
             suppress_legacy_delivery = (
                 _has_slackbot_live_delivery(metadata)
                 and not slackbot_live_delivery_failed
-                and (
-                    not result_has_text
-                    or _slackbot_live_delivery_covers_result(
-                        result_text,
-                        slackbot_streamed_answer_chars,
-                    )
+                and result_has_text
+                and _slackbot_live_delivery_covers_result(
+                    result_text,
+                    slackbot_streamed_answer_chars,
                 )
             )
         assignment_row = await pool.fetchrow(
