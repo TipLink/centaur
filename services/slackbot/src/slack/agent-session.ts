@@ -55,6 +55,7 @@ type AgentSessionState = {
   done: boolean
   statusCleared: boolean
   statusUnsupported: boolean
+  statusRefreshTimer?: ReturnType<typeof setInterval>
   segments: Segment[]
 }
 
@@ -107,6 +108,7 @@ function headerBlock(header: string): AnyBlock {
 const sessions = new Map<string, AgentSessionState>()
 const sessionQueues = new Map<string, Promise<void>>()
 const THINKING_STATUS = 'Thinking...'
+const STATUS_REFRESH_INTERVAL_MS = 30_000
 const TEXT_FLUSH_INTERVAL_MS = 250
 const TEXT_FLUSH_CHARS = 1000
 const FIRST_TEXT_FLUSH_CHARS = 1
@@ -125,7 +127,7 @@ export class AgentSessionRenderer {
   async open(input: OpenAgentSessionInput): Promise<{ sessionId: string }> {
     const id = ulid()
     const header = input.header?.trim() || undefined
-    sessions.set(id, {
+    const state = {
       id,
       channel: input.channel,
       parentTs: input.parentTs,
@@ -137,8 +139,11 @@ export class AgentSessionRenderer {
       done: false,
       statusCleared: false,
       statusUnsupported: false
-    })
-    await this.setStatus(id, THINKING_STATUS)
+    }
+    sessions.set(id, state)
+    if (await this.setStatus(id, THINKING_STATUS)) {
+      this.startStatusRefresh(state)
+    }
     return { sessionId: id }
   }
 
@@ -239,6 +244,7 @@ export class AgentSessionRenderer {
       streamedTextChars = streamedTextSourceChars(state)
       closed = true
     } finally {
+      this.stopStatusRefresh(state)
       if (!state.statusCleared) {
         state.statusCleared = await this.setStatus(sessionId, '')
       }
@@ -289,8 +295,6 @@ export class AgentSessionRenderer {
     if (!segment.streamTs && !segment.textParts.length && !segment.tasks.size && !hasFinalText) {
       return
     }
-    await this.ensureStream(state, segment, [])
-    if (!segment.streamTs) return
     const originalTasks = finalTaskSnapshot(segment)
     const tasks = compactFinalTasks(originalTasks)
     const answerSource =
@@ -313,6 +317,12 @@ export class AgentSessionRenderer {
       title: state.title,
       answerMarkdown
     })
+    if (!segment.streamTs) {
+      const initialChunks = markdownToStreamChunks(fallbackText)
+      if (!initialChunks.length) return
+      await this.ensureStream(state, segment, initialChunks)
+    }
+    if (!segment.streamTs) return
     const chunks =
       blocks.length || streamedTextLive ? undefined : markdownToStreamChunks(fallbackText)
     const stopResponse = await this.client.chat.stopStream({
@@ -344,7 +354,6 @@ export class AgentSessionRenderer {
       chunks: effectiveChunks as AnyChunk[]
     })
     if (!response.ok) throw new Error(response.error ?? 'chat.appendStream failed')
-    await this.clearStatusAfterVisibleOutput(state, effectiveChunks)
   }
 
   private async queueText(
@@ -483,7 +492,6 @@ export class AgentSessionRenderer {
       })
       if (!response.ok || !response.ts) throw new Error(response.error ?? 'chat.startStream failed')
       segment.streamTs = response.ts
-      await this.clearStatusAfterVisibleOutput(state, chunks)
     })()
 
     try {
@@ -492,14 +500,6 @@ export class AgentSessionRenderer {
     } finally {
       segment.streamStartPromise = undefined
     }
-  }
-
-  private async clearStatusAfterVisibleOutput(
-    state: AgentSessionState,
-    chunks: SlackStreamChunk[]
-  ): Promise<void> {
-    if (state.statusCleared || !hasVisibleStreamChunks(chunks)) return
-    state.statusCleared = await this.setStatus(state.id, '')
   }
 
   private planPrefix(state: AgentSessionState, segment: Segment): AnyChunk[] {
@@ -520,6 +520,37 @@ export class AgentSessionRenderer {
     if (!header || segment.headerEmitted) return chunks
     segment.headerEmitted = true
     return [markdownChunk(`${headerMarkdown(header)}\n`), ...chunks]
+  }
+
+  private startStatusRefresh(state: AgentSessionState): void {
+    if (state.statusRefreshTimer) return
+    const timer = setInterval(() => {
+      void this.refreshActiveStatus(state)
+    }, STATUS_REFRESH_INTERVAL_MS)
+    timer.unref?.()
+    state.statusRefreshTimer = timer
+  }
+
+  private stopStatusRefresh(state: AgentSessionState): void {
+    if (!state.statusRefreshTimer) return
+    clearInterval(state.statusRefreshTimer)
+    state.statusRefreshTimer = undefined
+  }
+
+  private async refreshActiveStatus(state: AgentSessionState): Promise<void> {
+    if (
+      state.done ||
+      state.statusCleared ||
+      state.statusUnsupported ||
+      !sessions.has(state.id)
+    ) {
+      this.stopStatusRefresh(state)
+      return
+    }
+    const refreshed = await this.setStatus(state.id, THINKING_STATUS)
+    if (!refreshed && state.statusUnsupported) {
+      this.stopStatusRefresh(state)
+    }
   }
 }
 
@@ -714,15 +745,6 @@ function requireSession(id: string): AgentSessionState {
 
 function raiseStreamError(segment: Segment): void {
   if (segment.streamError) throw segment.streamError
-}
-
-function hasVisibleStreamChunks(chunks: SlackStreamChunk[]): boolean {
-  return chunks.some(chunk => {
-    if (chunk.type === 'markdown_text') return Boolean(chunk.text?.trim())
-    if (chunk.type === 'task_update') return Boolean(chunk.title?.trim())
-    if (chunk.type === 'plan_update') return Boolean(chunk.title?.trim())
-    return false
-  })
 }
 
 function safeMarkdownFlush(markdown: string, pendingText: string, streamedText: string): boolean {

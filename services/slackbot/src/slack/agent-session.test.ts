@@ -2,6 +2,53 @@ import { describe, expect, it } from 'bun:test'
 import { AgentSessionRenderer, withAgentSessionLock } from './agent-session'
 
 describe('AgentSessionRenderer', () => {
+  it('clears status without opening a blank stream when a session has no visible output', async () => {
+    const calls: Array<{ method: string; params: any }> = []
+    const client = {
+      assistant: {
+        threads: {
+          setStatus: async (params: any) => {
+            calls.push({ method: 'assistant.threads.setStatus', params })
+            return { ok: true }
+          }
+        }
+      },
+      chat: {
+        startStream: async (params: any) => {
+          calls.push({ method: 'chat.startStream', params })
+          return { ok: true, ts: '1778866940.295499' }
+        },
+        appendStream: async (params: any) => {
+          calls.push({ method: 'chat.appendStream', params })
+          return { ok: true }
+        },
+        stopStream: async (params: any) => {
+          calls.push({ method: 'chat.stopStream', params })
+          return { ok: true }
+        },
+        update: async () => ({ ok: true })
+      }
+    }
+
+    const renderer = new AgentSessionRenderer(client as any)
+    const { sessionId } = await renderer.open({
+      channel: 'C123',
+      parentTs: '1778866921.505479',
+      recipientTeamId: 'T123',
+      recipientUserId: 'U123',
+      title: 'Centaur execution'
+    })
+
+    await renderer.done(sessionId)
+
+    expect(calls.map(call => call.method)).toEqual([
+      'assistant.threads.setStatus',
+      'assistant.threads.setStatus'
+    ])
+    expect(calls[0]?.params.status).toBe('Thinking...')
+    expect(calls[1]?.params.status).toBe('')
+  })
+
   it('stops calling assistant.threads.setStatus after the channel returns user_not_found', async () => {
     const setStatusCalls: any[] = []
     const client = {
@@ -101,15 +148,15 @@ describe('AgentSessionRenderer', () => {
         details: '```bash\nsleep 2\n```'
       }
     ])
-    expect(calls.slice(0, 3).map(call => call.method)).toEqual([
+    expect(calls.slice(0, 2).map(call => call.method)).toEqual([
       'assistant.threads.setStatus',
-      'chat.startStream',
-      'assistant.threads.setStatus'
+      'chat.startStream'
     ])
     expect(calls[0]?.params.status).toBe('Thinking...')
     expect(calls[0]?.params.loading_messages).toEqual(['Thinking...'])
-    expect(calls[2]?.params.status).toBe('')
-    expect(calls[2]?.params.loading_messages).toBeUndefined()
+    const statusCalls = calls.filter(call => call.method === 'assistant.threads.setStatus')
+    expect(statusCalls.at(-1)?.params.status).toBe('')
+    expect(statusCalls.at(-1)?.params.loading_messages).toBeUndefined()
 
     const appends = calls.filter(call => call.method === 'chat.appendStream')
     expect(appends[0]?.params.chunks).toEqual([
@@ -171,7 +218,7 @@ describe('AgentSessionRenderer', () => {
 
     expect(calls.map(call => call.method)).toContain('chat.startStream')
     expect(calls.map(call => call.method)).toContain('chat.stopStream')
-    expect(calls.filter(call => call.method === 'assistant.threads.setStatus')).toHaveLength(3)
+    expect(calls.filter(call => call.method === 'assistant.threads.setStatus')).toHaveLength(2)
   })
 
   it('streams task updates with accumulated details and output', async () => {
