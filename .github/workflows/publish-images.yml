@@ -105,3 +105,164 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  promote-fineas-infra:
+    name: Open Fineas infra promotion PR
+    runs-on: ubuntu-latest
+    needs: publish
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    steps:
+      - name: Create Fineas infra GitHub App token
+        id: fineas_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ vars.FINEAS_GITHUB_APP_ID }}
+          private-key: ${{ secrets.FINEAS_GITHUB_APP_PRIVATE_KEY }}
+          owner: TipLink
+          repositories: fineas-centaur-infra
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout Fineas infra
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: TipLink/fineas-centaur-infra
+          token: ${{ steps.fineas_token.outputs.token }}
+          path: fineas-centaur-infra
+          persist-credentials: false
+
+      - name: Update Fineas Centaur pins
+        working-directory: fineas-centaur-infra
+        run: |
+          bash scripts/bump-centaur-pins.sh "${GITHUB_SHA}"
+          scripts/audit-supply-chain.sh
+
+      - name: Open or update Fineas infra PR
+        id: promote
+        env:
+          FINEAS_INFRA_TOKEN: ${{ steps.fineas_token.outputs.token }}
+          CENTAUR_SHA: ${{ github.sha }}
+          CENTAUR_REPO: ${{ github.repository }}
+          CENTAUR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          owner = "TipLink"
+          repo = "fineas-centaur-infra"
+          base_branch = "main"
+          centaur_sha = os.environ["CENTAUR_SHA"]
+          centaur_short = centaur_sha[:7]
+          centaur_tag = f"sha-{centaur_short}"
+          branch = f"automation/promote-centaur-{centaur_short}"
+          root = Path("fineas-centaur-infra")
+          files = [
+              "README.md",
+              "clusters/centaur-sandbox/argocd/applications/centaur-sandbox.yaml",
+              "clusters/centaur-sandbox/argocd/values/centaur.yaml",
+              "clusters/centaur-sandbox/argocd/apps/centaur/github-app-repo-cache-token.yaml",
+          ]
+          title = f"Promote Centaur {centaur_short} to Fineas"
+          body = f"""## Summary
+          - update Fineas Centaur base image pins to `{centaur_tag}`
+          - pin the Centaur chart source to `{centaur_sha}`
+          - update the repo-cache token refresher image to the same Centaur agent tag
+
+          ## Source
+          - Centaur commit: https://github.com/{os.environ["CENTAUR_REPO"]}/commit/{centaur_sha}
+          - Image publish run: {os.environ["CENTAUR_RUN_URL"]}
+
+          ## Tests
+          - `bash scripts/bump-centaur-pins.sh {centaur_sha}`
+          - `scripts/audit-supply-chain.sh`
+          """
+
+          headers = {
+              "Authorization": f"Bearer {os.environ['FINEAS_INFRA_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "centaur-promote-fineas",
+          }
+          api = f"https://api.github.com/repos/{owner}/{repo}"
+
+          def request(method: str, url: str, payload: dict | None = None, *, ok=(200, 201, 204)):
+              data = None
+              req_headers = dict(headers)
+              if payload is not None:
+                  data = json.dumps(payload).encode()
+                  req_headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      body_text = resp.read().decode()
+                      if resp.status not in ok:
+                          raise RuntimeError(f"{method} {url} returned {resp.status}: {body_text}")
+                      return json.loads(body_text) if body_text else None
+              except urllib.error.HTTPError as exc:
+                  body_text = exc.read().decode()
+                  if exc.code in ok:
+                      return json.loads(body_text) if body_text else None
+                  raise RuntimeError(f"{method} {url} returned {exc.code}: {body_text}") from None
+
+          base_ref = request("GET", f"{api}/git/ref/heads/{base_branch}")
+          base_sha = base_ref["object"]["sha"]
+          encoded_branch = urllib.parse.quote(branch, safe="")
+          try:
+              request("POST", f"{api}/git/refs", {"ref": f"refs/heads/{branch}", "sha": base_sha})
+          except RuntimeError as exc:
+              if "Reference already exists" not in str(exc):
+                  raise
+
+          changed = False
+          for rel in files:
+              path = root / rel
+              encoded_path = urllib.parse.quote(rel, safe="")
+              content_bytes = path.read_bytes()
+              content = base64.b64encode(content_bytes).decode()
+              existing = request("GET", f"{api}/contents/{encoded_path}?ref={encoded_branch}")
+              current = base64.b64decode(existing["content"]).replace(b"\r\n", b"\n")
+              if current == content_bytes:
+                  continue
+              request(
+                  "PUT",
+                  f"{api}/contents/{encoded_path}",
+                  {
+                      "message": f"chore: promote centaur {centaur_short}",
+                      "content": content,
+                      "branch": branch,
+                      "sha": existing["sha"],
+                  },
+              )
+              changed = True
+
+          pulls = request(
+              "GET",
+              f"{api}/pulls?state=open&head={urllib.parse.quote(f'{owner}:{branch}', safe='')}",
+          )
+          if pulls:
+              pr = request("PATCH", f"{api}/pulls/{pulls[0]['number']}", {"title": title, "body": body})
+          elif changed:
+              pr = request(
+                  "POST",
+                  f"{api}/pulls",
+                  {"title": title, "head": branch, "base": base_branch, "body": body},
+              )
+          else:
+              pr = None
+
+          output_path = os.environ["GITHUB_OUTPUT"]
+          with open(output_path, "a", encoding="utf-8") as output:
+              if pr:
+                  output.write(f"pr_url={pr['html_url']}\n")
+                  output.write(f"pr_number={pr['number']}\n")
+              else:
+                  output.write("pr_url=\n")
+          PY
