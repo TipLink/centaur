@@ -14,6 +14,7 @@ import {
 } from './streaming'
 
 const COMMAND_EXECUTION_TITLE = 'Command execution'
+const PROGRESS_UPDATE_TITLE = 'Progress update'
 
 type AgentMessagePhase = 'commentary' | 'final_answer'
 
@@ -205,7 +206,7 @@ export class CodexSessionRenderer {
     if (reasoningMessage) {
       const task: HarnessTask = {
         id: `reasoning-${++state.stepCounter}`,
-        title: 'Thinking',
+        title: PROGRESS_UPDATE_TITLE,
         status: 'complete',
         details: [section([text(reasoningMessage)])],
         output: []
@@ -459,7 +460,7 @@ function upsertThinkingTask(state: CodexSessionState, event: any): void {
   }
   state.taskByUseId.set(`thinking-${id}`, {
     id: `thinking-${id}`,
-    title: 'Thinking',
+    title: PROGRESS_UPDATE_TITLE,
     status: 'complete',
     details: [section([text(body)])],
     output: []
@@ -891,7 +892,7 @@ function changedActivityTaskUpdates(
 }
 
 function activityRunBlock(task: HarnessTask): StreamRichText {
-  if (task.title === 'Thinking' && task.details.length) {
+  if (isProgressUpdateTask(task) && task.details.length) {
     return richText(task.details)
   }
   const command = firstPreformattedBody(task.details)
@@ -899,6 +900,14 @@ function activityRunBlock(task: HarnessTask): StreamRichText {
     return richText([pre(command, shellLanguage(firstPreformattedLanguage(task.details)))])
   }
   return richText(task.details)
+}
+
+function isProgressUpdateTask(task: HarnessTask): boolean {
+  return (
+    task.title === PROGRESS_UPDATE_TITLE ||
+    task.id.startsWith('thinking-') ||
+    task.id.startsWith('reasoning-')
+  )
 }
 
 function activityOutputBlock(task: HarnessTask): StreamRichText {
