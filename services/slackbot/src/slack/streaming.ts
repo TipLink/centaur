@@ -149,15 +149,18 @@ function paragraphSections(value: string): StreamRichTextElement[] {
 
 function parseInlineMarkdown(value: string): StreamInline[] {
   const out: StreamInline[] = []
-  const pattern = /(`([^`]+)`)|\[([^\]]+)\]\(([^)]+)\)|(\*\*([^*]+)\*\*)|<@(U[A-Z0-9]+)>/g
+  const pattern =
+    /(`([^`]+)`)|\[([^\]]+)\]\(\s*<?((?:https?|slack):\/\/[^\s>)]+)>?\s*\)|<((?:https?|slack):\/\/[^>|]+)\|([^>]+)>|(\*\*([^*]+)\*\*)|<@(U[A-Z0-9]+)>|((?:https?|slack):\/\/[^\s<>)]+)/g
   let index = 0
   for (const match of value.matchAll(pattern)) {
     if (match.index !== undefined && match.index > index)
       out.push(text(value.slice(index, match.index)))
     if (match[2]) out.push(text(match[2], { code: true }))
     else if (match[3] && match[4]) out.push(link(match[4], match[3]))
-    else if (match[6]) out.push(text(match[6], { bold: true }))
-    else if (match[7]) out.push({ type: 'user', user_id: match[7] })
+    else if (match[5] && match[6]) out.push(link(match[5], match[6]))
+    else if (match[8]) out.push(text(match[8], { bold: true }))
+    else if (match[9]) out.push({ type: 'user', user_id: match[9] })
+    else if (match[10]) out.push(link(match[10]))
     index = (match.index ?? 0) + match[0].length
   }
   if (index < value.length) out.push(text(value.slice(index)))

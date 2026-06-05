@@ -1074,13 +1074,13 @@ def _build_session_context(
                 "",
                 "## Slack Formatting Rules",
                 "",
-                "- Use standard markdown links `[Display Text](URL)` for hyperlinks",
-                "- Do NOT use Slack-native `<URL|text>` link syntax",
+                "- Use bare URLs or Slack-native `<URL|text>` links for hyperlinks",
+                "- Do NOT use GitHub-style inline links like `[text](URL)` for Slack-visible posts",
                 "- Preserve Slack user mentions (`<@UXXXXXXX>`) exactly as-is — only use these for actual Slack users",
-                "- For Twitter/X handles, link to the profile WITHOUT an @ prefix in the display text: `[handle](https://x.com/handle)` (NOT `[@handle](...)`)",
+                "- For Twitter/X handles, link to the profile WITHOUT an @ prefix in the display text: `<https://x.com/handle|handle>` (NOT `<https://x.com/handle|@handle>`)",
                 "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
                 "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
-                "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
+                "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with bare URLs or `<URL|text>` links instead",
                 "- For links to Slack threads or messages, use "
                 f"`{slack_base_url}/archives/{{CHANNEL_ID}}/p{{TS_WITHOUT_DOT}}`. "
                 "Use the configured workspace host; do not use bare `https://slack.com/archives/...` when a workspace host is available.",
