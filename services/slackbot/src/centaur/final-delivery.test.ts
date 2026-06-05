@@ -64,7 +64,7 @@ describe("final delivery polling", () => {
                       final_payload: {
                         session_title: "Centaur · codex",
                         result_text:
-                          "done [once](https://example.com) with **bold** text",
+                          "done [once](https://example.com) with **bold** text and https://example.com/raw",
                       },
                     },
                   ]
@@ -160,12 +160,24 @@ describe("final delivery polling", () => {
         (call) => call.method === "chat.postMessage",
       );
       expect((postMessage?.params as any)?.text).toBe(
-        "done [once](https://example.com) with **bold** text",
+        "done <https://example.com|once> with **bold** text and https://example.com/raw",
       );
       expect((postMessage?.params as any)?.blocks).toEqual([
         {
-          type: "markdown",
-          text: "done [once](https://example.com) with **bold** text",
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "done " },
+                { type: "link", url: "https://example.com", text: "once" },
+                { type: "text", text: " with " },
+                { type: "text", text: "bold", style: { bold: true } },
+                { type: "text", text: " text and " },
+                { type: "link", url: "https://example.com/raw" },
+              ],
+            },
+          ],
         },
       ]);
     } finally {
@@ -262,6 +274,81 @@ describe("final delivery polling", () => {
           (message) => message.metadata?.event_payload?.chunk_index === 0,
         ),
       ).toHaveLength(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("renders Slack-native links as visible rich-text links", async () => {
+    const originalFetch = globalThis.fetch;
+    const slackCalls: Array<{ method: string; params: any }> = [];
+    const fetchMock = mock(
+      async (input: string | URL | Request, _init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        if (url.pathname === "/agent/final-deliveries/claim") {
+          return jsonResponse({
+            deliveries: [
+              {
+                execution_id: "exe-native-link",
+                thread_key: "slack:T123:C123:1778883099.579529",
+                delivery: {
+                  platform: "slack",
+                  channel: "C123",
+                  thread_ts: "1778883099.579529",
+                },
+                final_payload: {
+                  result_text:
+                    "Opened PR: <https://github.com/TipLink/centaur/pull/123|TipLink/centaur#123>",
+                },
+              },
+            ],
+          });
+        }
+        if (url.pathname === "/agent/final-deliveries/exe-native-link/delivered")
+          return jsonResponse({ ok: true });
+        throw new Error(`unexpected request: ${url.pathname}`);
+      },
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const client = {
+      chat: {
+        postMessage: async (params: any) => {
+          slackCalls.push({ method: "chat.postMessage", params });
+          return { ok: true };
+        },
+      },
+      conversations: {
+        replies: async () => ({ ok: true, messages: [] }),
+      },
+    };
+
+    try {
+      await pollFinalDeliveriesOnce(config, client as any);
+      const postMessage = slackCalls.find(
+        (call) => call.method === "chat.postMessage",
+      );
+      expect(postMessage?.params.text).toBe(
+        "Opened PR: <https://github.com/TipLink/centaur/pull/123|TipLink/centaur#123>",
+      );
+      expect(postMessage?.params.blocks).toEqual([
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "Opened PR: " },
+                {
+                  type: "link",
+                  url: "https://github.com/TipLink/centaur/pull/123",
+                  text: "TipLink/centaur#123",
+                },
+              ],
+            },
+          ],
+        },
+      ]);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -508,11 +595,26 @@ describe("final delivery polling", () => {
       const postMessage = slackCalls.find(
         (call) => call.method === "chat.postMessage",
       );
-      const expected =
-        "See [thread](slack://channel?team=T123&id=C456&message=1779828836.722119&thread_ts=1779828827.919439)";
-      expect(postMessage?.params.text).toBe(expected);
+      const expectedFallback =
+        "See <slack://channel?team=T123&id=C456&message=1779828836.722119&thread_ts=1779828827.919439|thread>";
+      expect(postMessage?.params.text).toBe(expectedFallback);
       expect(postMessage?.params.blocks).toEqual([
-        { type: "markdown", text: expected },
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "See " },
+                {
+                  type: "link",
+                  url: "slack://channel?team=T123&id=C456&message=1779828836.722119&thread_ts=1779828827.919439",
+                  text: "thread",
+                },
+              ],
+            },
+          ],
+        },
       ]);
     } finally {
       globalThis.fetch = originalFetch;
@@ -573,10 +675,25 @@ describe("final delivery polling", () => {
       const postMessage = slackCalls.find(
         (call) => call.method === "chat.postMessage",
       );
-      const expected = `See [thread](${archiveLink})`;
-      expect(postMessage?.params.text).toBe(expected);
+      const expectedFallback = `See <${archiveLink}|thread>`;
+      expect(postMessage?.params.text).toBe(expectedFallback);
       expect(postMessage?.params.blocks).toEqual([
-        { type: "markdown", text: expected },
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "See " },
+                {
+                  type: "link",
+                  url: archiveLink,
+                  text: "thread",
+                },
+              ],
+            },
+          ],
+        },
       ]);
     } finally {
       globalThis.fetch = originalFetch;

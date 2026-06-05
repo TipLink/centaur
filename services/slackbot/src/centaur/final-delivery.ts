@@ -11,7 +11,7 @@ import {
   withSpan,
   withTraceHeaders,
 } from "../otel";
-import { renderMarkdownBlocks } from "../slack/render";
+import { markdownToRichText } from "../slack/streaming";
 
 const CONSUMER_ID = `slackbot-${process.pid}`;
 const FINAL_DELIVERY_CHUNK_CHARS = slackReplyLimits.text.maxFallbackChars;
@@ -176,6 +176,7 @@ async function postFollowups(
   for (const [index, chunk] of chunks.entries()) {
     if (posted.has(index)) continue;
     const renderedChunk = rewriteSlackArchiveLinksForApp(chunk, teamId);
+    const fallbackText = markdownLinksToSlackMrkdwn(renderedChunk);
     const response = await withSpan(
       "centaur.slackbot.slack.post_message",
       clientSpanOptions({
@@ -184,14 +185,14 @@ async function postFollowups(
         "centaur.execution_id": executionId,
         "centaur.final_delivery.chunk_index": index,
         "centaur.final_delivery.chunk_count": chunks.length,
-        "centaur.final_delivery.chunk_chars": renderedChunk.length,
+        "centaur.final_delivery.chunk_chars": fallbackText.length,
       }),
       () =>
         client.chat.postMessage({
           channel,
           thread_ts: threadTs,
-          text: renderedChunk,
-          blocks: renderMarkdownBlocks(renderedChunk),
+          text: fallbackText,
+          blocks: [markdownToRichText(renderedChunk)],
           unfurl_links: false,
           unfurl_media: false,
           metadata: chunkMetadata(executionId, index, chunks.length),
@@ -306,6 +307,22 @@ function rewriteSlackArchiveLinksForApp(
       return `[${label}](${deepLink})`;
     },
   );
+}
+
+function markdownLinksToSlackMrkdwn(text: string): string {
+  return text.replace(
+    /(?<!!)\[([^\]\n]+)\]\(\s*<?((?:https?|slack):\/\/[^\s>)]+)>?\s*\)/g,
+    (_match, label: string, url: string) =>
+      `<${url}|${slackLinkLabel(label)}>`,
+  );
+}
+
+function slackLinkLabel(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\|/g, "/");
 }
 
 function slackTsFromArchivePath(raw: string): string | null {

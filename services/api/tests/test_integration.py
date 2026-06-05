@@ -540,6 +540,8 @@ class TestBuildSessionContext:
 
         ctx = _build_session_context("test:1", platform="slack", user_id="U123")
         assert "Slack Formatting Rules" in ctx
+        assert "Use bare URLs or Slack-native `<URL|text>` links" in ctx
+        assert "Use standard markdown links" not in ctx
         assert "<@U123>" not in ctx
         assert "Do not @-mention or tag the requester" in ctx
         assert "test:1" in ctx
