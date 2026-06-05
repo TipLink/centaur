@@ -266,20 +266,3 @@ jobs:
               else:
                   output.write("pr_url=\n")
           PY
-
-      - name: Notify Fineas Slack
-        if: steps.promote.outputs.pr_url != ''
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.FINEAS_SLACK_WEBHOOK_URL }}
-          PR_URL: ${{ steps.promote.outputs.pr_url }}
-          CENTAUR_SHA: ${{ github.sha }}
-        run: |
-          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
-            echo "FINEAS_SLACK_WEBHOOK_URL is not configured; skipping Slack notification."
-            exit 0
-          fi
-
-          short_sha="${CENTAUR_SHA:0:7}"
-          text="<!here> Fineas Centaur promotion is ready for review: ${PR_URL} (Centaur ${short_sha})."
-          jq -nc --arg text "$text" '{text: $text}' |
-            curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
