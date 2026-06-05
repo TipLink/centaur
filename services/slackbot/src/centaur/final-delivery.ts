@@ -16,6 +16,7 @@ import { markdownToRichText } from "../slack/streaming";
 const CONSUMER_ID = `slackbot-${process.pid}`;
 const FINAL_DELIVERY_CHUNK_CHARS = slackReplyLimits.text.maxFallbackChars;
 const FINAL_DELIVERY_CHUNK_EVENT = "centaur_final_delivery_chunk";
+const LIVE_DELIVERY_TAIL_DRIFT_CHARS = 3;
 const NON_RETRYABLE_SLACK_ERRORS = new Set([
   "msg_too_long",
   "msg_blocks_too_long",
@@ -136,7 +137,15 @@ async function deliver(
   const threadTs = meta.thread_ts ?? target.threadTs;
   if (!channel || !threadTs) throw new Error("missing_slack_delivery_target");
   const text = extractText(payload);
-  const textToPost = continuationText(payload, text) ?? text;
+  const textToPost = deliveryText(payload, text);
+  if (!textToPost) {
+    activeSpanAttributes({
+      "centaur.final_delivery.chunk_count": 0,
+      "centaur.final_delivery.text_chars": 0,
+      "centaur.final_delivery.skipped_reason": "live_delivery_tail_drift",
+    });
+    return;
+  }
   const chunks = splitFinalDeliveryText(textToPost);
   activeSpanAttributes({
     "centaur.final_delivery.chunk_count": chunks.length,
@@ -275,12 +284,30 @@ function firstNonEmpty(...values: unknown[]): string {
   return "";
 }
 
-function continuationText(payload: any, text: string): string | null {
+function deliveryText(payload: any, text: string): string | null {
+  const continuation = continuationText(payload, text);
+  return continuation === undefined ? text : continuation;
+}
+
+function continuationText(
+  payload: any,
+  text: string,
+): string | null | undefined {
   const rawOffset = Number(payload?.slackbot_streamed_answer_chars);
-  if (!Number.isFinite(rawOffset) || rawOffset <= 0) return null;
+  if (!Number.isFinite(rawOffset) || rawOffset <= 0) return undefined;
   const offset = Math.floor(rawOffset);
   if (offset >= text.length) return null;
-  return text.slice(offset).trimStart();
+  const continuation = text.slice(offset).trimStart();
+  if (isLiveDeliveryTailDrift(continuation)) return null;
+  return continuation;
+}
+
+function isLiveDeliveryTailDrift(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    !trimmed ||
+    (trimmed.length <= LIVE_DELIVERY_TAIL_DRIFT_CHARS && !/\s/.test(trimmed))
+  );
 }
 
 function rewriteSlackArchiveLinksForApp(
