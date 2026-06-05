@@ -542,6 +542,69 @@ describe("final delivery polling", () => {
     }
   });
 
+  it("does not post tiny live-delivery tail fragments", async () => {
+    const originalFetch = globalThis.fetch;
+    const resultText = "Assigned to Jacob Brown with priority High.";
+    const fetchCalls: Array<{ path: string; body: unknown }> = [];
+    const fetchMock = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        fetchCalls.push({ path: url.pathname, body });
+        if (url.pathname === "/agent/final-deliveries/claim") {
+          return jsonResponse({
+            deliveries: [
+              {
+                execution_id: "exe-tail-drift",
+                thread_key: "slack:T123:C123:1778883099.579529",
+                delivery: {
+                  platform: "slack",
+                  channel: "C123",
+                  thread_ts: "1778883099.579529",
+                },
+                final_payload: {
+                  result_text: resultText,
+                  slackbot_streamed_answer_chars: resultText.length - 2,
+                },
+              },
+            ],
+          });
+        }
+        if (url.pathname === "/agent/final-deliveries/exe-tail-drift/delivered")
+          return jsonResponse({ ok: true });
+        throw new Error(`unexpected request: ${url.pathname}`);
+      },
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const slackCalls: Array<{ method: string; params: any }> = [];
+    const client = {
+      chat: {
+        postMessage: async (params: any) => {
+          slackCalls.push({ method: "chat.postMessage", params });
+          return { ok: true };
+        },
+      },
+      conversations: {
+        replies: async () => ({ ok: true, messages: [] }),
+      },
+    };
+
+    try {
+      await pollFinalDeliveriesOnce(config, client as any);
+
+      expect(slackCalls).toHaveLength(0);
+      expect(
+        fetchCalls.some(
+          (call) =>
+            call.path === "/agent/final-deliveries/exe-tail-drift/delivered",
+        ),
+      ).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("rewrites Slack archive markdown links to app deep links for final delivery", async () => {
     const originalFetch = globalThis.fetch;
     const slackCalls: Array<{ method: string; params: any }> = [];
