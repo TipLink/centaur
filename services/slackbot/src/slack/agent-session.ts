@@ -264,8 +264,7 @@ export class AgentSessionRenderer {
       const response = await this.client.assistant.threads.setStatus({
         channel_id: state.channel,
         thread_ts: state.parentTs,
-        status,
-        ...(status ? { loading_messages: [status] } : {})
+        status
       })
       if (!response.ok) {
         const errorCode = response.error ?? 'unknown_error'
