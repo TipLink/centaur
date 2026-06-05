@@ -41,6 +41,9 @@ def test_slackbot_streamed_answer_chars_requires_positive_integer_offset():
     assert _slackbot_streamed_answer_chars(25) == 25
     assert _slackbot_live_delivery_covers_result("", 0) is False
     assert _slackbot_live_delivery_covers_result("already streamed", 16) is True
+    assert _slackbot_live_delivery_covers_result("priority High.", 12) is True
+    assert _slackbot_live_delivery_covers_result("priority High.", 0) is False
+    assert _slackbot_live_delivery_covers_result("needs fallback", 10) is False
     assert _slackbot_live_delivery_covers_result("cut off report", 6) is False
 
 
