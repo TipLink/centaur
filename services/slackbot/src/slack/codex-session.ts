@@ -224,7 +224,6 @@ export class CodexSessionRenderer {
       if (resultText && !state.answerText.trim()) {
         state.harnessAnswerText += resultText
         recomposeBuffers(state)
-        await this.publishPendingAssistantText(agentSessionId, state, { force: true })
       }
       if (willClose) {
         await this.done(agentSessionId)
@@ -243,22 +242,38 @@ export class CodexSessionRenderer {
     if (state.done) return
     if (threadId) state.threadId = threadId
     state.done = true
-    completeThinkingTasks(state)
-    completeOpenTasks(state)
-    await this.publishActivitySummary(agentSessionId, state, { final: true })
-    await this.publishPendingAssistantText(agentSessionId, state, { force: true })
-    const { streamedTextChars } = await this.renderer.done(agentSessionId, {
-      streamFinalUpdates: true,
-      answerMarkdown: state.answerText
-    })
-    state.deliveredAnswerChars = streamedTextChars
-    state.done = true
-    completedStates.set(agentSessionId, {
-      threadId: state.threadId,
-      streamedAnswerChars: state.deliveredAnswerChars,
-      completedAt: Date.now()
-    })
-    states.delete(agentSessionId)
+    let doneError: unknown
+    let streamedTextChars = state.deliveredAnswerChars
+
+    try {
+      completeThinkingTasks(state)
+      completeOpenTasks(state)
+      await this.publishActivitySummary(agentSessionId, state, { final: true })
+      await this.publishPendingAssistantText(agentSessionId, state, { force: true })
+    } catch (error) {
+      doneError = error
+    }
+
+    try {
+      const result = await this.renderer.done(agentSessionId, {
+        streamFinalUpdates: true,
+        answerMarkdown: state.answerText
+      })
+      streamedTextChars = result.streamedTextChars
+    } catch (error) {
+      doneError ??= error
+    } finally {
+      state.deliveredAnswerChars = streamedTextChars
+      state.done = true
+      completedStates.set(agentSessionId, {
+        threadId: state.threadId,
+        streamedAnswerChars: state.deliveredAnswerChars,
+        completedAt: Date.now()
+      })
+      states.delete(agentSessionId)
+    }
+
+    if (doneError) throw doneError
   }
 
   private async publishActivitySummary(

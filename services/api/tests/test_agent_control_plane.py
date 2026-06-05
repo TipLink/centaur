@@ -1779,6 +1779,134 @@ async def test_worker_sends_final_result_when_live_slack_only_streamed_placehold
 
 
 @pytest.mark.asyncio
+async def test_worker_closes_slackbot_session_after_live_delivery_disables(db_pool):
+    from api.runtime_control import _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:live-disabled"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    runtime_id = f"rt-{uuid.uuid4().hex[:8]}"
+    final_text = "Finished through fallback after live streaming failed."
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'codex', 'codex', NULL, 'harness:codex', 'sha', 'active')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, hard_deadline_at"
+        ") VALUES ($1, $2, 1, 'exec-live-disabled', 'hash-live-disabled', 'running', "
+        '\'{"platform":"slack","channel":"C-test","thread_ts":"1779333881.200699"}\'::jsonb, '
+        '\'{"slackbot_live_delivery":true,"slackbot_agent_session_id":"sess-live-disabled"}\'::jsonb, '
+        "NOW() + INTERVAL '10 minutes')",
+        execution_id,
+        thread_key,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "delivery": {
+            "platform": "slack",
+            "channel": "C-test",
+            "thread_ts": "1779333881.200699",
+        },
+        "metadata": {
+            "slackbot_live_delivery": True,
+            "slackbot_agent_session_id": "sess-live-disabled",
+        },
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+    }
+    session = SandboxSession(
+        sandbox_id=runtime_id,
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+
+    async def _live_delivery_failure_stream(*_args, **_kwargs):
+        for index in range(5):
+            yield {
+                "data": json.dumps(
+                    {
+                        "type": "item.agentMessage.delta",
+                        "itemId": "msg-1",
+                        "delta": f"chunk {index}\n",
+                    }
+                )
+            }
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "turn.done",
+                    "result": final_text,
+                }
+            )
+        }
+
+    session_done_mock = AsyncMock()
+    backend = SimpleNamespace(attach=AsyncMock(), close_streams=AsyncMock())
+    with (
+        patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
+        patch(
+            "api.runtime_control.inject_stdin",
+            new=AsyncMock(
+                return_value={"ok": True, "injected": True, "durable_turn_id": "turn-1"}
+            ),
+        ),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch(
+            "api.runtime_control._get_runtime",
+            return_value=SimpleNamespace(turn_counter=1),
+        ),
+        patch("api.runtime_control._stream_stdout", _live_delivery_failure_stream),
+        patch(
+            "api.runtime_control.slackbot_client.harness_event",
+            new=AsyncMock(return_value=None),
+        ) as harness_event_mock,
+        patch(
+            "api.runtime_control.slackbot_client.session_done",
+            new=session_done_mock,
+        ),
+        patch("api.runtime_control.slackbot_client.set_status", new=AsyncMock()),
+    ):
+        await _process_execution(db_pool, row)
+
+    assert harness_event_mock.await_count == 5
+    session_done_mock.assert_awaited_once_with("sess-live-disabled", None)
+    execution = await db_pool.fetchrow(
+        "SELECT status, terminal_reason, result_text, metadata "
+        "FROM agent_execution_requests WHERE execution_id = $1",
+        execution_id,
+    )
+    assert execution is not None
+    assert execution["status"] == "completed"
+    assert execution["terminal_reason"] == "completed"
+    assert execution["result_text"] == final_text
+    metadata = execution["metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    assert metadata["slackbot_live_delivery_failed"] == "harness_event_failed"
+    outbox = await db_pool.fetchrow(
+        "SELECT state, final_payload FROM agent_final_delivery_outbox WHERE execution_id = $1",
+        execution_id,
+    )
+    assert outbox is not None
+    assert outbox["state"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_worker_requeues_raw_harness_auth_error_once_on_fresh_runtime(db_pool):
     from api.runtime_control import _claim_next_execution, _process_execution
 
