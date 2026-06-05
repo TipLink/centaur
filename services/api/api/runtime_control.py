@@ -2874,7 +2874,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         finalize_session_id = slackbot_session_id or str(
             execution_metadata.get("slackbot_agent_session_id") or ""
         )
-        if finalize_session_id and not slackbot_done and slackbot_forward_live:
+        if finalize_session_id and not slackbot_done:
             try:
                 terminal_result_sent_to_slackbot = False
                 await slackbot_client.session_done(
@@ -2891,6 +2891,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                     terminal_result_sent_to_slackbot=terminal_result_sent_to_slackbot,
                     result_size_bytes=payload_size_bytes(result_text),
                     slackbot_text_sent=slackbot_text_sent,
+                    live_delivery_enabled=slackbot_forward_live,
                 )
             except Exception:
                 log.warning(
