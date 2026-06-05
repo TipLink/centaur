@@ -119,6 +119,59 @@ describe('CodexSessionRenderer', () => {
     expect(calls.filter(call => call.method === 'chat.stopStream')).toHaveLength(1)
   })
 
+  it('clears assistant status when terminal stream rendering fails', async () => {
+    const calls: Array<{ method: string; params: any }> = []
+    const client = {
+      assistant: {
+        threads: {
+          setStatus: async (params: any) => {
+            calls.push({ method: 'assistant.threads.setStatus', params })
+            return { ok: true }
+          }
+        }
+      },
+      chat: {
+        startStream: async (params: any) => {
+          calls.push({ method: 'chat.startStream', params })
+          return { ok: false, error: 'msg_too_long' }
+        },
+        appendStream: async (params: any) => {
+          calls.push({ method: 'chat.appendStream', params })
+          return { ok: true }
+        },
+        stopStream: async (params: any) => {
+          calls.push({ method: 'chat.stopStream', params })
+          return { ok: true }
+        },
+        update: async (params: any) => {
+          calls.push({ method: 'chat.update', params })
+          return { ok: true }
+        }
+      }
+    }
+
+    const { sessionId } = await new AgentSessionRenderer(client as any).open({
+      channel: 'C123',
+      parentTs: '1778866921.505479',
+      recipientTeamId: 'T123',
+      recipientUserId: 'U123',
+      title: 'Centaur execution'
+    })
+    const renderer = new CodexSessionRenderer(client as any)
+
+    await expect(
+      renderer.event(sessionId, { type: 'result', result: 'Final answer' })
+    ).rejects.toThrow('msg_too_long')
+
+    const statusCalls = calls.filter(call => call.method === 'assistant.threads.setStatus')
+    expect(statusCalls[0]?.params.status).toBe('Thinking...')
+    expect(statusCalls.at(-1)?.params.status).toBe('')
+
+    const duplicate = await renderer.event(sessionId, { type: 'turn.done', result: 'Final answer' })
+    expect(duplicate.done).toBe(true)
+    expect(calls.filter(call => call.method === 'chat.startStream')).toHaveLength(2)
+  })
+
   it('waits for turn.done when a result event has no terminal text', async () => {
     const calls: Array<{ method: string; params: any }> = []
     const client = {
