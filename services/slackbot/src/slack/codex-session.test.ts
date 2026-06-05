@@ -1003,6 +1003,72 @@ describe('CodexSessionRenderer', () => {
     expect(thinkingBlockText(calls)).toBe('')
   })
 
+  it('labels commentary plan entries as progress updates instead of Thinking', async () => {
+    const calls: Array<{ method: string; params: any }> = []
+    const client = {
+      assistant: {
+        threads: {
+          setStatus: async () => ({ ok: true })
+        }
+      },
+      chat: {
+        startStream: async (params: any) => {
+          calls.push({ method: 'chat.startStream', params })
+          return { ok: true, ts: '1778866940.295499' }
+        },
+        appendStream: async (params: any) => {
+          calls.push({ method: 'chat.appendStream', params })
+          return { ok: true }
+        },
+        stopStream: async (params: any) => {
+          calls.push({ method: 'chat.stopStream', params })
+          return { ok: true }
+        },
+        update: async () => ({ ok: true })
+      }
+    }
+
+    const { sessionId } = await new AgentSessionRenderer(client as any).open({
+      channel: 'C123',
+      parentTs: '1778866921.505479',
+      recipientTeamId: 'T123',
+      recipientUserId: 'U123',
+      title: 'Centaur execution'
+    })
+    const renderer = new CodexSessionRenderer(client as any)
+
+    await renderer.event(sessionId, {
+      type: 'item.started',
+      item: { id: 'msg-1', type: 'agentMessage', phase: 'commentary' }
+    })
+    await renderer.event(sessionId, {
+      type: 'item.agentMessage.delta',
+      itemId: 'msg-1',
+      delta: 'I’ll inspect the runtime metadata.'
+    })
+    await renderer.event(sessionId, {
+      type: 'item.completed',
+      item: {
+        id: 'msg-1',
+        type: 'agentMessage',
+        phase: 'commentary',
+        text: 'I’ll inspect the runtime metadata.'
+      }
+    })
+    await renderer.event(sessionId, {
+      type: 'item.started',
+      item: { id: 'cmd-1', type: 'commandExecution', command: 'kubectl get pod' }
+    })
+    await renderer.event(sessionId, { type: 'turn.completed', result: 'Done.' })
+
+    const tasks = planTasksFromStop(calls)
+    expect(tasks.map(task => task.title)).not.toContain('Thinking')
+
+    const progressTask = tasks.find(task => task.title === 'Progress update')
+    expect(progressTask).toBeTruthy()
+    expect(richTextPlain(progressTask?.details)).toContain('runtime metadata')
+  })
+
   it('streams fenced task details in live task updates', async () => {
     const calls: Array<{ method: string; params: any }> = []
     const client = {
