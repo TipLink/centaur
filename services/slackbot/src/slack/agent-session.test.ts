@@ -153,7 +153,7 @@ describe('AgentSessionRenderer', () => {
       'chat.startStream'
     ])
     expect(calls[0]?.params.status).toBe('Thinking...')
-    expect(calls[0]?.params.loading_messages).toEqual(['Thinking...'])
+    expect(calls[0]?.params.loading_messages).toBeUndefined()
     const statusCalls = calls.filter(call => call.method === 'assistant.threads.setStatus')
     expect(statusCalls.at(-1)?.params.status).toBe('')
     expect(statusCalls.at(-1)?.params.loading_messages).toBeUndefined()
