@@ -56,6 +56,7 @@ type AgentSessionState = {
   statusCleared: boolean
   statusUnsupported: boolean
   statusRefreshTimer?: ReturnType<typeof setInterval>
+  statusRefreshPromise?: Promise<void>
   segments: Segment[]
 }
 
@@ -244,7 +245,8 @@ export class AgentSessionRenderer {
       streamedTextChars = streamedTextSourceChars(state)
       closed = true
     } finally {
-      this.stopStatusRefresh(state)
+      this.stopStatusRefreshTimer(state)
+      await this.waitForStatusRefresh(state)
       if (!state.statusCleared) {
         state.statusCleared = await this.setStatus(sessionId, '')
       }
@@ -525,16 +527,28 @@ export class AgentSessionRenderer {
   private startStatusRefresh(state: AgentSessionState): void {
     if (state.statusRefreshTimer) return
     const timer = setInterval(() => {
-      void this.refreshActiveStatus(state)
+      if (state.statusRefreshPromise) return
+      const refresh = this.refreshActiveStatus(state)
+      state.statusRefreshPromise = refresh
+      void refresh
+        .finally(() => {
+          if (state.statusRefreshPromise === refresh) state.statusRefreshPromise = undefined
+        })
+        .catch(() => undefined)
     }, STATUS_REFRESH_INTERVAL_MS)
     timer.unref?.()
     state.statusRefreshTimer = timer
   }
 
-  private stopStatusRefresh(state: AgentSessionState): void {
+  private stopStatusRefreshTimer(state: AgentSessionState): void {
     if (!state.statusRefreshTimer) return
     clearInterval(state.statusRefreshTimer)
     state.statusRefreshTimer = undefined
+  }
+
+  private async waitForStatusRefresh(state: AgentSessionState): Promise<void> {
+    if (!state.statusRefreshPromise) return
+    await state.statusRefreshPromise.catch(() => undefined)
   }
 
   private async refreshActiveStatus(state: AgentSessionState): Promise<void> {
@@ -544,12 +558,12 @@ export class AgentSessionRenderer {
       state.statusUnsupported ||
       !sessions.has(state.id)
     ) {
-      this.stopStatusRefresh(state)
+      this.stopStatusRefreshTimer(state)
       return
     }
     const refreshed = await this.setStatus(state.id, THINKING_STATUS)
     if (!refreshed && state.statusUnsupported) {
-      this.stopStatusRefresh(state)
+      this.stopStatusRefreshTimer(state)
     }
   }
 }
