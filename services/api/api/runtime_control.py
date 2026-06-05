@@ -1036,11 +1036,18 @@ def _slackbot_streamed_answer_chars(value: Any) -> int:
     return 0
 
 
+_SLACKBOT_LIVE_DELIVERY_TAIL_DRIFT_CHARS = 3
+
+
 def _slackbot_live_delivery_covers_result(result_text: str, streamed_chars: int) -> bool:
     text = result_text.strip()
     if not text:
         return False
-    return streamed_chars >= len(text)
+    if streamed_chars >= len(text):
+        return True
+    if streamed_chars <= 0:
+        return False
+    return len(text) - streamed_chars <= _SLACKBOT_LIVE_DELIVERY_TAIL_DRIFT_CHARS
 
 
 async def _send_slackbot_canonical_event(
