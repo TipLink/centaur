@@ -136,6 +136,13 @@ _STALE_CODEX_THREAD_SAFE_FAILURE_MESSAGE = (
     "I could not recover it cleanly. Please retry the request; if it repeats, "
     "ask an operator to inspect DEV-5186."
 )
+_EMPTY_CODEX_TURN_RETRY_LIMIT = 1
+_EMPTY_CODEX_TURN_RETRY_REASON = "empty_codex_turn"
+_EMPTY_CODEX_TURN_SAFE_FAILURE_MESSAGE = (
+    "The Codex runtime returned an empty completion without any visible work. "
+    "I stopped the run so it does not appear silently stuck. Please retry the "
+    "request; if it repeats, ask an operator to inspect DEV-5186."
+)
 _EXECUTION_SILENCE_SAFE_FAILURE_MESSAGE = (
     "The agent runtime stopped reporting progress before the turn completed. "
     "I stopped the run so it does not appear silently stuck. Please retry the "
@@ -212,6 +219,10 @@ def _stale_codex_thread_retry_attempt(metadata: dict[str, Any]) -> int:
     return _control_plane_retry_attempt(metadata, _STALE_CODEX_THREAD_RETRY_REASON)
 
 
+def _empty_codex_turn_retry_attempt(metadata: dict[str, Any]) -> int:
+    return _control_plane_retry_attempt(metadata, _EMPTY_CODEX_TURN_RETRY_REASON)
+
+
 def _matches_stale_codex_thread_failure(*values: str | None) -> bool:
     for value in values:
         if not isinstance(value, str):
@@ -222,6 +233,49 @@ def _matches_stale_codex_thread_failure(*values: str | None) -> bool:
         if "codex" in normalized and "thread not found" in normalized:
             return True
     return False
+
+
+def _codex_terminal_has_observed_work(
+    observations: ExecutionObservationAccumulator,
+    *,
+    slackbot_text_sent: bool,
+    slackbot_streamed_answer_chars: int,
+) -> bool:
+    return any(
+        (
+            observations.assistant_text_chars > 0,
+            observations.assistant_tool_use_events > 0,
+            observations.tool_result_events > 0,
+            observations.command_events > 0,
+            observations.file_change_events > 0,
+            observations.subagent_events > 0,
+            observations.error_events > 0,
+            slackbot_text_sent,
+            slackbot_streamed_answer_chars > 0,
+        )
+    )
+
+
+def _is_empty_codex_terminal_without_work(
+    *,
+    harness: str,
+    engine: str,
+    result_text: str,
+    error_text: str,
+    is_error: bool,
+    observations: ExecutionObservationAccumulator,
+    slackbot_text_sent: bool,
+    slackbot_streamed_answer_chars: int,
+) -> bool:
+    if harness != "codex" and engine != "codex":
+        return False
+    if is_error or error_text.strip() or result_text.strip():
+        return False
+    return not _codex_terminal_has_observed_work(
+        observations,
+        slackbot_text_sent=slackbot_text_sent,
+        slackbot_streamed_answer_chars=slackbot_streamed_answer_chars,
+    )
 
 
 def prompt_identity(
@@ -2420,6 +2474,27 @@ async def _requeue_execution_after_stale_codex_thread(
     )
 
 
+async def _requeue_execution_after_empty_codex_turn(
+    pool,
+    *,
+    execution_id: str,
+    thread_key: str,
+    metadata: dict[str, Any],
+    combined_error: str,
+) -> bool:
+    return await _requeue_execution_on_fresh_runtime(
+        pool,
+        execution_id=execution_id,
+        thread_key=thread_key,
+        metadata=metadata,
+        retry_reason=_EMPTY_CODEX_TURN_RETRY_REASON,
+        retry_limit=_EMPTY_CODEX_TURN_RETRY_LIMIT,
+        combined_error=combined_error,
+        stop_reason="empty_codex_turn_retry",
+        clear_agent_thread_id=True,
+    )
+
+
 async def _claim_next_execution(pool) -> dict[str, Any] | None:
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -3604,6 +3679,51 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
             status="failed_permanent",
             terminal_reason=terminal_reason,
             result_text=result_text,
+            error_text=combined_error,
+        )
+        return
+
+    if _is_empty_codex_terminal_without_work(
+        harness=harness,
+        engine=engine,
+        result_text=result_text,
+        error_text=error_text,
+        is_error=is_error,
+        observations=observations,
+        slackbot_text_sent=slackbot_text_sent,
+        slackbot_streamed_answer_chars=slackbot_streamed_answer_chars,
+    ):
+        combined_error = (
+            "empty Codex terminal event without result text, live Slack text, "
+            "or observed tool/file/command work"
+        )
+        retry_attempt = _empty_codex_turn_retry_attempt(execution_metadata)
+        if retry_attempt < _EMPTY_CODEX_TURN_RETRY_LIMIT:
+            await _requeue_execution_after_empty_codex_turn(
+                pool,
+                execution_id=execution_id,
+                thread_key=thread_key,
+                metadata=execution_metadata,
+                combined_error=combined_error,
+            )
+            return
+        terminal_reason = "empty_codex_turn"
+        await _stop_execution_session(
+            thread_key,
+            reason="empty_codex_turn_failed",
+        )
+        log.warning(
+            "execution_empty_codex_turn_retry_exhausted",
+            execution_id=execution_id,
+            thread_key=thread_key,
+            retry_attempt=retry_attempt,
+            raw_event_count=observations.raw_event_count,
+            observation_event_count=observations.observation_event_count,
+        )
+        await _finalize_execution(
+            status="failed_permanent",
+            terminal_reason=terminal_reason,
+            result_text=_EMPTY_CODEX_TURN_SAFE_FAILURE_MESSAGE,
             error_text=combined_error,
         )
         return
