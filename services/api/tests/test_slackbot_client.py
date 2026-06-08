@@ -103,6 +103,51 @@ async def test_post_returns_none_after_exhausting_retries():
 
 
 @pytest.mark.asyncio
+async def test_post_logs_delivery_diagnostics_for_harness_event_failures():
+    fake = _FakeClient([_response(502), _response(502), _response(502)])
+    with (
+        patch("api.slackbot_client.httpx.AsyncClient", return_value=fake),
+        patch("api.slackbot_client.log.warning") as warning,
+    ):
+        from api import slackbot_client
+
+        result = await slackbot_client.harness_event(
+            "sess-live",
+            {
+                "type": "item.agentMessage.delta",
+                "centaur_execution_id": "exe-live",
+                "centaur_thread_key": "slack:T-test:C-test:1779333881.200699",
+                "delta": "This response body should not be logged",
+            },
+        )
+
+    assert result is None
+    assert len(fake.calls) == 3
+    retry_logs = [
+        call
+        for call in warning.call_args_list
+        if call.args == ("slackbot_call_retrying",)
+    ]
+    assert len(retry_logs) == 2
+    final = warning.call_args_list[-1]
+    assert final.args == ("slackbot_call_failed",)
+    assert final.kwargs == {
+        "path": "/api/slack/agent-sessions/sess-live/harness-event",
+        "operation": "slack.agent_session.harness_event",
+        "slackbot_agent_session_id": "sess-live",
+        "event_type": "item.agentMessage.delta",
+        "centaur_execution_id": "exe-live",
+        "thread_key": "slack:T-test:C-test:1779333881.200699",
+        "status": 502,
+        "response": "",
+        "error": None,
+        "attempts": 3,
+        "retryable": True,
+    }
+    assert "delta" not in final.kwargs
+
+
+@pytest.mark.asyncio
 async def test_harness_event_suppresses_auto_http_span(monkeypatch):
     from api import slackbot_client
 
