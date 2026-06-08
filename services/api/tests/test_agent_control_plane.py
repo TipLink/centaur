@@ -47,6 +47,73 @@ def test_slackbot_streamed_answer_chars_requires_positive_integer_offset():
     assert _slackbot_live_delivery_covers_result("cut off report", 6) is False
 
 
+def test_empty_codex_terminal_guard_is_narrow():
+    from api.observability import ExecutionObservationAccumulator
+    from api.runtime_control import _is_empty_codex_terminal_without_work
+
+    assert _is_empty_codex_terminal_without_work(
+        harness="codex",
+        engine="codex",
+        result_text="",
+        error_text="",
+        is_error=False,
+        observations=ExecutionObservationAccumulator(),
+        slackbot_text_sent=False,
+        slackbot_streamed_answer_chars=0,
+    )
+    assert not _is_empty_codex_terminal_without_work(
+        harness="amp",
+        engine="amp",
+        result_text="",
+        error_text="",
+        is_error=False,
+        observations=ExecutionObservationAccumulator(),
+        slackbot_text_sent=False,
+        slackbot_streamed_answer_chars=0,
+    )
+    assert not _is_empty_codex_terminal_without_work(
+        harness="codex",
+        engine="codex",
+        result_text="done",
+        error_text="",
+        is_error=False,
+        observations=ExecutionObservationAccumulator(),
+        slackbot_text_sent=False,
+        slackbot_streamed_answer_chars=0,
+    )
+    tool_observations = ExecutionObservationAccumulator(assistant_tool_use_events=1)
+    assert not _is_empty_codex_terminal_without_work(
+        harness="codex",
+        engine="codex",
+        result_text="",
+        error_text="",
+        is_error=False,
+        observations=tool_observations,
+        slackbot_text_sent=False,
+        slackbot_streamed_answer_chars=0,
+    )
+    assert not _is_empty_codex_terminal_without_work(
+        harness="codex",
+        engine="codex",
+        result_text="",
+        error_text="",
+        is_error=False,
+        observations=ExecutionObservationAccumulator(),
+        slackbot_text_sent=True,
+        slackbot_streamed_answer_chars=0,
+    )
+    assert not _is_empty_codex_terminal_without_work(
+        harness="codex",
+        engine="codex",
+        result_text="",
+        error_text="",
+        is_error=False,
+        observations=ExecutionObservationAccumulator(),
+        slackbot_text_sent=False,
+        slackbot_streamed_answer_chars=12,
+    )
+
+
 def _auth(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
 
@@ -2151,6 +2218,398 @@ async def test_worker_requeues_raw_harness_auth_error_once_on_fresh_runtime(db_p
     assert assignment["runtime_id"] == fresh_runtime_id
     assert inject_stdin_mock.await_count == 2
     stop_session_mock.assert_awaited_once_with(thread_key)
+
+
+@pytest.mark.asyncio
+async def test_worker_requeues_empty_codex_terminal_once_on_fresh_runtime(db_pool):
+    from api.runtime_control import _claim_next_execution, _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    initial_runtime_id = f"rt-codex-{uuid.uuid4().hex[:8]}"
+    fresh_runtime_id = f"rt-fresh-{uuid.uuid4().hex[:8]}"
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'codex', 'codex', NULL, 'harness:codex', 'sha', 'active')",
+        thread_key,
+        initial_runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, hard_deadline_at"
+        ") VALUES ($1, $2, 1, 'exec-empty-codex', 'hash-empty-codex', 'running', "
+        "'{}'::jsonb, '{}'::jsonb, NOW() + INTERVAL '10 minutes')",
+        execution_id,
+        thread_key,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_message_requests ("
+        "thread_key, message_id, assignment_generation, request_hash, event_json, "
+        "metadata, delivered_execution_id"
+        ") VALUES ($1, 'msg-empty-codex', 1, 'hash-msg-empty-codex', '{}'::jsonb, '{}'::jsonb, $2)",
+        thread_key,
+        execution_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO sandbox_sessions ("
+        "thread_key, sandbox_id, harness, engine, state, started_at, updated_at, "
+        "agent_thread_id, last_delivered_id"
+        ") VALUES ($1, $2, 'codex', 'codex', 'running', NOW(), NOW(), "
+        "'codex-thread-empty', 'msg-empty-codex')",
+        thread_key,
+        initial_runtime_id,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "status": "running",
+        "delivery": {},
+        "metadata": {},
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+        "created_at": dt.datetime.now(dt.timezone.utc),
+        "claimed_at": dt.datetime.now(dt.timezone.utc),
+    }
+    initial_session = SandboxSession(
+        sandbox_id=initial_runtime_id,
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+    fresh_session = SandboxSession(
+        sandbox_id=fresh_runtime_id,
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+
+    stream_calls = 0
+
+    async def _empty_then_success_stream(*_args, **_kwargs):
+        nonlocal stream_calls
+        stream_calls += 1
+        if stream_calls == 1:
+            yield {"data": json.dumps({"type": "turn.done", "result": ""})}
+            return
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "turn.done",
+                    "result": "Created the Excel file.",
+                }
+            )
+        }
+
+    stop_session_mock = AsyncMock()
+    inject_stdin_mock = AsyncMock(
+        side_effect=[
+            {"ok": True, "injected": True, "durable_turn_id": "turn-empty-1"},
+            {"ok": True, "injected": True, "durable_turn_id": "turn-empty-2"},
+        ]
+    )
+    backend = SimpleNamespace(attach=AsyncMock(), close_streams=AsyncMock())
+
+    with (
+        patch(
+            "api.runtime_control.get_or_spawn",
+            new=AsyncMock(side_effect=[initial_session, fresh_session]),
+        ),
+        patch("api.runtime_control.inject_stdin", inject_stdin_mock),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch(
+            "api.runtime_control._get_runtime",
+            return_value=SimpleNamespace(turn_counter=1),
+        ),
+        patch("api.runtime_control._stream_stdout", _empty_then_success_stream),
+        patch("api.runtime_control.stop_session", stop_session_mock),
+    ):
+        await _process_execution(db_pool, row)
+
+        queued = await db_pool.fetchrow(
+            "SELECT status, durable_turn_id, terminal_reason, result_text, error_text, metadata "
+            "FROM agent_execution_requests WHERE execution_id = $1",
+            execution_id,
+        )
+        assert queued is not None
+        assert queued["status"] == "queued"
+        assert queued["durable_turn_id"] is None
+        assert queued["terminal_reason"] is None
+        assert queued["result_text"] is None
+        assert queued["error_text"] is None
+        metadata = queued["metadata"]
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        assert metadata["control_plane_retry"] == {
+            "reason": "empty_codex_turn",
+            "attempt": 1,
+            "max_attempts": 1,
+            "fresh_runtime": True,
+            "last_error": (
+                "empty Codex terminal event without result text, live Slack text, "
+                "or observed tool/file/command work"
+            ),
+        }
+
+        delivered_message = await db_pool.fetchrow(
+            "SELECT delivered_execution_id FROM agent_message_requests "
+            "WHERE thread_key = $1 AND message_id = 'msg-empty-codex'",
+            thread_key,
+        )
+        assert delivered_message is not None
+        assert delivered_message["delivered_execution_id"] is None
+        session_cursor = await db_pool.fetchrow(
+            "SELECT agent_thread_id, last_delivered_id FROM sandbox_sessions WHERE thread_key = $1",
+            thread_key,
+        )
+        assert session_cursor is not None
+        assert session_cursor["agent_thread_id"] is None
+        assert session_cursor["last_delivered_id"] is None
+
+        outbox = await db_pool.fetchrow(
+            "SELECT state, final_payload FROM agent_final_delivery_outbox WHERE execution_id = $1",
+            execution_id,
+        )
+        assert outbox is not None
+        assert outbox["state"] == "awaiting_terminal"
+        assert outbox["final_payload"] is None
+
+        claimed = await _claim_next_execution(db_pool)
+        assert claimed is not None
+        assert claimed["execution_id"] == execution_id
+
+        await _process_execution(db_pool, claimed)
+
+    execution = await db_pool.fetchrow(
+        "SELECT status, terminal_reason, result_text, error_text FROM agent_execution_requests WHERE execution_id = $1",
+        execution_id,
+    )
+    assert execution is not None
+    assert execution["status"] == "completed"
+    assert execution["terminal_reason"] == "completed"
+    assert execution["result_text"] == "Created the Excel file."
+    assert execution["error_text"] in (None, "")
+    assert inject_stdin_mock.await_count == 2
+    stop_session_mock.assert_awaited_once_with(thread_key)
+
+
+@pytest.mark.asyncio
+async def test_worker_fails_empty_codex_terminal_after_retry_exhausted(db_pool):
+    from api.runtime_control import _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    runtime_id = f"rt-codex-{uuid.uuid4().hex[:8]}"
+    retry_metadata = {
+        "control_plane_retry": {
+            "reason": "empty_codex_turn",
+            "attempt": 1,
+            "max_attempts": 1,
+            "fresh_runtime": True,
+            "last_error": (
+                "empty Codex terminal event without result text, live Slack text, "
+                "or observed tool/file/command work"
+            ),
+        }
+    }
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'codex', 'codex', NULL, 'harness:codex', 'sha', 'active')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, hard_deadline_at"
+        ") VALUES ($1, $2, 1, 'exec-empty-exhausted', 'hash-empty-exhausted', "
+        "'running', '{}'::jsonb, $3::jsonb, NOW() + INTERVAL '10 minutes')",
+        execution_id,
+        thread_key,
+        json.dumps(retry_metadata),
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "status": "running",
+        "delivery": {},
+        "metadata": retry_metadata,
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+        "created_at": dt.datetime.now(dt.timezone.utc),
+        "claimed_at": dt.datetime.now(dt.timezone.utc),
+    }
+    session = SandboxSession(
+        sandbox_id=runtime_id,
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+
+    async def _empty_stream(*_args, **_kwargs):
+        yield {"data": json.dumps({"type": "turn.done", "result": ""})}
+
+    stop_session_mock = AsyncMock()
+    backend = SimpleNamespace(attach=AsyncMock(), close_streams=AsyncMock())
+    with (
+        patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
+        patch(
+            "api.runtime_control.inject_stdin",
+            new=AsyncMock(
+                return_value={"ok": True, "injected": True, "durable_turn_id": "turn-1"}
+            ),
+        ),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch(
+            "api.runtime_control._get_runtime",
+            return_value=SimpleNamespace(turn_counter=1),
+        ),
+        patch("api.runtime_control._stream_stdout", _empty_stream),
+        patch("api.runtime_control.stop_session", stop_session_mock),
+    ):
+        await _process_execution(db_pool, row)
+
+    execution = await db_pool.fetchrow(
+        "SELECT status, terminal_reason, result_text, error_text "
+        "FROM agent_execution_requests WHERE execution_id = $1",
+        execution_id,
+    )
+    assert execution is not None
+    assert execution["status"] == "failed_permanent"
+    assert execution["terminal_reason"] == "empty_codex_turn"
+    assert "returned an empty completion" in execution["result_text"]
+    assert "empty Codex terminal event" in (execution["error_text"] or "")
+    stop_session_mock.assert_awaited_once_with(thread_key)
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_requeue_empty_codex_terminal_after_tool_activity(
+    db_pool,
+):
+    from api.runtime_control import _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    runtime_id = f"rt-codex-{uuid.uuid4().hex[:8]}"
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'codex', 'codex', NULL, 'harness:codex', 'sha', 'active')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, hard_deadline_at"
+        ") VALUES ($1, $2, 1, 'exec-empty-with-tool', 'hash-empty-with-tool', "
+        "'running', '{}'::jsonb, '{}'::jsonb, NOW() + INTERVAL '10 minutes')",
+        execution_id,
+        thread_key,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "status": "running",
+        "delivery": {},
+        "metadata": {},
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+        "created_at": dt.datetime.now(dt.timezone.utc),
+        "claimed_at": dt.datetime.now(dt.timezone.utc),
+    }
+    session = SandboxSession(
+        sandbox_id=runtime_id,
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+
+    async def _tool_then_empty_stream(*_args, **_kwargs):
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call-1",
+                                "name": "attio.update_record",
+                                "input": {"record_id": "rec_123"},
+                            }
+                        ],
+                    },
+                }
+            )
+        }
+        yield {"data": json.dumps({"type": "turn.done", "result": ""})}
+
+    stop_session_mock = AsyncMock()
+    backend = SimpleNamespace(attach=AsyncMock(), close_streams=AsyncMock())
+
+    with (
+        patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
+        patch(
+            "api.runtime_control.inject_stdin",
+            new=AsyncMock(
+                return_value={"ok": True, "injected": True, "durable_turn_id": "turn-1"}
+            ),
+        ),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch(
+            "api.runtime_control._get_runtime",
+            return_value=SimpleNamespace(turn_counter=1),
+        ),
+        patch("api.runtime_control._stream_stdout", _tool_then_empty_stream),
+        patch("api.runtime_control.stop_session", stop_session_mock),
+    ):
+        await _process_execution(db_pool, row)
+
+    execution = await db_pool.fetchrow(
+        "SELECT status, terminal_reason, result_text, error_text, metadata "
+        "FROM agent_execution_requests WHERE execution_id = $1",
+        execution_id,
+    )
+    assert execution is not None
+    assert execution["status"] == "completed"
+    assert execution["terminal_reason"] == "completed"
+    assert execution["result_text"] == ""
+    metadata = execution["metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    assert "control_plane_retry" not in metadata
+    stop_session_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
