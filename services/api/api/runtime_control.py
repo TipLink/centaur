@@ -1076,22 +1076,27 @@ async def _mark_slackbot_live_delivery_failed(
     reason: str,
     *,
     streamed_answer_chars: int | None = None,
+    last_event_type: str | None = None,
+    failure_count: int | None = None,
+    failure_limit: int | None = None,
 ) -> None:
+    metadata_update: dict[str, Any] = {
+        "slackbot_live_delivery_failed": reason,
+        "slackbot_streamed_answer_chars": max(streamed_answer_chars or 0, 0),
+    }
+    if last_event_type:
+        metadata_update["slackbot_live_delivery_last_event_type"] = last_event_type
+    if failure_count is not None:
+        metadata_update["slackbot_live_delivery_failure_count"] = max(failure_count, 0)
+    if failure_limit is not None:
+        metadata_update["slackbot_live_delivery_failure_limit"] = max(failure_limit, 0)
     await pool.execute(
         "UPDATE agent_execution_requests "
-        "SET metadata = jsonb_set("
-        "  jsonb_set(metadata, "
-        "  '{slackbot_live_delivery_failed}', "
-        "  to_jsonb($2::text), "
-        "  true), "
-        "  '{slackbot_streamed_answer_chars}', "
-        "  to_jsonb($3::int), "
-        "  true"
-        "), updated_at = NOW() "
+        "SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb, "
+        "updated_at = NOW() "
         "WHERE execution_id = $1",
         execution_id,
-        reason,
-        max(streamed_answer_chars or 0, 0),
+        canonical_json(metadata_update),
     )
 
 
@@ -3329,6 +3334,11 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                                 execution_id,
                                 "harness_event_failed",
                                 streamed_answer_chars=slackbot_streamed_answer_chars,
+                                last_event_type=slack_event.get("type")
+                                if isinstance(slack_event, dict)
+                                else None,
+                                failure_count=slackbot_live_failure_streak,
+                                failure_limit=slackbot_live_failure_limit,
                             )
                             with contextlib.suppress(Exception):
                                 await slackbot_client.set_status(delivery, "")

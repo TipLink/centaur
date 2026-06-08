@@ -31,6 +31,86 @@ def enabled() -> bool:
     return bool(_base_url() and _api_key())
 
 
+def _string_diagnostic(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _agent_session_id_from_path(path: str) -> str | None:
+    parts = path.strip("/").split("/")
+    for index, part in enumerate(parts):
+        if part == "agent-sessions" and index + 1 < len(parts):
+            return _string_diagnostic(parts[index + 1])
+    return None
+
+
+def _operation_from_path(path: str) -> str:
+    if path == "/api/slack/agent-sessions":
+        return "slack.agent_session.open"
+    if path == "/api/slack/assistant/status":
+        return "slack.assistant.status"
+    if path == "/api/slack/assistant/title":
+        return "slack.assistant.title"
+    if path.endswith("/harness-event"):
+        return "slack.agent_session.harness_event"
+    if path.endswith("/text"):
+        return "slack.agent_session.text"
+    if path.endswith("/step"):
+        return "slack.agent_session.step"
+    if path.endswith("/done"):
+        return "slack.agent_session.done"
+    return "slackbot.post"
+
+
+def _delivery_diagnostics(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "path": path,
+        "operation": _operation_from_path(path),
+    }
+    session_id = _agent_session_id_from_path(path)
+    if session_id:
+        diagnostics["slackbot_agent_session_id"] = session_id
+
+    channel = _string_diagnostic(body.get("channel")) or _string_diagnostic(
+        body.get("channel_id")
+    )
+    if channel:
+        diagnostics["channel"] = channel
+    thread_ts = _string_diagnostic(body.get("thread_ts")) or _string_diagnostic(
+        body.get("parent_ts")
+    )
+    if thread_ts:
+        diagnostics["thread_ts"] = thread_ts
+    step_id = _string_diagnostic(body.get("id"))
+    if step_id:
+        diagnostics["step_id"] = step_id
+    step_status = _string_diagnostic(body.get("status"))
+    if step_status and path.endswith("/step"):
+        diagnostics["step_status"] = step_status
+    harness_thread_id = _string_diagnostic(body.get("thread_id"))
+    if harness_thread_id:
+        diagnostics["harness_thread_id"] = harness_thread_id
+
+    event = body.get("event")
+    if isinstance(event, dict):
+        event_type = _string_diagnostic(event.get("type"))
+        if event_type:
+            diagnostics["event_type"] = event_type
+        execution_id = _string_diagnostic(event.get("centaur_execution_id"))
+        if execution_id:
+            diagnostics["centaur_execution_id"] = execution_id
+        thread_key = _string_diagnostic(event.get("centaur_thread_key"))
+        if thread_key:
+            diagnostics["thread_key"] = thread_key
+        harness_session_id = _string_diagnostic(event.get("session_id"))
+        if harness_session_id:
+            diagnostics["harness_thread_id"] = harness_session_id
+
+    return diagnostics
+
+
 async def post(
     path: str,
     body: dict[str, Any],
@@ -46,6 +126,7 @@ async def post(
     last_status: int | None = None
     last_response: str | None = None
     last_error: str | None = None
+    diagnostics = _delivery_diagnostics(path, body)
     for attempt in range(_RETRY_ATTEMPTS):
         try:
             async with httpx.AsyncClient(timeout=request_timeout) as client:
@@ -74,22 +155,45 @@ async def post(
                 if response.status_code not in _RETRYABLE_STATUS:
                     log.warning(
                         "slackbot_call_failed",
-                        path=path,
+                        **diagnostics,
                         status=response.status_code,
                         response=last_response,
+                        attempt=attempt + 1,
+                        attempts=_RETRY_ATTEMPTS,
+                        retryable=False,
                     )
                     return None
+                if attempt + 1 < _RETRY_ATTEMPTS:
+                    log.warning(
+                        "slackbot_call_retrying",
+                        **diagnostics,
+                        status=response.status_code,
+                        response=last_response,
+                        attempt=attempt + 1,
+                        attempts=_RETRY_ATTEMPTS,
+                        retryable=True,
+                    )
         except Exception as exc:
             last_error = str(exc)
+            if attempt + 1 < _RETRY_ATTEMPTS:
+                log.warning(
+                    "slackbot_call_retrying",
+                    **diagnostics,
+                    error=last_error,
+                    attempt=attempt + 1,
+                    attempts=_RETRY_ATTEMPTS,
+                    retryable=True,
+                )
         if attempt + 1 < _RETRY_ATTEMPTS:
             await asyncio.sleep(_RETRY_BASE_DELAY_S * (2**attempt))
     log.warning(
         "slackbot_call_failed",
-        path=path,
+        **diagnostics,
         status=last_status,
         response=last_response,
         error=last_error,
         attempts=_RETRY_ATTEMPTS,
+        retryable=True,
     )
     return None
 

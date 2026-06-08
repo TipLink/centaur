@@ -2022,6 +2022,11 @@ async def test_worker_closes_slackbot_session_after_live_delivery_disables(db_po
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
     assert metadata["slackbot_live_delivery_failed"] == "harness_event_failed"
+    assert (
+        metadata["slackbot_live_delivery_last_event_type"] == "item.agentMessage.delta"
+    )
+    assert metadata["slackbot_live_delivery_failure_count"] == 5
+    assert metadata["slackbot_live_delivery_failure_limit"] == 5
     outbox = await db_pool.fetchrow(
         "SELECT state, final_payload FROM agent_final_delivery_outbox WHERE execution_id = $1",
         execution_id,
