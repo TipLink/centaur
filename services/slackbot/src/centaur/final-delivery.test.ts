@@ -430,6 +430,82 @@ describe("final delivery polling", () => {
     }
   });
 
+  it("dead-letters invalid Slack thread targets before posting fallback chunks", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchCalls: Array<{ path: string; body: any }> = [];
+    const fetchMock = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        fetchCalls.push({ path: url.pathname, body });
+        if (url.pathname === "/agent/final-deliveries/claim") {
+          return jsonResponse({
+            deliveries: [
+              {
+                execution_id: "exe-invalid-thread",
+                thread_key: "slack:T123:C123:1778883099.579529",
+                delivery: {
+                  platform: "slack",
+                  channel: "C123",
+                  thread_ts: "1778883099.579529",
+                },
+                final_payload: { result_text: "hello" },
+              },
+            ],
+          });
+        }
+        if (
+          url.pathname === "/agent/final-deliveries/exe-invalid-thread/failed"
+        )
+          return jsonResponse({ ok: true });
+        throw new Error(`unexpected request: ${url.pathname}`);
+      },
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const slackCalls: Array<{ method: string; params: any }> = [];
+    const client = {
+      assistant: recordingAssistant(slackCalls),
+      chat: {
+        postMessage: async (params: any) => {
+          slackCalls.push({ method: "chat.postMessage", params });
+          throw new Error("chat.postMessage should not be called");
+        },
+      },
+      conversations: {
+        replies: async (params: any) => {
+          slackCalls.push({ method: "conversations.replies", params });
+          return { ok: false, error: "thread_not_found" };
+        },
+      },
+    };
+
+    try {
+      await pollFinalDeliveriesOnce(config, client as any);
+      expect(
+        slackCalls.filter((call) => call.method === "conversations.replies"),
+      ).toHaveLength(1);
+      expect(
+        slackCalls.filter((call) => call.method === "chat.postMessage"),
+      ).toHaveLength(0);
+      expect(
+        slackCalls.filter(
+          (call) => call.method === "assistant.threads.setStatus",
+        ),
+      ).toHaveLength(0);
+      const failed = fetchCalls.find((call) =>
+        call.path.endsWith("/final-deliveries/exe-invalid-thread/failed"),
+      );
+      expect(failed?.body).toMatchObject({
+        error: "thread_not_found",
+        error_class: "thread_not_found",
+        non_retryable: true,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("marks thrown Slack Web API block-size errors non-retryable", async () => {
     const originalFetch = globalThis.fetch;
     const fetchCalls: Array<{ path: string; body: any }> = [];

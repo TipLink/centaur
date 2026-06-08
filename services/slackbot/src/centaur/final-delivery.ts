@@ -20,6 +20,8 @@ const LIVE_DELIVERY_TAIL_DRIFT_CHARS = 3;
 const NON_RETRYABLE_SLACK_ERRORS = new Set([
   "msg_too_long",
   "msg_blocks_too_long",
+  "invalid_thread_ts",
+  "thread_not_found",
   "channel_not_found",
   "user_not_found",
   "missing_slack_delivery_target",
@@ -235,7 +237,13 @@ async function postedChunkIndexes(
       limit: 200,
       inclusive: true,
     });
-    if (!response.ok || !Array.isArray(response.messages)) return new Set();
+    if (!response.ok) {
+      const error = String(response.error ?? "conversations.replies failed");
+      if (nonRetryableSlackErrorCode(error))
+        throw slackApiError(error, response);
+      return new Set();
+    }
+    if (!Array.isArray(response.messages)) return new Set();
     const indexes = response.messages
       .map((message: any) => message?.metadata)
       .filter(
@@ -248,7 +256,8 @@ async function postedChunkIndexes(
       .map((metadata: any) => Number(metadata.event_payload.chunk_index))
       .filter((index: number) => Number.isInteger(index) && index >= 0);
     return new Set(indexes);
-  } catch {
+  } catch (error) {
+    if (slackDeliveryErrorClass(error)) throw error;
     return new Set();
   }
 }
@@ -464,11 +473,21 @@ function slackDeliveryErrorMessage(error: unknown): string {
 }
 
 function slackDeliveryErrorClass(error: unknown): string | null {
-  const normalized = slackDeliveryErrorFingerprint(error).trim().toLowerCase();
+  return nonRetryableSlackErrorCode(slackDeliveryErrorFingerprint(error));
+}
+
+function nonRetryableSlackErrorCode(value: string): string | null {
+  const normalized = value.trim().toLowerCase();
   for (const errorClass of NON_RETRYABLE_SLACK_ERRORS) {
     if (normalized.includes(errorClass)) return errorClass;
   }
   return null;
+}
+
+function slackApiError(message: string, data: unknown): Error {
+  const error = new Error(message);
+  (error as { data?: unknown }).data = data;
+  return error;
 }
 
 function slackDeliveryErrorFingerprint(error: unknown): string {
