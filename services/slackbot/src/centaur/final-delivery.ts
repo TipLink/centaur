@@ -1,7 +1,7 @@
 import type { WebClient } from "@slack/web-api";
 import { centaurApiKey, type AppConfig } from "../config";
 import { slackReplyLimits } from "../constants";
-import { logError } from "../logging";
+import { logError, logWarn } from "../logging";
 import {
   activeSpanAttributes,
   clientSpanOptions,
@@ -28,6 +28,13 @@ const NON_RETRYABLE_SLACK_ERRORS = new Set([
   "restricted_action",
   "not_in_channel",
   "channel_type_not_supported",
+]);
+const UNSUPPORTED_ASSISTANT_STATUS_ERRORS = new Set([
+  "user_not_found",
+  "channel_not_found",
+  "channel_type_not_supported",
+  "not_in_channel",
+  "restricted_action",
 ]);
 
 export function startFinalDeliveryPoller(
@@ -144,6 +151,7 @@ async function deliver(
       "centaur.final_delivery.text_chars": 0,
       "centaur.final_delivery.skipped_reason": "live_delivery_tail_drift",
     });
+    await clearAssistantStatus(client, channel, threadTs);
     return;
   }
   const chunks = splitFinalDeliveryText(textToPost);
@@ -159,6 +167,7 @@ async function deliver(
     config.SLACK_TEAM_ID,
     chunks,
   );
+  await clearAssistantStatus(client, channel, threadTs);
 }
 
 function executionId(delivery: any): string {
@@ -242,6 +251,61 @@ async function postedChunkIndexes(
   } catch {
     return new Set();
   }
+}
+
+async function clearAssistantStatus(
+  client: WebClient,
+  channel: string,
+  threadTs: string,
+): Promise<void> {
+  try {
+    const response = await client.assistant.threads.setStatus({
+      channel_id: channel,
+      thread_ts: threadTs,
+      status: "",
+    });
+    if (!response.ok) {
+      const errorCode = response.error ?? "unknown_error";
+      if (isUnsupportedAssistantStatusError(errorCode)) {
+        logWarn("final_delivery_assistant_status_unsupported", {
+          channel_id: channel,
+          thread_ts: threadTs,
+          error: errorCode,
+        });
+        return;
+      }
+      throw new Error(errorCode);
+    }
+  } catch (error) {
+    const errorCode = slackDeliveryErrorClass(error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (errorCode && isUnsupportedAssistantStatusError(errorCode)) {
+      logWarn("final_delivery_assistant_status_unsupported", {
+        channel_id: channel,
+        thread_ts: threadTs,
+        error: errorCode,
+      });
+      return;
+    }
+    if (isUnsupportedAssistantStatusError(message)) {
+      logWarn("final_delivery_assistant_status_unsupported", {
+        channel_id: channel,
+        thread_ts: threadTs,
+        error: message,
+      });
+      return;
+    }
+    throw error;
+  }
+}
+
+function isUnsupportedAssistantStatusError(error: string): boolean {
+  const trimmed = error.trim().toLowerCase();
+  if (UNSUPPORTED_ASSISTANT_STATUS_ERRORS.has(trimmed)) return true;
+  for (const code of UNSUPPORTED_ASSISTANT_STATUS_ERRORS) {
+    if (trimmed.includes(code)) return true;
+  }
+  return false;
 }
 
 function chunkMetadata(

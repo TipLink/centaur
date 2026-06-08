@@ -23,6 +23,19 @@ afterEach(() => {
   mock.restore();
 });
 
+function recordingAssistant(
+  slackCalls: Array<{ method: string; params: any }>,
+) {
+  return {
+    threads: {
+      setStatus: async (params: any) => {
+        slackCalls.push({ method: "assistant.threads.setStatus", params });
+        return { ok: true };
+      },
+    },
+  };
+}
+
 describe("final delivery polling", () => {
   it("posts a claimed delivery once and marks it delivered before the next poll", async () => {
     const originalFetch = globalThis.fetch;
@@ -86,14 +99,7 @@ describe("final delivery polling", () => {
 
     const slackCalls: Array<{ method: string; params: unknown }> = [];
     const client = {
-      assistant: {
-        threads: {
-          setStatus: async (params: unknown) => {
-            slackCalls.push({ method: "assistant.threads.setStatus", params });
-            return { ok: true };
-          },
-        },
-      },
+      assistant: recordingAssistant(slackCalls as any),
       chat: {
         startStream: async (params: any) => {
           slackCalls.push({ method: "chat.startStream", params });
@@ -159,9 +165,17 @@ describe("final delivery polling", () => {
       const postMessage = slackCalls.find(
         (call) => call.method === "chat.postMessage",
       );
+      const statusClear = slackCalls.find(
+        (call) => call.method === "assistant.threads.setStatus",
+      );
       expect((postMessage?.params as any)?.text).toBe(
         "done <https://example.com|once> with **bold** text and https://example.com/raw",
       );
+      expect((statusClear?.params as any)).toEqual({
+        channel_id: "C123",
+        thread_ts: "1778883099.579529",
+        status: "",
+      });
       expect((postMessage?.params as any)?.blocks).toEqual([
         {
           type: "rich_text",
@@ -223,7 +237,9 @@ describe("final delivery polling", () => {
     );
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
+    const slackCalls: Array<{ method: string; params: any }> = [];
     const client = {
+      assistant: recordingAssistant(slackCalls),
       chat: {
         postMessage: async (params: any) => {
           posted.push(params);
@@ -274,6 +290,11 @@ describe("final delivery polling", () => {
           (message) => message.metadata?.event_payload?.chunk_index === 0,
         ),
       ).toHaveLength(1);
+      expect(
+        slackCalls.filter(
+          (call) => call.method === "assistant.threads.setStatus",
+        ),
+      ).toHaveLength(1);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -312,6 +333,7 @@ describe("final delivery polling", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const client = {
+      assistant: recordingAssistant(slackCalls),
       chat: {
         postMessage: async (params: any) => {
           slackCalls.push({ method: "chat.postMessage", params });
@@ -508,6 +530,7 @@ describe("final delivery polling", () => {
 
     const slackCalls: Array<{ method: string; params: any }> = [];
     const client = {
+      assistant: recordingAssistant(slackCalls),
       chat: {
         postMessage: async (params: any) => {
           slackCalls.push({ method: "chat.postMessage", params });
@@ -579,6 +602,7 @@ describe("final delivery polling", () => {
 
     const slackCalls: Array<{ method: string; params: any }> = [];
     const client = {
+      assistant: recordingAssistant(slackCalls),
       chat: {
         postMessage: async (params: any) => {
           slackCalls.push({ method: "chat.postMessage", params });
@@ -593,7 +617,23 @@ describe("final delivery polling", () => {
     try {
       await pollFinalDeliveriesOnce(config, client as any);
 
-      expect(slackCalls).toHaveLength(0);
+      expect(
+        slackCalls.filter((call) => call.method === "chat.postMessage"),
+      ).toHaveLength(0);
+      expect(
+        slackCalls.filter(
+          (call) => call.method === "assistant.threads.setStatus",
+        ),
+      ).toEqual([
+        {
+          method: "assistant.threads.setStatus",
+          params: {
+            channel_id: "C123",
+            thread_ts: "1778883099.579529",
+            status: "",
+          },
+        },
+      ]);
       expect(
         fetchCalls.some(
           (call) =>
@@ -639,6 +679,7 @@ describe("final delivery polling", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const client = {
+      assistant: recordingAssistant(slackCalls),
       chat: {
         postMessage: async (params: any) => {
           slackCalls.push({ method: "chat.postMessage", params });
@@ -722,6 +763,7 @@ describe("final delivery polling", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const client = {
+      assistant: recordingAssistant(slackCalls),
       chat: {
         postMessage: async (params: any) => {
           slackCalls.push({ method: "chat.postMessage", params });
