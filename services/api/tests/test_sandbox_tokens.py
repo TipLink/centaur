@@ -12,6 +12,7 @@ import types
 from fastapi import HTTPException
 
 from api.deps import (
+    DEFAULT_SANDBOX_TOKEN_TTL_S,
     enforce_sandbox_thread_scope,
     mint_sandbox_token,
     sandbox_thread_in_scope,
@@ -35,11 +36,38 @@ class TestRoundtrip:
         assert claims["container_id"] == "ctr-abc"
         assert "created_at" in claims
         assert "expires_at" in claims
-        assert claims["expires_at"] - claims["created_at"] == 7200
+        assert claims["expires_at"] - claims["created_at"] == DEFAULT_SANDBOX_TOKEN_TTL_S
 
     def test_token_has_sbx1_prefix(self):
         token = mint_sandbox_token("t", "c")
         assert token.startswith("sbx1.")
+
+    def test_env_configures_default_ttl(self, monkeypatch):
+        monkeypatch.setenv("CENTAUR_SANDBOX_TOKEN_TTL_S", "172800")
+
+        token = mint_sandbox_token("thread:1", "ctr-abc")
+        claims = verify_sandbox_token(token)
+
+        assert claims is not None
+        assert claims["expires_at"] - claims["created_at"] == 172800
+
+    def test_explicit_ttl_overrides_env_default(self, monkeypatch):
+        monkeypatch.setenv("CENTAUR_SANDBOX_TOKEN_TTL_S", "172800")
+
+        token = mint_sandbox_token("thread:1", "ctr-abc", ttl_s=3600)
+        claims = verify_sandbox_token(token)
+
+        assert claims is not None
+        assert claims["expires_at"] - claims["created_at"] == 3600
+
+    def test_invalid_env_ttl_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("CENTAUR_SANDBOX_TOKEN_TTL_S", "not-an-int")
+
+        token = mint_sandbox_token("thread:1", "ctr-abc")
+        claims = verify_sandbox_token(token)
+
+        assert claims is not None
+        assert claims["expires_at"] - claims["created_at"] == DEFAULT_SANDBOX_TOKEN_TTL_S
 
 
 class TestTampering:
