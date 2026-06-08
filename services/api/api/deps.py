@@ -18,6 +18,8 @@ from api.api_keys import APIKeyInfo, check_scope, lookup_key
 
 log = structlog.get_logger()
 
+DEFAULT_SANDBOX_TOKEN_TTL_S = 7200
+
 # Every caller must present a valid API key. There is no IP-based trust:
 # the previous loopback bypass was spoofable via X-Forwarded-For and gave
 # any peer that could reach the API full unauthenticated admin access.
@@ -47,18 +49,42 @@ _auto_signing_key: str = secrets.token_hex(32)
 # ---------------------------------------------------------------------------
 
 
-def mint_sandbox_token(thread_key: str, container_id: str, ttl_s: int = 7200) -> str:
-    """Create a short-lived sandbox token signed with the sandbox signing key."""
+def _sandbox_token_ttl_s() -> int:
+    raw = os.environ.get("CENTAUR_SANDBOX_TOKEN_TTL_S", "").strip()
+    if not raw:
+        return DEFAULT_SANDBOX_TOKEN_TTL_S
+    try:
+        ttl_s = int(raw)
+    except ValueError:
+        log.warning(
+            "invalid_sandbox_token_ttl",
+            value=raw,
+            fallback=DEFAULT_SANDBOX_TOKEN_TTL_S,
+        )
+        return DEFAULT_SANDBOX_TOKEN_TTL_S
+    if ttl_s <= 0:
+        log.warning(
+            "invalid_sandbox_token_ttl",
+            value=raw,
+            fallback=DEFAULT_SANDBOX_TOKEN_TTL_S,
+        )
+        return DEFAULT_SANDBOX_TOKEN_TTL_S
+    return ttl_s
+
+
+def mint_sandbox_token(thread_key: str, container_id: str, ttl_s: int | None = None) -> str:
+    """Create a sandbox token signed with the sandbox signing key."""
     api_key = _get_sandbox_signing_key()
     if not api_key:
         raise RuntimeError("Sandbox signing key not configured")
 
     now = int(time.time())
+    resolved_ttl_s = _sandbox_token_ttl_s() if ttl_s is None else ttl_s
     payload = {
         "thread_key": thread_key,
         "container_id": container_id,
         "created_at": now,
-        "expires_at": now + ttl_s,
+        "expires_at": now + resolved_ttl_s,
     }
     payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
     sig = hmac.new(api_key.encode(), payload_b64.encode(), hashlib.sha256).digest()
