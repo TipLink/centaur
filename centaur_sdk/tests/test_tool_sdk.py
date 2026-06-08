@@ -4,6 +4,7 @@ import threading
 
 import pytest
 
+import centaur_sdk.tool_sdk as tool_sdk
 from centaur_sdk import ToolContext, reset_tool_context, secret, set_tool_context
 from centaur_sdk.backends import registry
 from centaur_sdk.backends.base import SecretBackend
@@ -39,6 +40,46 @@ def test_secret_uses_backend_when_context_is_missing(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(registry, "_backend", MappingBackend({"TOKEN": "from-backend"}))
 
     assert secret("TOKEN") == "from-backend"
+
+
+def test_centaur_api_key_prefers_refreshed_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    key_file = tmp_path / ".api_key"
+    key_file.write_text("fresh-token\n", encoding="utf-8")
+    monkeypatch.setattr(tool_sdk, "CENTAUR_API_KEY_FILE", key_file)
+    monkeypatch.setattr(
+        registry,
+        "_backend",
+        MappingBackend({"CENTAUR_API_KEY": "from-backend"}),
+    )
+    token = set_tool_context(
+        ToolContext(name="fake-tool", secrets={"CENTAUR_API_KEY": "from-context"})
+    )
+    try:
+        assert secret("CENTAUR_API_KEY") == "fresh-token"
+    finally:
+        reset_tool_context(token)
+
+
+def test_centaur_api_key_uses_tool_context_when_refreshed_file_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    monkeypatch.setattr(tool_sdk, "CENTAUR_API_KEY_FILE", tmp_path / "missing")
+    monkeypatch.setattr(
+        registry,
+        "_backend",
+        MappingBackend({"CENTAUR_API_KEY": "from-backend"}),
+    )
+    token = set_tool_context(
+        ToolContext(name="fake-tool", secrets={"CENTAUR_API_KEY": "from-context"})
+    )
+    try:
+        assert secret("CENTAUR_API_KEY") == "from-context"
+    finally:
+        reset_tool_context(token)
 
 
 def test_secret_uses_default_after_context_and_backend_miss(
