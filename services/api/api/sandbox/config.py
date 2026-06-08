@@ -199,6 +199,7 @@ def container_env(
         env.append(f"AMP_THREAD_VISIBILITY={visibility}")
     if resume_thread_id:
         env.append(f"AMP_CONTINUE_THREAD_ID={resume_thread_id}")
+        env.append(f"CODEX_CONTINUE_THREAD_ID={resume_thread_id}")
 
     no_proxy_hosts = [
         "localhost",

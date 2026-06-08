@@ -693,10 +693,7 @@ def test_tool_server_tool_dirs_points_overlay_at_sandbox_mount(
     monkeypatch.delenv("KUBERNETES_TOOL_SERVER_TOOL_DIRS", raising=False)
     monkeypatch.setenv("CENTAUR_OVERLAY_IMAGE", "centaur-overlay:test")
 
-    assert (
-        _tool_server_tool_dirs()
-        == "/app/tools:/home/agent/overlay/org/tools"
-    )
+    assert _tool_server_tool_dirs() == "/app/tools:/home/agent/overlay/org/tools"
 
 
 def test_tool_server_tool_dirs_without_overlay_is_base_only(
@@ -751,6 +748,7 @@ async def test_create_builds_pod_and_prompt_secret(
             "CENTAUR_API_URL=http://api.internal:8000",
             "CENTAUR_API_KEY=sandbox-token",
             "CENTAUR_TRACE_ID=00000000-0000-0000-0000-000000000123",
+            "CODEX_CONTINUE_THREAD_ID=T-123",
             "AMP_API_KEY=AMP_API_KEY",
         ],
     )
@@ -807,6 +805,7 @@ async def test_create_builds_pod_and_prompt_secret(
     assert env["CENTAUR_API_URL"] == "http://api.internal:8000"
     assert env["CENTAUR_API_KEY"] == "sandbox-token"
     assert env["CENTAUR_TRACE_ID"] == "00000000-0000-0000-0000-000000000123"
+    assert env["CODEX_CONTINUE_THREAD_ID"] == "T-123"
     assert env["AMP_API_KEY"] == "AMP_API_KEY"
     assert env["CENTAUR_OVERLAY_DIR"] == "/home/agent/overlay/org"
     assert env["AGENT_PERSONA"] == "eng"
@@ -990,9 +989,7 @@ class FakeAppsApi:
 
     async def read_namespaced_deployment(self, name: str, namespace: str):  # noqa: ANN201, ARG002
         if not self.deployments_to_read:
-            raise AssertionError(
-                f"unexpected read_namespaced_deployment({name})"
-            )
+            raise AssertionError(f"unexpected read_namespaced_deployment({name})")
         item = self.deployments_to_read.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -1020,9 +1017,7 @@ async def test_ensure_token_broker_writes_configmap_and_patches_deployment(
     from api.tool_manager import BrokeredTokenSecret, OAuthFieldSource
 
     monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur")
-    monkeypatch.setenv(
-        "KUBERNETES_TOKEN_BROKER_NAME", "centaur-centaur-token-broker"
-    )
+    monkeypatch.setenv("KUBERNETES_TOKEN_BROKER_NAME", "centaur-centaur-token-broker")
     monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
 
     backend = KubernetesExecutorBackend()
@@ -1083,9 +1078,7 @@ async def test_ensure_token_broker_skips_rollout_when_config_unchanged(
     from api.tool_manager import BrokeredTokenSecret, OAuthFieldSource
 
     monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur")
-    monkeypatch.setenv(
-        "KUBERNETES_TOKEN_BROKER_NAME", "centaur-centaur-token-broker"
-    )
+    monkeypatch.setenv("KUBERNETES_TOKEN_BROKER_NAME", "centaur-centaur-token-broker")
     monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
 
     secrets = [
@@ -1136,9 +1129,7 @@ async def test_ensure_token_broker_tolerates_missing_deployment(
     from api.tool_manager import BrokeredTokenSecret, OAuthFieldSource
 
     monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur")
-    monkeypatch.setenv(
-        "KUBERNETES_TOKEN_BROKER_NAME", "centaur-centaur-token-broker"
-    )
+    monkeypatch.setenv("KUBERNETES_TOKEN_BROKER_NAME", "centaur-centaur-token-broker")
     monkeypatch.setenv("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
 
     backend = KubernetesExecutorBackend()
@@ -1205,9 +1196,7 @@ def test_proxy_iron_env_injects_broker_when_url_set(
     )
     env = _proxy_iron_env("centaur-infra-env", [])
     by_name = {e["name"]: e for e in env}
-    assert by_name["IRON_BROKER_URL"]["value"] == (
-        "http://centaur-token-broker:8181"
-    )
+    assert by_name["IRON_BROKER_URL"]["value"] == ("http://centaur-token-broker:8181")
     assert by_name["IRON_BROKER_TOKEN"]["valueFrom"]["secretKeyRef"] == {
         "name": "centaur-infra-env",
         "key": "IRON_BROKER_TOKEN",

@@ -64,7 +64,9 @@ async def _insert_assignment(db_pool, thread_key: str, generation: int = 1) -> N
 
 
 @pytest.mark.asyncio
-async def test_spawn_assignment_defaults_to_codex_when_no_selector(db_pool, monkeypatch):
+async def test_spawn_assignment_defaults_to_codex_when_no_selector(
+    db_pool, monkeypatch
+):
     from api.runtime_control import spawn_assignment
 
     monkeypatch.delenv("CENTAUR_DEFAULT_HARNESS", raising=False)
@@ -253,6 +255,56 @@ async def test_db_insert_session_initial_state_tracks_inflight_turn(db_pool):
     assert running_row["inflight_turn_id"] == "turn-live"
     assert running_row["inflight_attempts"] == 1
     assert str(running_row["trace_id"]) == "00000000-0000-0000-0000-000000000123"
+
+
+@pytest.mark.asyncio
+async def test_get_or_spawn_replaces_unresumable_suspended_session(db_pool):
+    from api.agent import get_or_spawn
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:suspended-stale"
+    stale_runtime_id = f"rt-stale-{uuid.uuid4().hex[:8]}"
+    fresh_runtime_id = f"rt-fresh-{uuid.uuid4().hex[:8]}"
+    await db_pool.execute(
+        "INSERT INTO sandbox_sessions ("
+        "thread_key, sandbox_id, harness, engine, state, started_at, updated_at, "
+        "agent_thread_id, last_delivered_id"
+        ") VALUES ($1, $2, 'codex', 'codex', 'suspended', NOW(), NOW(), "
+        "'019ea7c3-29dd-79c3-88c6-babee1a6a022', 'msg-old')",
+        thread_key,
+        stale_runtime_id,
+    )
+
+    fresh_session = SandboxSession(
+        sandbox_id=fresh_runtime_id,
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+    backend = SimpleNamespace(
+        status=AsyncMock(return_value="gone"),
+        resume_by_id=AsyncMock(),
+        stop_by_id=AsyncMock(),
+        create=AsyncMock(return_value=fresh_session),
+    )
+
+    with patch("api.agent.get_backend", return_value=backend):
+        session = await get_or_spawn(thread_key, "codex", engine="codex")
+
+    assert session.sandbox_id == fresh_runtime_id
+    backend.resume_by_id.assert_awaited_once_with(stale_runtime_id)
+    backend.stop_by_id.assert_awaited_once_with(stale_runtime_id)
+    assert backend.create.await_args.kwargs["resume_thread_id"] is None
+
+    row = await db_pool.fetchrow(
+        "SELECT sandbox_id, state, agent_thread_id, last_delivered_id "
+        "FROM sandbox_sessions WHERE thread_key = $1",
+        thread_key,
+    )
+    assert row is not None
+    assert row["sandbox_id"] == fresh_runtime_id
+    assert row["state"] == "idle"
+    assert row["agent_thread_id"] is None
+    assert row["last_delivered_id"] == "msg-old"
 
 
 @pytest.mark.asyncio
@@ -1089,7 +1141,9 @@ async def test_mark_execution_terminal_delays_outbox_claimability(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_mark_execution_terminal_skips_durable_delivery_after_live_answer(db_pool):
+async def test_mark_execution_terminal_skips_durable_delivery_after_live_answer(
+    db_pool,
+):
     from api.runtime_control import _mark_execution_terminal
 
     execution_id = f"exe-{uuid.uuid4().hex[:10]}"
@@ -2096,6 +2150,278 @@ async def test_worker_requeues_raw_harness_auth_error_once_on_fresh_runtime(db_p
     assert assignment is not None
     assert assignment["runtime_id"] == fresh_runtime_id
     assert inject_stdin_mock.await_count == 2
+    stop_session_mock.assert_awaited_once_with(thread_key)
+
+
+@pytest.mark.asyncio
+async def test_worker_requeues_stale_codex_thread_once_on_fresh_runtime(db_pool):
+    from api.runtime_control import _claim_next_execution, _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    initial_runtime_id = f"rt-codex-{uuid.uuid4().hex[:8]}"
+    fresh_runtime_id = f"rt-fresh-{uuid.uuid4().hex[:8]}"
+    stale_thread_id = "019ea7c3-29dd-79c3-88c6-babee1a6a022"
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'codex', 'codex', NULL, 'harness:codex', 'sha', 'active')",
+        thread_key,
+        initial_runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, hard_deadline_at"
+        ") VALUES ($1, $2, 1, 'exec-stale-thread', 'hash-stale-thread', 'running', '{}'::jsonb, '{}'::jsonb, NOW() + INTERVAL '10 minutes')",
+        execution_id,
+        thread_key,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_message_requests ("
+        "thread_key, message_id, assignment_generation, request_hash, event_json, "
+        "metadata, delivered_execution_id"
+        ") VALUES ($1, 'msg-stale-thread', 1, 'hash-msg-stale-thread', '{}'::jsonb, '{}'::jsonb, $2)",
+        thread_key,
+        execution_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO sandbox_sessions ("
+        "thread_key, sandbox_id, harness, engine, state, started_at, updated_at, "
+        "agent_thread_id, last_delivered_id"
+        ") VALUES ($1, $2, 'codex', 'codex', 'running', NOW(), NOW(), $3, 'msg-stale-thread')",
+        thread_key,
+        initial_runtime_id,
+        stale_thread_id,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "status": "running",
+        "delivery": {},
+        "metadata": {},
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+        "created_at": dt.datetime.now(dt.timezone.utc),
+        "claimed_at": dt.datetime.now(dt.timezone.utc),
+    }
+    initial_session = SandboxSession(
+        sandbox_id=initial_runtime_id,
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+    fresh_session = SandboxSession(
+        sandbox_id=fresh_runtime_id,
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+
+    stream_calls = 0
+
+    async def _stale_thread_then_success_stream(*_args, **_kwargs):
+        nonlocal stream_calls
+        stream_calls += 1
+        if stream_calls == 1:
+            yield {
+                "data": json.dumps(
+                    {
+                        "type": "turn.done",
+                        "error": f"thread not found: {stale_thread_id}",
+                        "is_error": True,
+                    }
+                )
+            }
+            return
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "turn.done",
+                    "result": "recovered after stale thread",
+                }
+            )
+        }
+
+    stop_session_mock = AsyncMock()
+    inject_stdin_mock = AsyncMock(
+        side_effect=[
+            {"ok": True, "injected": True, "durable_turn_id": "turn-stale-1"},
+            {"ok": True, "injected": True, "durable_turn_id": "turn-stale-2"},
+        ]
+    )
+    backend = SimpleNamespace(attach=AsyncMock())
+
+    with (
+        patch(
+            "api.runtime_control.get_or_spawn",
+            new=AsyncMock(side_effect=[initial_session, fresh_session]),
+        ),
+        patch("api.runtime_control.inject_stdin", inject_stdin_mock),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch(
+            "api.runtime_control._get_runtime",
+            return_value=SimpleNamespace(turn_counter=1),
+        ),
+        patch("api.runtime_control._stream_stdout", _stale_thread_then_success_stream),
+        patch("api.runtime_control.stop_session", stop_session_mock),
+    ):
+        await _process_execution(db_pool, row)
+
+        queued = await db_pool.fetchrow(
+            "SELECT status, durable_turn_id, terminal_reason, result_text, error_text, metadata "
+            "FROM agent_execution_requests WHERE execution_id = $1",
+            execution_id,
+        )
+        assert queued is not None
+        assert queued["status"] == "queued"
+        assert queued["durable_turn_id"] is None
+        assert queued["terminal_reason"] is None
+        assert queued["result_text"] is None
+        assert queued["error_text"] is None
+        metadata = queued["metadata"]
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        assert metadata["control_plane_retry"] == {
+            "reason": "stale_codex_thread",
+            "attempt": 1,
+            "max_attempts": 1,
+            "fresh_runtime": True,
+            "last_error": f"thread not found: {stale_thread_id}",
+        }
+        agent_thread_id = await db_pool.fetchval(
+            "SELECT agent_thread_id FROM sandbox_sessions WHERE thread_key = $1",
+            thread_key,
+        )
+        assert agent_thread_id is None
+
+        claimed = await _claim_next_execution(db_pool)
+        assert claimed is not None
+        assert claimed["execution_id"] == execution_id
+
+        await _process_execution(db_pool, claimed)
+
+    execution = await db_pool.fetchrow(
+        "SELECT status, terminal_reason, result_text, error_text FROM agent_execution_requests WHERE execution_id = $1",
+        execution_id,
+    )
+    assert execution is not None
+    assert execution["status"] == "completed"
+    assert execution["terminal_reason"] == "completed"
+    assert execution["result_text"] == "recovered after stale thread"
+    assert execution["error_text"] in (None, "")
+
+    assert inject_stdin_mock.await_count == 2
+    stop_session_mock.assert_awaited_once_with(thread_key)
+
+
+@pytest.mark.asyncio
+async def test_worker_sanitizes_stale_codex_thread_failure_after_retry(db_pool):
+    from api.runtime_control import _process_execution
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    runtime_id = f"rt-codex-{uuid.uuid4().hex[:8]}"
+    stale_thread_id = "019ea7c3-29dd-79c3-88c6-babee1a6a022"
+    retry_metadata = {
+        "control_plane_retry": {
+            "reason": "stale_codex_thread",
+            "attempt": 1,
+            "max_attempts": 1,
+            "fresh_runtime": True,
+            "last_error": f"thread not found: {stale_thread_id}",
+        }
+    }
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'codex', 'codex', NULL, 'harness:codex', 'sha', 'active')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, hard_deadline_at"
+        ") VALUES ($1, $2, 1, 'exec-stale-thread-final', 'hash-stale-thread-final', 'running', '{}'::jsonb, $3::jsonb, NOW() + INTERVAL '10 minutes')",
+        execution_id,
+        thread_key,
+        json.dumps(retry_metadata),
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+
+    row = {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "assignment_generation": 1,
+        "status": "running",
+        "delivery": {},
+        "metadata": retry_metadata,
+        "hard_deadline_at": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10),
+        "created_at": dt.datetime.now(dt.timezone.utc),
+        "claimed_at": dt.datetime.now(dt.timezone.utc),
+    }
+    session = SandboxSession(
+        sandbox_id=runtime_id,
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+
+    async def _stale_thread_failure_stream(*_args, **_kwargs):
+        yield {
+            "data": json.dumps(
+                {
+                    "type": "turn.done",
+                    "error": f"thread not found: {stale_thread_id}",
+                    "is_error": True,
+                }
+            )
+        }
+
+    stop_session_mock = AsyncMock()
+    backend = SimpleNamespace(attach=AsyncMock())
+    with (
+        patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
+        patch(
+            "api.runtime_control.inject_stdin",
+            new=AsyncMock(return_value={"ok": True, "injected": True}),
+        ),
+        patch("api.runtime_control.get_backend", return_value=backend),
+        patch(
+            "api.runtime_control._get_runtime",
+            return_value=SimpleNamespace(turn_counter=1),
+        ),
+        patch("api.runtime_control._stream_stdout", _stale_thread_failure_stream),
+        patch("api.runtime_control.stop_session", stop_session_mock),
+    ):
+        await _process_execution(db_pool, row)
+
+    execution = await db_pool.fetchrow(
+        "SELECT status, terminal_reason, result_text, error_text FROM agent_execution_requests WHERE execution_id = $1",
+        execution_id,
+    )
+    assert execution is not None
+    assert execution["status"] == "failed_permanent"
+    assert execution["terminal_reason"] == "codex_thread_not_found"
+    assert "lost its Codex runtime thread" in execution["result_text"]
+    assert execution["error_text"] == f"thread not found: {stale_thread_id}"
     stop_session_mock.assert_awaited_once_with(thread_key)
 
 
@@ -3334,12 +3660,14 @@ async def test_worker_marks_silence_deadline_exceeded_and_stops_session(db_pool)
         await _process_execution(db_pool, row)
 
     execution = await db_pool.fetchrow(
-        "SELECT status, terminal_reason, error_text FROM agent_execution_requests WHERE execution_id = $1",
+        "SELECT status, terminal_reason, result_text, error_text "
+        "FROM agent_execution_requests WHERE execution_id = $1",
         execution_id,
     )
     assert execution is not None
     assert execution["status"] == "failed_permanent"
     assert execution["terminal_reason"] == "silence_deadline_exceeded"
+    assert "stopped reporting progress" in execution["result_text"]
     assert "no progress" in (execution["error_text"] or "")
     stop_session_mock.assert_awaited_once_with(thread_key)
 

@@ -129,6 +129,18 @@ _RAW_HARNESS_AUTH_SAFE_FAILURE_MESSAGE = (
     "The agent hit a temporary runtime startup issue and could not complete the turn. "
     "Please retry in a moment."
 )
+_STALE_CODEX_THREAD_RETRY_LIMIT = 1
+_STALE_CODEX_THREAD_RETRY_REASON = "stale_codex_thread"
+_STALE_CODEX_THREAD_SAFE_FAILURE_MESSAGE = (
+    "The agent lost its Codex runtime thread while continuing this Slack session. "
+    "I could not recover it cleanly. Please retry the request; if it repeats, "
+    "ask an operator to inspect DEV-5186."
+)
+_EXECUTION_SILENCE_SAFE_FAILURE_MESSAGE = (
+    "The agent runtime stopped reporting progress before the turn completed. "
+    "I stopped the run so it does not appear silently stuck. Please retry the "
+    "request; if it repeats, ask an operator to inspect DEV-5186."
+)
 _OTEL_METADATA_KEY = "_otel"
 _OTEL_EXECUTION_SPAN_CONTEXT_KEY = "execution_span_context"
 
@@ -180,16 +192,36 @@ def _matches_user_cancelled(*values: str | None) -> bool:
     return False
 
 
-def _raw_harness_auth_retry_attempt(metadata: dict[str, Any]) -> int:
+def _control_plane_retry_attempt(metadata: dict[str, Any], reason: str) -> int:
     retry_metadata = metadata.get(_RAW_HARNESS_AUTH_RETRY_METADATA_KEY)
     if not isinstance(retry_metadata, dict):
         return 0
-    if str(retry_metadata.get("reason") or "") != _RAW_HARNESS_AUTH_RETRY_REASON:
+    if str(retry_metadata.get("reason") or "") != reason:
         return 0
     attempt = retry_metadata.get("attempt")
     with contextlib.suppress(TypeError, ValueError):
         return max(int(attempt), 0)
     return 0
+
+
+def _raw_harness_auth_retry_attempt(metadata: dict[str, Any]) -> int:
+    return _control_plane_retry_attempt(metadata, _RAW_HARNESS_AUTH_RETRY_REASON)
+
+
+def _stale_codex_thread_retry_attempt(metadata: dict[str, Any]) -> int:
+    return _control_plane_retry_attempt(metadata, _STALE_CODEX_THREAD_RETRY_REASON)
+
+
+def _matches_stale_codex_thread_failure(*values: str | None) -> bool:
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        normalized = " ".join(value.strip().casefold().split())
+        if normalized.startswith("thread not found:"):
+            return True
+        if "codex" in normalized and "thread not found" in normalized:
+            return True
+    return False
 
 
 def prompt_identity(
@@ -1039,7 +1071,9 @@ def _slackbot_streamed_answer_chars(value: Any) -> int:
 _SLACKBOT_LIVE_DELIVERY_TAIL_DRIFT_CHARS = 3
 
 
-def _slackbot_live_delivery_covers_result(result_text: str, streamed_chars: int) -> bool:
+def _slackbot_live_delivery_covers_result(
+    result_text: str, streamed_chars: int
+) -> bool:
     text = result_text.strip()
     if not text:
         return False
@@ -2036,10 +2070,18 @@ async def _mark_execution_terminal(
         decode_jsonb(row["delivery"], {}) if row else {}
     )
     suppress_no_input_delivery = terminal_reason == "no_input"
-    if delivery_platform == "dev" or suppress_legacy_delivery or suppress_no_input_delivery:
+    if (
+        delivery_platform == "dev"
+        or suppress_legacy_delivery
+        or suppress_no_input_delivery
+    ):
         slackbot_agent_session_id = str(metadata.get("slackbot_agent_session_id") or "")
         result_size = payload_size_bytes(result_text)
-        if suppress_legacy_delivery and result_size > 0 and slackbot_streamed_answer_chars <= 0:
+        if (
+            suppress_legacy_delivery
+            and result_size > 0
+            and slackbot_streamed_answer_chars <= 0
+        ):
             log.warning(
                 "final_delivery_skipped_without_live_answer",
                 execution_id=execution_id,
@@ -2129,7 +2171,9 @@ async def _mark_execution_terminal(
                     "result_text": result_text,
                     **({"error_text": error_text} if error_text else {}),
                     **(
-                        {"slackbot_streamed_answer_chars": slackbot_streamed_answer_chars}
+                        {
+                            "slackbot_streamed_answer_chars": slackbot_streamed_answer_chars
+                        }
                         if slackbot_streamed_answer_chars
                         else {}
                     ),
@@ -2239,27 +2283,37 @@ async def _stop_execution_session(thread_key: str, *, reason: str) -> None:
         )
 
 
-async def _requeue_execution_after_raw_harness_auth_failure(
+async def _requeue_execution_on_fresh_runtime(
     pool,
     *,
     execution_id: str,
     thread_key: str,
     metadata: dict[str, Any],
+    retry_reason: str,
+    retry_limit: int,
     combined_error: str,
+    stop_reason: str,
+    clear_agent_thread_id: bool = False,
 ) -> bool:
-    next_attempt = _raw_harness_auth_retry_attempt(metadata) + 1
+    next_attempt = _control_plane_retry_attempt(metadata, retry_reason) + 1
     retry_metadata = {
         _RAW_HARNESS_AUTH_RETRY_METADATA_KEY: {
-            "reason": _RAW_HARNESS_AUTH_RETRY_REASON,
+            "reason": retry_reason,
             "attempt": next_attempt,
-            "max_attempts": _RAW_HARNESS_AUTH_RETRY_LIMIT,
+            "max_attempts": retry_limit,
             "fresh_runtime": True,
             "last_error": combined_error,
         }
     }
+    if clear_agent_thread_id:
+        await pool.execute(
+            "UPDATE sandbox_sessions SET agent_thread_id = NULL, last_result = NULL, "
+            "last_result_at = NULL, updated_at = NOW() WHERE thread_key = $1",
+            thread_key,
+        )
     await _stop_execution_session(
         thread_key,
-        reason="raw_harness_auth_retry",
+        reason=stop_reason,
     )
     update_result = await pool.execute(
         "UPDATE agent_execution_requests SET "
@@ -2289,9 +2343,10 @@ async def _requeue_execution_after_raw_harness_auth_failure(
         updated_rows = 0
     if updated_rows != 1:
         log.warning(
-            "execution_raw_harness_auth_requeue_skipped",
+            "execution_fresh_runtime_requeue_skipped",
             execution_id=execution_id,
             thread_key=thread_key,
+            retry_reason=retry_reason,
             update_result=update_result,
         )
         return False
@@ -2314,13 +2369,55 @@ async def _requeue_execution_after_raw_harness_auth_failure(
         extra={"retry": retry_metadata[_RAW_HARNESS_AUTH_RETRY_METADATA_KEY]},
     )
     log.warning(
-        "execution_requeued_after_raw_harness_auth_failure",
+        "execution_requeued_on_fresh_runtime",
         execution_id=execution_id,
         thread_key=thread_key,
+        retry_reason=retry_reason,
         retry_attempt=next_attempt,
     )
     _worker_wake.set()
     return True
+
+
+async def _requeue_execution_after_raw_harness_auth_failure(
+    pool,
+    *,
+    execution_id: str,
+    thread_key: str,
+    metadata: dict[str, Any],
+    combined_error: str,
+) -> bool:
+    return await _requeue_execution_on_fresh_runtime(
+        pool,
+        execution_id=execution_id,
+        thread_key=thread_key,
+        metadata=metadata,
+        retry_reason=_RAW_HARNESS_AUTH_RETRY_REASON,
+        retry_limit=_RAW_HARNESS_AUTH_RETRY_LIMIT,
+        combined_error=combined_error,
+        stop_reason="raw_harness_auth_retry",
+    )
+
+
+async def _requeue_execution_after_stale_codex_thread(
+    pool,
+    *,
+    execution_id: str,
+    thread_key: str,
+    metadata: dict[str, Any],
+    combined_error: str,
+) -> bool:
+    return await _requeue_execution_on_fresh_runtime(
+        pool,
+        execution_id=execution_id,
+        thread_key=thread_key,
+        metadata=metadata,
+        retry_reason=_STALE_CODEX_THREAD_RETRY_REASON,
+        retry_limit=_STALE_CODEX_THREAD_RETRY_LIMIT,
+        combined_error=combined_error,
+        stop_reason="stale_codex_thread_retry",
+        clear_agent_thread_id=True,
+    )
 
 
 async def _claim_next_execution(pool) -> dict[str, Any] | None:
@@ -2518,7 +2615,9 @@ async def _process_execution(pool, row: dict[str, Any]) -> None:
                         },
                     )
                 if status in {"failed_permanent", "cancelled"}:
-                    mark_error(span, str(terminal_reason or terminal["error_text"] or status))
+                    mark_error(
+                        span, str(terminal_reason or terminal["error_text"] or status)
+                    )
 
 
 async def _execution_input_text(
@@ -2560,7 +2659,9 @@ async def _store_execution_span_context(
         "UPDATE agent_execution_requests "
         "SET metadata = metadata || $1::jsonb, updated_at = NOW() "
         "WHERE execution_id = $2",
-        canonical_json({_OTEL_METADATA_KEY: {_OTEL_EXECUTION_SPAN_CONTEXT_KEY: span_context}}),
+        canonical_json(
+            {_OTEL_METADATA_KEY: {_OTEL_EXECUTION_SPAN_CONTEXT_KEY: span_context}}
+        ),
         execution_id,
     )
 
@@ -2686,7 +2787,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
             thread_key=thread_key,
             status="failed_permanent",
             terminal_reason="silence_deadline_exceeded",
-            result_text="",
+            result_text=_EXECUTION_SILENCE_SAFE_FAILURE_MESSAGE,
             error_text="execution made no progress before silence deadline",
         )
         await _stop_execution_session(
@@ -2723,7 +2824,9 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     else:
         requester_user_id = None
         if isinstance(delivery, dict):
-            requester_user_id = delivery.get("recipient_user_id") or delivery.get("user_id")
+            requester_user_id = delivery.get("recipient_user_id") or delivery.get(
+                "user_id"
+            )
         requester_user_id = requester_user_id or execution_metadata.get("user_id")
         trace_metadata = _execution_laminar_metadata(
             thread_key=thread_key,
@@ -2756,7 +2859,9 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
             inject_result = await inject_stdin(
                 session,
                 "",
-                platform=delivery.get("platform") if isinstance(delivery, dict) else None,
+                platform=delivery.get("platform")
+                if isinstance(delivery, dict)
+                else None,
                 user_id=requester_user_id,
                 trace_id=inject_span_context.get("trace_id"),
                 traceparent=current_traceparent(span),
@@ -3045,7 +3150,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                 await _finalize_execution(
                     status="failed_permanent",
                     terminal_reason="silence_deadline_exceeded",
-                    result_text="",
+                    result_text=_EXECUTION_SILENCE_SAFE_FAILURE_MESSAGE,
                     error_text="execution made no progress before silence deadline",
                 )
                 await _stop_execution_session(
@@ -3455,6 +3560,41 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                 status="failed_permanent",
                 terminal_reason=terminal_reason,
                 result_text=_RAW_HARNESS_AUTH_SAFE_FAILURE_MESSAGE,
+                error_text=combined_error,
+            )
+            return
+        if (
+            engine == "codex" or harness == "codex"
+        ) and _matches_stale_codex_thread_failure(
+            error_text,
+            result_text,
+            combined_error,
+        ):
+            retry_attempt = _stale_codex_thread_retry_attempt(execution_metadata)
+            if retry_attempt < _STALE_CODEX_THREAD_RETRY_LIMIT:
+                await _requeue_execution_after_stale_codex_thread(
+                    pool,
+                    execution_id=execution_id,
+                    thread_key=thread_key,
+                    metadata=execution_metadata,
+                    combined_error=combined_error,
+                )
+                return
+            terminal_reason = "codex_thread_not_found"
+            await _stop_execution_session(
+                thread_key,
+                reason="stale_codex_thread_failed",
+            )
+            log.warning(
+                "execution_stale_codex_thread_retry_exhausted",
+                execution_id=execution_id,
+                thread_key=thread_key,
+                retry_attempt=retry_attempt,
+            )
+            await _finalize_execution(
+                status="failed_permanent",
+                terminal_reason=terminal_reason,
+                result_text=_STALE_CODEX_THREAD_SAFE_FAILURE_MESSAGE,
                 error_text=combined_error,
             )
             return
