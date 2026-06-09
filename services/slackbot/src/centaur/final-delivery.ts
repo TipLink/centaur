@@ -1,7 +1,8 @@
+import { createHash } from "crypto";
 import type { WebClient } from "@slack/web-api";
 import { centaurApiKey, type AppConfig } from "../config";
 import { slackReplyLimits } from "../constants";
-import { logError, logWarn } from "../logging";
+import { logError, logInfo, logWarn } from "../logging";
 import {
   activeSpanAttributes,
   clientSpanOptions,
@@ -108,6 +109,13 @@ export async function pollFinalDeliveriesOnce(
           } catch (error) {
             const errorMessage = slackDeliveryErrorMessage(error);
             const errorClass = slackDeliveryErrorClass(error);
+            logWarn("slack_final_delivery_audit", {
+              ...deliveryFailureAuditFields(delivery),
+              delivery_action: "postMessage",
+              slack_ok: false,
+              error: errorMessage,
+              error_class: errorClass,
+            });
             spanAttributes(span, {
               "centaur.final_delivery.status": "failed",
               "centaur.final_delivery.error_class": errorClass,
@@ -147,11 +155,25 @@ async function deliver(
   if (!channel || !threadTs) throw new Error("missing_slack_delivery_target");
   const text = extractText(payload);
   const textToPost = deliveryText(payload, text);
+  const audit = deliveryAuditFields(delivery, {
+    channel,
+    threadTs,
+    payloadText: text,
+    textToPost,
+  });
   if (!textToPost) {
     activeSpanAttributes({
       "centaur.final_delivery.chunk_count": 0,
       "centaur.final_delivery.text_chars": 0,
       "centaur.final_delivery.skipped_reason": "live_delivery_tail_drift",
+    });
+    logInfo("slack_final_delivery_audit", {
+      ...audit,
+      delivery_action: "skip_live_delivery_tail_drift",
+      slack_ok: true,
+      chunk_count: 0,
+      posted_chunk_count: 0,
+      skipped_chunk_count: 0,
     });
     await clearAssistantStatus(client, channel, threadTs);
     return;
@@ -161,7 +183,7 @@ async function deliver(
     "centaur.final_delivery.chunk_count": chunks.length,
     "centaur.final_delivery.text_chars": textToPost.length,
   });
-  await postFollowups(
+  const postResult = await postFollowups(
     client,
     channel,
     threadTs,
@@ -169,6 +191,14 @@ async function deliver(
     config.SLACK_TEAM_ID,
     chunks,
   );
+  logInfo("slack_final_delivery_audit", {
+    ...audit,
+    delivery_action: "postMessage",
+    slack_ok: true,
+    chunk_count: chunks.length,
+    posted_chunk_count: postResult.posted,
+    skipped_chunk_count: postResult.skipped,
+  });
   await clearAssistantStatus(client, channel, threadTs);
 }
 
@@ -183,7 +213,7 @@ async function postFollowups(
   executionId: string,
   teamId: string | undefined,
   chunks: string[],
-): Promise<void> {
+): Promise<{ posted: number; skipped: number }> {
   const posted = await withSpan(
     "centaur.slackbot.slack.conversations_replies",
     clientSpanOptions({
@@ -193,8 +223,13 @@ async function postFollowups(
     }),
     () => postedChunkIndexes(client, channel, threadTs, executionId),
   );
+  let postedCount = 0;
+  let skippedCount = 0;
   for (const [index, chunk] of chunks.entries()) {
-    if (posted.has(index)) continue;
+    if (posted.has(index)) {
+      skippedCount += 1;
+      continue;
+    }
     const renderedChunk = rewriteSlackArchiveLinksForApp(chunk, teamId);
     const fallbackText = markdownLinksToSlackMrkdwn(renderedChunk);
     const response = await withSpan(
@@ -220,7 +255,9 @@ async function postFollowups(
     );
     if (!response.ok)
       throw new Error(response.error ?? "chat.postMessage failed");
+    postedCount += 1;
   }
+  return { posted: postedCount, skipped: skippedCount };
 }
 
 async function postedChunkIndexes(
@@ -331,6 +368,54 @@ function chunkMetadata(
       chunk_count: chunkCount,
     },
   };
+}
+
+function deliveryAuditFields(
+  delivery: any,
+  opts: {
+    channel: string;
+    threadTs: string;
+    payloadText: string;
+    textToPost: string | null;
+  },
+): Record<string, unknown> {
+  const payload = delivery.final_payload ?? {};
+  const streamedAnswerChars = Number(payload?.slackbot_streamed_answer_chars);
+  return {
+    execution_id: executionId(delivery),
+    centaur_thread_key: delivery?.thread_key,
+    channel_id: opts.channel,
+    thread_ts: opts.threadTs,
+    payload_text_chars: opts.payloadText.length,
+    payload_text_hash: textHash(opts.payloadText),
+    text_to_post_chars: opts.textToPost?.length ?? 0,
+    text_to_post_hash: textHash(opts.textToPost ?? ""),
+    slackbot_streamed_answer_chars: Number.isFinite(streamedAnswerChars)
+      ? streamedAnswerChars
+      : undefined,
+    attempt_count: delivery?.attempt_count,
+  };
+}
+
+function deliveryFailureAuditFields(delivery: any): Record<string, unknown> {
+  const meta = delivery.delivery ?? {};
+  const target = targetFromDelivery(delivery);
+  const channel = meta.channel_id ?? meta.channel ?? target.channel ?? "";
+  const threadTs = meta.thread_ts ?? target.threadTs ?? "";
+  const payload = delivery.final_payload ?? {};
+  const payloadText = extractText(payload);
+  return deliveryAuditFields(delivery, {
+    channel,
+    threadTs,
+    payloadText,
+    textToPost: deliveryText(payload, payloadText),
+  });
+}
+
+function textHash(value: string): string {
+  return value
+    ? createHash("sha256").update(value).digest("hex").slice(0, 16)
+    : "";
 }
 
 function extractText(payload: any): string {

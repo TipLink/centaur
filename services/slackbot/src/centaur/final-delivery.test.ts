@@ -199,6 +199,84 @@ describe("final delivery polling", () => {
     }
   });
 
+  it("logs durable Slack final-delivery audit without recording final text", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalLog = console.log;
+    const logs: Array<[string, any]> = [];
+    console.log = mock((event: string, value: any) => {
+      logs.push([event, value]);
+    }) as typeof console.log;
+
+    const fetchMock = mock(async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname === "/agent/final-deliveries/claim") {
+        return jsonResponse({
+          deliveries: [
+            {
+              execution_id: "exe-reminder",
+              thread_key: "slack:T123:C123:1778883099.579529",
+              delivery: {
+                platform: "slack",
+                channel: "C123",
+                thread_ts: "1778883099.579529",
+              },
+              final_payload: {
+                result_text: "Reminder confirmed.",
+                slackbot_streamed_answer_chars: 0,
+              },
+            },
+          ],
+        });
+      }
+      if (url.pathname === "/agent/final-deliveries/exe-reminder/delivered")
+        return jsonResponse({ ok: true });
+      throw new Error(`unexpected request: ${url.pathname}`);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const slackCalls: Array<{ method: string; params: any }> = [];
+    const client = {
+      assistant: recordingAssistant(slackCalls),
+      chat: {
+        postMessage: async (params: any) => {
+          slackCalls.push({ method: "chat.postMessage", params });
+          return { ok: true };
+        },
+      },
+      conversations: {
+        replies: async (params: any) => {
+          slackCalls.push({ method: "conversations.replies", params });
+          return { ok: true, messages: [] };
+        },
+      },
+    };
+
+    try {
+      await pollFinalDeliveriesOnce(config, client as any);
+
+      const audit = logs.find(
+        ([event]) => event === "slack_final_delivery_audit",
+      );
+      expect(audit?.[1]).toMatchObject({
+        execution_id: "exe-reminder",
+        centaur_thread_key: "slack:T123:C123:1778883099.579529",
+        channel_id: "C123",
+        thread_ts: "1778883099.579529",
+        delivery_action: "postMessage",
+        slack_ok: true,
+        payload_text_chars: "Reminder confirmed.".length,
+        text_to_post_chars: "Reminder confirmed.".length,
+        chunk_count: 1,
+        posted_chunk_count: 1,
+        skipped_chunk_count: 0,
+      });
+      expect(JSON.stringify(logs)).not.toContain("Reminder confirmed.");
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.log = originalLog;
+    }
+  });
+
   it("does not repost already-delivered fallback chunks after a retry", async () => {
     const originalFetch = globalThis.fetch;
     const fetchCalls: Array<{ path: string; body: any }> = [];
