@@ -1794,7 +1794,7 @@ async def test_worker_marks_turn_done_error_as_failed_and_updates_runtime(db_poo
 
 
 @pytest.mark.asyncio
-async def test_worker_sends_final_result_when_live_slack_only_streamed_placeholder(
+async def test_worker_closes_live_slack_with_final_result_when_only_placeholder_streamed(
     db_pool,
 ):
     from api.runtime_control import _process_execution
@@ -1883,7 +1883,9 @@ async def test_worker_sends_final_result_when_live_slack_only_streamed_placehold
         }
 
     session_text_mock = AsyncMock()
-    session_done_mock = AsyncMock()
+    session_done_mock = AsyncMock(
+        return_value={"ok": True, "streamedAnswerChars": len(final_text)}
+    )
     backend = SimpleNamespace(attach=AsyncMock(), close_streams=AsyncMock())
     with (
         patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
@@ -1915,7 +1917,11 @@ async def test_worker_sends_final_result_when_live_slack_only_streamed_placehold
         await _process_execution(db_pool, row)
 
     session_text_mock.assert_not_awaited()
-    session_done_mock.assert_awaited_once_with("sess-blank", "turn-059d374be813486b")
+    session_done_mock.assert_awaited_once_with(
+        "sess-blank",
+        "turn-059d374be813486b",
+        answer_markdown=final_text,
+    )
     execution = await db_pool.fetchrow(
         "SELECT status, terminal_reason, result_text FROM agent_execution_requests WHERE execution_id = $1",
         execution_id,
@@ -1929,11 +1935,8 @@ async def test_worker_sends_final_result_when_live_slack_only_streamed_placehold
         execution_id,
     )
     assert outbox is not None
-    assert outbox["state"] == "pending"
-    final_payload = outbox["final_payload"]
-    if isinstance(final_payload, str):
-        final_payload = json.loads(final_payload)
-    assert final_payload["result_text"] == final_text
+    assert outbox["state"] == "awaiting_terminal"
+    assert outbox["final_payload"] is None
 
 
 @pytest.mark.asyncio
@@ -2013,7 +2016,7 @@ async def test_worker_closes_slackbot_session_after_live_delivery_disables(db_po
             )
         }
 
-    session_done_mock = AsyncMock()
+    session_done_mock = AsyncMock(return_value={"ok": True, "streamedAnswerChars": 0})
     backend = SimpleNamespace(attach=AsyncMock(), close_streams=AsyncMock())
     with (
         patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
@@ -2042,7 +2045,11 @@ async def test_worker_closes_slackbot_session_after_live_delivery_disables(db_po
         await _process_execution(db_pool, row)
 
     assert harness_event_mock.await_count == 5
-    session_done_mock.assert_awaited_once_with("sess-live-disabled", None)
+    session_done_mock.assert_awaited_once_with(
+        "sess-live-disabled",
+        None,
+        answer_markdown=None,
+    )
     execution = await db_pool.fetchrow(
         "SELECT status, terminal_reason, result_text, metadata "
         "FROM agent_execution_requests WHERE execution_id = $1",

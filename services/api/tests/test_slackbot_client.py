@@ -63,6 +63,31 @@ async def test_post_retries_on_5xx_then_returns_payload():
 
 
 @pytest.mark.asyncio
+async def test_session_done_sends_terminal_answer_and_returns_coverage():
+    fake = _FakeClient(
+        [_response(200, {"ok": True, "streamedAnswerChars": len("Final answer")})]
+    )
+    with patch("api.slackbot_client.httpx.AsyncClient", return_value=fake):
+        from api import slackbot_client
+
+        result = await slackbot_client.session_done(
+            "sess",
+            "thread-1",
+            answer_markdown="Final answer",
+        )
+
+    assert result == {"ok": True, "streamedAnswerChars": len("Final answer")}
+    assert (
+        fake.calls[0]["url"]
+        == "http://slackbot.test/api/slack/agent-sessions/sess/done"
+    )
+    assert fake.calls[0]["json"] == {
+        "thread_id": "thread-1",
+        "answer_markdown": "Final answer",
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [408, 429])
 async def test_post_retries_on_retryable_4xx(status: int):
     fake = _FakeClient([_response(status), _response(200, {"ok": True})])

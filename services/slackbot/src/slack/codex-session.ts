@@ -58,6 +58,10 @@ type CompletedCodexSessionState = {
   completedAt: number
 }
 
+type DoneOptions = {
+  answerMarkdown?: string
+}
+
 const states = new Map<string, CodexSessionState>()
 const completedStates = new Map<string, CompletedCodexSessionState>()
 const PRE_STREAM_GRACE_MS = 500
@@ -227,7 +231,9 @@ export class CodexSessionRenderer {
         recomposeBuffers(state)
       }
       if (willClose) {
-        await this.done(agentSessionId)
+        await this.done(agentSessionId, undefined, {
+          answerMarkdown: resultText || undefined
+        })
       }
     }
 
@@ -238,13 +244,22 @@ export class CodexSessionRenderer {
     }
   }
 
-  async done(agentSessionId: string, threadId?: string): Promise<void> {
+  async done(
+    agentSessionId: string,
+    threadId?: string,
+    opts: DoneOptions = {}
+  ): Promise<{ streamedAnswerChars: number }> {
+    const completed = completedState(agentSessionId)
+    if (completed) {
+      return { streamedAnswerChars: completed.streamedAnswerChars }
+    }
     const state = getState(agentSessionId)
-    if (state.done) return
+    if (state.done) return { streamedAnswerChars: state.deliveredAnswerChars }
     if (threadId) state.threadId = threadId
     state.done = true
     let doneError: unknown
     let streamedTextChars = state.deliveredAnswerChars
+    const answerMarkdown = String(opts.answerMarkdown ?? '').trim() || state.answerText
 
     try {
       completeThinkingTasks(state)
@@ -258,7 +273,8 @@ export class CodexSessionRenderer {
     try {
       const result = await this.renderer.done(agentSessionId, {
         streamFinalUpdates: true,
-        answerMarkdown: state.answerText
+        answerMarkdown,
+        forceFinalAnswerBlocksOnMismatch: Boolean(opts.answerMarkdown?.trim())
       })
       streamedTextChars = result.streamedTextChars
     } catch (error) {
@@ -275,6 +291,7 @@ export class CodexSessionRenderer {
     }
 
     if (doneError) throw doneError
+    return { streamedAnswerChars: state.deliveredAnswerChars }
   }
 
   private async publishActivitySummary(
@@ -361,6 +378,10 @@ export class CodexSessionRenderer {
 export function hasActiveCodexSession(agentSessionId: string): boolean {
   const state = states.get(agentSessionId)
   return Boolean(state && !state.done)
+}
+
+export function hasKnownCodexSession(agentSessionId: string): boolean {
+  return hasActiveCodexSession(agentSessionId) || Boolean(completedState(agentSessionId))
 }
 
 function getState(agentSessionId: string): CodexSessionState {

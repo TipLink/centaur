@@ -3071,15 +3071,33 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         if user_id:
             record_execution_by_user(user_id, harness, status)
         nonlocal slackbot_session_id, slackbot_text_sent, slackbot_done
+        nonlocal slackbot_streamed_answer_chars
         finalize_session_id = slackbot_session_id or str(
             execution_metadata.get("slackbot_agent_session_id") or ""
         )
         if finalize_session_id and not slackbot_done:
             try:
-                terminal_result_sent_to_slackbot = False
-                await slackbot_client.session_done(
-                    finalize_session_id, harness_thread_id or None
+                terminal_result_sent_to_slackbot = bool(
+                    slackbot_forward_live and result_text.strip()
                 )
+                done_result = await slackbot_client.session_done(
+                    finalize_session_id,
+                    harness_thread_id or None,
+                    answer_markdown=result_text
+                    if terminal_result_sent_to_slackbot
+                    else None,
+                )
+                if done_result is None:
+                    raise RuntimeError("slackbot session_done returned no response")
+                streamed_chars = _slackbot_streamed_answer_chars(
+                    done_result.get("streamedAnswerChars")
+                )
+                if streamed_chars:
+                    slackbot_streamed_answer_chars = max(
+                        slackbot_streamed_answer_chars,
+                        streamed_chars,
+                    )
+                    slackbot_text_sent = True
                 slackbot_done = True
                 log.info(
                     "slackbot_live_delivery_finalized",

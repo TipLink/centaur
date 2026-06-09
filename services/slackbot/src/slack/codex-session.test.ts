@@ -119,6 +119,89 @@ describe('CodexSessionRenderer', () => {
     expect(calls.filter(call => call.method === 'chat.stopStream')).toHaveLength(1)
   })
 
+  it('returns completed session coverage when done is called after terminal event', async () => {
+    const calls: Array<{ method: string; params: any }> = []
+    const client = makeFakeSlackClient(calls)
+
+    const { sessionId } = await new AgentSessionRenderer(client as any).open({
+      channel: 'C123',
+      parentTs: '1778866921.505479',
+      recipientTeamId: 'T123',
+      recipientUserId: 'U123',
+      title: 'Centaur execution'
+    })
+    const renderer = new CodexSessionRenderer(client as any)
+
+    await renderer.event(sessionId, { type: 'result', result: 'PONG' })
+    const result = await renderer.done(sessionId)
+
+    expect(result.streamedAnswerChars).toBe(4)
+    expect(calls.filter(call => call.method === 'chat.stopStream')).toHaveLength(1)
+  })
+
+  it('closes terminal events with full result text when live final text was only partial', async () => {
+    const calls: Array<{ method: string; params: any }> = []
+    const client = {
+      assistant: {
+        threads: {
+          setStatus: async () => ({ ok: true })
+        }
+      },
+      chat: {
+        startStream: async (params: any) => {
+          calls.push({ method: 'chat.startStream', params })
+          return { ok: true, ts: '1778866940.295499' }
+        },
+        appendStream: async (params: any) => {
+          calls.push({ method: 'chat.appendStream', params })
+          return { ok: true }
+        },
+        stopStream: async (params: any) => {
+          calls.push({ method: 'chat.stopStream', params })
+          return { ok: true }
+        },
+        update: async (params: any) => {
+          calls.push({ method: 'chat.update', params })
+          return { ok: true }
+        }
+      }
+    }
+
+    const { sessionId } = await new AgentSessionRenderer(client as any).open({
+      channel: 'C123',
+      parentTs: '1778866921.505479',
+      recipientTeamId: 'T123',
+      recipientUserId: 'U123',
+      title: 'Centaur execution'
+    })
+    const renderer = new CodexSessionRenderer(client as any)
+
+    await renderer.event(sessionId, {
+      type: 'item.started',
+      item: { id: 'msg-1', type: 'agentMessage', phase: 'final_answer' }
+    })
+    await renderer.event(sessionId, {
+      type: 'item.agentMessage.delta',
+      itemId: 'msg-1',
+      delta: 'Found the likely scored source CSV.'
+    })
+    const finalAnswer =
+      'Yes, found the likely scored source CSV and re-shared it here: malta_scored_google_maps_original.csv.'
+
+    const result = await renderer.event(sessionId, {
+      type: 'turn.done',
+      result: finalAnswer
+    })
+
+    const stop = calls.find(call => call.method === 'chat.stopStream')
+    const blocks = stop?.params.blocks ?? []
+    expect(
+      blocks.some((block: any) => block.type === 'markdown' && block.text.includes(finalAnswer))
+    ).toBe(true)
+    expect(result.done).toBe(true)
+    expect(result.streamedAnswerChars).toBe(finalAnswer.length)
+  })
+
   it('clears assistant status when terminal stream rendering fails', async () => {
     const calls: Array<{ method: string; params: any }> = []
     const client = {

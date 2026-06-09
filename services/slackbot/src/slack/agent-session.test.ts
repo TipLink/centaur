@@ -514,6 +514,57 @@ describe('AgentSessionRenderer', () => {
     expect(calls.some(call => call.method === 'chat.appendStream')).toBe(true)
   })
 
+  it('renders a durable final answer when terminal text differs from live text', async () => {
+    const calls: Array<{ method: string; params: any }> = []
+    const client = {
+      assistant: {
+        threads: {
+          setStatus: async () => ({ ok: true })
+        }
+      },
+      chat: {
+        startStream: async (params: any) => {
+          calls.push({ method: 'chat.startStream', params })
+          return { ok: true, ts: '1778866940.295499' }
+        },
+        appendStream: async (params: any) => {
+          calls.push({ method: 'chat.appendStream', params })
+          return { ok: true }
+        },
+        stopStream: async (params: any) => {
+          calls.push({ method: 'chat.stopStream', params })
+          return { ok: true }
+        },
+        update: async () => ({ ok: true })
+      }
+    }
+
+    const renderer = new AgentSessionRenderer(client as any)
+    const { sessionId } = await renderer.open({
+      channel: 'C123',
+      parentTs: '1778866921.505479',
+      recipientTeamId: 'T123',
+      recipientUserId: 'U123',
+      title: 'Centaur execution'
+    })
+
+    await renderer.text(sessionId, 'Found the likely scored source CSV.')
+    const finalAnswer =
+      'Yes, found the likely scored source CSV and re-shared it here: malta_scored_google_maps_original.csv.'
+    const result = await renderer.done(sessionId, {
+      answerMarkdown: finalAnswer,
+      forceFinalAnswerBlocksOnMismatch: true
+    })
+
+    const stop = calls.find(call => call.method === 'chat.stopStream')
+    const blocks = stop?.params.blocks ?? []
+    expect(
+      blocks.some((block: any) => block.type === 'markdown' && block.text.includes(finalAnswer))
+    ).toBe(true)
+    expect(stop?.params.chunks).toBeUndefined()
+    expect(result.streamedTextChars).toBe(finalAnswer.length)
+  })
+
   it('keeps a durable final answer when the answer did not stream live', async () => {
     const calls: Array<{ method: string; params: any }> = []
     const client = {
