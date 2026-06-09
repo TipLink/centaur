@@ -301,6 +301,7 @@ async def _auto_execute(pool, body: ExecuteRequest) -> JSONResponse:
         harness=body.harness,
         engine=body.engine,
         persona_id=body.persona_id,
+        model=None,
         agents_md_override=None,
     )
     assignment_generation = int(spawn_result["assignment_generation"])
@@ -360,6 +361,7 @@ async def spawn(req: SpawnRequest, request: Request):
             harness=req.harness,
             engine=req.engine,
             persona_id=req.persona_id,
+            model=None,
             agents_md_override=req.agents_md_override,
         )
     except ControlPlaneError as exc:

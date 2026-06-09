@@ -396,35 +396,37 @@ def test_recovery_command_paraphrases_are_recognized():
 
 
 @pytest.mark.parametrize(
-    ("text", "harness", "persona", "cleaned"),
+    ("text", "harness", "persona", "model", "cleaned"),
     [
-        ("--invest hyperliquid miqs", None, "invest", "hyperliquid miqs"),
-        ("--INVEST hyperliquid miqs", None, "invest", "hyperliquid miqs"),
-        ("\u2014invest hyperliquid miqs", None, "invest", "hyperliquid miqs"),
-        ("\u2013invest hyperliquid miqs", None, "invest", "hyperliquid miqs"),
-        ("`--invest` hyperliquid miqs", None, "invest", "hyperliquid miqs"),
-        ("`--invest hyperliquid miqs`", None, "invest", "hyperliquid miqs"),
-        ("--claude review this", "claude-code", None, "review this"),
-        ("--pi analyze this", "pi-mono", None, "analyze this"),
+        ("--invest hyperliquid miqs", None, "invest", None, "hyperliquid miqs"),
+        ("--INVEST hyperliquid miqs", None, "invest", None, "hyperliquid miqs"),
+        ("\u2014invest hyperliquid miqs", None, "invest", None, "hyperliquid miqs"),
+        ("\u2013invest hyperliquid miqs", None, "invest", None, "hyperliquid miqs"),
+        ("`--invest` hyperliquid miqs", None, "invest", None, "hyperliquid miqs"),
+        ("`--invest hyperliquid miqs`", None, "invest", None, "hyperliquid miqs"),
+        ("--claude review this", "claude-code", None, None, "review this"),
+        ("--pi analyze this", "pi-mono", None, None, "analyze this"),
+        ("--fast summarize this", None, None, "fast", "summarize this"),
         # Persona + harness compose orthogonally.
-        ("--invest --claude review this", "claude-code", "invest", "review this"),
-        ("--claude --invest review this", "claude-code", "invest", "review this"),
-        ("--invest --amp review this", "amp", "invest", "review this"),
-        ("--invest --codex review this", "codex", "invest", "review this"),
-        ("please use --opus and review this", None, None, "please use and review this"),
-        ("please use --model opus and review this", None, None, "please use and review this"),
-        ("please use `--model opus` and review this", None, None, "please use and review this"),
+        ("--invest --claude review this", "claude-code", "invest", None, "review this"),
+        ("--claude --invest review this", "claude-code", "invest", None, "review this"),
+        ("--invest --amp review this", "amp", "invest", None, "review this"),
+        ("--invest --codex review this", "codex", "invest", None, "review this"),
+        ("--invest --fast review this", None, "invest", "fast", "review this"),
+        ("please use --opus and review this", None, None, None, "please use and review this"),
+        ("please use --model opus and review this", None, None, None, "please use and review this"),
+        ("please use `--model opus` and review this", None, None, None, "please use and review this"),
     ],
 )
 def test_prompt_selection_extraction_handles_slack_flag_shapes(
-    text, harness, persona, cleaned
+    text, harness, persona, model, cleaned
 ):
     from api.workflows.slack_thread_turn import _extract_prompt_selection_from_text
 
     assert _extract_prompt_selection_from_text(
         text,
         personas={"invest"},
-    ) == (harness, persona, cleaned)
+    ) == (harness, persona, model, cleaned)
 
 
 def test_prompt_selection_extraction_preserves_unknown_flags():
@@ -434,7 +436,7 @@ def test_prompt_selection_extraction_preserves_unknown_flags():
     assert _extract_prompt_selection_from_text(
         text,
         personas={"invest"},
-    ) == (None, None, text)
+    ) == (None, None, None, text)
 
 
 def test_bare_persona_flag_gets_intro_prompt():
@@ -447,6 +449,7 @@ def test_bare_persona_flag_gets_intro_prompt():
 
     assert selection.harness is None
     assert selection.persona == "invest"
+    assert selection.model is None
     assert selection.parts == [
         {
             "type": "text",
@@ -468,6 +471,7 @@ def test_persona_with_harness_keeps_user_text():
 
     assert selection.harness == "claude-code"
     assert selection.persona == "invest"
+    assert selection.model is None
     assert selection.parts == [{"type": "text", "text": "review this PR"}]
 
 
@@ -481,6 +485,7 @@ def test_explicit_harness_and_persona_override_inline_flags():
     )
     assert harness_only.harness == "claude-code"
     assert harness_only.persona is None
+    assert harness_only.model is None
 
     persona_only = _extract_prompt_selection(
         [{"type": "text", "text": "do the thing"}],
@@ -489,6 +494,7 @@ def test_explicit_harness_and_persona_override_inline_flags():
     )
     assert persona_only.harness is None
     assert persona_only.persona == "invest"
+    assert persona_only.model is None
 
     both = _extract_prompt_selection(
         [{"type": "text", "text": "do the thing"}],
@@ -498,6 +504,7 @@ def test_explicit_harness_and_persona_override_inline_flags():
     )
     assert both.harness == "amp"
     assert both.persona == "invest"
+    assert both.model is None
 
 
 def test_prompt_switch_context_note_only_for_mid_thread_selector():
@@ -802,6 +809,51 @@ async def test_slack_thread_turn_derives_persona_and_releases_assignment(db_pool
             ),
         },
         {"type": "text", "text": "hyperliquid miqs"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_slack_thread_turn_fast_profile_releases_assignment(db_pool):
+    from api.workflow_engine import WorkflowContext
+    from api.workflows.slack_thread_turn import Input, handler
+
+    run_id = f"wfr_{uuid.uuid4().hex[:16]}"
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    ctx = WorkflowContext(
+        pool=db_pool,
+        run_id=run_id,
+        checkpoints={},
+        lease_s=30.0,
+        worker_id="w1",
+    )
+    do_agent_turn_mock = AsyncMock(return_value={"ok": True, "execution_id": "exe-1"})
+    release_assignment_mock = AsyncMock(return_value={"ok": True, "released": True})
+
+    with (
+        patch("api.workflow_engine.do_agent_turn", new=do_agent_turn_mock),
+        patch("api.runtime_control.release_assignment", new=release_assignment_mock),
+    ):
+        await handler(
+            Input(
+                thread_key=thread_key,
+                parts=[{"type": "text", "text": "--fast summarize this quickly"}],
+                message_id="slack:current",
+            ),
+            ctx,
+        )
+
+    release_assignment_mock.assert_awaited_once_with(
+        db_pool,
+        thread_key=thread_key,
+        release_id="prompt-switch:slack:current",
+        cancel_inflight=True,
+        stop_runtime_background=True,
+    )
+    assert do_agent_turn_mock.await_args.kwargs["harness"] is None
+    assert do_agent_turn_mock.await_args.kwargs["persona"] is None
+    assert do_agent_turn_mock.await_args.kwargs["model"] == "fast"
+    assert do_agent_turn_mock.await_args.kwargs["parts"] == [
+        {"type": "text", "text": "summarize this quickly"}
     ]
 
 

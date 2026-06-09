@@ -99,6 +99,49 @@ else
     echo "missing Codex harness config: $HARNESS_CONFIG_DIR/codex/config.toml" >&2
     exit 1
 fi
+case "${CODEX_MODEL_PROFILE:-}" in
+    "")
+        ;;
+    fast)
+        python3 - "$HOME_DIR/.codex/config.toml" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+updates = {
+    "model_reasoning_effort": "low",
+    "plan_mode_reasoning_effort": "low",
+}
+lines = path.read_text().splitlines()
+seen = set()
+out = []
+for line in lines:
+    stripped = line.strip()
+    key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
+    if key in updates and not stripped.startswith("#"):
+        prefix = line[: len(line) - len(line.lstrip())]
+        out.append(f'{prefix}{key} = "{updates[key]}"')
+        seen.add(key)
+    else:
+        out.append(line)
+
+insert_at = 0
+while insert_at < len(out):
+    stripped = out[insert_at].strip()
+    if not stripped or stripped.startswith("["):
+        break
+    insert_at += 1
+for key, value in reversed(list(updates.items())):
+    if key not in seen:
+        out.insert(insert_at, f'{key} = "{value}"')
+path.write_text("\n".join(out).rstrip() + "\n")
+PYEOF
+        ;;
+    *)
+        echo "unknown CODEX_MODEL_PROFILE: $CODEX_MODEL_PROFILE (expected fast)" >&2
+        exit 1
+        ;;
+esac
 
 # ── Claude Code settings ────────────────────────────────────────────────────
 mkdir -p "$HOME_DIR/.claude"

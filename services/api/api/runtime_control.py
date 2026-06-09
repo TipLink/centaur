@@ -594,6 +594,7 @@ async def spawn_assignment(
     harness: str | None,
     engine: str | None,
     persona_id: str | None,
+    model: str | None,
     agents_md_override: str | None,
 ) -> dict[str, Any]:
     persona_info = None
@@ -622,6 +623,7 @@ async def spawn_assignment(
         harness is None
         and engine is None
         and persona_id is None
+        and model is None
         and agents_md_override is None
     )
     active_assignment = (
@@ -634,6 +636,7 @@ async def spawn_assignment(
         effective_harness = active_assignment.get("harness") or default_harness()
         effective_engine = active_assignment.get("engine")
         effective_persona_id = active_assignment.get("persona_id")
+        effective_model = None
         effective_agents_md_override = active_assignment.get("agents_md_override")
     else:
         # Explicit harness wins; otherwise inherit from the persona's declared
@@ -646,6 +649,7 @@ async def spawn_assignment(
             effective_harness = default_harness()
         effective_engine = engine
         effective_persona_id = persona_id
+        effective_model = model
         effective_agents_md_override = agents_md_override
 
     payload = {
@@ -654,6 +658,7 @@ async def spawn_assignment(
         "harness": effective_harness,
         "engine": effective_engine,
         "persona_id": effective_persona_id,
+        "model": effective_model,
         "agents_md_override": effective_agents_md_override,
     }
     req_hash = request_hash(payload)
@@ -680,6 +685,7 @@ async def spawn_assignment(
             "centaur.harness": effective_harness,
             "centaur.engine": effective_engine,
             "centaur.persona_id": effective_persona_id,
+            "centaur.model": effective_model,
             "centaur.spawn_id": spawn_id,
             "centaur.assignment.attach_active": attach_active_assignment,
         },
@@ -687,6 +693,8 @@ async def spawn_assignment(
         spawn_kwargs: dict[str, Any] = {"engine": effective_engine}
         if effective_persona_id is not None:
             spawn_kwargs["persona"] = effective_persona_id
+        if effective_model is not None:
+            spawn_kwargs["model"] = effective_model
         session = await get_or_spawn(
             thread_key,
             effective_harness,

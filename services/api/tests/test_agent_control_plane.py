@@ -154,6 +154,7 @@ async def test_spawn_assignment_defaults_to_codex_when_no_selector(
             harness=None,
             engine=None,
             persona_id=None,
+            model=None,
             agents_md_override=None,
         )
 
@@ -191,6 +192,7 @@ async def test_spawn_assignment_uses_configured_default_harness(db_pool, monkeyp
             harness=None,
             engine=None,
             persona_id=None,
+            model=None,
             agents_md_override=None,
         )
 
@@ -203,6 +205,37 @@ async def test_spawn_assignment_uses_configured_default_harness(db_pool, monkeyp
     assert assignment["harness"] == "claude-code"
     assert assignment["engine"] == "claude-code"
     assert assignment["persona_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_assignment_forwards_model_profile(db_pool, monkeypatch):
+    from api.runtime_control import spawn_assignment
+
+    monkeypatch.delenv("CENTAUR_DEFAULT_HARNESS", raising=False)
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:fast-profile"
+    session = SandboxSession(
+        sandbox_id=f"rt-{uuid.uuid4().hex[:8]}",
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+    get_or_spawn = AsyncMock(return_value=session)
+
+    with patch("api.runtime_control.get_or_spawn", new=get_or_spawn):
+        await spawn_assignment(
+            db_pool,
+            thread_key=thread_key,
+            spawn_id="spawn-fast",
+            harness=None,
+            engine=None,
+            persona_id=None,
+            model="fast",
+            agents_md_override=None,
+        )
+
+    get_or_spawn.assert_awaited_once_with(
+        thread_key, "codex", engine=None, model="fast"
+    )
 
 
 @pytest.mark.asyncio
@@ -240,6 +273,7 @@ async def test_spawn_assignment_treats_harness_persona_selector_as_persona(db_po
             harness="legal",
             engine=None,
             persona_id=None,
+            model=None,
             agents_md_override=None,
         )
 

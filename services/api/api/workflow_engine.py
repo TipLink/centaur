@@ -1170,6 +1170,7 @@ async def do_agent_turn(
     delivery: Delivery | dict[str, Any] | None = None,
     harness: str | None = None,
     persona: str | None = None,
+    model: str | None = None,
     agents_md_override: str | None = None,
 ) -> dict[str, Any]:
     """Orchestrate spawn → message → execute → wait-for-terminal.
@@ -1226,6 +1227,7 @@ async def do_agent_turn(
                 harness=harness,
                 engine=None,
                 persona_id=persona,
+                model=model,
                 agents_md_override=agents_md_override,
             )
         except Exception as exc:

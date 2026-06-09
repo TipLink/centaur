@@ -17,6 +17,7 @@ _PROMPT_FLAG_ALIASES = {
     "claude": "claude-code",
     "pi": "pi-mono",
 }
+_MODEL_PROFILE_FLAGS = frozenset({"fast"})
 _PROMPT_FLAG_SKIP = frozenset({"engine", "model", "opus", "sonnet", "haiku"})
 _PROMPT_FLAG_VALUE_SKIP = frozenset({"engine", "model"})
 _PROMPT_FLAG_RE = re.compile(
@@ -67,12 +68,14 @@ class PromptSelection:
 
     Both fields are optional and orthogonal: ``--invest`` sets only
     ``persona``, ``--claude`` sets only ``harness``, and ``--invest --claude``
-    sets both. The downstream resolver applies ``harness`` as the engine
-    override and ``persona`` as the system-prompt overlay.
+    sets both. ``--fast`` selects the fast Codex model profile for the sandbox
+    spawned for this turn. The downstream resolver applies ``harness`` as the
+    engine override and ``persona`` as the system-prompt overlay.
     """
 
     harness: str | None
     persona: str | None
+    model: str | None
     parts: list[dict[str, Any]]
 
 
@@ -127,25 +130,30 @@ def _extend_value_skip(text: str, end: int) -> int:
     return end + match.end() if match else end
 
 
-def _classify_flag(flag: str, personas: set[str]) -> tuple[str | None, str | None]:
-    """Map a flag name to ``(harness, persona)``; ``(None, None)`` if unknown."""
+def _classify_flag(
+    flag: str, personas: set[str]
+) -> tuple[str | None, str | None, str | None]:
+    """Map a flag name to ``(harness, persona, model)``; all ``None`` if unknown."""
     resolved = _PROMPT_FLAG_ALIASES.get(flag, flag)
     if resolved in _EXECUTION_HARNESSES:
-        return resolved, None
+        return resolved, None, None
     if resolved in personas or flag in personas:
-        return None, resolved
-    return None, None
+        return None, resolved, None
+    if resolved in _MODEL_PROFILE_FLAGS:
+        return None, None, resolved
+    return None, None, None
 
 
 def _extract_prompt_selection_from_text(
     text: str,
     *,
     personas: set[str],
-) -> tuple[str | None, str | None, str]:
-    """Strip known flags and return ``(harness, persona, cleaned_text)``."""
+) -> tuple[str | None, str | None, str | None, str]:
+    """Strip known flags and return ``(harness, persona, model, cleaned_text)``."""
 
     harness: str | None = None
     persona: str | None = None
+    model: str | None = None
     ranges: list[tuple[int, int]] = []
     for match in _PROMPT_FLAG_RE.finditer(text):
         leading = match.group(1) or ""
@@ -167,8 +175,12 @@ def _extract_prompt_selection_from_text(
                 closing_tick = text.find("`", strip_end)
 
         is_skip = flag in _PROMPT_FLAG_SKIP
-        classified_harness, classified_persona = _classify_flag(flag, personas)
-        recognized = is_skip or classified_harness or classified_persona
+        classified_harness, classified_persona, classified_model = _classify_flag(
+            flag, personas
+        )
+        recognized = (
+            is_skip or classified_harness or classified_persona or classified_model
+        )
         if not recognized:
             continue
 
@@ -179,9 +191,11 @@ def _extract_prompt_selection_from_text(
             harness = classified_harness
         if classified_persona:
             persona = classified_persona
+        if classified_model:
+            model = classified_model
 
     cleaned = _strip_ranges(text, ranges) if ranges else text.strip()
-    return harness, persona, cleaned
+    return harness, persona, model, cleaned
 
 
 def _extract_prompt_selection(
@@ -199,6 +213,7 @@ def _extract_prompt_selection(
     known_personas = personas if personas is not None else _known_personas()
     harness: str | None = None
     persona: str | None = None
+    model: str | None = None
     cleaned_parts: list[dict[str, Any]] = []
     has_non_text_part = False
 
@@ -208,7 +223,12 @@ def _extract_prompt_selection(
             has_non_text_part = True
             continue
 
-        part_harness, part_persona, cleaned_text = _extract_prompt_selection_from_text(
+        (
+            part_harness,
+            part_persona,
+            part_model,
+            cleaned_text,
+        ) = _extract_prompt_selection_from_text(
             part["text"],
             personas=known_personas,
         )
@@ -216,6 +236,8 @@ def _extract_prompt_selection(
             harness = part_harness
         if part_persona:
             persona = part_persona
+        if part_model:
+            model = part_model
         if cleaned_text:
             cleaned_parts.append({**part, "text": cleaned_text})
 
@@ -233,7 +255,9 @@ def _extract_prompt_selection(
     if not cleaned_parts:
         cleaned_parts = parts
 
-    return PromptSelection(harness=harness, persona=persona, parts=cleaned_parts)
+    return PromptSelection(
+        harness=harness, persona=persona, model=model, parts=cleaned_parts
+    )
 
 
 def _with_prompt_switch_context_note(
@@ -478,7 +502,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         explicit_harness=inp.harness,
         explicit_persona=inp.persona,
     )
-    selection_changed = bool(selection.harness or selection.persona)
+    selection_changed = bool(selection.harness or selection.persona or selection.model)
     if selection_changed:
         await _release_for_prompt_switch(
             ctx,
@@ -522,5 +546,6 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         delivery=inp.delivery,
         harness=selection.harness,
         persona=selection.persona,
+        model=selection.model,
         agents_md_override=inp.agents_md_override,
     )
