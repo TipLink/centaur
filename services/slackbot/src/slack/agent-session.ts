@@ -52,6 +52,7 @@ type AgentSessionState = {
   title: string
   header?: string
   finalAnswerMarkdown?: string
+  forceFinalAnswerBlocksOnMismatch?: boolean
   done: boolean
   statusCleared: boolean
   statusUnsupported: boolean
@@ -96,6 +97,7 @@ export type TextOptions = {
 export type DoneOptions = {
   streamFinalUpdates?: boolean
   answerMarkdown?: string
+  forceFinalAnswerBlocksOnMismatch?: boolean
 }
 
 function headerMarkdown(header: string): string {
@@ -222,9 +224,11 @@ export class AgentSessionRenderer {
     const state = requireSession(sessionId)
     state.done = true
     state.finalAnswerMarkdown = opts.answerMarkdown
+    state.forceFinalAnswerBlocksOnMismatch = opts.forceFinalAnswerBlocksOnMismatch
     const streamFinalUpdates = opts.streamFinalUpdates ?? true
     let closed = false
     let streamedTextChars = 0
+    let visibleAnswerChars = 0
 
     try {
       for (const segment of state.segments) {
@@ -240,9 +244,12 @@ export class AgentSessionRenderer {
             await this.flushTask(state, segment, task)
           }
         }
-        await this.closeTextStream(state, segment)
+        visibleAnswerChars = Math.max(
+          visibleAnswerChars,
+          await this.closeTextStream(state, segment)
+        )
       }
-      streamedTextChars = streamedTextSourceChars(state)
+      streamedTextChars = Math.max(streamedTextSourceChars(state), visibleAnswerChars)
       closed = true
     } finally {
       this.stopStatusRefreshTimer(state)
@@ -289,22 +296,32 @@ export class AgentSessionRenderer {
     }
   }
 
-  private async closeTextStream(state: AgentSessionState, segment: Segment): Promise<void> {
+  private async closeTextStream(state: AgentSessionState, segment: Segment): Promise<number> {
     raiseStreamError(segment)
-    if (segment.closed) return
+    if (segment.closed) return segment.streamedTextSourceChars
     const hasFinalText = Boolean(state.finalAnswerMarkdown?.trim())
     if (!segment.streamTs && !segment.textParts.length && !segment.tasks.size && !hasFinalText) {
-      return
+      return 0
     }
     const originalTasks = finalTaskSnapshot(segment)
     const tasks = compactFinalTasks(originalTasks)
     const answerSource =
       state.finalAnswerMarkdown?.trim() || segment.streamedText.trim() || segment.textParts.join('')
+    const forceFinalAnswerBlocksOnMismatch = Boolean(
+      hasFinalText && state.forceFinalAnswerBlocksOnMismatch
+    )
+    const liveAnswerRemainder = unstreamedMarkdownAfterLivePrefix(
+      answerSource,
+      segment.streamedText
+    )
     const answerMarkdown = finalMarkdownForFinalBlocks(answerSource, segment, {
-      includeStreamedText: originalTasks.length >= DURABLE_STREAMED_ANSWER_TASK_THRESHOLD
+      includeStreamedText: originalTasks.length >= DURABLE_STREAMED_ANSWER_TASK_THRESHOLD,
+      includeFullOnStreamMismatch: forceFinalAnswerBlocksOnMismatch
     })
     const streamedTextLive =
-      Boolean(segment.streamedText.trim()) && segment.streamedText.length < MAX_LIVE_TEXT_CHARS
+      Boolean(segment.streamedText.trim()) &&
+      segment.streamedText.length < MAX_LIVE_TEXT_CHARS &&
+      (!forceFinalAnswerBlocksOnMismatch || liveAnswerRemainder === '')
     // Slack accumulates appendStream chunks; stopStream blocks are the composed final layout.
     // Only add blocks for content that was not streamed live; live task_update chunks carry
     // fenced details/output, and the header has already been streamed as the first chunk.
@@ -320,10 +337,10 @@ export class AgentSessionRenderer {
     })
     if (!segment.streamTs) {
       const initialChunks = markdownToStreamChunks(fallbackText)
-      if (!initialChunks.length) return
+      if (!initialChunks.length) return 0
       await this.ensureStream(state, segment, initialChunks)
     }
-    if (!segment.streamTs) return
+    if (!segment.streamTs) return 0
     const chunks =
       blocks.length || streamedTextLive ? undefined : markdownToStreamChunks(fallbackText)
     const stopResponse = await this.client.chat.stopStream({
@@ -334,6 +351,18 @@ export class AgentSessionRenderer {
     })
     if (!stopResponse.ok) throw new Error(stopResponse.error ?? 'chat.stopStream failed')
     segment.closed = true
+    if (!answerSource.trim()) return segment.streamedTextSourceChars
+    if (!forceFinalAnswerBlocksOnMismatch) return segment.streamedTextSourceChars
+    if (streamedTextLive) return Math.max(segment.streamedTextSourceChars, answerSource.length)
+    if (!answerMarkdown) return segment.streamedTextSourceChars
+    if (segment.streamedText.length >= MAX_LIVE_TEXT_CHARS && liveAnswerRemainder !== null) {
+      return segment.streamedTextSourceChars
+    }
+    const livePrefixChars =
+      liveAnswerRemainder === null
+        ? 0
+        : Math.max(answerSource.length - liveAnswerRemainder.length, 0)
+    return Math.max(segment.streamedTextSourceChars, livePrefixChars + answerMarkdown.length)
   }
 
   private async streamChunks(
@@ -687,7 +716,7 @@ function compactTaskBody(body: StreamTask['details'], maxLines: number): StreamT
 function finalMarkdownForFinalBlocks(
   markdown: string,
   segment: Segment,
-  opts: { includeStreamedText?: boolean } = {}
+  opts: { includeStreamedText?: boolean; includeFullOnStreamMismatch?: boolean } = {}
 ): string {
   const trimmed = markdown.trim()
   if (!trimmed) return ''
@@ -697,6 +726,9 @@ function finalMarkdownForFinalBlocks(
   const streamedPrefix = unstreamedMarkdownAfterLivePrefix(markdown, segment.streamedText)
   if (streamedPrefix !== null) {
     return clipText(streamedPrefix, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
+  }
+  if (opts.includeFullOnStreamMismatch) {
+    return clipText(trimmed, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
   }
   const unstreamed = markdown.slice(segment.streamedTextSourceChars).trim()
   if (!unstreamed) return ''

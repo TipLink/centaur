@@ -18,7 +18,7 @@ import {
 } from './otel'
 import { AgentSessionRenderer, withAgentSessionLock } from './slack/agent-session'
 import { authorizeSlackOrg } from './slack/authorization'
-import { CodexSessionRenderer, hasActiveCodexSession } from './slack/codex-session'
+import { CodexSessionRenderer, hasKnownCodexSession } from './slack/codex-session'
 import { EventDeduper, slackDedupKey } from './slack/dedup'
 import { duplicateSlackAlertText, type DuplicateSlackEventDetails } from './slack/duplicate-alert'
 import { EnvSlackInstallationStore, SlackClientResolver } from './slack/installations'
@@ -445,7 +445,7 @@ app.post('/api/slack/agent-sessions/:session_id/step', apiKeyMiddleware, async c
 })
 
 app.post('/api/slack/agent-sessions/:session_id/done', apiKeyMiddleware, async c => {
-  const body = await c.req.json<{ thread_id?: string }>()
+  const body = await c.req.json<{ thread_id?: string; answer_markdown?: string }>()
   const { client } = await resolver.resolve({})
   const sessionId = c.req.param('session_id')
   const diagnostics = {
@@ -454,14 +454,22 @@ app.post('/api/slack/agent-sessions/:session_id/done', apiKeyMiddleware, async c
     harness_thread_id: body.thread_id
   }
   try {
+    let streamedAnswerChars = 0
     await withAgentSessionLock(sessionId, async () => {
-      if (hasActiveCodexSession(sessionId)) {
-        await new CodexSessionRenderer(client).done(sessionId, body.thread_id)
+      if (hasKnownCodexSession(sessionId)) {
+        const result = await new CodexSessionRenderer(client).done(sessionId, body.thread_id, {
+          answerMarkdown: body.answer_markdown
+        })
+        streamedAnswerChars = result.streamedAnswerChars
       } else {
-        await new AgentSessionRenderer(client).done(sessionId)
+        const result = await new AgentSessionRenderer(client).done(sessionId, {
+          answerMarkdown: body.answer_markdown,
+          forceFinalAnswerBlocksOnMismatch: Boolean(body.answer_markdown?.trim())
+        })
+        streamedAnswerChars = result.streamedTextChars
       }
     })
-    return c.json({ ok: true })
+    return c.json({ ok: true, streamedAnswerChars })
   } catch (error) {
     return slackApiErrorResponse(c, error, diagnostics)
   }
