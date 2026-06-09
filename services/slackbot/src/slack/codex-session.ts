@@ -60,6 +60,8 @@ type CompletedCodexSessionState = {
 
 type DoneOptions = {
   answerMarkdown?: string
+  terminalEvent?: any
+  terminalResultText?: string
 }
 
 const states = new Map<string, CodexSessionState>()
@@ -232,7 +234,9 @@ export class CodexSessionRenderer {
       }
       if (willClose) {
         await this.done(agentSessionId, undefined, {
-          answerMarkdown: resultText || undefined
+          answerMarkdown: resultText || undefined,
+          terminalEvent: event,
+          terminalResultText: resultText
         })
       }
     }
@@ -260,6 +264,16 @@ export class CodexSessionRenderer {
     let doneError: unknown
     let streamedTextChars = state.deliveredAnswerChars
     const answerMarkdown = String(opts.answerMarkdown ?? '').trim() || state.answerText
+    const startedAnswerChars = state.deliveredAnswerChars
+    const terminalAudit = opts.terminalEvent
+      ? terminalDeliveryAuditFields(agentSessionId, opts.terminalEvent, state, {
+          answerMarkdown,
+          terminalResultText: opts.terminalResultText ?? ''
+        })
+      : null
+    if (terminalAudit) {
+      logInfo('slack_codex_terminal_delivery_started', terminalAudit)
+    }
 
     try {
       completeThinkingTasks(state)
@@ -290,6 +304,16 @@ export class CodexSessionRenderer {
       states.delete(agentSessionId)
     }
 
+    if (terminalAudit) {
+      logInfo('slack_codex_terminal_delivery_completed', {
+        ...terminalAudit,
+        delivery_status: doneError ? 'failed' : 'completed',
+        streamed_answer_chars_before_delivery: startedAnswerChars,
+        streamed_answer_chars_after_delivery: streamedTextChars,
+        streamed_answer_chars_delta: streamedTextChars - startedAnswerChars,
+        error: doneError ? errorMessage(doneError) : undefined
+      })
+    }
     if (doneError) throw doneError
     return { streamedAnswerChars: state.deliveredAnswerChars }
   }
@@ -729,6 +753,33 @@ function logCodexTerminalEventReceived(
     streamed_answer_chars_before_event: state.deliveredAnswerChars,
     task_count: state.taskByUseId.size
   })
+}
+
+function terminalDeliveryAuditFields(
+  agentSessionId: string,
+  event: any,
+  state: CodexSessionState,
+  opts: { answerMarkdown: string; terminalResultText: string }
+): Record<string, unknown> {
+  return {
+    agent_session_id: agentSessionId,
+    centaur_thread_key: event?.centaur_thread_key,
+    execution_id: event?.centaur_execution_id,
+    assignment_generation: event?.centaur_assignment_generation,
+    event_type: event?.type,
+    codex_session_id: state.threadId || event?.session_id || event?.thread_id,
+    terminal_result_text_chars: opts.terminalResultText.length,
+    terminal_result_text_hash: textHash(opts.terminalResultText),
+    final_answer_chars: opts.answerMarkdown.length,
+    final_answer_hash: textHash(opts.answerMarkdown),
+    buffered_answer_chars: state.answerText.length,
+    streamed_answer_chars_before_event: state.deliveredAnswerChars,
+    task_count: state.taskByUseId.size
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function logCodexTerminalEventIgnoredAfterDone(

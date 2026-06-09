@@ -1,6 +1,6 @@
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, mock } from 'bun:test'
 import { AgentSessionRenderer } from './agent-session'
 import { CodexSessionRenderer } from './codex-session'
 
@@ -63,6 +63,62 @@ describe('CodexSessionRenderer', () => {
     expect(
       stopStreamFallbackText(calls.find(call => call.method === 'chat.stopStream')?.params)
     ).toBe('')
+  })
+
+  it('logs terminal delivery audit without recording final answer text', async () => {
+    const originalLog = console.log
+    const logs: Array<[string, any]> = []
+    console.log = mock((event: string, value: any) => {
+      logs.push([event, value])
+    }) as typeof console.log
+
+    try {
+      const calls: Array<{ method: string; params: any }> = []
+      const client = makeFakeSlackClient(calls)
+      const { sessionId } = await new AgentSessionRenderer(client as any).open({
+        channel: 'C123',
+        parentTs: '1778866921.505479',
+        recipientTeamId: 'T123',
+        recipientUserId: 'U123',
+        title: 'Centaur execution'
+      })
+      const renderer = new CodexSessionRenderer(client as any)
+
+      await renderer.event(sessionId, {
+        type: 'turn.done',
+        result: 'Reminder confirmed.',
+        centaur_thread_key: 'slack:T123:C123:1778866921.505479',
+        centaur_execution_id: 'exe-reminder'
+      })
+
+      const started = logs.find(([event]) => event === 'slack_codex_terminal_delivery_started')
+      const completed = logs.find(([event]) => event === 'slack_codex_terminal_delivery_completed')
+      const liveSlack = logs.find(
+        ([event]) => event === 'slack_agent_session_final_delivery_audit'
+      )
+
+      expect(started?.[1]).toMatchObject({
+        execution_id: 'exe-reminder',
+        centaur_thread_key: 'slack:T123:C123:1778866921.505479',
+        final_answer_chars: 'Reminder confirmed.'.length
+      })
+      expect(completed?.[1]).toMatchObject({
+        execution_id: 'exe-reminder',
+        delivery_status: 'completed',
+        streamed_answer_chars_before_delivery: 0,
+        streamed_answer_chars_after_delivery: 'Reminder confirmed.'.length
+      })
+      expect(liveSlack?.[1]).toMatchObject({
+        channel_id: 'C123',
+        thread_ts: '1778866921.505479',
+        delivery_action: 'stopStream',
+        slack_ok: true,
+        final_text_chars: 'Reminder confirmed.'.length
+      })
+      expect(JSON.stringify(logs)).not.toContain('Reminder confirmed.')
+    } finally {
+      console.log = originalLog
+    }
   })
 
   it('ignores duplicate terminal events after the session is already done', async () => {

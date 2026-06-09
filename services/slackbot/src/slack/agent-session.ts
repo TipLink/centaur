@@ -1,8 +1,9 @@
+import { createHash } from 'crypto'
 import type { AnyBlock, AnyChunk } from '@slack/types'
 import type { WebClient } from '@slack/web-api'
 import { ulid } from '@std/ulid'
 import { slackReplyLimits } from '../constants'
-import { logWarn } from '../logging'
+import { logInfo, logWarn } from '../logging'
 import {
   markdownChunk,
   planBlock,
@@ -301,8 +302,20 @@ export class AgentSessionRenderer {
     if (segment.closed) return segment.streamedTextSourceChars
     const hasFinalText = Boolean(state.finalAnswerMarkdown?.trim())
     if (!segment.streamTs && !segment.textParts.length && !segment.tasks.size && !hasFinalText) {
+      logFinalDeliveryAudit(state, segment, {
+        delivery_action: 'skip_empty',
+        slack_ok: true,
+        final_text_chars: 0,
+        final_text_hash: '',
+        answer_markdown_chars: 0,
+        block_count: 0,
+        chunk_count: 0,
+        streamed_text_live: false,
+        had_stream_before_close: false
+      })
       return 0
     }
+    const hadStreamBeforeClose = Boolean(segment.streamTs)
     const originalTasks = finalTaskSnapshot(segment)
     const tasks = compactFinalTasks(originalTasks)
     const answerSource =
@@ -337,10 +350,52 @@ export class AgentSessionRenderer {
     })
     if (!segment.streamTs) {
       const initialChunks = markdownToStreamChunks(fallbackText)
-      if (!initialChunks.length) return 0
-      await this.ensureStream(state, segment, initialChunks)
+      if (!initialChunks.length) {
+        logFinalDeliveryAudit(state, segment, {
+          delivery_action: 'skip_no_initial_chunks',
+          slack_ok: true,
+          final_text_chars: answerSource.length,
+          final_text_hash: textHash(answerSource),
+          answer_markdown_chars: answerMarkdown.length,
+          block_count: blocks.length,
+          chunk_count: 0,
+          streamed_text_live: streamedTextLive,
+          had_stream_before_close: false
+        })
+        return 0
+      }
+      try {
+        await this.ensureStream(state, segment, initialChunks)
+      } catch (error) {
+        logFinalDeliveryAudit(state, segment, {
+          delivery_action: 'startStream',
+          slack_ok: false,
+          final_text_chars: answerSource.length,
+          final_text_hash: textHash(answerSource),
+          answer_markdown_chars: answerMarkdown.length,
+          block_count: blocks.length,
+          chunk_count: initialChunks.length,
+          streamed_text_live: streamedTextLive,
+          had_stream_before_close: false,
+          error: errorMessage(error)
+        })
+        throw error
+      }
     }
-    if (!segment.streamTs) return 0
+    if (!segment.streamTs) {
+      logFinalDeliveryAudit(state, segment, {
+        delivery_action: 'skip_no_stream_ts',
+        slack_ok: true,
+        final_text_chars: answerSource.length,
+        final_text_hash: textHash(answerSource),
+        answer_markdown_chars: answerMarkdown.length,
+        block_count: blocks.length,
+        chunk_count: 0,
+        streamed_text_live: streamedTextLive,
+        had_stream_before_close: false
+      })
+      return 0
+    }
     const chunks =
       blocks.length || streamedTextLive ? undefined : markdownToStreamChunks(fallbackText)
     const stopResponse = await this.client.chat.stopStream({
@@ -349,8 +404,33 @@ export class AgentSessionRenderer {
       ...(chunks ? { chunks } : {}),
       ...(blocks.length ? { blocks } : {})
     })
-    if (!stopResponse.ok) throw new Error(stopResponse.error ?? 'chat.stopStream failed')
+    if (!stopResponse.ok) {
+      logFinalDeliveryAudit(state, segment, {
+        delivery_action: 'stopStream',
+        slack_ok: false,
+        final_text_chars: answerSource.length,
+        final_text_hash: textHash(answerSource),
+        answer_markdown_chars: answerMarkdown.length,
+        block_count: blocks.length,
+        chunk_count: chunks?.length ?? 0,
+        streamed_text_live: streamedTextLive,
+        had_stream_before_close: hadStreamBeforeClose,
+        error: stopResponse.error ?? 'chat.stopStream failed'
+      })
+      throw new Error(stopResponse.error ?? 'chat.stopStream failed')
+    }
     segment.closed = true
+    logFinalDeliveryAudit(state, segment, {
+      delivery_action: hadStreamBeforeClose ? 'stopStream' : 'startStream+stopStream',
+      slack_ok: true,
+      final_text_chars: answerSource.length,
+      final_text_hash: textHash(answerSource),
+      answer_markdown_chars: answerMarkdown.length,
+      block_count: blocks.length,
+      chunk_count: chunks?.length ?? 0,
+      streamed_text_live: streamedTextLive,
+      had_stream_before_close: hadStreamBeforeClose
+    })
     if (!answerSource.trim()) return segment.streamedTextSourceChars
     if (!forceFinalAnswerBlocksOnMismatch) return segment.streamedTextSourceChars
     if (streamedTextLive) return Math.max(segment.streamedTextSourceChars, answerSource.length)
@@ -594,6 +674,44 @@ export class AgentSessionRenderer {
       this.stopStatusRefreshTimer(state)
     }
   }
+}
+
+function logFinalDeliveryAudit(
+  state: AgentSessionState,
+  segment: Segment,
+  fields: {
+    delivery_action: string
+    slack_ok: boolean
+    final_text_chars: number
+    final_text_hash: string
+    answer_markdown_chars: number
+    block_count: number
+    chunk_count: number
+    streamed_text_live: boolean
+    had_stream_before_close: boolean
+    error?: string
+  }
+): void {
+  logInfo('slack_agent_session_final_delivery_audit', {
+    agent_session_id: state.id,
+    channel_id: state.channel,
+    thread_ts: state.parentTs,
+    stream_ts: segment.streamTs,
+    segment_id: segment.id,
+    task_count: segment.tasks.size,
+    streamed_answer_chars: segment.streamedTextSourceChars,
+    pending_answer_chars: segment.pendingTextSourceChars,
+    force_final_answer_blocks_on_mismatch: Boolean(state.forceFinalAnswerBlocksOnMismatch),
+    ...fields
+  })
+}
+
+function textHash(value: string): string {
+  return value ? createHash('sha256').update(value).digest('hex').slice(0, 16) : ''
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function logStatusFailure(state: AgentSessionState, status: string, error: string): void {
