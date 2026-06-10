@@ -1498,9 +1498,10 @@ class KubernetesExecutorBackend(SandboxBackend):
         if engine == "claude-code" and model:
             env.append(f"CLAUDE_MODEL={model}")
         if engine == "codex" and model:
-            if model != "fast":
+            if model not in {"fast", "think"}:
                 raise ValueError(f"unknown Codex model profile: {model}")
-            env.append("CODEX_MODEL_PROFILE=fast")
+            if model == "fast":
+                env.append("CODEX_MODEL_PROFILE=fast")
         if engine == "claude-code" and resume_thread_id:
             env.append(f"CLAUDE_CONTINUE_SESSION_ID={resume_thread_id}")
         if persona:
@@ -1722,6 +1723,7 @@ class KubernetesExecutorBackend(SandboxBackend):
             thread_key=thread_key,
             harness=harness,
             engine=engine,
+            model=model or "",
             started_at=time.time(),
             backend_name=self.name,
             trace_id=trace_id or "",

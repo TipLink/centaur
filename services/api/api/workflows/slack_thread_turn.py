@@ -17,7 +17,10 @@ _PROMPT_FLAG_ALIASES = {
     "claude": "claude-code",
     "pi": "pi-mono",
 }
-_MODEL_PROFILE_FLAGS = frozenset({"fast"})
+_MODEL_PROFILE_FLAGS = {
+    "fast": "fast",
+    "think": "think",
+}
 _PROMPT_FLAG_SKIP = frozenset({"engine", "model", "opus", "sonnet", "haiku"})
 _PROMPT_FLAG_VALUE_SKIP = frozenset({"engine", "model"})
 _PROMPT_FLAG_RE = re.compile(
@@ -68,7 +71,8 @@ class PromptSelection:
 
     Both fields are optional and orthogonal: ``--invest`` sets only
     ``persona``, ``--claude`` sets only ``harness``, and ``--invest --claude``
-    sets both. ``--fast`` selects the fast Codex model profile for the sandbox
+    sets both. Slack turns default to the fast Codex model profile; ``--think``
+    opts into the deployment's higher-reasoning Codex profile for the sandbox
     spawned for this turn. The downstream resolver applies ``harness`` as the
     engine override and ``persona`` as the system-prompt overlay.
     """
@@ -140,7 +144,7 @@ def _classify_flag(
     if resolved in personas or flag in personas:
         return None, resolved, None
     if resolved in _MODEL_PROFILE_FLAGS:
-        return None, None, resolved
+        return None, None, _MODEL_PROFILE_FLAGS[resolved]
     return None, None, None
 
 

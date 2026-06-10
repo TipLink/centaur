@@ -143,6 +143,7 @@ async def test_spawn_assignment_defaults_to_codex_when_no_selector(
         thread_key=thread_key,
         harness="codex",
         engine="codex",
+        model="fast",
     )
     get_or_spawn = AsyncMock(return_value=session)
 
@@ -158,16 +159,19 @@ async def test_spawn_assignment_defaults_to_codex_when_no_selector(
             agents_md_override=None,
         )
 
-    get_or_spawn.assert_awaited_once_with(thread_key, "codex", engine=None)
+    get_or_spawn.assert_awaited_once_with(
+        thread_key, "codex", engine=None, model="fast"
+    )
     assert result["persona_id"] is None
     assignment = await db_pool.fetchrow(
-        "SELECT harness, engine, persona_id FROM agent_runtime_assignments WHERE thread_key = $1",
+        "SELECT harness, engine, persona_id, model FROM agent_runtime_assignments WHERE thread_key = $1",
         thread_key,
     )
     assert assignment is not None
     assert assignment["harness"] == "codex"
     assert assignment["engine"] == "codex"
     assert assignment["persona_id"] is None
+    assert assignment["model"] == "fast"
 
 
 @pytest.mark.asyncio
@@ -218,6 +222,7 @@ async def test_spawn_assignment_forwards_model_profile(db_pool, monkeypatch):
         thread_key=thread_key,
         harness="codex",
         engine="codex",
+        model="fast",
     )
     get_or_spawn = AsyncMock(return_value=session)
 
@@ -236,6 +241,68 @@ async def test_spawn_assignment_forwards_model_profile(db_pool, monkeypatch):
     get_or_spawn.assert_awaited_once_with(
         thread_key, "codex", engine=None, model="fast"
     )
+    assignment = await db_pool.fetchrow(
+        "SELECT model FROM agent_runtime_assignments WHERE thread_key = $1",
+        thread_key,
+    )
+    assert assignment is not None
+    assert assignment["model"] == "fast"
+
+
+@pytest.mark.asyncio
+async def test_spawn_assignment_defaults_active_codex_assignment_to_fast_profile(
+    db_pool, monkeypatch
+):
+    from api.runtime_control import prompt_identity, spawn_assignment
+
+    monkeypatch.delenv("CENTAUR_DEFAULT_HARNESS", raising=False)
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:active-codex-fast-profile"
+    prompt_ref, prompt_sha = prompt_identity(
+        harness="codex",
+        persona_id=None,
+        agents_md_override=None,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, model, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'codex', 'codex', 'think', NULL, $3, $4, 'active')",
+        thread_key,
+        f"rt-{uuid.uuid4().hex[:8]}",
+        prompt_ref,
+        prompt_sha,
+    )
+    session = SandboxSession(
+        sandbox_id=f"rt-{uuid.uuid4().hex[:8]}",
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+        model="fast",
+    )
+    get_or_spawn = AsyncMock(return_value=session)
+
+    with patch("api.runtime_control.get_or_spawn", new=get_or_spawn):
+        await spawn_assignment(
+            db_pool,
+            thread_key=thread_key,
+            spawn_id="spawn-existing-fast",
+            harness=None,
+            engine=None,
+            persona_id=None,
+            model=None,
+            agents_md_override=None,
+        )
+
+    get_or_spawn.assert_awaited_once_with(
+        thread_key, "codex", engine="codex", model="fast"
+    )
+    assignment = await db_pool.fetchrow(
+        "SELECT assignment_generation, model FROM agent_runtime_assignments WHERE thread_key = $1",
+        thread_key,
+    )
+    assert assignment is not None
+    assert assignment["assignment_generation"] == 1
+    assert assignment["model"] == "fast"
 
 
 @pytest.mark.asyncio

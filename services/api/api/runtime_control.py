@@ -303,6 +303,7 @@ def _agent_session_title(
 # ── Per-message header (rendered italic at the top of every assistant message) ──
 
 _DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"
+_DEFAULT_CODEX_MODEL_PROFILE = "fast"
 
 _CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "opus": _DEFAULT_CLAUDE_MODEL,
@@ -325,6 +326,19 @@ def _resolve_codex_model_label(model: str | None) -> str:
     if raw.startswith("codex-"):
         return raw
     return f"codex-{raw}"
+
+
+def _default_model_for_assignment(
+    *,
+    harness: str | None,
+    engine: str | None,
+    model: str | None,
+) -> str | None:
+    if model:
+        return model
+    if (engine or harness or "").strip().lower() == "codex":
+        return _DEFAULT_CODEX_MODEL_PROFILE
+    return None
 
 
 def _engine_model_label(
@@ -576,7 +590,7 @@ async def _write_agents_override(runtime_id: str, agents_md_override: str) -> No
 
 async def get_active_assignment(pool, thread_key: str) -> dict[str, Any] | None:
     row = await pool.fetchrow(
-        "SELECT thread_key, assignment_generation, runtime_id, harness, engine, persona_id, "
+        "SELECT thread_key, assignment_generation, runtime_id, harness, engine, model, persona_id, "
         "prompt_ref, effective_agents_md_sha256, agents_md_override, state "
         "FROM agent_runtime_assignments "
         "WHERE thread_key = $1 AND state = 'active' "
@@ -636,7 +650,11 @@ async def spawn_assignment(
         effective_harness = active_assignment.get("harness") or default_harness()
         effective_engine = active_assignment.get("engine")
         effective_persona_id = active_assignment.get("persona_id")
-        effective_model = None
+        effective_model = _default_model_for_assignment(
+            harness=effective_harness,
+            engine=effective_engine,
+            model=model,
+        )
         effective_agents_md_override = active_assignment.get("agents_md_override")
     else:
         # Explicit harness wins; otherwise inherit from the persona's declared
@@ -649,7 +667,11 @@ async def spawn_assignment(
             effective_harness = default_harness()
         effective_engine = engine
         effective_persona_id = persona_id
-        effective_model = model
+        effective_model = _default_model_for_assignment(
+            harness=effective_harness,
+            engine=effective_engine,
+            model=model,
+        )
         effective_agents_md_override = agents_md_override
 
     payload = {
@@ -738,7 +760,7 @@ async def spawn_assignment(
                 return decode_jsonb(existing_idem["response_json"], {})
 
             active = await conn.fetchrow(
-                "SELECT assignment_generation, runtime_id, harness, engine, persona_id, "
+                "SELECT assignment_generation, runtime_id, harness, engine, model, persona_id, "
                 "prompt_ref, effective_agents_md_sha256, agents_md_override "
                 "FROM agent_runtime_assignments "
                 "WHERE thread_key = $1 AND state = 'active' "
@@ -758,11 +780,15 @@ async def spawn_assignment(
                     )
                 generation = int(active["assignment_generation"])
                 runtime_id = active["runtime_id"]
-                if runtime_id != session.sandbox_id:
+                if (
+                    runtime_id != session.sandbox_id
+                    or (active["model"] or None) != (session.model or None)
+                ):
                     await conn.execute(
-                        "UPDATE agent_runtime_assignments SET runtime_id = $1, updated_at = NOW() "
-                        "WHERE thread_key = $2 AND assignment_generation = $3",
+                        "UPDATE agent_runtime_assignments SET runtime_id = $1, model = $2, updated_at = NOW() "
+                        "WHERE thread_key = $3 AND assignment_generation = $4",
                         session.sandbox_id,
+                        session.model or None,
                         thread_key,
                         generation,
                     )
@@ -784,14 +810,15 @@ async def spawn_assignment(
                 )
                 await conn.execute(
                     "INSERT INTO agent_runtime_assignments ("
-                    "thread_key, assignment_generation, runtime_id, harness, engine, "
+                    "thread_key, assignment_generation, runtime_id, harness, engine, model, "
                     "persona_id, prompt_ref, effective_agents_md_sha256, agents_md_override, state"
-                    ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active')",
+                    ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active')",
                     thread_key,
                     generation,
                     session.sandbox_id,
                     session.harness,
                     session.engine,
+                    session.model or None,
                     effective_persona_id,
                     prompt_ref,
                     prompt_sha,
@@ -811,6 +838,7 @@ async def spawn_assignment(
                 "assignment_state": assignment_state,
                 "assignment_generation": generation,
                 "persona_id": resolved_persona,
+                "model": session.model or None,
                 "prompt_ref": resolved_prompt_ref,
                 "effective_agents_md_sha256": resolved_prompt_sha,
             }
@@ -2797,7 +2825,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     )
 
     assignment = await pool.fetchrow(
-        "SELECT harness, engine, runtime_id, agents_md_override, persona_id, prompt_ref, effective_agents_md_sha256 "
+        "SELECT harness, engine, model, runtime_id, agents_md_override, persona_id, prompt_ref, effective_agents_md_sha256 "
         "FROM agent_runtime_assignments "
         "WHERE thread_key = $1 AND assignment_generation = $2",
         thread_key,
@@ -2890,6 +2918,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         assignment["harness"],
         engine=assignment["engine"],
         persona=assignment["persona_id"],
+        model=assignment["model"],
     )
     if session.sandbox_id != assignment["runtime_id"]:
         await pool.execute(
