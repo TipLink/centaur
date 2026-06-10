@@ -407,12 +407,14 @@ def test_recovery_command_paraphrases_are_recognized():
         ("--claude review this", "claude-code", None, None, "review this"),
         ("--pi analyze this", "pi-mono", None, None, "analyze this"),
         ("--fast summarize this", None, None, "fast", "summarize this"),
+        ("--think summarize this", None, None, "think", "summarize this"),
         # Persona + harness compose orthogonally.
         ("--invest --claude review this", "claude-code", "invest", None, "review this"),
         ("--claude --invest review this", "claude-code", "invest", None, "review this"),
         ("--invest --amp review this", "amp", "invest", None, "review this"),
         ("--invest --codex review this", "codex", "invest", None, "review this"),
         ("--invest --fast review this", None, "invest", "fast", "review this"),
+        ("--invest --think review this", None, "invest", "think", "review this"),
         ("please use --opus and review this", None, None, None, "please use and review this"),
         ("please use --model opus and review this", None, None, None, "please use and review this"),
         ("please use `--model opus` and review this", None, None, None, "please use and review this"),
@@ -854,6 +856,49 @@ async def test_slack_thread_turn_fast_profile_releases_assignment(db_pool):
     assert do_agent_turn_mock.await_args.kwargs["model"] == "fast"
     assert do_agent_turn_mock.await_args.kwargs["parts"] == [
         {"type": "text", "text": "summarize this quickly"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_slack_thread_turn_think_profile_releases_assignment(db_pool):
+    from api.workflow_engine import WorkflowContext
+    from api.workflows.slack_thread_turn import Input, handler
+
+    run_id = f"wfr_{uuid.uuid4().hex[:16]}"
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    ctx = WorkflowContext(
+        pool=db_pool,
+        run_id=run_id,
+        checkpoints={},
+        lease_s=30.0,
+        worker_id="w1",
+    )
+    do_agent_turn_mock = AsyncMock(return_value={"ok": True, "execution_id": "exe-1"})
+    release_assignment_mock = AsyncMock(return_value={"ok": True, "released": True})
+
+    with (
+        patch("api.workflow_engine.do_agent_turn", new=do_agent_turn_mock),
+        patch("api.runtime_control.release_assignment", new=release_assignment_mock),
+    ):
+        await handler(
+            Input(
+                thread_key=thread_key,
+                parts=[{"type": "text", "text": "--think summarize this carefully"}],
+                message_id="slack:current",
+            ),
+            ctx,
+        )
+
+    release_assignment_mock.assert_awaited_once_with(
+        db_pool,
+        thread_key=thread_key,
+        release_id="prompt-switch:slack:current",
+        cancel_inflight=True,
+        stop_runtime_background=True,
+    )
+    assert do_agent_turn_mock.await_args.kwargs["model"] == "think"
+    assert do_agent_turn_mock.await_args.kwargs["parts"] == [
+        {"type": "text", "text": "summarize this carefully"}
     ]
 
 

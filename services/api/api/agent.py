@@ -100,9 +100,23 @@ _VALID_STDOUT_EVENT_TYPES = frozenset(
 
 _ENGINE_HARNESSES = {"amp", "claude-code", "codex", "pi-mono"}
 _REUSABLE_DB_STATES = {"running", "idle", "delivering", "error", "suspended"}
+_CODEX_MODEL_PROFILES = frozenset({"fast", "think"})
 
 IDLE_TTL_S = int(os.getenv("IDLE_TTL_S", "86400"))  # 24 hours
 SUSPENDED_RETENTION_S = int(os.getenv("SUSPENDED_RETENTION_S", str(7 * 24 * 60 * 60)))
+
+
+def _runtime_model_for_engine(engine: str | None, model: str | None) -> str | None:
+    normalized = (model or "").strip().lower() or None
+    if not normalized:
+        return None
+    if engine == "codex":
+        return normalized
+    if normalized in _CODEX_MODEL_PROFILES:
+        return None
+    return normalized
+
+
 MAX_ACTIVE_SANDBOX_SESSIONS = int(os.getenv("MAX_ACTIVE_SANDBOX_SESSIONS", "45"))
 STREAM_EOF_REATTACH_MAX = int(os.getenv("STREAM_EOF_REATTACH_MAX", "6"))
 STREAM_EOF_REATTACH_BACKOFF_S = float(os.getenv("STREAM_EOF_REATTACH_BACKOFF_S", "1.0"))
@@ -200,6 +214,7 @@ async def _db_get_session(thread_key: str) -> SandboxSession | None:
     pool = _get_pool()
     row = await pool.fetchrow(
         "SELECT thread_key, sandbox_id, harness, engine, state, started_at, "
+        "model, "
         "agent_thread_id, last_delivered_id, inflight_turn_id, inflight_turn_input, "
         "inflight_attempts, last_result, trace_id "
         "FROM sandbox_sessions WHERE thread_key = $1",
@@ -212,6 +227,7 @@ async def _db_get_session(thread_key: str) -> SandboxSession | None:
         thread_key=row["thread_key"],
         harness=row["harness"],
         engine=row["engine"],
+        model=row["model"] or "",
         started_at=row["started_at"].timestamp() if row["started_at"] else 0.0,
         backend_name="kubernetes",
         db_state=row["state"],
@@ -254,18 +270,19 @@ async def _db_insert_session(
     session.trace_id = trace_id
     row = await pool.fetchrow(
         "INSERT INTO sandbox_sessions ("
-        "thread_key, sandbox_id, harness, engine, state, started_at, "
+        "thread_key, sandbox_id, harness, engine, model, state, started_at, "
         "agent_thread_id, last_delivered_id, inflight_turn_id, inflight_turn_input, "
         "inflight_started_at, inflight_attempts, last_result, last_result_at, trace_id"
-        ") VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8::text, $9::jsonb, "
-        "CASE WHEN $8::text IS NULL THEN NULL ELSE NOW() END, $10, $11, "
-        "CASE WHEN $11::text = '' THEN NULL ELSE NOW() END, $12::uuid) "
+        ") VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9::text, $10::jsonb, "
+        "CASE WHEN $9::text IS NULL THEN NULL ELSE NOW() END, $11, $12, "
+        "CASE WHEN $12::text = '' THEN NULL ELSE NOW() END, $13::uuid) "
         "ON CONFLICT (thread_key) DO NOTHING "
         "RETURNING thread_key",
         session.thread_key,
         session.sandbox_id,
         harness,
         engine,
+        session.model or None,
         initial_state,
         agent_thread_id or None,
         last_delivered_id or None,
@@ -836,7 +853,28 @@ async def get_or_spawn(
     old_last_result: str = ""
     old_trace_id: str = ""
     pool = _get_pool()
+    effective_harness = harness or default_harness()
+    resolved_engine, resolved_persona, repo = _resolve_harness_profile(
+        effective_harness, persona=persona, engine_override=engine
+    )
+    requested_model = _runtime_model_for_engine(resolved_engine, model)
+
     session = await _db_get_session(thread_key)
+    if session and requested_model and (session.model or "") != requested_model:
+        old_sandbox_id = session.sandbox_id
+        backend = get_backend()
+        with contextlib.suppress(Exception):
+            await backend.stop_by_id(old_sandbox_id)
+        await _db_delete_session(thread_key)
+        _drop_runtime(old_sandbox_id)
+        session = None
+        log.info(
+            "sandbox_replaced_for_model_profile",
+            thread_key=thread_key,
+            sandbox=old_sandbox_id[:12],
+            model=requested_model,
+        )
+
     if session:
         if session.db_state in _REUSABLE_DB_STATES:
             backend = get_backend()
@@ -913,17 +951,10 @@ async def get_or_spawn(
 
     thread_trace_id = await get_or_create_thread_trace_id(pool, thread_key)
 
-    effective_harness = harness or default_harness()
-
-    # Resolve harness profile (engine, persona, repo) once for both warm and cold paths
-    resolved_engine, resolved_persona, repo = _resolve_harness_profile(
-        effective_harness, persona=persona, engine_override=engine
-    )
-
     # Try warm pool first
     should_try_warm = (
         not engine
-        and not model
+        and not requested_model
         and not old_agent_thread_id
         and not old_inflight_turn_id
         and not (effective_harness == "amp" and resolved_engine == "codex")
@@ -958,9 +989,6 @@ async def get_or_spawn(
                 return claimed
 
     # Cold spawn
-    resolved_engine, resolved_persona, repo = _resolve_harness_profile(
-        effective_harness, persona=persona, engine_override=engine
-    )
     backend = get_backend()
     await _evict_idle_sessions_for_capacity(backend)
     trace_id = old_trace_id or thread_trace_id or str(uuid.uuid4())
@@ -970,7 +998,7 @@ async def get_or_spawn(
         resolved_engine,
         persona=resolved_persona,
         repo=repo,
-        model=model,
+        model=requested_model,
         resume_thread_id=old_agent_thread_id or None,
         trace_id=trace_id,
     )

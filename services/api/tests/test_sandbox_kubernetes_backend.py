@@ -2118,6 +2118,30 @@ async def test_create_sets_codex_fast_profile_env(
 
 
 @pytest.mark.asyncio
+async def test_create_accepts_codex_think_profile_without_fast_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = KubernetesExecutorBackend()
+    fake_core = FakeCoreApi()
+    backend._core = fake_core
+    backend._networking = FakeNetworkingApi()
+    _stub_create_dependencies(
+        monkeypatch,
+        backend,
+        extra_env=[{"name": "CODEX_AUTH_MODE", "value": "access_token"}],
+        harness_cmd="codex-app-wrapper",
+    )
+
+    session = await backend.create("slack:C123:123.456", "codex", "codex", model="think")
+
+    pod_body = fake_core.created_pods[-1][1]
+    container = pod_body["spec"]["containers"][0]
+    env = {item["name"]: item["value"] for item in container["env"]}
+    assert "CODEX_MODEL_PROFILE" not in env
+    assert session.model == "think"
+
+
+@pytest.mark.asyncio
 async def test_create_uses_api_key_in_default_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
