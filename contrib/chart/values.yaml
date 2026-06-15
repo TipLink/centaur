@@ -43,7 +43,7 @@ toolServer:
   port: 8001
   # owner/name of the GitHub repo carrying the tools tree. REQUIRED when enabled;
   # override for forks. Private repos additionally need githubToken below.
-  repo: paradigmxyz/centaur
+  repo: TipLink/centaur
   # Branch, tag, or commit to check out; empty = the repo's default branch. Pin
   # this to the tool set the api-rs image was built with so the creds api-rs
   # grants match the tools the sandbox installs.
@@ -160,6 +160,11 @@ secrets:
 overlay:
   mountPath: /app/overlay/org
   systemPrompt: ""
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+    sourcePath: /overlay
 
 # Ordered repo-cache-backed overlays. Each source repo is synced by repo-cache;
 # api-rs reads tools/workflows from /var/lib/centaur/repos, while sandboxes read
