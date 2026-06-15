@@ -6,17 +6,21 @@
 {{- end -}}
 {{- $toolsUseRepoCache := and .Values.repoCache.enabled .Values.toolServer.enabled .Values.toolServer.repo -}}
 {{- $toolDirs := list "/app/tools" -}}
-{{- $workflowDirs := "/app/workflows" -}}
+{{- $workflowDirList := list "/app/workflows" -}}
 {{- if $toolsUseRepoCache -}}
 {{- $toolDirs = list (printf "%s/%s/%s" .Values.repoCache.hostPath .Values.toolServer.repo .Values.toolServer.subdir) -}}
-{{- $workflowDirList := list (printf "%s/%s/workflows" .Values.repoCache.hostPath .Values.toolServer.repo) -}}
+{{- $workflowDirList = list (printf "%s/%s/workflows" .Values.repoCache.hostPath .Values.toolServer.repo) -}}
 {{- range .Values.toolServer.extraSources }}
 {{- $sourceSubdir := default "tools" .subdir -}}
 {{- $toolDirs = append $toolDirs (printf "%s/%s/%s" $.Values.repoCache.hostPath .repo $sourceSubdir) -}}
 {{- $workflowDirList = append $workflowDirList (printf "%s/%s/workflows" $.Values.repoCache.hostPath .repo) -}}
 {{- end -}}
-{{- $workflowDirs = join ":" $workflowDirList -}}
 {{- end -}}
+{{- if .Values.overlay.image.repository -}}
+{{- $toolDirs = append $toolDirs (printf "%s/tools" .Values.overlay.mountPath) -}}
+{{- $workflowDirList = append $workflowDirList (printf "%s/workflows" .Values.overlay.mountPath) -}}
+{{- end -}}
+{{- $workflowDirs := join ":" $workflowDirList -}}
 {{- $apiRsMetricsAnnotations := dict -}}
 {{- if .Values.apiRs.metrics.scrapeAnnotations -}}
 {{- $apiRsMetricsAnnotations = dict "prometheus.io/scrape" "true" "prometheus.io/path" .Values.apiRs.metrics.path "prometheus.io/port" (printf "%v" .Values.apiRs.port) -}}
@@ -110,6 +114,25 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
+{{- if .Values.overlay.image.repository }}
+      initContainers:
+        - name: overlay-bootstrap
+          image: {{ printf "%s:%s" .Values.overlay.image.repository .Values.overlay.image.tag | quote }}
+          imagePullPolicy: {{ .Values.overlay.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              src={{ .Values.overlay.image.sourcePath | quote }}
+              target={{ .Values.overlay.mountPath | quote }}
+              mkdir -p "$target"
+              cp -R "$src"/. "$target"/
+          volumeMounts:
+            - name: overlay-root
+              mountPath: {{ .Values.overlay.mountPath | quote }}
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+{{- end }}
       containers:
         - name: api-rs
           image: {{ printf "%s:%s" .Values.apiRs.image.repository .Values.apiRs.image.tag | quote }}
@@ -130,9 +153,27 @@ spec:
               value: {{ join ":" $toolDirs | quote }}
             - name: WORKFLOW_DIRS
               value: {{ $workflowDirs | quote }}
-{{- if .Values.overlay.systemPrompt }}
+{{- if or .Values.overlay.systemPrompt .Values.overlay.image.repository }}
             - name: CENTAUR_OVERLAY_DIR
               value: {{ .Values.overlay.mountPath | quote }}
+{{- end }}
+{{- if .Values.overlay.image.repository }}
+            - name: TOOLS_OVERLAY_PATH
+              value: {{ printf "%s/tools" .Values.overlay.mountPath | quote }}
+            - name: CENTAUR_OVERLAY_IMAGE
+              value: {{ printf "%s:%s" .Values.overlay.image.repository .Values.overlay.image.tag | quote }}
+            - name: CENTAUR_OVERLAY_IMAGE_PULL_POLICY
+              value: {{ .Values.overlay.image.pullPolicy | quote }}
+            - name: CENTAUR_OVERLAY_IMAGE_SOURCE_PATH
+              value: {{ .Values.overlay.image.sourcePath | quote }}
+            - name: SESSION_SANDBOX_OVERLAY_IMAGE
+              value: {{ printf "%s:%s" .Values.overlay.image.repository .Values.overlay.image.tag | quote }}
+            - name: SESSION_SANDBOX_OVERLAY_IMAGE_PULL_POLICY
+              value: {{ .Values.overlay.image.pullPolicy | quote }}
+            - name: SESSION_SANDBOX_OVERLAY_IMAGE_SOURCE_PATH
+              value: {{ .Values.overlay.image.sourcePath | quote }}
+            - name: SESSION_SANDBOX_OVERLAY_MOUNT_PATH
+              value: "/home/agent/overlay/org"
 {{- end }}
             - name: SESSION_SANDBOX_BACKEND
               value: {{ .Values.apiRs.sandboxBackend | quote }}
@@ -311,18 +352,42 @@ spec:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.apiRs.resources | nindent 12 }}
-{{- if $toolsUseRepoCache }}
+{{- if or $toolsUseRepoCache .Values.overlay.image.repository .Values.overlay.systemPrompt }}
           volumeMounts:
+{{- if $toolsUseRepoCache }}
             - name: repo-cache
               mountPath: {{ .Values.repoCache.hostPath | quote }}
               readOnly: true
 {{- end }}
-{{- if $toolsUseRepoCache }}
+{{- if .Values.overlay.image.repository }}
+            - name: overlay-root
+              mountPath: {{ .Values.overlay.mountPath | quote }}
+              readOnly: true
+{{- else if .Values.overlay.systemPrompt }}
+            - name: overlay
+              mountPath: {{ .Values.overlay.mountPath | quote }}
+              readOnly: true
+{{- end }}
+{{- end }}
+{{- if or $toolsUseRepoCache .Values.overlay.image.repository .Values.overlay.systemPrompt }}
       volumes:
+{{- if $toolsUseRepoCache }}
         - name: repo-cache
           hostPath:
             path: {{ .Values.repoCache.hostPath | quote }}
             type: DirectoryOrCreate
+{{- end }}
+{{- if .Values.overlay.image.repository }}
+        - name: overlay-root
+          emptyDir: {}
+{{- else if .Values.overlay.systemPrompt }}
+        - name: overlay
+          configMap:
+            name: {{ include "centaur.componentName" (dict "root" . "component" "overlay") }}
+            items:
+              - key: SYSTEM_PROMPT.md
+                path: services/sandbox/SYSTEM_PROMPT.md
+{{- end }}
 {{- end }}
 ---
 apiVersion: v1

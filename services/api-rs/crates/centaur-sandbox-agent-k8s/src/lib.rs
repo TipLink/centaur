@@ -66,6 +66,10 @@ pub struct AgentSandboxConfig {
     /// git-clones the tools repo into the agent's `/app/tools`, and `TOOL_DIRS`
     /// is set so the agent's shim installer finds them.
     pub tools: Option<ToolsConfig>,
+    /// Optional org/deployment overlay image copied into each sandbox before
+    /// the agent starts. The overlay can carry tools, workflows, prompts, and
+    /// harness config without rebuilding the base sandbox image.
+    pub overlay_image: Option<OverlayImageConfig>,
     /// In-cluster OTLP collector (e.g. Laminar) the sandbox exports harness
     /// traces to directly. The per-sandbox egress NetworkPolicy denies all
     /// destinations except the proxy/control plane, so without this rule the
@@ -111,6 +115,7 @@ impl AgentSandboxConfig {
             iron_proxy: None,
             iron_control: None,
             tools: None,
+            overlay_image: None,
             otlp_egress: None,
             ready_timeout: Duration::from_secs(60),
         }
@@ -133,6 +138,45 @@ impl AgentSandboxConfig {
 
     pub fn tools(mut self, tools: ToolsConfig) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    pub fn overlay_image(mut self, overlay_image: OverlayImageConfig) -> Self {
+        self.overlay_image = Some(overlay_image);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlayImageConfig {
+    pub image: String,
+    pub image_pull_policy: Option<String>,
+    pub source_path: String,
+    pub mount_path: String,
+}
+
+impl OverlayImageConfig {
+    pub fn new(image: impl Into<String>) -> Self {
+        Self {
+            image: image.into(),
+            image_pull_policy: None,
+            source_path: "/overlay".to_owned(),
+            mount_path: "/home/agent/overlay/org".to_owned(),
+        }
+    }
+
+    pub fn image_pull_policy(mut self, image_pull_policy: impl Into<String>) -> Self {
+        self.image_pull_policy = Some(image_pull_policy.into());
+        self
+    }
+
+    pub fn source_path(mut self, source_path: impl Into<String>) -> Self {
+        self.source_path = source_path.into();
+        self
+    }
+
+    pub fn mount_path(mut self, mount_path: impl Into<String>) -> Self {
+        self.mount_path = mount_path.into();
         self
     }
 }
@@ -599,6 +643,18 @@ fn build_agent_sandbox(
             upsert_env(&mut agent_env, &name, value);
         }
     }
+    if let Some(overlay_image) = &config.overlay_image {
+        upsert_env(
+            &mut agent_env,
+            "CENTAUR_OVERLAY_DIR",
+            overlay_image.mount_path.clone(),
+        );
+        upsert_env(
+            &mut agent_env,
+            "TOOLS_OVERLAY_PATH",
+            format!("{}/tools", overlay_image.mount_path.trim_end_matches('/')),
+        );
+    }
     insert_optional(
         &mut container,
         "env",
@@ -631,6 +687,17 @@ fn build_agent_sandbox(
         volume_mounts.extend(tools::agent_volume_mounts_json(config.tools.as_ref()));
         volumes.extend(tools::volumes_json(config.tools.as_ref()));
     }
+    if let Some(overlay_image) = &config.overlay_image {
+        volume_mounts.push(json!({
+            "name": "overlay-root",
+            "mountPath": overlay_image.mount_path,
+            "readOnly": true,
+        }));
+        volumes.push(json!({
+            "name": "overlay-root",
+            "emptyDir": {},
+        }));
+    }
     insert_optional(
         &mut container,
         "volumeMounts",
@@ -658,6 +725,9 @@ fn build_agent_sandbox(
             clone_proxy.as_ref(),
         ));
     }
+    if let Some(overlay_image) = &config.overlay_image {
+        init_containers.push(overlay_init_container_json(overlay_image));
+    }
 
     let mut pod_spec = json!({
         "containers": [container],
@@ -665,7 +735,7 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    if config.tools.is_some() {
+    if config.tools.is_some() || config.overlay_image.is_some() {
         pod_spec["securityContext"] = tools::pod_security_context_json();
     }
     insert_optional(
@@ -722,6 +792,31 @@ fn build_agent_sandbox(
     sandbox.metadata.labels = Some(labels);
     sandbox.metadata.annotations = Some(annotations);
     Ok(sandbox)
+}
+
+fn overlay_init_container_json(overlay_image: &OverlayImageConfig) -> Value {
+    let script = format!(
+        "src={source_path:?}\n\
+         target={mount_path:?}\n\
+         mkdir -p \"$target\"\n\
+         cp -R \"$src\"/. \"$target\"/",
+        source_path = overlay_image.source_path,
+        mount_path = overlay_image.mount_path,
+    );
+    let mut container = json!({
+        "name": "overlay-bootstrap",
+        "image": overlay_image.image,
+        "command": ["/bin/sh", "-ec", script],
+        "volumeMounts": [{
+            "name": "overlay-root",
+            "mountPath": overlay_image.mount_path,
+        }],
+        "securityContext": tools::security_context_json(),
+    });
+    if let Some(policy) = &overlay_image.image_pull_policy {
+        container["imagePullPolicy"] = json!(policy);
+    }
+    container
 }
 
 fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
@@ -930,6 +1025,64 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|mount| mount.name == "firewall-ca")
+        );
+    }
+
+    #[test]
+    fn overlay_image_bootstraps_into_agent_sandbox() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur").overlay_image(
+            OverlayImageConfig::new("ghcr.io/example/overlay:sha-test")
+                .image_pull_policy("IfNotPresent")
+                .source_path("/overlay")
+                .mount_path("/home/agent/overlay/org"),
+        );
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+        let bootstrap = pod_spec
+            .init_containers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|container| container.name == "overlay-bootstrap")
+            .expect("overlay bootstrap container");
+        assert_eq!(
+            bootstrap.image.as_deref(),
+            Some("ghcr.io/example/overlay:sha-test")
+        );
+        assert_eq!(bootstrap.image_pull_policy.as_deref(), Some("IfNotPresent"));
+        let script = &bootstrap.command.as_ref().unwrap()[2];
+        assert!(script.contains("src=\"/overlay\""));
+        assert!(script.contains("target=\"/home/agent/overlay/org\""));
+
+        let container = &pod_spec.containers[0];
+        let env = container.env.as_ref().unwrap();
+        assert!(env.iter().any(|env| {
+            env.name == "CENTAUR_OVERLAY_DIR"
+                && env.value.as_deref() == Some("/home/agent/overlay/org")
+        }));
+        assert!(env.iter().any(|env| {
+            env.name == "TOOLS_OVERLAY_PATH"
+                && env.value.as_deref() == Some("/home/agent/overlay/org/tools")
+        }));
+        assert!(
+            container
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|mount| mount.name == "overlay-root"
+                    && mount.mount_path == "/home/agent/overlay/org"
+                    && mount.read_only == Some(true))
+        );
+        assert!(
+            pod_spec
+                .volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|volume| volume.name == "overlay-root" && volume.empty_dir.is_some())
         );
     }
 

@@ -101,7 +101,16 @@
       "type": "object",
       "properties": {
         "mountPath": { "type": "string" },
-        "systemPrompt": { "type": "string" }
+        "systemPrompt": { "type": "string" },
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string" },
+            "tag": { "type": "string" },
+            "pullPolicy": { "type": "string" },
+            "sourcePath": { "type": "string" }
+          }
+        }
       }
     },
     "sandbox": {
