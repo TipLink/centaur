@@ -24,67 +24,52 @@ ironProxy:
     proxyPort: 8080
     managementPort: 9092
     healthPort: 9090
-    # Postgres listener ports. iron-proxy allocates one listener per pg_dsn
-    # secret, starting at pgPortRangeStart and incrementing. NetworkPolicies
-    # allow the whole range so callers can reach any listener.
-    pgPortRangeStart: 5432
-    pgPortRangeEnd: 5471
+    # Postgres listener port. iron-proxy multiplexes every pg_dsn secret through
+    # a single listener (routing by database name); NetworkPolicies allow this
+    # one port so callers can reach it.
+    pgPort: 5432
   secretSource: onepassword
   secretTtl: 10m
 
-# Tool-server sidecar — runs alongside the sandbox container in each sandbox
-# Pod and exposes the same /tools/* surface the API used to. Same image as
-# the API; the sidecar runs uvicorn against api.tool_server_app.
-# When toolServer.enabled is false (default), the sandbox pod has no
-# sidecar — currently the API still serves /tools so this is a no-op
-# until the API drops its router (Phase 5).
+# Base tools delivery for api-rs sandboxes. When enabled, repo-cache keeps `repo`
+# fresh on each node and a tools-bootstrap init container copies `subdir` into
+# each sandbox's /app/tools, so adding a tool is a push to the repo, not an image
+# rebuild. `port` is legacy (the deprecated tool-server sidecar) and unused here.
 toolServer:
   enabled: true
   port: 8001
-
-# iron-token-broker — race-free OAuth refresh-token coordinator. Enable when
-# any tool uses `brokered_token` against an IdP that rotates refresh tokens
-# with strict reuse detection (OpenAI Codex, Anthropic Claude Code OAuth).
-# With ironProxy.secretSource=env, enable fileStore so the broker has a
-# writable place to persist refresh-token rotations.
-tokenBroker:
-  enabled: false
-  image:
-    repository: ironsh/iron-token-broker
-    tag: 0.0.1-rc.2
-    pullPolicy: IfNotPresent
-  service:
-    httpPort: 8181
-    metricsPort: 9091
-  # iron-proxy caches each broker-issued access token for this long before
-  # re-fetching. Must be strictly less than the IdP's token lifetime or the
-  # broker resolver rejects the response.
-  ttl: 1m
-  fileStore:
-    enabled: false
-    mountPath: /var/lib/iron-token-broker/store
-    hostPath: /var/lib/centaur/token-broker
-    bootstrapSecretName: ""
-    bootstrapKeys: []
-  # GitHub App installation tokens are not OAuth refresh tokens. When enabled,
-  # a small API-image sidecar fronts iron-token-broker and serves this
-  # credential id while forwarding all other broker credentials upstream.
-  githubApp:
-    enabled: false
-    credentialId: github-app
+  # owner/name of the GitHub repo carrying the tools tree. REQUIRED when enabled;
+  # override for forks. Private repos additionally need githubToken below.
+  repo: TipLink/centaur
+  # Branch, tag, or commit to check out; empty = the repo's default branch. Pin
+  # this to the tool set the api-rs image was built with so the creds api-rs
+  # grants match the tools the sandbox installs.
+  ref: ""
+  # Subdirectory in the repo holding the tools tree (mounted at /app/tools).
+  subdir: tools
+  # Additional repo/subdir sources copied after the base tools source. Later
+  # sources shadow earlier ones when tool directory names collide. These repos
+  # are cached automatically when repoCache.enabled=true.
+  extraSources: []
+  # - repo: tempoxyz/centaur-tempo
+  #   ref: ""
+  #   subdir: tools
+  # Git-capable image the clone init container runs in; empty fields fall back to
+  # sandbox.image (which carries git).
+  runnerImage:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  # GitHub token for direct private-repo clones when repoCache.enabled=false.
+  # With the default repo-cache path, configure repoCache.githubToken instead.
+  githubToken:
     existingSecretName: ""
-    appIdSecretKey: app-id
-    installationIdSecretKey: installation-id
-    privateKeySecretKey: private-key
-    upstreamPort: 8182
-    refreshSkewSeconds: 300
-    resources: {}
-  resources: {}
+    secretKey: token
 
 # iron-control — Rails control plane for authenticated API access + encrypted
 # secret storage. Off by default; enable per-environment. Uses a dedicated
 # `iron_control_production` database on the bundled Postgres (its own logical DB so its
-# Rails schema_migrations table never collides with the API's dbmate table); an
+# Rails schema_migrations table never collides with the API's migration table); an
 # init container creates the DB idempotently. DATABASE_URL, bootstrap
 # user/API-key, and the three ActiveRecord encryption keys are injected from the
 # shared infra Secret. Point IRON_CONTROL_DATABASE_URL elsewhere to use an
@@ -95,7 +80,9 @@ ironControl:
   image:
     repository: ironsh/iron-control
     tag: latest
-    pullPolicy: IfNotPresent
+    # Default Always: the image is published under the mutable `latest` tag, so
+    # IfNotPresent would pin pods to whatever digest a node already cached.
+    pullPolicy: Always
   railsEnv: production
   database:
     # Logical DB created on the bundled Postgres by the create-db init
@@ -105,7 +92,39 @@ ironControl:
     name: iron_control_production
   service:
     httpPort: 3000
+  # Optional Ingress for iron-control. Bring your own controller — Tailscale
+  # operator, Cloudflare, ingress-nginx, etc. — via className + annotations +
+  # tls. Mirrors the top-level `ingress` block (which is wired to the
+  # Slackbot). Add the controller's namespace to
+  # networkPolicy.ingressControllerNamespaces so its pods can reach
+  # iron-control; the iron-control NetworkPolicy admits those namespaces when
+  # this is enabled.
+  #
+  # Tailscale operator example (serves https://iron-control.<tailnet>.ts.net):
+  #   className: tailscale
+  #   defaultBackend: true
+  #   tls: [{hosts: [iron-control]}]
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    # When true, render a single spec.defaultBackend instead of host/path
+    # rules. Required by the Tailscale operator; harmless otherwise.
+    defaultBackend: false
+    # Host for the path rule when not using defaultBackend; empty matches any
+    # host.
+    host: ""
+    tls: []
   resources: {}
+  # Solid Queue worker (`bin/jobs`) that runs iron-control's background jobs —
+  # most importantly the broker-credential OAuth refresh loop that mints and
+  # refreshes the access tokens delivered inline via `token_broker` sources
+  # (e.g. the `openai-codex` brokered token). The web Puma pod runs no worker, so
+  # without this those jobs never execute. Active only when ironControl.enabled.
+  worker:
+    enabled: true
+    replicaCount: 1
+    resources: {}
 
 # Values for the upstream 1Password Connect subchart
 # (https://github.com/1Password/connect-helm-charts/tree/main/charts/connect).
@@ -121,53 +140,6 @@ onepasswordConnect:
 
 secrets:
   bootstrapSecretName: ""
-
-api:
-  replicaCount: 1
-  image:
-    repository: centaur-api
-    tag: latest
-    pullPolicy: Always
-  executionWorkerEnabled: false
-  defaultHarness: codex
-  # The API's worker claims workflow_runs and spawns a per-run sandbox to
-  # execute each handler. Disable only if you're running your own claimer.
-  workflowWorkerEnabled: true
-  warmPoolEnabled: false
-  pluginWatcherEnabled: false
-  slackEtlEnabled: false
-  slackSyncIntervalSeconds: 3600
-  slackBackfillIntervalSeconds: 3600
-  slackBackfillChannelBatchLimit: 20
-  slackSyncBackfillLookbackDays: 30
-  slackSyncThreadLookbackDays: 3
-  googleDriveEtlEnabled: false
-  googleDriveSyncIntervalSeconds: 14400
-  googleCalendarEtlEnabled: false
-  googleCalendarSyncIntervalSeconds: 14400
-  companyContextDocumentsIntervalSeconds: 14400
-  slackEtlExcludedChannelPatterns: ""
-  victoriaMetricsPushEnabled: false
-  startupProbe:
-    failureThreshold: 30
-    periodSeconds: 10
-    timeoutSeconds: 5
-  livenessProbe:
-    failureThreshold: 6
-    periodSeconds: 10
-    timeoutSeconds: 5
-  readinessProbe:
-    failureThreshold: 6
-    periodSeconds: 10
-    timeoutSeconds: 5
-  egressDiscovery:
-    enabled: true
-    namespace: centaur-egress
-    clusterDomain: cluster.local
-    tailnetFqdnAnnotation: tailscale.com/tailnet-fqdn
-  terminationGracePeriodSeconds: 35
-  extraEnv: {}
-  resources: {}
 
 overlay:
   mountPath: /app/overlay/org
@@ -186,6 +158,20 @@ sandbox:
     pullPolicy: Always
   runtimeClassName: ""
   reposPath: ""
+  # How the in-sandbox harness authenticates upstream. Single source of truth:
+  # the control plane reads it to register the matching iron-proxy credential
+  # AND propagates it into the sandbox, so the agent's auth.json and the
+  # injected credential always agree.
+  #   api_key      — codex/claude use an API key (proxy replaces the
+  #                  placeholder against api.openai.com / api.anthropic.com).
+  #   access_token — codex uses a ChatGPT token against chatgpt.com / claude a
+  #                  subscription token (proxy injects the brokered credential).
+  codexAuthMode: api_key
+  claudeCodeAuthMode: api_key
+  # Which harness the sandbox runs: codex | amp | claudecode. Selects the
+  # iron-proxy auth fragment api-rs registers and must agree with the sandbox
+  # image's default CMD (services/sandbox/Dockerfile).
+  harnessEngine: codex
   extraEnv: {}
   stateVolume:
     enabled: false
@@ -198,27 +184,38 @@ sandbox:
       memory: 512Mi
 
 repoCache:
-  enabled: false
+  enabled: true
   hostPath: /var/lib/centaur/repos
+  # Additional repos to cache. toolServer.repo is cached automatically when the
+  # tool server is enabled.
   repositories: []
+  repositoryRefs: {}
   syncIntervalSeconds: 300
   image:
     repository: ""
     tag: ""
     pullPolicy: ""
   githubToken:
+    # Optional for public repos; required for private repos.
     existingSecretName: ""
     secretKey: token
     token: ""
   egressPorts:
     - 443
+  readinessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
   nodeSelector: {}
   tolerations: []
   affinity: {}
   resources: {}
 
+# Installs the upstream agent-sandbox controller + CRDs (subchart). Required by
+# apiRs when apiRs.sandboxBackend is agent-k8s, which is the default.
 agentSandbox:
-  enabled: false
+  enabled: true
   namespace:
     create: true
     name: agent-sandbox-system
@@ -229,14 +226,89 @@ agentSandbox:
   controller:
     extensions: false
 
-slackbot:
+# Rust session control plane (services/api-rs). Owns sessions, agent-k8s
+# sandboxes (via the agents.x-k8s.io Sandbox CRD), and the per-sandbox
+# iron-proxy/firewall.
+apiRs:
   enabled: true
   replicaCount: 1
   image:
-    repository: centaur-slackbot
+    repository: centaur-api-rs
     tag: latest
     pullPolicy: Always
-  runtimeErrorAlertChannel: ""
+  port: 8080
+  runMigrations: true
+  sandboxBackend: agent-k8s
+  sandboxWorkload: codex-app-server
+  sandboxReadyTimeoutSecs: 90
+  sandboxWarmPoolSize: 0
+  sandboxWarmPoolReplenishIntervalSecs: 5
+  # Reaper: stop sandboxes idle-paused longer than the idle TTL or older than
+  # the max lifetime. 0 disables that sweep. Interval must be >= 1.
+  sandboxIdleStopTtlSecs: 10800 # 3 hours
+  sandboxMaxLifetimeSecs: 259200 # 3 days
+  sandboxReapIntervalSecs: 300
+  ironProxy:
+    mode: enabled
+  metrics:
+    # The Rust API always serves Prometheus text metrics at /metrics. This flag
+    # only controls scrape annotations for Prometheus/VictoriaMetrics-style
+    # discovery.
+    scrapeAnnotations: true
+    path: /metrics
+    annotations: {}
+  # 1Password vault the iron-proxy secret source reads from when
+  # ironProxy.secretSource is "onepassword". Empty falls back to the binary
+  # default ("ai-agents").
+  opVault: ""
+  startupProbe:
+    failureThreshold: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+  livenessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readinessProbe:
+    failureThreshold: 6
+    periodSeconds: 10
+    timeoutSeconds: 5
+  terminationGracePeriodSeconds: 35
+  extraEnv: {}
+  resources: {}
+
+# Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
+# (:8080) and streams responses back. Listens on :3001.
+slackbotv2:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: centaur-slackbotv2
+    tag: latest
+    pullPolicy: Always
+  userName: centaur
+  assistantStatus: ""
+  externalOrgAllowlist: ""
+  triggerBotAllowlist: ""
+  extraEnv: {}
+  resources: {}
+
+# Discord chat ingress — mirrors slackbotv2, forwards to the api-rs control plane (:8080) over a
+# persistent Discord Gateway connection. Off by default; needs a Discord app + Message Content
+# Intent + a guild allowlist. Always exactly one replica (singleton Gateway session).
+discordbot:
+  enabled: false
+  image:
+    repository: centaur-discordbot
+    tag: latest
+    pullPolicy: Always
+  userName: centaur
+  # Comma/space-separated Discord guild IDs. The bot is INERT (ignores all messages) until set.
+  guildAllowlist: ""
+  # Comma/space-separated role IDs whose mentions also trigger the bot.
+  mentionRoleIds: ""
+  # Rename auto-created threads to the triggering message; set false to keep generic names.
+  nameThreads: true
   extraEnv: {}
   resources: {}
 
@@ -249,6 +321,8 @@ postgres:
   args:
     - "-c"
     - "shared_preload_libraries=pg_search,pg_cron"
+    - "-c"
+    - "max_connections=500"
   auth:
     database: ai_v2
     username: tempo
@@ -265,21 +339,14 @@ postgres:
 ingress:
   enabled: false
   className: ""
+  # When true, render a single spec.defaultBackend instead of host/path rules.
+  # Required by the Tailscale operator's Funnel Ingress; harmless otherwise.
+  defaultBackend: false
   annotations: {}
   host: centaur.local
   tls: []
 
 httpRoutes: []
-
-runnerAccess:
-  enabled: false
-  allowedCidrs: []
-  apiService:
-    type: LoadBalancer
-    loadBalancerSourceRanges: []
-  proxyService:
-    type: LoadBalancer
-    loadBalancerSourceRanges: []
 
 networkPolicy:
   enabled: true
@@ -293,6 +360,16 @@ networkPolicy:
   # the egress rule must allow it. Defaults to 6443 (k3s, kubeadm). Set to 443
   # on clusters whose API server endpoint already listens on 443.
   apiServerPort: 6443
+  # Egress to an in-cluster OTLP trace collector (e.g. Laminar) in another
+  # namespace. api-rs needs this to export its own spans; sandboxes get their
+  # equivalent per-sandbox rule from api-rs, derived from the OTLP endpoint in
+  # sandbox.extraEnv. The collector's own namespace must also admit ingress
+  # from this namespace's pods.
+  otlpEgress:
+    enabled: false
+    # kubernetes.io/metadata.name of the collector's namespace, e.g. "laminar".
+    namespace: ""
+    port: 8000
 
 podSecurityContext:
   fsGroupChangePolicy: OnRootMismatch

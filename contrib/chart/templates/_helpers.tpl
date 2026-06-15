@@ -51,10 +51,6 @@ app.kubernetes.io/component: {{ .component }}
 {{- required "firewall.existingCaKeySecretName is required" .Values.firewall.existingCaKeySecretName | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "centaur.apiServiceAccountName" -}}
-{{- printf "%s-api" (include "centaur.fullname" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
 {{- define "centaur.repoCacheGithubTokenSecretName" -}}
 {{- if .Values.repoCache.githubToken.existingSecretName -}}
 {{- .Values.repoCache.githubToken.existingSecretName | trunc 63 | trimSuffix "-" -}}
@@ -85,22 +81,6 @@ app.kubernetes.io/component: {{ .component }}
 {{- toJson $payload | sha256sum -}}
 {{- end -}}
 
-{{- define "centaur.firewallProxyHost" -}}
-centaur-api-proxy
-{{- end -}}
-
-{{- define "centaur.firewallProxyPort" -}}
-{{- .Values.ironProxy.service.proxyPort -}}
-{{- end -}}
-
-{{- define "centaur.firewallProxyUrl" -}}
-{{- printf "http://%s:%v" (include "centaur.firewallProxyHost" .) (include "centaur.firewallProxyPort" .) -}}
-{{- end -}}
-
-{{- define "centaur.firewallNoProxyHosts" -}}
-{{- include "centaur.firewallProxyHost" . -}}
-{{- end -}}
-
 {{- /*
 The upstream 1Password Connect subchart names its Service after
 `connect.applicationName` (default `onepassword-connect`) and exposes the
@@ -121,24 +101,6 @@ namespace as this release, so a short DNS name is enough.
 
 {{- define "centaur.onepasswordConnectUrl" -}}
 {{- printf "http://%s:%v" (include "centaur.onepasswordConnectHost" .) (include "centaur.onepasswordConnectPort" .) -}}
-{{- end -}}
-
-{{- /*
-iron-token-broker — owns OAuth refresh-token state for credentials whose IdP
-rotates refresh tokens with strict reuse detection (OpenAI Codex, Anthropic
-Claude Code OAuth). One process, ClusterIP service, config rendered from
-registered refresh_token OAuthTokenSecrets by the API server at startup.
-*/ -}}
-{{- define "centaur.tokenBrokerName" -}}
-{{- include "centaur.componentName" (dict "root" . "component" "token-broker") -}}
-{{- end -}}
-
-{{- define "centaur.tokenBrokerHost" -}}
-{{- include "centaur.tokenBrokerName" . -}}
-{{- end -}}
-
-{{- define "centaur.tokenBrokerUrl" -}}
-{{- printf "http://%s:%v" (include "centaur.tokenBrokerHost" .) .Values.tokenBroker.service.httpPort -}}
 {{- end -}}
 
 {{- /*

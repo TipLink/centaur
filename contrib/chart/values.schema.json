@@ -33,8 +33,7 @@
             "proxyPort": { "type": "integer" },
             "managementPort": { "type": "integer" },
             "healthPort": { "type": "integer" },
-            "pgPortRangeStart": { "type": "integer" },
-            "pgPortRangeEnd": { "type": "integer" }
+            "pgPort": { "type": "integer" }
           }
         },
         "secretSource": { "type": "string" },
@@ -45,7 +44,22 @@
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" },
-        "port": { "type": "integer" }
+        "port": { "type": "integer" },
+        "repo": { "type": "string" },
+        "ref": { "type": "string" },
+        "subdir": { "type": "string" },
+        "extraSources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "repo": { "type": "string" },
+              "ref": { "type": "string" },
+              "subdir": { "type": "string" }
+            },
+            "required": ["repo"]
+          }
+        }
       }
     },
     "ironControl": {
@@ -117,29 +131,6 @@
         "bootstrapSecretName": { "type": "string" }
       }
     },
-    "api": {
-      "type": "object",
-      "properties": {
-        "egressDiscovery": {
-          "type": "object",
-          "properties": {
-            "enabled": { "type": "boolean" },
-            "namespace": { "type": "string" },
-            "clusterDomain": { "type": "string" },
-            "tailnetFqdnAnnotation": { "type": "string" }
-          }
-        },
-        "slackEtlEnabled": { "type": "boolean" },
-        "slackSyncIntervalSeconds": { "type": "integer" },
-        "slackSyncLookbackDays": { "type": "integer" },
-        "slackSyncThreadLookbackDays": { "type": "integer" },
-        "googleDriveEtlEnabled": { "type": "boolean" },
-        "googleDriveSyncIntervalSeconds": { "type": "integer" },
-        "googleCalendarEtlEnabled": { "type": "boolean" },
-        "googleCalendarSyncIntervalSeconds": { "type": "integer" },
-        "companyContextDocumentsIntervalSeconds": { "type": "integer" }
-      }
-    },
     "overlay": {
       "type": "object",
       "properties": {
@@ -173,6 +164,10 @@
           "type": "array",
           "items": { "type": "string" }
         },
+        "repositoryRefs": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
         "syncIntervalSeconds": { "type": "integer" },
         "image": {
           "type": "object",
@@ -193,6 +188,15 @@
         "egressPorts": {
           "type": "array",
           "items": { "type": "integer" }
+        },
+        "readinessProbe": {
+          "type": "object",
+          "properties": {
+            "initialDelaySeconds": { "type": "integer" },
+            "periodSeconds": { "type": "integer" },
+            "timeoutSeconds": { "type": "integer" },
+            "failureThreshold": { "type": "integer" }
+          }
         },
         "nodeSelector": { "type": "object" },
         "tolerations": { "type": "array" },
@@ -227,10 +231,24 @@
         }
       }
     },
-    "slackbot": {
+    "apiRs": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" }
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "scrapeAnnotations": { "type": "boolean" },
+            "path": { "type": "string" },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        },
+        "extraEnv": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
       }
     },
     "postgres": {
@@ -241,15 +259,6 @@
           "properties": {
             "subPath": { "type": "string" }
           }
-        }
-      }
-    },
-    "runnerAccess": {
-      "type": "object",
-      "properties": {
-        "allowedCidrs": {
-          "type": "array",
-          "items": { "type": "string" }
         }
       }
     },
