@@ -28,8 +28,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAMESPACE: paradigmxyz/centaur
-  IMAGE_SOURCE: https://github.com/paradigmxyz/centaur
+  IMAGE_NAMESPACE: tiplink/centaur
+  IMAGE_SOURCE: https://github.com/TipLink/centaur
   # Main/tags keep optimized release images. PRs and manual branch publishes
   # use debug builds so staging/dev iteration does not spend minutes optimizing
   # Rust binaries that are immediately replaced by the next test build.
@@ -216,3 +216,89 @@ jobs:
       - name: Inspect manifest
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+
+  promote-fineas-infra:
+    name: Open Fineas infra promotion PR
+    runs-on: ubuntu-latest
+    needs: merge
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    steps:
+      - name: Create Fineas infra GitHub App token
+        id: fineas_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ vars.FINEAS_GITHUB_APP_ID }}
+          private-key: ${{ secrets.FINEAS_GITHUB_APP_PRIVATE_KEY }}
+          owner: TipLink
+          repositories: fineas-centaur-infra
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout Fineas infra
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: TipLink/fineas-centaur-infra
+          token: ${{ steps.fineas_token.outputs.token }}
+          persist-credentials: true
+
+      - name: Update Fineas Centaur pins
+        run: |
+          set -euo pipefail
+          bash scripts/bump-centaur-pins.sh "${GITHUB_SHA}"
+          scripts/audit-supply-chain.sh
+
+      - name: Commit Fineas pin update
+        id: commit
+        env:
+          CENTAUR_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          centaur_short="${CENTAUR_SHA::7}"
+          branch="automation/promote-centaur-${centaur_short}"
+          git config user.name "fineas-bot[bot]"
+          git config user.email "258147136+fineas-bot[bot]@users.noreply.github.com"
+          git switch -C "${branch}"
+          if git diff --quiet; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          git add -A
+          git commit -m "chore: promote centaur ${centaur_short}"
+          git push --force-with-lease origin "${branch}"
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
+          echo "centaur_short=${centaur_short}" >> "${GITHUB_OUTPUT}"
+
+      - name: Open or update Fineas infra PR
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.fineas_token.outputs.token }}
+          CENTAUR_SHA: ${{ github.sha }}
+          CENTAUR_REPO: ${{ github.repository }}
+          CENTAUR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PROMOTION_BRANCH: ${{ steps.commit.outputs.branch }}
+          CENTAUR_SHORT: ${{ steps.commit.outputs.centaur_short }}
+        run: |
+          set -euo pipefail
+          title="Promote Centaur ${CENTAUR_SHORT} to Fineas"
+          body="$(cat <<EOF
+          ## Summary
+          - update Fineas Centaur base image pins to \`sha-${CENTAUR_SHORT}\`
+          - pin the Centaur chart source to \`${CENTAUR_SHA}\`
+
+          ## Source
+          - Centaur commit: https://github.com/${CENTAUR_REPO}/commit/${CENTAUR_SHA}
+          - Image publish run: ${CENTAUR_RUN_URL}
+
+          ## Tests
+          - \`bash scripts/bump-centaur-pins.sh ${CENTAUR_SHA}\`
+          - \`scripts/audit-supply-chain.sh\`
+          EOF
+          )"
+          existing="$(gh pr list --repo TipLink/fineas-centaur-infra --state open --head "${PROMOTION_BRANCH}" --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh pr edit "${existing}" --repo TipLink/fineas-centaur-infra --title "${title}" --body "${body}"
+          else
+            gh pr create --repo TipLink/fineas-centaur-infra --base main --head "${PROMOTION_BRANCH}" --title "${title}" --body "${body}"
+          fi
