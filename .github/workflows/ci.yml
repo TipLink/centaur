@@ -13,6 +13,17 @@ permissions:
   contents: read
 
 jobs:
+  sandbox-config-tests:
+    name: Sandbox Codex config tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Test sandbox Codex config generation
+        run: python3 services/sandbox/test_configure_codex_config.py
+
   migration-order:
     name: Migration order
     runs-on: ubuntu-latest

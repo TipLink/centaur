@@ -194,8 +194,8 @@ RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace 
 
 # ==============================================================================
 # Final thin stage: only frequently-changing local files below.
-# Changing harness_session.py / SYSTEM_PROMPT.md / entrypoint.sh rebuilds only
-# the COPY layers — the entire toolchain stage stays cached.
+# Changing harness_session.py / SYSTEM_PROMPT.md / entrypoint.sh / config helpers
+# rebuilds only the COPY layers — the entire toolchain stage stays cached.
 # ==============================================================================
 
 FROM toolchain AS sandbox
@@ -213,6 +213,7 @@ COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/workflow-python/workflow_host.py /usr/local/bin/workflow-host
 COPY --link --chmod=755 services/sandbox/git-branch.sh /usr/local/bin/git-branch
 COPY --link --chmod=755 services/sandbox/install_tool_shims.py /usr/local/bin/install-tool-shims
+COPY --link --chmod=755 services/sandbox/configure_codex_config.py /usr/local/bin/configure-codex-config
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 
 USER agent
