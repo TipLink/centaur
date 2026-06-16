@@ -1640,18 +1640,19 @@ function slackTimestampToIso(ts: string): string {
 }
 
 function normalizeSlackText(input: string): string {
-  return input
-    .replace(/<([a-z]+:\/\/[^>|]+)\|([^>]+)>/gi, '$2 ($1)')
-    .replace(/<([a-z]+:\/\/[^>]+)>/gi, '$1')
-    .replace(/<#([A-Z0-9]+)\|([^>]+)>/g, '#$2')
-    .replace(/<#([A-Z0-9]+)>/g, '#$1')
-    .replace(/<@([A-Z0-9]+)>/g, '@$1')
-    .replace(/<!subteam\^([A-Z0-9]+)\|([^>]+)>/g, '@$2')
-    .replace(/<!(channel|here|everyone)>/g, '@$1')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
+  return decodeSlackEntities(input)
+    .replace(/<([a-z]+:\/\/[^>|]+)\|([^>]+)>/gi, (_match, url, label) => `${label} (${url})`)
+    .replace(/<([a-z]+:\/\/[^>]+)>/gi, (_match, url) => url)
+    .replace(/<#([A-Z0-9]+)\|([^>]+)>/g, (_match, _channel, label) => `#${label}`)
+    .replace(/<#([A-Z0-9]+)>/g, (_match, channel) => `#${channel}`)
+    .replace(/<@([A-Z0-9]+)>/g, (_match, user) => `@${user}`)
+    .replace(/<!subteam\^([A-Z0-9]+)\|([^>]+)>/g, (_match, _subteam, label) => `@${label}`)
+    .replace(/<!(channel|here|everyone)>/g, (_match, target) => `@${target}`)
     .trim()
+}
+
+function decodeSlackEntities(input: string): string {
+  return input.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
 }
 
 function rendererOptions(thread: Thread, options: SlackbotV2Options): CodexAppServerToChatStreamOptions {

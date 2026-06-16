@@ -1,6 +1,7 @@
 import base64
 import email.message
 import json
+from urllib.parse import urlparse
 
 import pytest
 from slack.client import SlackAuthError, SlackClient, SlackRateLimitError
@@ -821,7 +822,7 @@ def test_download_file_stores_attachment(monkeypatch: pytest.MonkeyPatch) -> Non
     posted: dict = {}
 
     def fake_urlopen(req, *args, **kwargs):
-        if "files.slack.com" in req.full_url:
+        if urlparse(req.full_url).hostname == "files.slack.com":
             assert req.get_header("Authorization") == "Bearer SLACK_BOT_TOKEN"
             return _FakeHTTPResponse(b"%PDF-1.4 report", "application/pdf")
         if req.full_url.endswith("/agent/attachments/upload"):

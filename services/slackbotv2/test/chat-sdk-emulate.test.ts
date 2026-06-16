@@ -3830,7 +3830,7 @@ async function handlePatchedSlackRequest(
     }
     if (input.threadMessageFiles.size > 0) {
       const rawBody = await request.arrayBuffer()
-      const proxied = await fetch(new URL(`${path}${url.search}`, input.upstreamUrl), {
+      const proxied = await fetch(slackApiProxyUrl(path, url.search, input.upstreamUrl), {
         method: request.method,
         headers: request.headers,
         body: rawBody.byteLength > 0 ? rawBody : undefined
@@ -3852,12 +3852,31 @@ async function handlePatchedSlackRequest(
   }
 
   const body = await request.arrayBuffer()
-  const proxied = await fetch(new URL(`${path}${url.search}`, input.upstreamUrl), {
+  const proxied = await fetch(slackApiProxyUrl(path, url.search, input.upstreamUrl), {
     method: request.method,
     headers: request.headers,
     body: body.byteLength > 0 ? body : undefined
   })
   await sendWebResponse(res, proxied)
+}
+
+function slackApiProxyUrl(path: string, search: string, upstreamUrl: string): URL {
+  const target = new URL(upstreamUrl)
+  switch (path) {
+    case '/api/chat.postMessage':
+      target.pathname = '/api/chat.postMessage'
+      break
+    case '/api/chat.update':
+      target.pathname = '/api/chat.update'
+      break
+    case '/api/conversations.replies':
+      target.pathname = '/api/conversations.replies'
+      break
+    default:
+      throw new Error(`unsupported Slack API proxy path: ${path}`)
+  }
+  target.search = search
+  return target
 }
 
 function loopbackUrl(value: string): string {

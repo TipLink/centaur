@@ -1085,13 +1085,29 @@ function parsePlanText(value: string): Array<{ step: string; status: RendererTas
     .split('\n')
     .map(line => {
       const trimmed = line.trim()
-      if (!/^[-*]\s+|\d+[.)]\s+/.test(trimmed)) return null
+      if (!isPlanListItem(trimmed)) return null
       return {
         step: trimmed,
-        status: /\[[xX]\]/.test(trimmed) ? ('complete' as const) : ('pending' as const)
+        status:
+          trimmed.includes('[x]') || trimmed.includes('[X]')
+            ? ('complete' as const)
+            : ('pending' as const)
       }
     })
     .filter(item => item !== null)
+}
+
+function isPlanListItem(value: string): boolean {
+  if (value.startsWith('- ') || value.startsWith('* ')) return true
+  let index = 0
+  while (index < value.length && isDigit(value.charCodeAt(index))) index += 1
+  if (index === 0 || index + 1 >= value.length) return false
+  const marker = value[index]
+  return (marker === '.' || marker === ')') && value[index + 1] === ' '
+}
+
+function isDigit(code: number): boolean {
+  return code >= 48 && code <= 57
 }
 
 function planStatus(value: string | undefined): RendererTaskStatus {
@@ -1542,10 +1558,14 @@ function unwrapShellCommand(command: string): string {
   const trimmed = command.trim()
   if (!trimmed) return trimmed
 
-  const bashLc = /^\/bin\/bash\s+-lc\s+([\s\S]+)$/i.exec(trimmed)
-  if (!bashLc?.[1]) return trimmed
+  let index = consumeLiteralIgnoreCase(trimmed, 0, '/bin/bash')
+  if (index < 0) return trimmed
+  index = consumeShellWhitespace(trimmed, index)
+  index = consumeLiteralIgnoreCase(trimmed, index, '-lc')
+  if (index < 0) return trimmed
+  if (index >= trimmed.length || !isShellWhitespace(trimmed[index])) return trimmed
 
-  let inner = bashLc[1].trim()
+  let inner = trimmed.slice(consumeShellWhitespace(trimmed, index)).trim()
   if (
     (inner.startsWith("'") && inner.endsWith("'")) ||
     (inner.startsWith('"') && inner.endsWith('"'))
@@ -1553,6 +1573,21 @@ function unwrapShellCommand(command: string): string {
     inner = inner.slice(1, -1)
   }
   return inner.trim() || trimmed
+}
+
+function consumeLiteralIgnoreCase(value: string, index: number, literal: string): number {
+  return value.slice(index, index + literal.length).toLowerCase() === literal.toLowerCase()
+    ? index + literal.length
+    : -1
+}
+
+function consumeShellWhitespace(value: string, index: number): number {
+  while (index < value.length && isShellWhitespace(value[index])) index += 1
+  return index
+}
+
+function isShellWhitespace(value: string | undefined): boolean {
+  return value === ' ' || value === '\t' || value === '\n' || value === '\r'
 }
 
 function commandExecutionTitle(index?: number): string {

@@ -11,6 +11,9 @@ on:
       - services/console/**
       - .github/workflows/console-ci.yml
 
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: services/console
