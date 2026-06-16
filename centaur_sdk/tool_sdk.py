@@ -58,8 +58,8 @@ def secret(key: str, default: str | None = None) -> str:
     """Get a secret. Resolution order: refreshed API key → tool context → backend → default.
 
     - **Refreshed API key**: ``CENTAUR_API_KEY`` prefers
-      ``/home/agent/.api_key`` when present so long-lived sandboxes use rotated
-      sandbox tokens.
+      ``/home/agent/.api_key`` when present so long-lived sandboxes can use a
+      rotated control-plane token.
     - **ToolContext**: Set by ToolManager, populated from .env files (if any).
     - **Pluggable backend**: Configured via ``centaur_sdk.backends.registry``
       (env vars, HTTP sidecar, etc.).

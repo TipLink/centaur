@@ -1,6 +1,7 @@
 import base64
 import email.message
 import json
+from urllib.parse import urlparse
 
 import pytest
 from slack.client import SlackAuthError, SlackClient, SlackRateLimitError
@@ -25,6 +26,8 @@ class _FakeWebClient:
         self.history_pages: list[dict] = []
         self.reply_calls: list[dict] = []
         self.reply_pages: list[dict] = []
+        self.open_calls: list[dict] = []
+        self.open_response: dict = {"channel": {"id": "D123"}}
         self.users_calls: list[dict] = []
         self.users_pages: list[dict] = []
         self.list_calls: list[dict] = []
@@ -57,6 +60,10 @@ class _FakeWebClient:
         self.reply_calls.append(kwargs)
         return self.reply_pages.pop(0)
 
+    def conversations_open(self, **kwargs):
+        self.open_calls.append(kwargs)
+        return self.open_response
+
     def users_list(self, **kwargs):
         self.users_calls.append(kwargs)
         return self.users_pages.pop(0)
@@ -88,9 +95,8 @@ class _FakeWebClient:
             entry: dict = {"ts": "1.1", "channel_name": "paradigm-pulse"}
             if kwargs.get("thread_ts"):
                 entry["thread_ts"] = kwargs["thread_ts"]
-            upload_channel = (kwargs.get("channels") or [kwargs.get("channel", "C123")])[0]
             self._shares_by_file[file_id] = {
-                "public": {upload_channel: [entry]}
+                "public": {kwargs.get("channel", "C123"): [entry]}
             }
         else:
             self._shares_by_file[file_id] = {}
@@ -162,6 +168,39 @@ def test_send_message_omits_unfurl_flags_by_default() -> None:
     assert fake_web_client.last_kwargs is not None
     assert "unfurl_links" not in fake_web_client.last_kwargs
     assert "unfurl_media" not in fake_web_client.last_kwargs
+
+
+def test_send_message_normalizes_escaped_line_breaks() -> None:
+    client, fake_web_client = _make_client()
+
+    client.send_message("paradigm-pulse", "*Title*\\n- one\\r\\n- two", no_attribution=True)
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["text"] == "*Title*\n- one\n- two"
+
+
+def test_send_message_opens_dm_for_user_id_destination() -> None:
+    client, fake_web_client = _make_client()
+
+    result = client.send_message("<@U123ABC>", "hello", no_attribution=True)
+
+    assert fake_web_client.open_calls == [{"users": "U123ABC"}]
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "D123"
+    assert fake_web_client.last_kwargs["text"] == "hello"
+    assert result["channel"] == "D123"
+    assert result["permalink"] == "https://slack.com/archives/D123/p123456"
+
+
+def test_send_dm_opens_dm_and_posts_message() -> None:
+    client, fake_web_client = _make_client()
+
+    client.send_dm("U234ABC", "hello", no_attribution=True, unfurl_links=False)
+
+    assert fake_web_client.open_calls == [{"users": "U234ABC"}]
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "D123"
+    assert fake_web_client.last_kwargs["unfurl_links"] is False
 
 
 def test_retry_on_ratelimit_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -553,7 +592,7 @@ def test_upload_file_accepts_channel_id_alias_and_returns_preview() -> None:
     )
 
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channels"] == ["C123"]
+    assert fake_web_client.last_kwargs["channel"] == "C123"
     assert fake_web_client.last_kwargs["filename"] == "data.csv"
     assert fake_web_client.last_kwargs["file"] == b"a,b\n1,2\n"
     assert result["preview"] == {
@@ -579,7 +618,7 @@ def test_upload_file_infers_slack_thread_from_tool_context() -> None:
         reset_tool_context(token)
 
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channels"] == ["C123"]
+    assert fake_web_client.last_kwargs["channel"] == "C123"
     assert fake_web_client.last_kwargs["thread_ts"] == "1777910337.403889"
     assert fake_web_client.last_kwargs["initial_comment"] == "Uploaded `chart.png`."
 
@@ -602,7 +641,7 @@ def test_upload_file_infers_destination_from_team_scoped_thread_key() -> None:
         reset_tool_context(token)
 
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channels"] == ["C123"]
+    assert fake_web_client.last_kwargs["channel"] == "C123"
     assert fake_web_client.last_kwargs["thread_ts"] == "1780035646.228899"
 
 
@@ -736,7 +775,7 @@ def test_upload_file_can_infer_destination_without_channel_arg() -> None:
         reset_tool_context(token)
 
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channels"] == ["C123"]
+    assert fake_web_client.last_kwargs["channel"] == "C123"
     assert fake_web_client.last_kwargs["thread_ts"] == "1777910337.403889"
 
 
@@ -783,7 +822,7 @@ def test_download_file_stores_attachment(monkeypatch: pytest.MonkeyPatch) -> Non
     posted: dict = {}
 
     def fake_urlopen(req, *args, **kwargs):
-        if "files.slack.com" in req.full_url:
+        if urlparse(req.full_url).hostname == "files.slack.com":
             assert req.get_header("Authorization") == "Bearer SLACK_BOT_TOKEN"
             return _FakeHTTPResponse(b"%PDF-1.4 report", "application/pdf")
         if req.full_url.endswith("/agent/attachments/upload"):
