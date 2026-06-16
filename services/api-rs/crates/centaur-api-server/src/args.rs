@@ -20,7 +20,7 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, ToolSource, ToolsConfig,
+    OtlpEgressTarget, OverlayImageConfig, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -482,6 +482,28 @@ struct SandboxArgs {
     )]
     image_pull_secrets: Vec<String>,
     #[arg(
+        long = "session-sandbox-overlay-image",
+        env = "SESSION_SANDBOX_OVERLAY_IMAGE"
+    )]
+    overlay_image: Option<String>,
+    #[arg(
+        long = "session-sandbox-overlay-image-pull-policy",
+        env = "SESSION_SANDBOX_OVERLAY_IMAGE_PULL_POLICY"
+    )]
+    overlay_image_pull_policy: Option<String>,
+    #[arg(
+        long = "session-sandbox-overlay-image-source-path",
+        env = "SESSION_SANDBOX_OVERLAY_IMAGE_SOURCE_PATH",
+        default_value = "/overlay"
+    )]
+    overlay_image_source_path: String,
+    #[arg(
+        long = "session-sandbox-overlay-mount-path",
+        env = "SESSION_SANDBOX_OVERLAY_MOUNT_PATH",
+        default_value = "/home/agent/overlay/org"
+    )]
+    overlay_mount_path: String,
+    #[arg(
         long = "session-sandbox-ready-timeout-secs",
         alias = "kubernetes-sandbox-ready-timeout-s",
         env = "SESSION_SANDBOX_READY_TIMEOUT_SECS",
@@ -780,7 +802,10 @@ impl SandboxArgs {
 
     fn agent_k8s_workflow_dirs(&self) -> String {
         let Some(config) = self.tools_source.to_config() else {
-            return "/opt/centaur/workflows".to_owned();
+            return self
+                .overlay_image_config()
+                .map(|overlay| format!("{}/workflows", overlay.mount_path.trim_end_matches('/')))
+                .unwrap_or_else(|| "/opt/centaur/workflows".to_owned());
         };
         // The base tools repo and every `extra_sources` entry each ship a
         // `workflows/` tree at the repo root (sibling of the tools subdir). The
@@ -799,6 +824,12 @@ impl SandboxArgs {
                 .iter()
                 .map(|source| format!("{SANDBOX_REPOS_MOUNT_PATH}/{}/workflows", source.repo)),
         );
+        if let Some(overlay) = self.overlay_image_config() {
+            dirs.push(format!(
+                "{}/workflows",
+                overlay.mount_path.trim_end_matches('/')
+            ));
+        }
         dirs.join(":")
     }
 
@@ -1203,6 +1234,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         }
         config.iron_control = args.iron_control.settings();
         config.tools = args.tools_source.to_config();
+        config.overlay_image = args.overlay_image_config();
         // Direct harness OTLP export (codex usage/cost spans) needs a hole in
         // the per-sandbox egress NetworkPolicy; derived from the sandbox's own
         // OTLP endpoint env so there is a single source of truth.
@@ -1217,6 +1249,25 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             ));
         }
         Ok(config)
+    }
+}
+
+impl SandboxArgs {
+    fn overlay_image_config(&self) -> Option<OverlayImageConfig> {
+        let image = clean_optional_value(self.overlay_image.as_deref())?;
+        let mut config = OverlayImageConfig::new(image);
+        if let Some(policy) = clean_optional_value(self.overlay_image_pull_policy.as_deref()) {
+            config = config.image_pull_policy(policy);
+        }
+        if let Some(source_path) =
+            clean_optional_value(Some(self.overlay_image_source_path.as_str()))
+        {
+            config = config.source_path(source_path);
+        }
+        if let Some(mount_path) = clean_optional_value(Some(self.overlay_mount_path.as_str())) {
+            config = config.mount_path(mount_path);
+        }
+        Some(config)
     }
 }
 
@@ -1906,6 +1957,38 @@ mod tests {
     }
 
     #[test]
+    fn overlay_image_config_read_from_flags() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--session-sandbox-overlay-image",
+            "ghcr.io/tiplink/fineas-centaur-overlay:sha-test",
+            "--session-sandbox-overlay-image-pull-policy",
+            "IfNotPresent",
+            "--session-sandbox-overlay-image-source-path",
+            "/overlay",
+            "--session-sandbox-overlay-mount-path",
+            "/home/agent/overlay/org",
+        ])
+        .unwrap();
+
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let overlay = config.overlay_image.expect("overlay should be configured");
+        assert_eq!(
+            overlay.image,
+            "ghcr.io/tiplink/fineas-centaur-overlay:sha-test"
+        );
+        assert_eq!(overlay.image_pull_policy.as_deref(), Some("IfNotPresent"));
+        assert_eq!(overlay.source_path, "/overlay");
+        assert_eq!(overlay.mount_path, "/home/agent/overlay/org");
+    }
+
+    #[test]
     fn agent_k8s_workflow_dirs_fan_out_across_extra_sources() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -1921,6 +2004,10 @@ mod tests {
             "centaur-agent:test",
             "--kubernetes-tools-extra-sources",
             r#"[{"repo":"acme/overlay"},{"repo":"acme/other","subdir":"packages/tools"}]"#,
+            "--session-sandbox-overlay-image",
+            "ghcr.io/acme/runtime-overlay:sha-test",
+            "--session-sandbox-overlay-mount-path",
+            "/home/agent/overlay/org",
         ])
         .unwrap();
 
@@ -1930,7 +2017,8 @@ mod tests {
             args.sandbox.agent_k8s_workflow_dirs(),
             "/home/agent/github/paradigmxyz/centaur/workflows:\
              /home/agent/github/acme/overlay/workflows:\
-             /home/agent/github/acme/other/workflows",
+             /home/agent/github/acme/other/workflows:\
+             /home/agent/overlay/org/workflows",
         );
     }
 

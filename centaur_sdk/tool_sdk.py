@@ -15,6 +15,8 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+CENTAUR_API_KEY_FILE = Path("/home/agent/.api_key")
+
 
 @dataclass
 class ToolContext:
@@ -44,13 +46,29 @@ def get_tool_context() -> ToolContext:
 # ---------------------------------------------------------------------------
 
 
-def secret(key: str, default: str | None = None) -> str:
-    """Get a secret. Resolution order: tool context → pluggable backend → default.
+def _refreshed_centaur_api_key() -> str | None:
+    try:
+        value = CENTAUR_API_KEY_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
 
+
+def secret(key: str, default: str | None = None) -> str:
+    """Get a secret. Resolution order: refreshed API key → tool context → backend → default.
+
+    - **Refreshed API key**: ``CENTAUR_API_KEY`` prefers
+      ``/home/agent/.api_key`` when present so long-lived sandboxes can use a
+      rotated control-plane token.
     - **ToolContext**: Set by ToolManager, populated from .env files (if any).
     - **Pluggable backend**: Configured via ``centaur_sdk.backends.registry``
       (env vars, HTTP sidecar, etc.).
     """
+    if key == "CENTAUR_API_KEY":
+        val = _refreshed_centaur_api_key()
+        if val is not None:
+            return val
+
     # 1. Check tool context if available (server mode)
     try:
         ctx = _tool_ctx.get()
