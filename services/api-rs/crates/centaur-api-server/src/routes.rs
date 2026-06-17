@@ -120,10 +120,7 @@ pub fn build_router_with_session_and_workflow_runtime(
             "/api/workflows/runs/{run_id}/cancel",
             post(cancel_workflow_run),
         )
-        .route(
-            "/workflows/runs/{run_id}/cancel",
-            post(cancel_workflow_run),
-        )
+        .route("/workflows/runs/{run_id}/cancel", post(cancel_workflow_run))
         .route("/api/workflows/events", post(emit_workflow_event))
         .route("/workflows/events", post(emit_workflow_event))
         .route("/api/webhooks/{slug}", any(invoke_workflow_webhook))
@@ -352,7 +349,9 @@ async fn list_workflow_runs(
             query.parent_run_id.as_deref(),
         )
         .await?;
-    Ok(Json(json!({ "ok": true, "runs": runs.clone(), "items": runs })))
+    Ok(Json(
+        json!({ "ok": true, "runs": runs.clone(), "items": runs }),
+    ))
 }
 
 async fn list_workflow_schedules(
