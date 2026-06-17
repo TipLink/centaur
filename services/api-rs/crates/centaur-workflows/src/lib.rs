@@ -748,9 +748,7 @@ impl WorkflowRuntime {
         .fetch_all(self.inner.client.pool())
         .await?;
 
-        rows.into_iter()
-            .map(workflow_checkpoint_from_row)
-            .collect()
+        rows.into_iter().map(workflow_checkpoint_from_row).collect()
     }
 
     pub async fn emit_event(
@@ -2220,8 +2218,7 @@ async fn run_python_workflow_host_local(
             }
             Some(message_type) if message_type.starts_with("ctx.") => {
                 let response =
-                    handle_python_context_request(&message, &ctx, &session_runtime, &input)
-                        .await?;
+                    handle_python_context_request(&message, &ctx, &session_runtime, &input).await?;
                 write_host_message(&mut stdin, &response).await?;
             }
             other => {
@@ -2353,8 +2350,7 @@ where
             }
             Some(message_type) if message_type.starts_with("ctx.") => {
                 let response =
-                    handle_python_context_request(&message, &ctx, &session_runtime, &input)
-                        .await?;
+                    handle_python_context_request(&message, &ctx, &session_runtime, &input).await?;
                 write_host_message(stdin, &response).await?;
             }
             other => {
