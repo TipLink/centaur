@@ -1,5 +1,5 @@
 import type { Logger, Message } from 'chat'
-import type { JsonValue, SlackbotV2Options } from './types'
+import type { JsonObject, JsonValue, SlackbotV2Options } from './types'
 import { isJsonObject, stringValue } from './utils'
 
 type RawSlackBotProfile = {
@@ -12,10 +12,16 @@ type RawSlackEvent = {
   app_id?: JsonValue
   bot_id?: JsonValue
   bot_profile?: RawSlackBotProfile
+  channel?: JsonValue
+  channel_type?: JsonValue
   source_team?: JsonValue
   subtype?: JsonValue
   team?: JsonValue
   team_id?: JsonValue
+  text?: JsonValue
+  thread_ts?: JsonValue
+  ts?: JsonValue
+  type?: JsonValue
   user?: JsonValue
   user_team?: JsonValue
 }
@@ -23,8 +29,27 @@ type RawSlackEvent = {
 type RawSlackEnvelope = {
   event?: JsonValue
   event_id?: JsonValue
+  api_app_id?: JsonValue
   team_id?: JsonValue
   type?: JsonValue
+}
+
+type SlackEventLogDetails = JsonObject & {
+  app_id?: string
+  bot_id?: string
+  channel_id?: string
+  channel_type?: string
+  event_id?: string
+  event_subtype?: string
+  event_type?: string
+  is_mention?: boolean
+  message_id?: string
+  message_ts?: string
+  raw_text_mentions_bot?: boolean
+  team_id?: string
+  thread_id?: string
+  thread_ts?: string
+  user_id?: string
 }
 
 export function isAllowedSlackWebhookBody(
@@ -67,6 +92,7 @@ export function isAllowedSlackMessage(
   const externalTeamId = raw ? externalSlackTeamId(raw) : undefined
   if (externalTeamId && !new Set(allowedExternalTeamIds).has(externalTeamId)) {
     logger.warn('slackbotv2_event_ignored_external_org_not_allowlisted', {
+      ...slackMessageLogDetails(message),
       external_team_id: externalTeamId,
       message_id: message.id,
       thread_id: message.threadId
@@ -79,6 +105,7 @@ export function isAllowedSlackMessage(
   const botAuthored = message.author.isBot === true || (raw ? isBotAuthoredSlackEvent(raw) : false)
   if (botAuthored && !(raw && isAllowedTriggerBotMessage(raw, triggerBotAllowlist))) {
     logger.warn('slackbotv2_event_ignored_bot_not_allowlisted', {
+      ...slackMessageLogDetails(message),
       message_id: message.id,
       thread_id: message.threadId
     })
@@ -86,6 +113,64 @@ export function isAllowedSlackMessage(
   }
 
   return true
+}
+
+export function slackWebhookEventLogDetails(
+  rawBody: string,
+  botUserId?: string
+): SlackEventLogDetails | null {
+  let payload: unknown
+  try {
+    payload = JSON.parse(rawBody)
+  } catch {
+    return null
+  }
+  if (!isRawSlackEnvelope(payload) || payload.type !== 'event_callback') return null
+  const event = isRawSlackEvent(payload.event) ? payload.event : undefined
+  if (!event) return null
+  return {
+    app_id: stringValue(event.app_id) ?? stringValue(payload.api_app_id),
+    bot_id: stringValue(event.bot_id) ?? stringValue(event.bot_profile?.id),
+    channel_id: stringValue(event.channel),
+    channel_type: stringValue(event.channel_type),
+    event_id: stringValue(payload.event_id),
+    event_subtype: stringValue(event.subtype),
+    event_type: stringValue(event.type),
+    message_ts: stringValue(event.ts),
+    raw_text_mentions_bot: slackTextMentionsBot(stringValue(event.text), botUserId),
+    team_id: stringValue(payload.team_id) ?? stringValue(event.team_id) ?? stringValue(event.team),
+    thread_ts: stringValue(event.thread_ts),
+    user_id: stringValue(event.user) ?? stringValue(event.bot_profile?.user_id)
+  }
+}
+
+export function shouldLogSlackWebhookEvent(details: SlackEventLogDetails | null): boolean {
+  if (!details) return false
+  return Boolean(
+    details.event_type === 'app_mention'
+      || details.raw_text_mentions_bot === true
+      || details.channel_type === 'im'
+      || details.channel_type === 'mpim'
+  )
+}
+
+export function slackMessageLogDetails(message: Message): SlackEventLogDetails {
+  const raw = isRawSlackEvent(message.raw) ? message.raw : undefined
+  return {
+    app_id: raw ? stringValue(raw.app_id) ?? stringValue(raw.bot_profile?.app_id) : undefined,
+    bot_id: raw ? stringValue(raw.bot_id) ?? stringValue(raw.bot_profile?.id) : undefined,
+    channel_id: raw ? stringValue(raw.channel) : undefined,
+    channel_type: raw ? stringValue(raw.channel_type) : undefined,
+    event_subtype: raw ? stringValue(raw.subtype) : undefined,
+    event_type: raw ? stringValue(raw.type) : undefined,
+    is_mention: message.isMention === true,
+    message_id: message.id,
+    message_ts: raw ? stringValue(raw.ts) : undefined,
+    team_id: raw ? stringValue(raw.team_id) ?? stringValue(raw.team) : undefined,
+    thread_id: message.threadId,
+    thread_ts: raw ? stringValue(raw.thread_ts) : undefined,
+    user_id: message.author.userId || (raw ? stringValue(raw.user) : undefined)
+  }
 }
 
 function externalSlackTeamId(event: RawSlackEvent): string | undefined {
@@ -154,6 +239,11 @@ function splitEnvList(value: string | undefined): string[] {
     .split(/[\s,]+/)
     .map(part => part.trim())
     .filter(Boolean)
+}
+
+function slackTextMentionsBot(text: string | undefined, botUserId: string | undefined): boolean {
+  if (!text || !botUserId) return false
+  return text.includes(`<@${botUserId}>`)
 }
 
 function isRawSlackEvent(value: unknown): value is RawSlackEvent {
