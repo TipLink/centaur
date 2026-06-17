@@ -100,6 +100,11 @@ const SLACK_FALLBACK_TEXT_MAX_CHARS = 35_000
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
 
+type RenderFallbackResult =
+  | { status: 'delivered'; lastEventId: number }
+  | { status: 'failed'; error?: string; lastEventId: number }
+  | { status: 'retry'; error: string; lastEventId: number }
+
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
   const logger = options.logger ?? noopLogger
@@ -637,7 +642,7 @@ async function renderExecutionAttempt(
       })
       return 'complete'
     }
-    const fallback = await renderFallbackFinalAnswer(
+    const fallback = await renderFallbackFinalAnswerWithRetry(
       thread,
       options,
       {
@@ -648,9 +653,9 @@ async function renderExecutionAttempt(
       trace,
       replaceMessageId ? { replaceMessageId } : undefined
     )
-    if (fallback) {
+    fallbackLastEventId = fallback.lastEventId
+    if (fallback.status === 'delivered') {
       rendered = true
-      fallbackLastEventId = fallback.lastEventId
       return 'complete'
     }
     throw error
@@ -713,15 +718,38 @@ const FALLBACK_OPEN_MAX_ATTEMPTS = 4
  * so the terminal result is replayable even when the failed render already
  * consumed it), drains it without making Slack calls, and posts the terminal
  * result text once. Slack streaming is best-effort; this is the delivery
- * guarantee. Returns null when nothing could be delivered.
+ * guarantee. Retryable delivery failures stay retryable instead of clearing the
+ * render obligation as an undelivered final answer.
  */
+async function renderFallbackFinalAnswerWithRetry(
+  thread: Thread,
+  options: SlackbotV2Options,
+  source: { afterEventId: number; executionId?: string; threadId: string },
+  trace?: SlackbotV2Trace,
+  replacement?: { replaceMessageId: string }
+): Promise<RenderFallbackResult> {
+  for (let attempt = 0; ; attempt++) {
+    const fallback = await renderFallbackFinalAnswer(thread, options, source, trace, replacement)
+    if (fallback.status !== 'retry') return fallback
+
+    const delayMs = renderRetryDelayMs(attempt)
+    traceLog(options, 'slackbotv2_render_fallback_retry_scheduled', trace, {
+      error: fallback.error,
+      last_event_id: fallback.lastEventId,
+      retry_attempt: attempt + 1,
+      retry_delay_ms: delayMs
+    })
+    await sleep(delayMs)
+  }
+}
+
 async function renderFallbackFinalAnswer(
   thread: Thread,
   options: SlackbotV2Options,
   source: { afterEventId: number; executionId?: string; threadId: string },
   trace?: SlackbotV2Trace,
   replacement?: { replaceMessageId: string }
-): Promise<{ lastEventId: number } | null> {
+): Promise<RenderFallbackResult> {
   const startedAtMs = nowMs()
   let lastEventId = source.afterEventId
   try {
@@ -763,7 +791,7 @@ async function renderFallbackFinalAnswer(
         last_event_id: lastEventId,
         phase_ms: elapsedMs(startedAtMs)
       })
-      return null
+      return { status: 'failed', error: 'empty fallback final answer', lastEventId }
     }
     const fallbackText = truncateSlackText(text, SLACK_FALLBACK_TEXT_MAX_CHARS, 'Slack final answer')
     if (replacement) {
@@ -777,14 +805,38 @@ async function renderFallbackFinalAnswer(
       replacement_message_id: replacement?.replaceMessageId,
       phase_ms: elapsedMs(startedAtMs)
     })
-    return { lastEventId }
+    return { status: 'delivered', lastEventId }
   } catch (error) {
+    const retryable = isRetryableRenderFallbackError(error)
     traceLog(options, 'slackbotv2_render_fallback_failed', trace, {
       error: errorMessage(error),
-      phase_ms: elapsedMs(startedAtMs)
+      phase_ms: elapsedMs(startedAtMs),
+      retryable
     })
-    return null
+    if (retryable) {
+      return { status: 'retry', error: errorMessage(error), lastEventId }
+    }
+    return { status: 'failed', error: errorMessage(error), lastEventId }
   }
+}
+
+function isRetryableRenderFallbackError(error: unknown): boolean {
+  if (isRetryableSessionApiError(error)) return true
+  const message = errorMessage(error).toLowerCase()
+  return [
+    'aborted',
+    'connection closed',
+    'connection reset',
+    'econnrefused',
+    'econnreset',
+    'etimedout',
+    'fetch failed',
+    'network',
+    'socket closed',
+    'socket connection was closed unexpectedly',
+    'terminated',
+    'timed out'
+  ].some(fragment => message.includes(fragment))
 }
 
 function scheduleRenderObligationRecovery(
@@ -1034,7 +1086,7 @@ async function recoverRenderObligation(
         })
         return false
       }
-      const fallback = await renderFallbackFinalAnswer(
+      const fallback = await renderFallbackFinalAnswerWithRetry(
         thread,
         options,
         {
@@ -1045,9 +1097,9 @@ async function recoverRenderObligation(
         trace,
         replaceMessageId ? { replaceMessageId } : undefined
       )
-      if (!fallback) throw error
-      rendered = true
       lastEventId = Math.max(lastEventId, fallback.lastEventId)
+      if (fallback.status !== 'delivered') throw error
+      rendered = true
     }
   } finally {
     const latest = (await thread.state) ?? {}

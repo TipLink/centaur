@@ -1384,6 +1384,76 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('retries durable fallback delivery after a transient fallback post failure', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+    slackApi.failStreamAppendsAfter(1, 'message_not_in_streaming_state')
+
+    const parent = await postUserMessage('Context before a fallback post socket failure.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> run something long`, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-fallback-post-retry',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> run something long`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    slackApi.failNextChatPostMessageWithSocketError()
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'cmd-fallback-post-retry',
+          type: 'commandExecution',
+          command: 'sleep 600',
+          status: 'completed',
+          aggregatedOutput: 'done'
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-fallback-post-retry',
+      status: 'completed',
+      result_text: 'FALLBACK_POST_RETRY_VISIBLE'
+    })
+
+    await Promise.all(waits)
+    const texts = await threadTexts(parent.ts)
+    const visibleFinalReplies = texts.filter(text =>
+      text.includes('FALLBACK_POST_RETRY_VISIBLE')
+    )
+    expect(visibleFinalReplies).toHaveLength(1)
+    expect(slackApi.calls.filter(call => call.method === 'chat.startStream')).toHaveLength(1)
+    const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+    expect(threadState).toEqual(
+      expect.objectContaining({
+        activeExecution: false,
+        renderObligation: null
+      })
+    )
+  })
+
   it('rotates Slack stream segments before they reach the streaming age limit', async () => {
     process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS = '120'
     try {
@@ -3602,6 +3672,7 @@ type PatchedSlackApi = {
   calls: StreamCall[]
   close(): Promise<void>
   failRepliesWithThreadNotFound(channel: string, ts: string): void
+  failNextChatPostMessageWithSocketError(): void
   failStreamAppendsAfter(count: number, error: string): void
   failStreamStopsLongerThan(maxChars: number): void
   reset(): void
@@ -3645,6 +3716,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
   const userProfiles = new Map<string, Record<string, unknown>>()
   const userProfileRequests = new Map<string, number>()
   const threadNotFoundReplies = new Set<string>()
+  const chatPostMessageSocketFailures = { remaining: 0 }
   let maxStreamStopChars: number | null = null
   const appendFailure: { error: string; remaining: number } = { error: '', remaining: -1 }
   const streams = new Map<string, StreamRecord>()
@@ -3653,6 +3725,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
     void handlePatchedSlackRequest(req, res, {
       appendFailure,
       calls,
+      chatPostMessageSocketFailures,
       maxStreamStopChars,
       port,
       streams,
@@ -3677,6 +3750,9 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
     failRepliesWithThreadNotFound(channel: string, ts: string) {
       threadNotFoundReplies.add(slackReplyKey(channel, ts))
     },
+    failNextChatPostMessageWithSocketError() {
+      chatPostMessageSocketFailures.remaining += 1
+    },
     failStreamAppendsAfter(count: number, error: string) {
       appendFailure.remaining = count
       appendFailure.error = error
@@ -3689,6 +3765,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       maxStreamStopChars = null
       appendFailure.remaining = -1
       appendFailure.error = ''
+      chatPostMessageSocketFailures.remaining = 0
       threadNotFoundReplies.clear()
       threadMessageFiles.clear()
       streams.clear()
@@ -3714,6 +3791,7 @@ async function handlePatchedSlackRequest(
   input: {
     appendFailure: { error: string; remaining: number }
     calls: StreamCall[]
+    chatPostMessageSocketFailures: { remaining: number }
     maxStreamStopChars: number | null
     port: number
     streams: Map<string, StreamRecord>
@@ -3849,6 +3927,12 @@ async function handlePatchedSlackRequest(
       await sendWebResponse(res, Response.json(payload, { status: proxied.status }))
       return
     }
+  }
+
+  if (path === '/api/chat.postMessage' && input.chatPostMessageSocketFailures.remaining > 0) {
+    input.chatPostMessageSocketFailures.remaining -= 1
+    res.destroy(new Error('The socket connection was closed unexpectedly.'))
+    return
   }
 
   const body = await request.arrayBuffer()
