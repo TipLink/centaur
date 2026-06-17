@@ -96,6 +96,32 @@ module Api
         assert_response :unprocessable_entity
       end
 
+      test "create a github_app credential derives the endpoint and redacts the private key" do
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "github-app",
+            kind: "github_app",
+            client_id: "123456",
+            installation_id: "42",
+            private_key: "-----BEGIN RSA PRIVATE KEY-----\nMII...\n-----END RSA PRIVATE KEY-----"
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "github_app", data["kind"]
+        assert_equal "42", data["installation_id"]
+        assert_equal "https://api.github.com/app/installations/42/access_tokens", data["token_endpoint"]
+        refute data.key?("private_key")
+        assert data["next_attempt_at"].present?, "should be scheduled due"
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_includes created.private_key, "BEGIN RSA PRIVATE KEY" # persisted + decryptable
+      end
+
       test "re-auth via PUT clears dead state and reschedules" do
         bc = broker_credentials(:acme_managed_gmail)
         bc.update!(dead: true, dead_reason: "invalid_grant", failure_count: 3)

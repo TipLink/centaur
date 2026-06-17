@@ -744,10 +744,13 @@ The OAuth client credentials it refreshes with are fields on the credential, res
 | `foreign_id`                   | optional    | Unique per namespace. Immutable. |
 | `name`, `description`          | optional    | |
 | `labels`                       | optional    | |
-| `token_endpoint`               | required    | OAuth token endpoint the refresh request is sent to. |
+| `kind`                         | optional    | `oauth_refresh` (default) or `github_app`. See [the `github_app` kind](#the-github_app-kind). |
+| `token_endpoint`               | required    | OAuth token endpoint the refresh request is sent to. Optional for `github_app`, where it is derived from `installation_id`. |
 | `scopes`                       | optional    | Array of strings. |
-| `client_id`                    | required    | OAuth client id. Returned in responses. |
+| `client_id`                    | required    | OAuth client id. For `github_app`, the GitHub App id (the JWT issuer). Returned in responses. |
 | `client_secret`                | optional    | OAuth client secret. Write-only and encrypted at rest; omit for public clients. Never returned. |
+| `installation_id`              | `github_app` | GitHub App installation id. Returned in responses (not secret). |
+| `private_key`                  | `github_app` | GitHub App private key PEM. Write-only and encrypted at rest; (re)bootstraps the credential like a `refresh_token` seed. Never returned. |
 | `token_endpoint_headers`       | optional    | Object mapping header name to a string value, sent on the refresh request. Values are write-only and encrypted; only the header names are returned (as `token_endpoint_header_names`). |
 | `refresh_token`                | optional    | Write-only seed. Supplying a value (re)bootstraps the credential: it is scheduled to refresh immediately and any dead state is cleared. Never returned. |
 | `early_refresh_slack_seconds`  | optional    | Refresh this many seconds before expiry. Defaults to `300`. |
@@ -775,6 +778,26 @@ Read-only fields are returned but never accepted in requests:
 The minted `access_token`, the `refresh_token`, the `client_secret`, and the `token_endpoint_headers` values are never returned in any response.
 
 Credentials minted by the [OAuth consent flow](#oauth-consent-flow) are linked to an OAuth app and delegate their `client_id` and `client_secret` to it: rotating the app's secret applies to every credential it minted. Such a credential needs no `client_id`/`client_secret` of its own, and its `scopes` reflect exactly what the IdP granted.
+
+### The `github_app` kind
+
+GitHub App installation tokens are not an OAuth refresh-token grant: they are minted by signing a short-lived app JWT (RS256, signed with the App private key) and exchanging it at `POST /app/installations/{installation_id}/access_tokens`, which returns a `{ token, expires_at }` that expires about an hour later. A `kind: "github_app"` broker credential runs that mint on the same refresh loop as the OAuth kinds, so iron-control keeps a live installation token and delivers it through a `token_broker` source exactly like any other brokered credential. This is what keeps GitHub access working in long-lived (~48h) sandboxes, whose iron-proxy bakes its injected secrets at startup and would otherwise serve an installation token that expired within the hour.
+
+A `github_app` credential uses `client_id` as the App id (JWT issuer), `installation_id` to identify the installation (and to derive `token_endpoint` when it is omitted), and `private_key` as the signing key. It has no `refresh_token`; the `private_key` is its bootstrap seed — supplying it schedules an immediate mint and clears any dead state. Mint failures classify the same way as the OAuth kinds: a transient/5xx failure backs off, while a `401`/`403`/`404`/`422` (bad app, wrong installation, revoked key) marks the credential dead until a human re-supplies the key.
+
+The fleet's GitHub credential is provisioned out of band, mirroring `openai-codex`, from the `fineas-github-app` secret material (`app-id`, `installation-id`, `private-key`):
+
+```
+centaur-perms broker create \
+  --namespace default \
+  --foreign-id github-app \
+  --kind github_app \
+  --client-id "$GITHUB_APP_ID" \
+  --installation-id "$GITHUB_APP_INSTALLATION_ID" \
+  --private-key "$GITHUB_APP_PRIVATE_KEY"
+```
+
+The iron-proxy infra fragment references it as `{ type: token_broker, credential_id: github-app }` for `github.com` / `api.github.com`, replacing the former static `GITHUB_TOKEN` placeholder.
 
 ### Create
 

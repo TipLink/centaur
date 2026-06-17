@@ -21,9 +21,12 @@ fn harness_auth_fragments_are_baked_in() {
 
     let infra = infra_fragment().unwrap();
     let placeholders = placeholder_env(&[infra]);
-    for name in ["AMP_API_KEY", "GITHUB_TOKEN", "SLACK_BOT_TOKEN"] {
+    for name in ["AMP_API_KEY", "SLACK_BOT_TOKEN"] {
         assert_eq!(placeholders.get(name).map(String::as_str), Some(name));
     }
+    // GitHub resolves through the token broker (credential_id github-app), not a
+    // replace placeholder, so it contributes no sandbox placeholder env.
+    assert!(!placeholders.contains_key("GITHUB_TOKEN"));
 }
 
 #[test]

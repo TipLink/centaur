@@ -373,6 +373,19 @@ pub struct BrokerCredentialInput {
     pub client_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
+    /// Mint strategy: ``oauth_refresh`` (default in iron-control when omitted) or
+    /// ``github_app``. For ``github_app`` the credential mints a GitHub App
+    /// installation token from ``client_id`` (the App id), ``installation_id``,
+    /// and ``private_key`` instead of running the refresh_token grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// GitHub App installation id (``github_app`` kind only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<String>,
+    /// GitHub App private key PEM (``github_app`` kind only; write-only,
+    /// encrypted at rest, never echoed back).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub token_endpoint_headers: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]

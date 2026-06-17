@@ -267,4 +267,84 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     source.destroy!
     assert cred.destroy
   end
+
+  # --- github_app kind ------------------------------------------------------
+
+  # A stub github-app client returning a fixed Result or raising a fixed error.
+  class StubGithubClient
+    def initialize(&block) = (@block = block)
+    def mint(**kw) = @block.call(**kw)
+  end
+
+  def build_github_credential(**overrides)
+    build_credential({
+      kind: "github_app", client_id: "123456", installation_id: "42",
+      private_key: "PEM", client_secret: nil, refresh_token: nil, token_endpoint: nil
+    }.merge(overrides))
+  end
+
+  test "kind must be one of the known kinds" do
+    refute build_credential(kind: "nonsense").valid?
+  end
+
+  test "github_app derives its installations token endpoint from the installation id" do
+    bc = build_github_credential
+    assert bc.valid?, bc.errors.full_messages.to_sentence
+    assert_equal "https://api.github.com/app/installations/42/access_tokens", bc.token_endpoint
+  end
+
+  test "github_app requires an installation id and a private key" do
+    refute build_github_credential(installation_id: nil).valid?
+    refute build_github_credential(private_key: nil, token_endpoint: "https://api.github.com/app/installations/42/access_tokens").valid?
+  end
+
+  test "github_app private key is encrypted at rest" do
+    bc = build_github_credential
+    bc.save!
+    raw = BrokerCredential.connection.select_one(
+      "SELECT private_key FROM broker_credentials WHERE id = #{bc.id}"
+    )
+    refute_includes raw["private_key"].to_s, "PEM"
+    assert_equal "PEM", bc.reload.private_key
+  end
+
+  test "github_app refresh mints via the github client without a refresh_token" do
+    now = Time.current
+    captured = {}
+    bc = build_github_credential
+    bc.save!
+    bc.github_app_client = StubGithubClient.new do |**kw|
+      captured = kw
+      Broker::RefreshClient::Result.new(access_token: "ghs_live", refresh_token: nil, expires_in: 3600)
+    end
+    bc.refresh!(now: now)
+    bc.reload
+    assert_equal "live", bc.status
+    assert_equal "ghs_live", bc.access_token
+    assert_nil bc.refresh_token
+    assert_equal "123456", captured[:app_id]
+    assert_equal "PEM", captured[:private_key]
+    assert_equal "https://api.github.com/app/installations/42/access_tokens", captured[:token_endpoint]
+    assert_in_delta (now + 3600).to_f, bc.expires_at.to_f, 1
+  end
+
+  test "github_app with a blank refresh_token is not treated as un-bootstrapped" do
+    bc = build_github_credential
+    bc.save!
+    bc.github_app_client = StubGithubClient.new { Broker::RefreshClient::Result.new(access_token: "ghs", refresh_token: nil, expires_in: 60) }
+    bc.refresh!
+    bc.reload
+    refute bc.dead?
+    assert_equal "ghs", bc.access_token
+  end
+
+  test "github_app unrecoverable mint failure marks the credential dead" do
+    bc = build_github_credential
+    bc.save!
+    bc.github_app_client = StubGithubClient.new { raise Broker::RefreshError.new("bad app", stage: "oauth", code: "github_401", retryable: false) }
+    bc.refresh!
+    bc.reload
+    assert bc.dead?
+    assert_equal "github_401", bc.dead_reason
+  end
 end

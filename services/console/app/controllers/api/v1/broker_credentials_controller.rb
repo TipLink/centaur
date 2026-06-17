@@ -49,7 +49,7 @@ module Api
 
       def assign_and_save!(ref, attrs)
         base = attrs.permit(:namespace, :foreign_id, :name, :description, :token_endpoint,
-                            :client_id, :client_secret,
+                            :kind, :client_id, :client_secret, :installation_id,
                             :early_refresh_slack_seconds, :early_refresh_fraction,
                             :max_refresh_interval_seconds, :refresh_timeout_seconds,
                             labels: {}, scopes: [])
@@ -63,6 +63,7 @@ module Api
           ref.assign_attributes(base)
           apply_token_endpoint_headers(ref, attrs)
           apply_refresh_token_seed(ref, attrs)
+          apply_private_key_seed(ref, attrs)
           ref.save!
           ref.reload
         end
@@ -92,6 +93,22 @@ module Api
         ref.next_attempt_at = Time.current
       end
 
+      # The github_app private key is write-only signing material (encrypted at
+      # rest, never serialized back). It is the github_app equivalent of the
+      # refresh_token seed: supplying it (re)bootstraps the credential -- resets it
+      # to "due now" and clears any dead state so the next poll mints immediately.
+      # A blank/absent value on update leaves the stored key untouched.
+      def apply_private_key_seed(ref, attrs)
+        seed = attrs[:private_key]
+        return if seed.blank?
+
+        ref.private_key = seed
+        ref.dead = false
+        ref.dead_reason = nil
+        ref.failure_count = 0
+        ref.next_attempt_at = Time.current
+      end
+
       # Observability only. The client_secret, the token_endpoint_headers values,
       # the minted access_token, and the refresh_token are deliberately never
       # included; only the header names are surfaced.
@@ -103,9 +120,12 @@ module Api
           name: ref.name,
           description: ref.description,
           labels: ref.labels,
+          kind: ref.kind,
           token_endpoint: ref.token_endpoint,
           scopes: ref.scopes,
           client_id: ref.client_id,
+          # github_app provenance (not secret); the private_key is never serialized.
+          installation_id: ref.installation_id,
           token_endpoint_header_names: (ref.token_endpoint_headers || {}).keys,
           early_refresh_slack_seconds: ref.early_refresh_slack_seconds,
           early_refresh_fraction: ref.early_refresh_fraction,

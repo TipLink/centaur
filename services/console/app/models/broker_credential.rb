@@ -21,6 +21,15 @@ class BrokerCredential < ApplicationRecord
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
 
+  # How the access token is minted. `oauth_refresh` runs the RFC 6749 4.5
+  # refresh_token grant (the original behavior; default for every existing row).
+  # `github_app` mints a GitHub App installation token from the App private key
+  # (see Broker::GithubAppClient) -- it has no refresh_token to rotate, so it is
+  # bootstrapped by its private_key/installation_id rather than a seed token.
+  OAUTH_REFRESH_KIND = "oauth_refresh".freeze
+  GITHUB_APP_KIND = "github_app".freeze
+  KINDS = [ OAUTH_REFRESH_KIND, GITHUB_APP_KIND ].freeze
+
   # The access token must keep at least this much life past the scheduled
   # refresh, regardless of slack/fraction. Mirrors the 60s floor in
   # iron-token-broker's nextRefreshAt.
@@ -44,7 +53,7 @@ class BrokerCredential < ApplicationRecord
   # source still references the credential.
   has_one :static_secret, dependent: :nullify
 
-  attr_writer :refresh_client
+  attr_writer :refresh_client, :github_app_client
 
   # Refuse to delete a credential that token_broker sources still reference: there
   # is no FK to cascade or nullify, so deletion would silently leave those secrets
@@ -57,15 +66,28 @@ class BrokerCredential < ApplicationRecord
   encrypts :refresh_token
   encrypts :client_secret
   encrypts :token_endpoint_headers
+  # The GitHub App private key (github_app kind only) is long-lived config, not a
+  # rotating blob, but it is signing material -- encrypted at rest, never serialized.
+  encrypts :private_key
+
+  # github_app credentials derive their installations token endpoint from the
+  # installation id, so an operator only has to supply the installation id.
+  before_validation :derive_github_app_token_endpoint, if: :github_app?
 
   scope :refreshable, -> {
     where(dead: false).where("next_attempt_at IS NULL OR next_attempt_at <= ?", Time.current)
   }
 
+  validates :kind, inclusion: { in: KINDS, message: "must be one of #{KINDS.join(", ")}" }
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
   validates :foreign_id, uniqueness: { scope: :namespace, allow_nil: true },
             format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }, allow_nil: true
   validates :token_endpoint, presence: true
+  # github_app credentials carry no installation id / private key for the OAuth
+  # kinds, so gate those requirements on the kind. client_id (the App id, used as
+  # the JWT issuer) is already required below via the standalone-credential rule.
+  validates :installation_id, presence: true, if: :github_app?
+  validates :private_key, presence: true, if: :github_app?
   # client_id is sourced from the linked OauthApp for flow-minted credentials, so
   # it is only required on standalone (operator-authored) credentials.
   validates :client_id, presence: true, unless: :oauth_app_id?
@@ -84,6 +106,17 @@ class BrokerCredential < ApplicationRecord
   # credential it minted; standalone credentials use their own columns.
   def effective_client_id     = oauth_app&.client_id || client_id
   def effective_client_secret = oauth_app ? oauth_app.client_secret : client_secret
+
+  def github_app? = kind == GITHUB_APP_KIND
+
+  # The GitHub App installations token endpoint, derived from the installation id
+  # so operators supply only the id. Left untouched if explicitly provided.
+  def derive_github_app_token_endpoint
+    return if installation_id.blank?
+    return if token_endpoint.present?
+    self.token_endpoint =
+      "https://api.github.com/app/installations/#{installation_id}/access_tokens"
+  end
 
   # bootstrapping: seeded but never refreshed; dead: needs human re-auth;
   # live: has minted at least one access token.
@@ -123,12 +156,15 @@ class BrokerCredential < ApplicationRecord
   def refresh!(now: Time.current)
     with_lock do
       return if dead?
-      if refresh_token.blank?
+      # oauth_refresh needs a bootstrapped refresh_token; github_app is
+      # bootstrapped by its private_key/installation_id (validated at save), so it
+      # has no equivalent "blob not bootstrapped" precondition.
+      if !github_app? && refresh_token.blank?
         mark_dead!("blob_not_bootstrapped")
         return
       end
 
-      result = perform_refresh(now: now)
+      result = github_app? ? perform_github_app_mint(now: now) : perform_refresh(now: now)
       apply_success!(result, now: now)
     rescue Broker::RefreshError => e
       if e.retryable?
@@ -143,6 +179,19 @@ class BrokerCredential < ApplicationRecord
 
   def refresh_client
     @refresh_client ||= Broker::RefreshClient.new
+  end
+
+  def github_app_client
+    @github_app_client ||= Broker::GithubAppClient.new
+  end
+
+  def perform_github_app_mint(now:)
+    github_app_client.mint(
+      token_endpoint: token_endpoint,
+      app_id: effective_client_id,
+      private_key: private_key,
+      timeout: refresh_timeout_seconds
+    )
   end
 
   def perform_refresh(now:)

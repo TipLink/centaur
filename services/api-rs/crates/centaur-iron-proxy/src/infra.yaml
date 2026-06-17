@@ -14,9 +14,19 @@ transforms:
             proxy_value: AMP_API_KEY
             match_headers: ["Authorization"]
           rules: [{ host: ampcode.com }]
-        - replace:
-            proxy_value: GITHUB_TOKEN
-            match_headers: ["Authorization"]
+        # GitHub App installation tokens expire ~1h after mint, so a static
+        # placeholder baked into the sandbox at start goes stale within a
+        # long-lived (~48h) sandbox. Resolve through the token broker instead:
+        # the `github-app` broker credential is managed by iron-control (a
+        # `github_app` BrokerCredential, provisioned out of band via
+        # `centaur-perms broker create --kind github_app`) which mints and
+        # rotates the installation token, so every request gets a live token.
+        - source:
+            type: token_broker
+            credential_id: github-app
+          inject:
+            header: Authorization
+            formatter: "Bearer {{.Value}}"
           rules:
             - { host: github.com }
             - { host: api.github.com }

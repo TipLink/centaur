@@ -155,15 +155,23 @@ struct BrokerSelector {
 #[derive(Args, Debug)]
 struct BrokerCreateArgs {
     /// Stable upsert key for the credential (also what a `token_broker` source
-    /// references via `credential_id`), e.g. `openai-codex`.
+    /// references via `credential_id`), e.g. `openai-codex` or `github-app`.
     #[arg(long)]
     foreign_id: String,
 
-    /// OAuth token endpoint iron-control POSTs the refresh against.
+    /// Mint strategy: `oauth_refresh` (default) or `github_app`. `github_app`
+    /// mints a GitHub App installation token from `--client-id` (the App id),
+    /// `--installation-id`, and `--private-key` instead of an OAuth refresh.
     #[arg(long)]
-    token_endpoint: String,
+    kind: Option<String>,
 
-    /// OAuth client id (literal, not secret; echoed back by iron-control).
+    /// OAuth token endpoint iron-control POSTs the refresh against. Optional for
+    /// `--kind github_app`, where it is derived from `--installation-id`.
+    #[arg(long)]
+    token_endpoint: Option<String>,
+
+    /// OAuth client id (literal, not secret; echoed back by iron-control). For
+    /// `--kind github_app` this is the GitHub App id (the JWT issuer).
     #[arg(long)]
     client_id: String,
 
@@ -171,6 +179,15 @@ struct BrokerCreateArgs {
     /// public clients.
     #[arg(long)]
     client_secret: Option<String>,
+
+    /// GitHub App installation id (`--kind github_app` only).
+    #[arg(long)]
+    installation_id: Option<String>,
+
+    /// GitHub App private key PEM (`--kind github_app` only; literal, write-only,
+    /// encrypted at rest). Escaped-newline (`\n`) PEMs are accepted.
+    #[arg(long)]
+    private_key: Option<String>,
 
     /// Seed refresh token (literal; write-only). Supplying it (re)bootstraps the
     /// credential and triggers an immediate refresh.
@@ -779,17 +796,34 @@ async fn broker_create(
         .iter()
         .map(|raw| parse_kv(raw, "--token-endpoint-header"))
         .collect::<Result<BTreeMap<_, _>>>()?;
+
+    let is_github_app = args.kind.as_deref() == Some("github_app");
+    // github_app derives its installations token endpoint from the installation
+    // id; every other kind requires an explicit --token-endpoint.
+    let token_endpoint = match args.token_endpoint.clone() {
+        Some(endpoint) => endpoint,
+        None if is_github_app => {
+            let installation_id = args.installation_id.as_deref().ok_or_else(|| {
+                eyre::eyre!("--installation-id is required for --kind github_app (or pass --token-endpoint)")
+            })?;
+            format!("https://api.github.com/app/installations/{installation_id}/access_tokens")
+        }
+        None => bail!("--token-endpoint is required"),
+    };
     let input = BrokerCredentialInput {
         namespace: cli.namespace.clone(),
         foreign_id: args.foreign_id.clone(),
         name: args.name.clone(),
         description: args.description.clone(),
         labels: managed_labels(),
-        token_endpoint: args.token_endpoint.clone(),
+        token_endpoint,
         scopes: args.scopes.clone(),
         client_id: args.client_id.clone(),
         client_secret: args.client_secret.clone(),
         refresh_token: args.refresh_token.clone(),
+        kind: args.kind.clone(),
+        installation_id: args.installation_id.clone(),
+        private_key: args.private_key.clone(),
         token_endpoint_headers,
         early_refresh_slack_seconds: args.early_refresh_slack_seconds,
         early_refresh_fraction: args.early_refresh_fraction,
