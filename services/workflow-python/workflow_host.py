@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import dataclasses
+import datetime as dt
 import importlib.util
 import inspect
 import json
@@ -28,6 +29,14 @@ from typing import Any
 
 class ProtocolError(RuntimeError):
     pass
+
+
+@dataclasses.dataclass
+class RetryPolicy:
+    limit: int = 1
+    delay: Any = None
+    backoff: str | None = None
+    max_delay: Any = None
 
 
 class WorkflowContext:
@@ -55,8 +64,16 @@ class WorkflowContext:
             }
         )
 
-    async def step(self, name: str, fn: Any, *, retry: Any = None, timeout: Any = None) -> Any:
-        del retry, timeout
+    async def step(
+        self,
+        name: str,
+        fn: Any,
+        *,
+        retry: Any = None,
+        timeout: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        del retry, timeout, kwargs
         started = await self._rpc.request({"type": "ctx.step.get", "step": name})
         if started.get("done"):
             return started.get("value")
@@ -81,6 +98,34 @@ class WorkflowContext:
 
     async def run_agent(self, text: str | None = None, **kwargs: Any) -> Any:
         return await self.agent_turn(text, **kwargs)
+
+    async def start_agent(
+        self, name: str | None = None, text: str | None = None, **kwargs: Any
+    ) -> Any:
+        del name
+        args = dict(kwargs)
+        if "trigger_key" in args and "idempotency_key" not in args:
+            args["idempotency_key"] = args["trigger_key"]
+        args.pop("eager_start", None)
+        return await self.agent_turn(text, **args)
+
+    async def sleep_until(self, name: str, when: Any) -> Any:
+        if isinstance(when, dt.datetime):
+            wake_at = when.isoformat()
+        else:
+            wake_at = str(when)
+        return await self._rpc.request(
+            {"type": "ctx.sleep_until", "step": name, "wake_at": wake_at}
+        )
+
+    async def sleep_for(self, name: str, duration: Any) -> Any:
+        if isinstance(duration, dt.timedelta):
+            seconds = duration.total_seconds()
+        else:
+            seconds = float(duration)
+        return await self._rpc.request(
+            {"type": "ctx.sleep_for", "step": name, "seconds": seconds}
+        )
 
     async def call_tool(self, tool: str, method: str, args: dict[str, Any] | None = None) -> Any:
         tool_shim = resolve_tool_shim()
@@ -222,6 +267,7 @@ def install_api_compat_module() -> None:
             sys.modules["api"] = api_mod
 
     workflow_engine = types.ModuleType("api.workflow_engine")
+    workflow_engine.RetryPolicy = RetryPolicy
     workflow_engine.WorkflowContext = WorkflowContext
     sys.modules["api.workflow_engine"] = workflow_engine
     setattr(api_mod, "workflow_engine", workflow_engine)
