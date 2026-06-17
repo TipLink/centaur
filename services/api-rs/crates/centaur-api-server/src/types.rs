@@ -68,9 +68,13 @@ pub struct EventsQuery {
     pub execution_id: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ListWorkflowRunsQuery {
     pub limit: Option<i64>,
+    pub workflow_name: Option<String>,
+    pub thread_key: Option<String>,
+    pub status: Option<String>,
+    pub parent_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
