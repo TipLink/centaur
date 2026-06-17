@@ -99,7 +99,7 @@ pub struct CreateWorkflowRunRequest {
     pub workflow_name: String,
     #[serde(default)]
     pub input: Value,
-    #[serde(default)]
+    #[serde(default, alias = "trigger_key")]
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub harness_type: Option<HarnessType>,
@@ -121,6 +121,8 @@ pub struct WorkflowRun {
     pub run_id: String,
     pub task_id: String,
     pub workflow_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_key: Option<String>,
     pub status: String,
     pub input: Value,
     pub result: Option<Value>,
@@ -128,6 +130,16 @@ pub struct WorkflowRun {
     pub attempts: i32,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkflowCheckpoint {
+    pub checkpoint_name: String,
+    pub state: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_run_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
@@ -511,6 +523,58 @@ impl WorkflowRuntime {
         Ok(runs)
     }
 
+    pub async fn list_runs_filtered(
+        &self,
+        limit: i64,
+        workflow_name: Option<&str>,
+        thread_key: Option<&str>,
+        status: Option<&str>,
+        parent_run_id: Option<&str>,
+    ) -> Result<Vec<WorkflowRun>, WorkflowRuntimeError> {
+        let limit = limit.clamp(1, 200);
+        let mut runs = Vec::new();
+        runs.extend(
+            self.list_runs_for_queue_filtered(
+                WORKFLOW_QUEUE,
+                limit,
+                workflow_name,
+                thread_key,
+                status,
+                parent_run_id,
+            )
+            .await?,
+        );
+        runs.extend(
+            self.list_runs_for_queue_filtered(
+                WORKFLOW_ETL_QUEUE,
+                limit,
+                workflow_name,
+                thread_key,
+                status,
+                parent_run_id,
+            )
+            .await?,
+        );
+        runs.extend(
+            self.list_runs_for_queue_filtered(
+                WORKFLOW_ETL_BACKFILL_QUEUE,
+                limit,
+                workflow_name,
+                thread_key,
+                status,
+                parent_run_id,
+            )
+            .await?,
+        );
+        runs.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then(b.task_id.cmp(&a.task_id))
+        });
+        runs.truncate(limit as usize);
+        Ok(runs)
+    }
+
     async fn list_runs_for_queue(
         &self,
         queue_name: &str,
@@ -537,6 +601,50 @@ impl WorkflowRuntime {
             "#,
         ))
         .bind(limit)
+        .fetch_all(self.inner.client.pool())
+        .await?;
+
+        rows.into_iter().map(workflow_run_from_row).collect()
+    }
+
+    async fn list_runs_for_queue_filtered(
+        &self,
+        queue_name: &str,
+        limit: i64,
+        workflow_name: Option<&str>,
+        thread_key: Option<&str>,
+        status: Option<&str>,
+        parent_run_id: Option<&str>,
+    ) -> Result<Vec<WorkflowRun>, WorkflowRuntimeError> {
+        let (task_table, run_table) = absurd_queue_tables(queue_name)?;
+        let rows = sqlx::query(&format!(
+            r#"
+            select
+                r.run_id::text as run_id,
+                t.task_id::text as task_id,
+                t.task_name,
+                t.params,
+                t.state,
+                t.attempts,
+                t.completed_payload,
+                r.failure_reason,
+                t.enqueue_at as created_at,
+                greatest(t.enqueue_at, coalesce(r.available_at, t.enqueue_at)) as updated_at
+            from {task_table} t
+            join {run_table} r on r.run_id = t.last_attempt_run
+            where ($2::text is null or t.params->>'workflow_name' = $2)
+              and ($3::text is null or t.params->'input'->>'thread_key' = $3)
+              and ($4::text is null or t.state = $4)
+              and ($5::text is null or t.params->'input'->'metadata'->>'parent_run_id' = $5)
+            order by t.enqueue_at desc, t.task_id desc
+            limit $1
+            "#,
+        ))
+        .bind(limit)
+        .bind(workflow_name)
+        .bind(thread_key)
+        .bind(status)
+        .bind(parent_run_id)
         .fetch_all(self.inner.client.pool())
         .await?;
 
@@ -598,6 +706,51 @@ impl WorkflowRuntime {
             }
         }
         Err(WorkflowRuntimeError::NotFound(run_id.to_owned()))
+    }
+
+    pub async fn get_run_checkpoints(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowCheckpoint>, WorkflowRuntimeError> {
+        for queue_name in [
+            WORKFLOW_QUEUE,
+            WORKFLOW_ETL_QUEUE,
+            WORKFLOW_ETL_BACKFILL_QUEUE,
+        ] {
+            if let Some(run) = self.get_run_for_queue(queue_name, run_id).await? {
+                return self
+                    .get_run_checkpoints_for_queue(queue_name, &run.task_id)
+                    .await;
+            }
+        }
+        Err(WorkflowRuntimeError::NotFound(run_id.to_owned()))
+    }
+
+    async fn get_run_checkpoints_for_queue(
+        &self,
+        queue_name: &str,
+        task_id: &str,
+    ) -> Result<Vec<WorkflowCheckpoint>, WorkflowRuntimeError> {
+        let checkpoint_table = absurd_checkpoint_table(queue_name)?;
+        let rows = sqlx::query(&format!(
+            r#"
+            select
+                checkpoint_name,
+                state,
+                owner_run_id::text as owner_run_id,
+                updated_at
+            from {checkpoint_table}
+            where task_id = $1::uuid
+            order by updated_at asc, checkpoint_name asc
+            "#,
+        ))
+        .bind(task_id)
+        .fetch_all(self.inner.client.pool())
+        .await?;
+
+        rows.into_iter()
+            .map(workflow_checkpoint_from_row)
+            .collect()
     }
 
     pub async fn emit_event(
@@ -695,6 +848,18 @@ fn absurd_queue_tables(
             "absurd.t_centaur_workflow_schedules",
             "absurd.r_centaur_workflow_schedules",
         )),
+        other => Err(WorkflowRuntimeError::Internal(format!(
+            "unknown workflow queue {other:?}"
+        ))),
+    }
+}
+
+fn absurd_checkpoint_table(queue_name: &str) -> Result<&'static str, WorkflowRuntimeError> {
+    match queue_name {
+        WORKFLOW_QUEUE => Ok("absurd.c_centaur_workflows"),
+        WORKFLOW_ETL_QUEUE => Ok("absurd.c_centaur_workflows_etl"),
+        WORKFLOW_ETL_BACKFILL_QUEUE => Ok("absurd.c_centaur_workflows_etl_backfill"),
+        WORKFLOW_SCHEDULE_QUEUE => Ok("absurd.c_centaur_workflow_schedules"),
         other => Err(WorkflowRuntimeError::Internal(format!(
             "unknown workflow queue {other:?}"
         ))),
@@ -2055,7 +2220,8 @@ async fn run_python_workflow_host_local(
             }
             Some(message_type) if message_type.starts_with("ctx.") => {
                 let response =
-                    handle_python_context_request(&message, &ctx, &session_runtime, &input).await;
+                    handle_python_context_request(&message, &ctx, &session_runtime, &input)
+                        .await?;
                 write_host_message(&mut stdin, &response).await?;
             }
             other => {
@@ -2187,7 +2353,8 @@ where
             }
             Some(message_type) if message_type.starts_with("ctx.") => {
                 let response =
-                    handle_python_context_request(&message, &ctx, &session_runtime, &input).await;
+                    handle_python_context_request(&message, &ctx, &session_runtime, &input)
+                        .await?;
                 write_host_message(stdin, &response).await?;
             }
             other => {
@@ -2312,12 +2479,45 @@ fn is_valid_prometheus_name(value: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn python_sleep_step(message: &Value) -> String {
+    message
+        .get("step")
+        .or_else(|| message.get("name"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("sleep")
+        .to_owned()
+}
+
+fn parse_python_wake_at(message: &Value) -> Result<DateTime<Utc>, String> {
+    let raw = message
+        .get("wake_at")
+        .or_else(|| message.get("when"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ctx.sleep_until requires wake_at".to_owned())?;
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|error| format!("invalid ctx.sleep_until wake_at: {error}"))
+}
+
+fn parse_python_sleep_duration(message: &Value) -> Result<Duration, String> {
+    let seconds = message
+        .get("seconds")
+        .and_then(Value::as_f64)
+        .or_else(|| message.get("duration_seconds").and_then(Value::as_f64))
+        .ok_or_else(|| "ctx.sleep_for requires seconds".to_owned())?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err("ctx.sleep_for seconds must be finite and non-negative".to_owned());
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
 async fn handle_python_context_request(
     message: &Value,
     ctx: &TaskContext,
     session_runtime: &SessionRuntime,
     input: &WorkflowTaskInput,
-) -> Value {
+) -> Result<Value, WorkflowRuntimeError> {
     let request_id = message
         .get("request_id")
         .and_then(Value::as_str)
@@ -2373,6 +2573,28 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.sleep_until") => {
+            let step = python_sleep_step(message);
+            match parse_python_wake_at(message) {
+                Ok(wake_at) => match ctx.sleep_until(&step, wake_at).await {
+                    Ok(()) => Ok(json!({"slept": true})),
+                    Err(absurd::Error::Suspend) => return Err(WorkflowRuntimeError::Suspended),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        Some("ctx.sleep_for") => {
+            let step = python_sleep_step(message);
+            match parse_python_sleep_duration(message) {
+                Ok(duration) => match ctx.sleep_for(&step, duration).await {
+                    Ok(()) => Ok(json!({"slept": true})),
+                    Err(absurd::Error::Suspend) => return Err(WorkflowRuntimeError::Suspended),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error),
+            }
+        }
         Some("ctx.call_tool") => match call_python_workflow_tool(message).await {
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
@@ -2385,7 +2607,7 @@ async fn handle_python_context_request(
         }
         other => Err(format!("unsupported context request type {other:?}")),
     };
-    match result {
+    Ok(match result {
         Ok(value) => json!({
             "type": "ctx.response",
             "request_id": request_id,
@@ -2398,7 +2620,7 @@ async fn handle_python_context_request(
             "ok": false,
             "error": error,
         }),
-    }
+    })
 }
 
 async fn run_python_agent_turn(
@@ -2898,6 +3120,10 @@ fn result_text_from_output_lines(lines: &[String]) -> String {
 fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, WorkflowRuntimeError> {
     let params: Value = row.try_get("params")?;
     let input = params.get("input").cloned().unwrap_or(Value::Null);
+    let thread_key = input
+        .get("thread_key")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let workflow_name = params
         .get("workflow_name")
         .and_then(Value::as_str)
@@ -2907,6 +3133,7 @@ fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, Work
         run_id: row.try_get("run_id")?,
         task_id: row.try_get("task_id")?,
         workflow_name,
+        thread_key,
         status: row.try_get("state")?,
         input,
         result: row.try_get("completed_payload")?,
@@ -2917,12 +3144,28 @@ fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, Work
     })
 }
 
+fn workflow_checkpoint_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<WorkflowCheckpoint, WorkflowRuntimeError> {
+    Ok(WorkflowCheckpoint {
+        checkpoint_name: row.try_get("checkpoint_name")?,
+        state: row.try_get("state")?,
+        owner_run_id: row.try_get("owner_run_id")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn absurd_error(error: WorkflowRuntimeError) -> absurd::Error {
-    absurd::Error::TaskFailed(Box::new(error))
+    match error {
+        WorkflowRuntimeError::Suspended => absurd::Error::Suspend,
+        error => absurd::Error::TaskFailed(Box::new(error)),
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum WorkflowRuntimeError {
+    #[error("workflow suspended")]
+    Suspended,
     /// The caller supplied an invalid request or workflow configuration.
     /// Maps to HTTP 400.
     #[error("{0}")]
@@ -3130,6 +3373,7 @@ mod tests {
             run_id: "run".to_owned(),
             task_id: "task".to_owned(),
             workflow_name: "workflow".to_owned(),
+            thread_key: None,
             status: "completed".to_owned(),
             input: json!({}),
             result: None,
