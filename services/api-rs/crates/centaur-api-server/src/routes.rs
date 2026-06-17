@@ -97,16 +97,35 @@ pub fn build_router_with_session_and_workflow_runtime(
         .route("/api/session/{thread_key}/events", get(stream_events))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .route("/api/workflows/schedules", get(list_workflow_schedules))
+        .route("/workflows/schedules", get(list_workflow_schedules))
         .route(
             "/api/workflows/runs",
             post(create_workflow_run).get(list_workflow_runs),
         )
+        .route(
+            "/workflows/runs",
+            post(create_workflow_run).get(list_workflow_runs),
+        )
+        .route(
+            "/api/workflows/runs/{run_id}/checkpoints",
+            get(get_workflow_run_checkpoints),
+        )
+        .route(
+            "/workflows/runs/{run_id}/checkpoints",
+            get(get_workflow_run_checkpoints),
+        )
         .route("/api/workflows/runs/{run_id}", get(get_workflow_run))
+        .route("/workflows/runs/{run_id}", get(get_workflow_run))
         .route(
             "/api/workflows/runs/{run_id}/cancel",
             post(cancel_workflow_run),
         )
+        .route(
+            "/workflows/runs/{run_id}/cancel",
+            post(cancel_workflow_run),
+        )
         .route("/api/workflows/events", post(emit_workflow_event))
+        .route("/workflows/events", post(emit_workflow_event))
         .route("/api/webhooks/{slug}", any(invoke_workflow_webhook))
         .layer(
             TraceLayer::new_for_http()
@@ -324,8 +343,16 @@ async fn list_workflow_runs(
     Query(query): Query<ListWorkflowRunsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
-    let runs = workflows.list_runs(query.limit.unwrap_or(50)).await?;
-    Ok(Json(json!({ "ok": true, "runs": runs })))
+    let runs = workflows
+        .list_runs_filtered(
+            query.limit.unwrap_or(50),
+            query.workflow_name.as_deref(),
+            query.thread_key.as_deref(),
+            query.status.as_deref(),
+            query.parent_run_id.as_deref(),
+        )
+        .await?;
+    Ok(Json(json!({ "ok": true, "runs": runs.clone(), "items": runs })))
 }
 
 async fn list_workflow_schedules(
@@ -342,7 +369,16 @@ async fn get_workflow_run(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
     let run = workflows.get_run(&run_id).await?;
-    Ok(Json(json!({ "ok": true, "run": run })))
+    Ok(Json(workflow_run_response(run)?))
+}
+
+async fn get_workflow_run_checkpoints(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workflows = workflow_runtime(&state)?;
+    let checkpoints = workflows.get_run_checkpoints(&run_id).await?;
+    Ok(Json(json!({ "ok": true, "checkpoints": checkpoints })))
 }
 
 async fn cancel_workflow_run(
@@ -351,7 +387,17 @@ async fn cancel_workflow_run(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
     workflows.cancel_run(&run_id).await?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({ "ok": true, "status": "cancelled" })))
+}
+
+fn workflow_run_response(
+    run: centaur_workflows::WorkflowRun,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let run_value = serde_json::to_value(&run)?;
+    let mut response = run_value.as_object().cloned().unwrap_or_default();
+    response.insert("ok".to_owned(), json!(true));
+    response.insert("run".to_owned(), run_value);
+    Ok(serde_json::Value::Object(response))
 }
 
 async fn emit_workflow_event(
