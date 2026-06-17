@@ -736,6 +736,15 @@ Unlike the secret types above, a broker credential is not granted directly and i
 
 The client credentials it refreshes with are fields on the credential, resolved by iron-control itself. For OAuth, `client_id` and `client_secret` are the OAuth client credentials. For GitHub Apps, `client_id` is the App ID, `client_secret` is the private key PEM, and `token_endpoint` is the installation access-token endpoint. `client_id` is not secret and is returned in responses; `client_secret` and the `token_endpoint_headers` values are encrypted at rest and never returned.
 
+GitHub traffic is wired to this broker by the built-in sandbox proxy fragment (`centaur-iron-proxy/src/infra.yaml`): `github.com` and `api.github.com` already carry a `token_broker` source referencing the `github-app` credential, so a deployment only needs to provision that credential — no per-deployment static secret. The fragment uses a `replace` (placeholder swap) rather than a header `inject`, which preserves the caller's auth scheme: `git` over HTTPS keeps its Basic `x-access-token:<token>` form (`github.com` rejects `Bearer` for git transport) while the REST API keeps `Bearer`. Provision the credential with:
+
+```
+centaur-perms broker create --namespace default --foreign-id github-app \
+  --credential-kind github_app_installation --client-id "$GITHUB_APP_ID" \
+  --client-secret "$GITHUB_APP_PRIVATE_KEY" \
+  --token-endpoint "https://api.github.com/app/installations/$GITHUB_APP_INSTALLATION_ID/access_tokens"
+```
+
 ### Attributes
 
 | Field                          | In requests | Notes |

@@ -44,12 +44,22 @@ module Broker
         base64url({ alg: "RS256", typ: "JWT" }.to_json),
         base64url(payload.to_json)
       ].join(".")
-      key = OpenSSL::PKey::RSA.new(private_key_pem)
+      key = OpenSSL::PKey::RSA.new(normalize_pem(private_key_pem))
       signature = key.sign(OpenSSL::Digest.new("SHA256"), signing_input)
       "#{signing_input}.#{base64url(signature)}"
     rescue OpenSSL::PKey::PKeyError, OpenSSL::PKey::RSAError, ArgumentError
       raise RefreshError.new("invalid GitHub App private key",
                              stage: "config", code: "invalid_private_key", retryable: false)
+    end
+
+    # GitHub App private keys are often stored env-escaped (literal "\n" rather
+    # than real newlines) -- the fineas-github-app secret is one such source (the
+    # token-refresher CronJob expands it with `printf '%b'`). OpenSSL needs real
+    # newlines, so expand them when the PEM has no real newline of its own.
+    def normalize_pem(pem)
+      pem = pem.to_s.strip
+      pem = pem.gsub("\\n", "\n") if pem.include?("\\n") && !pem.include?("\n")
+      pem
     end
 
     def base64url(value)

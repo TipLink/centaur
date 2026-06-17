@@ -57,6 +57,16 @@ module Broker
       assert signature.present?
     end
 
+    test "mints with an env-escaped (literal \\n) private key PEM" do
+      escaped = private_key.gsub("\n", "\\n")
+      refute_includes escaped, "\n" # the PEM now has only literal backslash-n
+      client, = client_with(status: 201, body: { token: "ghs_installation", expires_at: "2026-06-17T13:00:00Z" }.to_json)
+
+      result = client.mint(**base_args(private_key_pem: escaped))
+
+      assert_equal "ghs_installation", result.access_token
+    end
+
     test "invalid private key is unrecoverable" do
       client, = client_with(status: 201, body: "{}")
       err = assert_raises(RefreshError) do
