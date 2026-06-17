@@ -31,21 +31,26 @@
       <h2 class="form-section-heading">OAuth Client</h2>
       <div class="grid gap-5 sm:grid-cols-2">
         <div>
+          <label class="form-label" for="credential_credential_kind">Credential kind</label>
+          <%= select_tag "credential[credential_kind]", options_for_select(BrokerCredential::CREDENTIAL_KINDS.map { |kind| [ kind.humanize, kind ] }, credential.credential_kind || BrokerCredential::OAUTH_REFRESH_TOKEN), id: "credential_credential_kind", class: "form-input #{field_error_class(credential, :credential_kind)}" %>
+          <%= field_error(credential, :credential_kind) %>
+        </div>
+        <div>
           <label class="form-label" for="credential_token_endpoint">Token endpoint *</label>
           <%= text_field_tag "credential[token_endpoint]", credential.token_endpoint, id: "credential_token_endpoint", class: "form-input #{field_error_class(credential, :token_endpoint)}", placeholder: "https://oauth2.googleapis.com/token" %>
           <%= field_error(credential, :token_endpoint) %>
-          <p class="form-hint">The IdP endpoint control refreshes against.</p>
+          <p class="form-hint">For GitHub Apps, use the installation access-token endpoint.</p>
         </div>
         <div>
           <label class="form-label" for="credential_client_id">Client ID *</label>
           <%= text_field_tag "credential[client_id]", credential.client_id, id: "credential_client_id", class: "form-input #{field_error_class(credential, :client_id)}" %>
           <%= field_error(credential, :client_id) %>
-          <p class="form-hint">Not secret. Sent on every refresh.</p>
+          <p class="form-hint">For GitHub Apps, this is the App ID.</p>
         </div>
         <div>
           <label class="form-label" for="credential_client_secret">Client secret</label>
-          <%= password_field_tag "credential[client_secret]", nil, id: "credential_client_secret", class: "form-input", autocomplete: "off", placeholder: credential.new_record? ? nil : "•••••••• (unchanged)" %>
-          <p class="form-hint">Stored encrypted.<%= " Leave blank to keep the current secret." unless credential.new_record? %></p>
+          <%= text_area_tag "credential[client_secret]", nil, id: "credential_client_secret", rows: 4, class: "form-input", autocomplete: "off", placeholder: credential.new_record? ? nil : "•••••••• (unchanged)" %>
+          <p class="form-hint">For GitHub Apps, paste the private key PEM. Stored encrypted.<%= " Leave blank to keep the current value." unless credential.new_record? %></p>
         </div>
         <div>
           <label class="form-label" for="credential_scopes">Scopes</label>
@@ -91,15 +96,10 @@
     <section class="form-section">
       <h2 class="form-section-heading">Bootstrap</h2>
       <div>
-        <label class="form-label" for="credential_refresh_token">Refresh token<%= " *".html_safe if credential.new_record? %></label>
+        <label class="form-label" for="credential_refresh_token">OAuth refresh token</label>
         <%= text_area_tag "credential[refresh_token]", nil, id: "credential_refresh_token", rows: 3, class: "form-input", autocomplete: "off", placeholder: credential.new_record? ? "the initial refresh token to seed the loop" : "•••••••• (unchanged)" %>
         <p class="form-hint">
-          Write-only seed, stored encrypted. The refresh loop rotates it from here.
-          <% if credential.new_record? %>
-            Required to leave bootstrapping.
-          <% else %>
-            Leave blank to keep the current token; entering a new one re-bootstraps the credential and clears any dead state.
-          <% end %>
+          OAuth credentials use this write-only seed. GitHub App credentials ignore it and mint installation tokens from the App ID and private key.
         </p>
       </div>
     </section>

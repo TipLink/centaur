@@ -18,6 +18,10 @@ class BrokerCredential < ApplicationRecord
 
   include ForeignIdCollisionGuard
 
+  OAUTH_REFRESH_TOKEN = "oauth_refresh_token"
+  GITHUB_APP_INSTALLATION = "github_app_installation"
+  CREDENTIAL_KINDS = [ OAUTH_REFRESH_TOKEN, GITHUB_APP_INSTALLATION ].freeze
+
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
 
@@ -45,6 +49,7 @@ class BrokerCredential < ApplicationRecord
   has_one :static_secret, dependent: :nullify
 
   attr_writer :refresh_client
+  attr_writer :github_app_client
 
   # Refuse to delete a credential that token_broker sources still reference: there
   # is no FK to cascade or nullify, so deletion would silently leave those secrets
@@ -65,6 +70,7 @@ class BrokerCredential < ApplicationRecord
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
   validates :foreign_id, uniqueness: { scope: :namespace, allow_nil: true },
             format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }, allow_nil: true
+  validates :credential_kind, inclusion: { in: CREDENTIAL_KINDS }
   validates :token_endpoint, presence: true
   # client_id is sourced from the linked OauthApp for flow-minted credentials, so
   # it is only required on standalone (operator-authored) credentials.
@@ -78,6 +84,7 @@ class BrokerCredential < ApplicationRecord
   validate :labels_is_a_hash
   validate :scopes_is_an_array
   validate :token_endpoint_headers_valid
+  validate :github_app_private_key_present
 
   # OAuth client identity used for refresh. Flow-minted credentials delegate to
   # their OauthApp so a client-secret rotation on the app applies to every
@@ -123,7 +130,7 @@ class BrokerCredential < ApplicationRecord
   def refresh!(now: Time.current)
     with_lock do
       return if dead?
-      if refresh_token.blank?
+      if oauth_refresh_token? && refresh_token.blank?
         mark_dead!("blob_not_bootstrapped")
         return
       end
@@ -145,7 +152,21 @@ class BrokerCredential < ApplicationRecord
     @refresh_client ||= Broker::RefreshClient.new
   end
 
+  def github_app_client
+    @github_app_client ||= Broker::GithubAppInstallationClient.new
+  end
+
   def perform_refresh(now:)
+    if github_app_installation?
+      return github_app_client.mint(
+        token_endpoint: token_endpoint,
+        app_id: effective_client_id,
+        private_key_pem: effective_client_secret,
+        timeout: refresh_timeout_seconds,
+        now: now
+      )
+    end
+
     refresh_client.refresh(
       token_endpoint: token_endpoint,
       client_id: effective_client_id,
@@ -159,6 +180,14 @@ class BrokerCredential < ApplicationRecord
 
   def refresh_scopes_for_provider
     oauth_app&.provider_strategy&.refresh_scopes(scopes) || scopes
+  end
+
+  def oauth_refresh_token?
+    credential_kind == OAUTH_REFRESH_TOKEN
+  end
+
+  def github_app_installation?
+    credential_kind == GITHUB_APP_INSTALLATION
   end
 
   def apply_success!(result, now:)
@@ -231,5 +260,10 @@ class BrokerCredential < ApplicationRecord
     valid = token_endpoint_headers.is_a?(Hash) &&
             token_endpoint_headers.all? { |k, v| k.is_a?(String) && v.is_a?(String) }
     errors.add(:token_endpoint_headers, "must be an object mapping header names to string values") unless valid
+  end
+
+  def github_app_private_key_present
+    return unless github_app_installation?
+    errors.add(:client_secret, "can't be blank for a GitHub App installation credential") if effective_client_secret.blank?
   end
 end

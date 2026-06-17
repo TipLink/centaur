@@ -58,7 +58,7 @@ module Console
     # re-bootstraps the credential (mirrors the API controller's seed handling).
     def assign_form(credential)
       fields = credential_params.permit(:namespace, :foreign_id, :name, :description,
-                                        :token_endpoint, :client_id,
+                                        :credential_kind, :token_endpoint, :client_id,
                                         :early_refresh_slack_seconds, :early_refresh_fraction,
                                         :max_refresh_interval_seconds, :refresh_timeout_seconds)
       fields[:namespace] = fields[:namespace].presence || "default"

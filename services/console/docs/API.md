@@ -730,11 +730,11 @@ Returns `201`. Response shape (note that `credentials` echoes each source as `{ 
 
 ## Broker credentials
 
-A broker credential is an OAuth credential whose refresh-token lifecycle iron-control manages itself. iron-control runs the refresh loop, mints fresh access tokens before they expire, and delivers the current access token to `iron-proxy` inline through [proxy sync](#proxy-sync) wherever a [`token_broker` secret source](#secret-sources) references the credential by its `id`.
+A broker credential is a managed short-lived access token whose lifecycle iron-control owns. `credential_kind: "oauth_refresh_token"` refreshes an OAuth refresh-token credential; `credential_kind: "github_app_installation"` mints GitHub App installation tokens by signing an App JWT. iron-control runs the refresh loop, mints fresh access tokens before they expire, and delivers the current access token to `iron-proxy` inline through [proxy sync](#proxy-sync) wherever a [`token_broker` secret source](#secret-sources) references the credential by its `id`.
 
 Unlike the secret types above, a broker credential is not granted directly and is not injected on its own. It is referenced by a `token_broker` source on a grantable secret (typically a [static secret](#static-secrets)), which carries the rules and injection config. The `refresh_token` never leaves iron-control.
 
-The OAuth client credentials it refreshes with are fields on the credential, resolved by iron-control itself. `client_id` is not secret and is returned in responses; `client_secret` and the `token_endpoint_headers` values are encrypted at rest and never returned.
+The client credentials it refreshes with are fields on the credential, resolved by iron-control itself. For OAuth, `client_id` and `client_secret` are the OAuth client credentials. For GitHub Apps, `client_id` is the App ID, `client_secret` is the private key PEM, and `token_endpoint` is the installation access-token endpoint. `client_id` is not secret and is returned in responses; `client_secret` and the `token_endpoint_headers` values are encrypted at rest and never returned.
 
 ### Attributes
 
@@ -744,12 +744,13 @@ The OAuth client credentials it refreshes with are fields on the credential, res
 | `foreign_id`                   | optional    | Unique per namespace. Immutable. |
 | `name`, `description`          | optional    | |
 | `labels`                       | optional    | |
-| `token_endpoint`               | required    | OAuth token endpoint the refresh request is sent to. |
+| `credential_kind`              | optional    | `"oauth_refresh_token"` (default) or `"github_app_installation"`. |
+| `token_endpoint`               | required    | OAuth token endpoint, or GitHub installation access-token endpoint. |
 | `scopes`                       | optional    | Array of strings. |
-| `client_id`                    | required    | OAuth client id. Returned in responses. |
-| `client_secret`                | optional    | OAuth client secret. Write-only and encrypted at rest; omit for public clients. Never returned. |
+| `client_id`                    | required    | OAuth client id, or GitHub App ID. Returned in responses. |
+| `client_secret`                | optional    | OAuth client secret, or GitHub App private key PEM. Write-only and encrypted at rest; required for GitHub App credentials. Never returned. |
 | `token_endpoint_headers`       | optional    | Object mapping header name to a string value, sent on the refresh request. Values are write-only and encrypted; only the header names are returned (as `token_endpoint_header_names`). |
-| `refresh_token`                | optional    | Write-only seed. Supplying a value (re)bootstraps the credential: it is scheduled to refresh immediately and any dead state is cleared. Never returned. |
+| `refresh_token`                | optional    | OAuth-only write-only seed. Supplying a value (re)bootstraps an OAuth credential: it is scheduled to refresh immediately and any dead state is cleared. GitHub App credentials ignore this field. Never returned. |
 | `early_refresh_slack_seconds`  | optional    | Refresh this many seconds before expiry. Defaults to `300`. |
 | `early_refresh_fraction`       | optional    | Refresh once this fraction of the token's lifetime remains, when that is larger than the slack. In `[0, 1)`. Defaults to `0.2`. |
 | `max_refresh_interval_seconds` | optional    | Refresh at least this often, even for long-lived tokens. Defaults to `86400`. |

@@ -132,10 +132,10 @@ struct SecretSelector {
 
 #[derive(Subcommand, Debug)]
 enum BrokerCmd {
-    /// Create or update a broker credential. iron-control owns the OAuth refresh
-    /// loop and delivers the current access token inline to proxies. Values are
-    /// passed literally; re-supplying `--refresh-token` re-bootstraps the
-    /// credential.
+    /// Create or update a broker credential. iron-control owns the refresh loop
+    /// and delivers the current access token inline to proxies. Values are
+    /// passed literally; re-supplying `--refresh-token` re-bootstraps OAuth
+    /// refresh-token credentials.
     Create(Box<BrokerCreateArgs>),
     /// List broker credentials registered in iron-control.
     List(FilterArgs),
@@ -163,12 +163,16 @@ struct BrokerCreateArgs {
     #[arg(long)]
     token_endpoint: String,
 
-    /// OAuth client id (literal, not secret; echoed back by iron-control).
+    /// Credential strategy: oauth_refresh_token or github_app_installation.
+    #[arg(long, default_value = "oauth_refresh_token")]
+    credential_kind: String,
+
+    /// OAuth client id, or GitHub App ID for github_app_installation.
     #[arg(long)]
     client_id: String,
 
-    /// OAuth client secret (literal; write-only, encrypted at rest). Omit for
-    /// public clients.
+    /// OAuth client secret, or GitHub App private key PEM for
+    /// github_app_installation. Literal; write-only, encrypted at rest.
     #[arg(long)]
     client_secret: Option<String>,
 
@@ -785,6 +789,7 @@ async fn broker_create(
         name: args.name.clone(),
         description: args.description.clone(),
         labels: managed_labels(),
+        credential_kind: Some(args.credential_kind.clone()),
         token_endpoint: args.token_endpoint.clone(),
         scopes: args.scopes.clone(),
         client_id: args.client_id.clone(),
