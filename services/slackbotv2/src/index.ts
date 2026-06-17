@@ -33,7 +33,13 @@ import {
   sessionStreamError
 } from './session-api'
 import { extractMessageOverrides } from './overrides'
-import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
+import {
+  isAllowedSlackMessage,
+  isAllowedSlackWebhookBody,
+  shouldLogSlackWebhookEvent,
+  slackMessageLogDetails,
+  slackWebhookEventLogDetails
+} from './slack-events'
 import type {
   ForwardSessionInput,
   SlackbotV2,
@@ -126,6 +132,11 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
 
   chat.onNewMention(async (thread, message) => {
+    logger.info('slackbotv2_trigger_received', {
+      ...slackMessageLogDetails(message),
+      mode: 'execute',
+      trigger_source: 'new_mention'
+    })
     if (!isAllowedSlackMessage(message, options, logger)) return
     const assistantStatus = setInitialAssistantStatus(thread, options)
     try {
@@ -143,15 +154,18 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
 
   chat.onSubscribedMessage(async (thread, message) => {
+    const mode = message.isMention === true ? 'execute' : 'append'
+    logger.info('slackbotv2_trigger_received', {
+      ...slackMessageLogDetails(message),
+      mode,
+      trigger_source: 'subscribed_message'
+    })
     if (!isAllowedSlackMessage(message, options, logger)) return
-    const assistantStatus =
-      message.isMention === true
-        ? setInitialAssistantStatus(thread, options)
-        : Promise.resolve(false)
+    const assistantStatus = mode === 'execute' ? setInitialAssistantStatus(thread, options) : Promise.resolve(false)
     try {
       await syncThreadMessageToSession(thread, message, {
         initialAssistantStatusVisible: await assistantStatus,
-        mode: message.isMention === true ? 'execute' : 'append',
+        mode,
         options,
         state
       })
@@ -165,7 +179,15 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
   const handleSlackWebhook = async (c: Context) => {
     const rawBody = await c.req.raw.clone().text()
+    const eventLogDetails = slackWebhookEventLogDetails(rawBody, options.botUserId)
+    const logWebhookEvent = shouldLogSlackWebhookEvent(eventLogDetails)
+    if (logWebhookEvent) {
+      traceLog(options, 'slackbotv2_webhook_event_received', undefined, eventLogDetails ?? {})
+    }
     if (!isAllowedSlackWebhookBody(rawBody, options, logger)) {
+      if (logWebhookEvent) {
+        traceLog(options, 'slackbotv2_webhook_event_prefilter_rejected', undefined, eventLogDetails ?? {})
+      }
       return new globalThis.Response('ok', { status: 200 })
     }
     const awaitHandoff = shouldAwaitSlackHandoff(rawBody)
@@ -185,6 +207,15 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         }
       })
     })
+    if (logWebhookEvent) {
+      traceLog(options, 'slackbotv2_webhook_adapter_response', undefined, {
+        ...(eventLogDetails ?? {}),
+        await_handoff: awaitHandoff,
+        handoff_task_count: handoffTasks.length,
+        response_ok: response.ok,
+        response_status: response.status
+      })
+    }
     if (awaitHandoff && response.ok) {
       try {
         await Promise.all(handoffTasks)
@@ -196,6 +227,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
           error: errorMessage(context.retryableErrors[0])
         })
         return new globalThis.Response('temporary upstream unavailable', { status: 503 })
+      }
+      if (logWebhookEvent) {
+        traceLog(options, 'slackbotv2_webhook_handoff_complete', undefined, {
+          ...(eventLogDetails ?? {}),
+          handoff_task_count: handoffTasks.length
+        })
       }
     }
     return new globalThis.Response(await response.text(), {

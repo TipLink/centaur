@@ -10,6 +10,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 import { WebClient } from '@slack/web-api'
 import { createEmulator, type Emulator } from 'emulate'
 import { createMemoryState } from '@chat-adapter/state-memory'
+import type { Logger } from 'chat'
 import type { ServerNotification } from '@centaur/harness-events'
 import {
   createSlackbotV2,
@@ -121,6 +122,98 @@ describe('slackbotv2', () => {
     await Promise.all(waits)
     expect(codexApi.executes).toHaveLength(1)
     expect(codexApi.executes[0]?.threadKey).toBe(threadKey(parent.ts))
+  })
+
+  it('logs webhook and trigger metadata for app mentions', async () => {
+    const logs: CapturedLog[] = []
+    bot = createTestBot({ logger: captureLogger(logs) })
+    const parent = await postUserMessage('Logging context.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> log this handoff`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-observability-mention',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> log this handoff`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    expect(logData(logs, 'slackbotv2_webhook_event_received')).toMatchObject({
+      channel_id: CHANNEL_ID,
+      event_id: 'Ev-slackbotv2-observability-mention',
+      event_type: 'app_mention',
+      message_ts: mention.ts,
+      raw_text_mentions_bot: true,
+      thread_ts: parent.ts,
+      user_id: USER_ID
+    })
+    expect(logData(logs, 'slackbotv2_trigger_received')).toMatchObject({
+      is_mention: true,
+      message_id: mention.ts,
+      mode: 'execute',
+      thread_id: threadKey(parent.ts),
+      trigger_source: 'new_mention'
+    })
+    const adapterResponse = logData(logs, 'slackbotv2_webhook_adapter_response')
+    expect(adapterResponse).toMatchObject({
+      event_id: 'Ev-slackbotv2-observability-mention',
+      response_ok: true,
+      response_status: 200
+    })
+    expect(Number(adapterResponse.handoff_task_count ?? 0)).toBeGreaterThan(0)
+    expect(logData(logs, 'slackbotv2_webhook_handoff_complete')).toMatchObject({
+      event_id: 'Ev-slackbotv2-observability-mention'
+    })
+  })
+
+  it('logs raw bot mentions delivered as message events', async () => {
+    const logs: CapturedLog[] = []
+    bot = createTestBot({ logger: captureLogger(logs) })
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> delivered as message event`)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-observability-message',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text: `<@${BOT_USER_ID}> delivered as message event`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(logData(logs, 'slackbotv2_webhook_event_received')).toMatchObject({
+      event_id: 'Ev-slackbotv2-observability-message',
+      event_type: 'message',
+      message_ts: mention.ts,
+      raw_text_mentions_bot: true
+    })
+    expect(logData(logs, 'slackbotv2_webhook_adapter_response')).toMatchObject({
+      event_id: 'Ev-slackbotv2-observability-message',
+      response_ok: true,
+      response_status: 200
+    })
   })
 
   it('syncs thread context, forwards subscribed messages, and renders execute streams', async () => {
@@ -2994,6 +3087,41 @@ function createTestBot(
     state: createMemoryState(),
     ...overrides
   })
+}
+
+type CapturedLog = {
+  data?: Record<string, unknown>
+  event: string
+  level: 'debug' | 'info' | 'warn' | 'error'
+}
+
+function captureLogger(logs: CapturedLog[]): Logger {
+  const logger: Logger = {
+    debug: (event: string, data?: unknown) => logs.push(capturedLog('debug', event, data)),
+    info: (event: string, data?: unknown) => logs.push(capturedLog('info', event, data)),
+    warn: (event: string, data?: unknown) => logs.push(capturedLog('warn', event, data)),
+    error: (event: string, data?: unknown) => logs.push(capturedLog('error', event, data)),
+    child: () => logger
+  }
+  return logger
+}
+
+function capturedLog(
+  level: CapturedLog['level'],
+  event: string,
+  data: unknown
+): CapturedLog {
+  return {
+    data: isRecord(data) ? data : undefined,
+    event,
+    level
+  }
+}
+
+function logData(logs: CapturedLog[], event: string): Record<string, unknown> {
+  const log = logs.find(item => item.event === event)
+  expect(log).toBeDefined()
+  return log?.data ?? {}
 }
 
 function sampleCodexNotifications(answer: string): ServerNotification[] {
