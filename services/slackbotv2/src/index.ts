@@ -349,7 +349,7 @@ async function syncThreadMessageToSession(
   }
 
   const serializeStartedAtMs = nowMs()
-  const serializedMessage = await serializeMessage(message)
+  const serializedMessage = await serializeSlackMessage(message)
   const overrides = extractMessageOverrides(serializedMessage.text)
   serializedMessage.text = overrides.cleanedText
   if (overrides.harnessType || overrides.model || overrides.reasoning) {
@@ -1527,6 +1527,12 @@ function isSlackThreadReply(message: ChatMessage): boolean {
   return Boolean(threadTs && ts && threadTs !== ts)
 }
 
+async function serializeSlackMessage(message: ChatMessage): Promise<SlackbotV2ApiMessage> {
+  const serialized = await serializeMessage(message)
+  serialized.text = slackTextWithNativeTables(serialized.text, slackRawRecord(message))
+  return serialized
+}
+
 async function collectSlackThreadContext(
   options: SlackbotV2Options,
   currentMessage: ChatMessage
@@ -1535,7 +1541,7 @@ async function collectSlackThreadContext(
   const channel = stringField(raw.channel)
   const threadTs = stringField(raw.thread_ts)
   const currentTs = stringField(raw.ts) || currentMessage.id
-  if (!channel || !threadTs) return [await serializeMessage(currentMessage)]
+  if (!channel || !threadTs) return [await serializeSlackMessage(currentMessage)]
 
   const messages: SlackbotV2ApiMessage[] = []
   let cursor: string | undefined
@@ -1560,7 +1566,7 @@ async function collectSlackThreadContext(
   } while (cursor)
 
   const currentIndex = messages.findIndex(message => message.id === currentMessage.id)
-  const serializedCurrent = await serializeMessage(currentMessage)
+  const serializedCurrent = await serializeSlackMessage(currentMessage)
   if (currentIndex >= 0) {
     messages[currentIndex] = serializedCurrent
   } else {
@@ -1595,7 +1601,7 @@ async function slackApiMessageFromSlack(
       || stringField(message.team_id)
       || stringField(rawCurrent.team)
       || stringField(rawCurrent.team_id),
-    text: normalizeSlackText(stringField(message.text)),
+    text: slackTextWithNativeTables(normalizeSlackText(stringField(message.text)), message),
     threadId: currentMessage.threadId,
     timestamp: slackTimestampToIso(id)
   }
@@ -1681,6 +1687,100 @@ function slackRawRecord(message: ChatMessage): Record<string, unknown> {
   return message.raw && typeof message.raw === 'object' && !Array.isArray(message.raw)
     ? (message.raw as Record<string, unknown>)
     : {}
+}
+
+function slackTextWithNativeTables(text: string, message: Record<string, unknown>): string {
+  const tableText = slackNativeTablesText(message)
+  if (!tableText) return text
+  const normalizedText = text.trim()
+  return normalizedText ? `${normalizedText}\n\n${tableText}` : tableText
+}
+
+function slackNativeTablesText(message: Record<string, unknown>): string {
+  const tableBlocks = [
+    ...slackBlockRecords(message.blocks),
+    ...slackAttachmentRecords(message.attachments).flatMap(attachment =>
+      slackBlockRecords(attachment.blocks)
+    )
+  ].filter(block => stringField(block.type) === 'table')
+  const tables = tableBlocks
+    .map((block, index) => slackNativeTableText(block, index + 1))
+    .filter(Boolean)
+  return tables.join('\n\n')
+}
+
+function slackNativeTableText(block: Record<string, unknown>, index: number): string {
+  const rows = Array.isArray(block.rows) ? block.rows : []
+  const normalizedRows = rows
+    .map(row => slackNativeTableRow(row))
+    .filter(row => row.some(cell => cell))
+  if (normalizedRows.length === 0) return ''
+
+  const columnCount = Math.max(...normalizedRows.map(row => row.length))
+  const paddedRows = normalizedRows.map(row =>
+    Array.from({ length: columnCount }, (_value, columnIndex) =>
+      markdownTableCell(row[columnIndex] ?? '')
+    )
+  )
+  const [header = [], ...body] = paddedRows
+  const lines = [`Slack table${index > 1 ? ` ${index}` : ''}:`]
+  lines.push(`| ${header.join(' | ')} |`)
+  lines.push(`| ${Array.from({ length: columnCount }, () => '---').join(' | ')} |`)
+  for (const row of body) lines.push(`| ${row.join(' | ')} |`)
+  return lines.join('\n')
+}
+
+function slackNativeTableRow(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(cell => slackNativeTableCellText(cell)) : []
+}
+
+function slackNativeTableCellText(cell: unknown): string {
+  return normalizeSlackText(slackRichTextObjectText(cell).replace(/\s+/g, ' ')).trim()
+}
+
+function slackRichTextObjectText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!isPlainRecord(value)) return ''
+
+  const type = stringField(value.type)
+  if (type === 'raw_text' || type === 'text') return stringField(value.text)
+  if (type === 'link') {
+    const label = stringField(value.text)
+    const url = stringField(value.url)
+    if (label && url && label !== url) return `${label} (${url})`
+    return label || url
+  }
+  if (type === 'user') return `@${stringField(value.user_id) || stringField(value.user)}`
+  if (type === 'channel') return `#${stringField(value.channel_id) || stringField(value.channel)}`
+  if (type === 'emoji') return `:${stringField(value.name)}:`
+  if (type === 'broadcast') return `@${stringField(value.range)}`
+
+  const nestedElements = ['elements', 'blocks', 'children']
+    .flatMap(key => recordElements(value[key]))
+    .map(element => slackRichTextObjectText(element))
+    .filter(Boolean)
+  if (nestedElements.length > 0) return nestedElements.join('')
+  return stringField(value.text)
+}
+
+function markdownTableCell(text: string): string {
+  return text.replace(/\|/g, '\\|').replace(/\n/g, ' ').trim()
+}
+
+function slackAttachmentRecords(value: unknown): Record<string, unknown>[] {
+  return recordElements(value)
+}
+
+function slackBlockRecords(value: unknown): Record<string, unknown>[] {
+  return recordElements(value)
+}
+
+function recordElements(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isPlainRecord) : []
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
 
 function slackActorId(message: Record<string, unknown>): string {
