@@ -1,6 +1,25 @@
 {{- if .Values.apiRs.enabled }}
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $githubAppBrokerBootstrapEnabled := and (or .Values.tokenBroker.enabled .Values.tokenBroker.githubApp.enabled) .Values.tokenBroker.githubApp.enabled .Values.tokenBroker.githubApp.bootstrap.enabled -}}
+{{- if and $githubAppBrokerBootstrapEnabled (not $console.enabled) -}}
+{{- fail "console.enabled must be true when tokenBroker.githubApp bootstrap is enabled" -}}
+{{- end -}}
+{{- if and $githubAppBrokerBootstrapEnabled (not .Values.tokenBroker.githubApp.existingSecretName) -}}
+{{- fail "tokenBroker.githubApp.existingSecretName must be set when tokenBroker.githubApp bootstrap is enabled" -}}
+{{- end -}}
+{{- $githubAppBrokerBootstrapImageRepository := default .Values.sandbox.image.repository .Values.tokenBroker.githubApp.bootstrap.image.repository -}}
+{{- $githubAppBrokerBootstrapImageTag := default .Values.sandbox.image.tag .Values.tokenBroker.githubApp.bootstrap.image.tag -}}
+{{- $githubAppBrokerBootstrapImagePullPolicy := default .Values.sandbox.image.pullPolicy .Values.tokenBroker.githubApp.bootstrap.image.pullPolicy -}}
+{{- $githubAppBrokerCredentialIds := list "github-app" -}}
+{{- with .Values.tokenBroker.githubApp.credentialId -}}
+{{- $githubAppBrokerCredentialIds = append $githubAppBrokerCredentialIds . -}}
+{{- end -}}
+{{- range .Values.tokenBroker.githubApp.extraCredentialIds -}}
+{{- $githubAppBrokerCredentialIds = append $githubAppBrokerCredentialIds . -}}
+{{- end -}}
+{{- $githubAppBrokerCredentialIds = uniq $githubAppBrokerCredentialIds -}}
+{{- $githubAppBrokerNamespaces := default (list "default") .Values.tokenBroker.githubApp.credentialNamespaces -}}
 {{- $reposPath := .Values.sandbox.reposPath -}}
 {{- if and .Values.repoCache.enabled (not $reposPath) -}}
 {{- $reposPath = .Values.repoCache.hostPath -}}
@@ -136,6 +155,9 @@ spec:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
         checksum/overlay: {{ dict "overlay" .Values.overlay "overlays" .Values.overlays | toJson | sha256sum }}
+{{- if $githubAppBrokerBootstrapEnabled }}
+        checksum/github-app-broker-bootstrap: {{ .Values.tokenBroker.githubApp | toJson | sha256sum }}
+{{- end }}
 {{- with $apiRsMetricsAnnotations }}
 {{ toYaml . | nindent 8 }}
 {{- end }}
@@ -149,8 +171,9 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
-{{- if .Values.overlay.image.repository }}
+{{- if or .Values.overlay.image.repository $githubAppBrokerBootstrapEnabled }}
       initContainers:
+{{- if .Values.overlay.image.repository }}
         - name: overlay-bootstrap
           image: {{ printf "%s:%s" .Values.overlay.image.repository .Values.overlay.image.tag | quote }}
           imagePullPolicy: {{ .Values.overlay.image.pullPolicy }}
@@ -167,6 +190,126 @@ spec:
               mountPath: {{ .Values.overlay.mountPath | quote }}
           securityContext:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
+{{- end }}
+{{- if $githubAppBrokerBootstrapEnabled }}
+        - name: github-app-broker-bootstrap
+          image: {{ printf "%s:%s" $githubAppBrokerBootstrapImageRepository $githubAppBrokerBootstrapImageTag | quote }}
+          imagePullPolicy: {{ $githubAppBrokerBootstrapImagePullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              private_key_file=/var/run/centaur/github-app/private-key
+
+              if [ -z "${IRON_CONTROL_URL:-}" ] || [ -z "${IRON_CONTROL_API_KEY:-}" ]; then
+                echo "IRON_CONTROL_URL and IRON_CONTROL_API_KEY are required" >&2
+                exit 1
+              fi
+              if [ -z "${GITHUB_APP_ID:-}" ] || [ -z "${GITHUB_APP_INSTALLATION_ID:-}" ]; then
+                echo "GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID are required" >&2
+                exit 1
+              fi
+              if [ ! -s "$private_key_file" ]; then
+                echo "GitHub App private key file is missing or empty" >&2
+                exit 1
+              fi
+
+              attempt=1
+              until curl -fsS --max-time 2 "$IRON_CONTROL_URL/up" >/dev/null 2>&1; do
+                if [ "$attempt" -ge 60 ]; then
+                  echo "Timed out waiting for iron-control at $IRON_CONTROL_URL" >&2
+                  exit 1
+                fi
+                attempt=$((attempt + 1))
+                sleep 2
+              done
+
+              tmp_dir="$(mktemp -d)"
+              trap 'rm -rf "$tmp_dir"' EXIT
+              curl_config="$tmp_dir/curl.conf"
+              response_file="$tmp_dir/response.json"
+              body_file="$tmp_dir/body.json"
+
+              {
+                printf 'silent\n'
+                printf 'show-error\n'
+                printf 'max-time = 30\n'
+                printf 'header = "Authorization: Bearer %s"\n' "$IRON_CONTROL_API_KEY"
+                printf 'header = "Content-Type: application/json"\n'
+              } > "$curl_config"
+
+              for namespace in $GITHUB_APP_BROKER_NAMESPACES; do
+                for credential_id in $GITHUB_APP_BROKER_CREDENTIAL_IDS; do
+                  endpoint="https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens"
+                  jq -n \
+                    --arg namespace "$namespace" \
+                    --arg foreign_id "$credential_id" \
+                    --arg app_id "$GITHUB_APP_ID" \
+                    --arg endpoint "$endpoint" \
+                    --rawfile private_key "$private_key_file" \
+                    '{
+                      data: {
+                        namespace: $namespace,
+                        foreign_id: $foreign_id,
+                        name: "GitHub App installation token",
+                        description: "Managed by the Centaur Helm chart tokenBroker.githubApp bootstrap.",
+                        labels: {
+                          "app.kubernetes.io/managed-by": "Helm",
+                          "centaur.ai/token-broker-bootstrap": "github-app"
+                        },
+                        credential_kind: "github_app_installation",
+                        token_endpoint: $endpoint,
+                        scopes: [],
+                        client_id: $app_id,
+                        client_secret: $private_key
+                      }
+                    }' > "$body_file"
+
+                  encoded_id="$(printf '%s' "$credential_id" | jq -sRr @uri)"
+                  status="$(curl -o "$response_file" -w '%{http_code}' -X PUT -K "$curl_config" --data-binary "@$body_file" "$IRON_CONTROL_URL/api/v1/broker_credentials/$encoded_id")"
+                  case "$status" in
+                    200|201)
+                      credential_status="$(jq -r '.data.status // "unknown"' "$response_file")"
+                      credential_dead="$(jq -r '.data.dead // "unknown"' "$response_file")"
+                      echo "Upserted GitHub App broker credential namespace=$namespace id=$credential_id status=$credential_status dead=$credential_dead"
+                      ;;
+                    *)
+                      echo "Failed to upsert GitHub App broker credential namespace=$namespace id=$credential_id http_status=$status" >&2
+                      jq -r '.error.message? // .error? // .' "$response_file" >&2 || true
+                      exit 1
+                      ;;
+                  esac
+                done
+              done
+          env:
+            - name: IRON_CONTROL_URL
+              value: {{ include "centaur.consoleUrl" . | quote }}
+            - name: IRON_CONTROL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.tokenBroker.githubApp.existingSecretName | quote }}
+                  key: {{ .Values.tokenBroker.githubApp.existingSecretKeys.appId | quote }}
+            - name: GITHUB_APP_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.tokenBroker.githubApp.existingSecretName | quote }}
+                  key: {{ .Values.tokenBroker.githubApp.existingSecretKeys.installationId | quote }}
+            - name: GITHUB_APP_BROKER_CREDENTIAL_IDS
+              value: {{ join " " $githubAppBrokerCredentialIds | quote }}
+            - name: GITHUB_APP_BROKER_NAMESPACES
+              value: {{ join " " $githubAppBrokerNamespaces | quote }}
+          volumeMounts:
+            - name: github-app-broker-secret
+              mountPath: /var/run/centaur/github-app
+              readOnly: true
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+{{- end }}
 {{- end }}
       containers:
         - name: api-rs
@@ -424,7 +567,7 @@ spec:
               readOnly: true
 {{- end }}
 {{- end }}
-{{- if or $useOverlayRepoCache .Values.overlay.image.repository .Values.overlay.systemPrompt }}
+{{- if or $useOverlayRepoCache .Values.overlay.image.repository .Values.overlay.systemPrompt $githubAppBrokerBootstrapEnabled }}
       volumes:
 {{- if $useOverlayRepoCache }}
         - name: repo-cache
@@ -442,6 +585,14 @@ spec:
             items:
               - key: SYSTEM_PROMPT.md
                 path: services/sandbox/SYSTEM_PROMPT.md
+{{- end }}
+{{- if $githubAppBrokerBootstrapEnabled }}
+        - name: github-app-broker-secret
+          secret:
+            secretName: {{ .Values.tokenBroker.githubApp.existingSecretName | quote }}
+            items:
+              - key: {{ .Values.tokenBroker.githubApp.existingSecretKeys.privateKey | quote }}
+                path: private-key
 {{- end }}
 {{- end }}
 ---

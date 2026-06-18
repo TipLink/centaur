@@ -19,7 +19,8 @@ transforms:
         # (~48h) sandbox and git/gh start failing with HTTP 401. Source the
         # replacement value from the `github-app` broker credential (a
         # github_app_installation BrokerCredential managed by iron-control,
-        # provisioned out of band via `centaur-perms broker create`), which
+        # provisioned by the Helm chart's tokenBroker.githubApp bootstrap or
+        # manually via `centaur-perms broker create`), which
         # mints and rotates the installation token so every request gets a live
         # one. Keep `replace` (not `inject`) so the request's existing auth
         # scheme is preserved: git over HTTPS keeps its Basic `x-access-token`

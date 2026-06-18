@@ -114,6 +114,50 @@
     },
     "console": { "$ref": "#/definitions/consoleConfig" },
     "ironControl": { "$ref": "#/definitions/consoleConfig" },
+    "tokenBroker": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "githubApp": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "credentialId": { "type": "string" },
+            "extraCredentialIds": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "credentialNamespaces": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "existingSecretName": { "type": "string" },
+            "existingSecretKeys": {
+              "type": "object",
+              "properties": {
+                "appId": { "type": "string" },
+                "installationId": { "type": "string" },
+                "privateKey": { "type": "string" }
+              }
+            },
+            "bootstrap": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "repository": { "type": "string" },
+                    "tag": { "type": "string" },
+                    "pullPolicy": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "secrets": {
       "type": "object",
       "properties": {
