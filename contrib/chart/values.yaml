@@ -142,6 +142,38 @@ console:
     replicaCount: 1
     resources: {}
 
+# Managed short-lived token credentials for sandbox proxy rules. The built-in
+# proxy fragment uses a `github-app` broker credential for github.com and
+# api.github.com so long-lived sandboxes do not keep using an expired
+# GITHUB_TOKEN value from pod startup.
+tokenBroker:
+  enabled: false
+  githubApp:
+    enabled: false
+    # The built-in sandbox proxy fragment references `github-app`. Keep this
+    # value unless you also change the proxy fragment. If an environment already
+    # used another ID, put it here; the chart always creates `github-app` too.
+    credentialId: github-app
+    extraCredentialIds: []
+    # The unqualified built-in reference resolves in the default namespace.
+    # `infra` is included as a compatibility alias for deployments that already
+    # provisioned grants/secrets there.
+    credentialNamespaces:
+      - default
+      - infra
+    existingSecretName: ""
+    existingSecretKeys:
+      appId: app-id
+      installationId: installation-id
+      privateKey: private-key
+    bootstrap:
+      enabled: true
+      # Empty fields fall back to sandbox.image, which carries curl and jq.
+      image:
+        repository: ""
+        tag: ""
+        pullPolicy: ""
+
 # Values for the upstream 1Password Connect subchart
 # (https://github.com/1Password/connect-helm-charts/tree/main/charts/connect).
 # Deployment is gated on onepasswordConnect.connect.create AND on
