@@ -31,6 +31,7 @@ module Api
         assert_response :ok
         data = json_body.fetch("data")
         assert_equal "https://oauth2.googleapis.com/token", data["token_endpoint"]
+        assert_equal "oauth_refresh_token", data["credential_kind"]
         assert_equal "gmail-client-id", data["client_id"]
         refute data.key?("client_secret")
         refute data.key?("access_token")
@@ -71,6 +72,7 @@ module Api
         assert_response :created
         data = json_body.fetch("data")
         assert_equal "the-client-id", data["client_id"]
+        assert_equal "oauth_refresh_token", data["credential_kind"]
         refute data.key?("client_secret")
         refute data.key?("refresh_token")
         assert_equal [ "X-Api-Key" ], data["token_endpoint_header_names"]
@@ -80,6 +82,32 @@ module Api
         assert_equal "super-secret-seed", created.refresh_token # persisted + decryptable
         assert_equal "the-client-secret", created.client_secret
         assert_equal({ "X-Api-Key" => "k" }, created.token_endpoint_headers)
+      end
+
+      test "create accepts a github app installation credential without a refresh token" do
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "fineas-github-app",
+            credential_kind: "github_app_installation",
+            token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+            client_id: "12345",
+            client_secret: "-----BEGIN RSA PRIVATE KEY-----\nprivate\n-----END RSA PRIVATE KEY-----"
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "github_app_installation", data["credential_kind"]
+        assert_equal "12345", data["client_id"]
+        refute data.key?("client_secret")
+        refute data.key?("refresh_token")
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_nil created.refresh_token
+        assert_equal "-----BEGIN RSA PRIVATE KEY-----\nprivate\n-----END RSA PRIVATE KEY-----", created.client_secret
       end
 
       test "create rejects a missing client_id" do

@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_06_16_170000) do
+ActiveRecord::Schema[8.1].define(version: 2026_06_17_194000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -47,6 +47,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_06_16_170000) do
     t.string "client_id"
     t.text "client_secret"
     t.datetime "created_at", null: false
+    t.string "credential_kind", default: "oauth_refresh_token", null: false
     t.bigint "created_by_id"
     t.boolean "dead", default: false, null: false
     t.string "dead_reason"

@@ -14,7 +14,23 @@ transforms:
             proxy_value: AMP_API_KEY
             match_headers: ["Authorization"]
           rules: [{ host: ampcode.com }]
-        - replace:
+        # GitHub App installation tokens expire ~1h after mint, so the static
+        # value baked into the sandbox at start goes stale within a long-lived
+        # (~48h) sandbox and git/gh start failing with HTTP 401. Source the
+        # replacement value from the `github-app` broker credential (a
+        # github_app_installation BrokerCredential managed by iron-control,
+        # provisioned out of band via `centaur-perms broker create`), which
+        # mints and rotates the installation token so every request gets a live
+        # one. Keep `replace` (not `inject`) so the request's existing auth
+        # scheme is preserved: git over HTTPS keeps its Basic `x-access-token`
+        # form (github.com rejects `Bearer` for git transport) while the REST
+        # API keeps Bearer -- both just get the placeholder swapped for the
+        # current token. The `GITHUB_TOKEN` placeholder is still injected into
+        # the sandbox env (it is this entry's proxy_value).
+        - source:
+            type: token_broker
+            credential_id: github-app
+          replace:
             proxy_value: GITHUB_TOKEN
             match_headers: ["Authorization"]
           rules:
