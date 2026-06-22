@@ -1119,6 +1119,17 @@ impl SandboxArgs {
             }
         }
 
+        for (name, value) in self.sandbox_extra_env() {
+            if let Some((_, existing_value)) = envs
+                .iter_mut()
+                .find(|(existing_name, _)| existing_name == &name)
+            {
+                *existing_value = value;
+            } else {
+                envs.push((name, value));
+            }
+        }
+
         Ok(envs)
     }
 
@@ -2210,6 +2221,43 @@ mod tests {
                 .map(|env| env.value.as_str()),
             Some("true")
         );
+    }
+
+    #[test]
+    fn workflow_host_env_template_applies_extra_env_last() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--session-sandbox-extra-env",
+            r#"[
+                {"name":"MOBILE_DISRUPT_EVENTMEET_TOKEN","value":"MOBILE_DISRUPT_EVENTMEET_TOKEN"},
+                {"name":"MOBILE_DISRUPT_SLACK_CHANNEL","value":"C0B7WSP2NCB"},
+                {"name":"NULL_VALUE"},
+                {"name":"BAD=NAME","value":"skipped"}
+            ]"#,
+        ])
+        .unwrap();
+
+        let spec = args.sandbox.workflow_host_spec(None).unwrap();
+        let value = |key: &str| {
+            spec.env
+                .iter()
+                .find(|env| env.name == key)
+                .map(|env| env.value.as_str())
+        };
+
+        assert_eq!(
+            value("MOBILE_DISRUPT_EVENTMEET_TOKEN"),
+            Some("MOBILE_DISRUPT_EVENTMEET_TOKEN")
+        );
+        assert_eq!(value("MOBILE_DISRUPT_SLACK_CHANNEL"), Some("C0B7WSP2NCB"));
+        assert_eq!(value("NULL_VALUE"), Some(""));
+        assert!(value("BAD=NAME").is_none());
     }
 
     #[test]
