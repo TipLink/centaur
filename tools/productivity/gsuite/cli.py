@@ -1258,7 +1258,7 @@ def sheets_read_cmd(
         result = sheets_read(spreadsheet_id, range_notation)
 
         if output_json:
-            console.print(json.dumps(result["rows"], indent=2))
+            print(json.dumps(result["rows"], indent=2))
             return
 
         if not result["rows"]:
@@ -1276,6 +1276,43 @@ def sheets_read_cmd(
         console.print(table)
         if len(result["rows"]) > 50:
             console.print(f"[dim]... and {len(result['rows']) - 50} more rows[/]")
+
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+
+@sheets_app.command("formatting")
+def sheets_formatting_cmd(
+    spreadsheet_id: str = typer.Argument(..., help="Spreadsheet ID (from URL)"),
+    range_notation: str = typer.Option("A1:Z1000", "--range", "-r", help="A1 notation range"),
+    output_json: bool = typer.Option(False, "--json", "-o", help="Output as JSON"),
+):
+    """Inspect highlighted rows and conditional formatting in a Google Sheet.
+
+    Examples:
+        gsuite sheets formatting "1Abc..." --range "Sheet1!A1:AF500"
+        gsuite sheets formatting "1Abc..." --json
+    """
+    import json
+    from .client import sheets_highlighted_rows
+
+    try:
+        result = sheets_highlighted_rows(spreadsheet_id, range_notation)
+
+        if output_json:
+            print(json.dumps(result, indent=2))
+            return
+
+        console.print(
+            f"[green]Found {result['highlighted_row_count']} highlighted row(s)[/]"
+        )
+        console.print(
+            f"[dim]Conditional formatting rules: {result['conditional_format_count']}[/]"
+        )
+        for color_name, row_numbers in result["row_numbers_by_color"].items():
+            joined_rows = ", ".join(str(row_number) for row_number in row_numbers)
+            console.print(f"[cyan]{color_name}[/]: {joined_rows}")
 
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")

@@ -66,12 +66,18 @@ class _FakeSheetsValuesApi:
 
 
 class _FakeSpreadsheetsApi:
-    def __init__(self):
+    def __init__(self, get_result: dict | None = None):
         self.values_api = _FakeSheetsValuesApi()
         self.batch_update_calls: list[dict] = []
+        self.get_calls: list[dict] = []
+        self.get_result = get_result or {}
 
     def values(self):
         return self.values_api
+
+    def get(self, **kwargs):
+        self.get_calls.append(kwargs)
+        return _CreateRequest(self.get_result)
 
     def batchUpdate(self, **kwargs):
         self.batch_update_calls.append(kwargs)
@@ -96,8 +102,8 @@ class _FakeSpreadsheetsApi:
 
 
 class _FakeSheetsService:
-    def __init__(self):
-        self.spreadsheets_api = _FakeSpreadsheetsApi()
+    def __init__(self, get_result: dict | None = None):
+        self.spreadsheets_api = _FakeSpreadsheetsApi(get_result=get_result)
 
     def spreadsheets(self):
         return self.spreadsheets_api
@@ -274,6 +280,86 @@ def test_sheets_add_tab_uses_batch_update(monkeypatch):
         },
         "url": "https://docs.google.com/spreadsheets/d/spreadsheet-123/edit#gid=789",
     }
+
+
+def test_sheets_get_metadata_uses_field_mask_and_ranges(monkeypatch):
+    fake_service = _FakeSheetsService(
+        get_result={"properties": {"title": "Lead Sheet"}, "sheets": []}
+    )
+    monkeypatch.setattr(client, "get_sheets_service", lambda: fake_service)
+
+    result = client.sheets_get_metadata(
+        "spreadsheet-123",
+        fields="properties.title,sheets.properties.title",
+        ranges=["Sheet1!A1:B10"],
+        include_grid_data=True,
+    )
+
+    assert fake_service.spreadsheets_api.get_calls == [
+        {
+            "spreadsheetId": "spreadsheet-123",
+            "includeGridData": True,
+            "fields": "properties.title,sheets.properties.title",
+            "ranges": ["Sheet1!A1:B10"],
+        }
+    ]
+    assert result["properties"]["title"] == "Lead Sheet"
+
+
+def test_sheets_highlighted_rows_groups_manual_row_fills(monkeypatch):
+    yellow = {"backgroundColor": {"red": 1, "green": 1, "blue": 0}}
+    green = {"backgroundColor": {"red": 0, "green": 1, "blue": 0}}
+    fake_service = _FakeSheetsService(
+        get_result={
+            "sheets": [
+                {
+                    "properties": {"title": "Leads", "sheetId": 456},
+                    "conditionalFormats": [{"ranges": []}],
+                    "data": [
+                        {
+                            "startRow": 1,
+                            "startColumn": 0,
+                            "rowData": [
+                                {
+                                    "values": [
+                                        {
+                                            "formattedValue": "100",
+                                            "userEnteredFormat": yellow,
+                                        },
+                                        {
+                                            "formattedValue": "Ada",
+                                            "userEnteredFormat": yellow,
+                                        },
+                                    ]
+                                },
+                                {
+                                    "values": [
+                                        {"formattedValue": "89"},
+                                        {
+                                            "formattedValue": "Ben",
+                                            "effectiveFormat": green,
+                                        },
+                                    ]
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(client, "get_sheets_service", lambda: fake_service)
+
+    result = client.sheets_highlighted_rows("spreadsheet-123", "Leads!A2:B3")
+
+    assert fake_service.spreadsheets_api.get_calls[0]["includeGridData"] is True
+    assert fake_service.spreadsheets_api.get_calls[0]["ranges"] == ["Leads!A2:B3"]
+    assert result["conditional_format_count"] == 1
+    assert result["highlighted_row_count"] == 2
+    assert result["row_numbers_by_color"] == {"yellow": [2], "green": [3]}
+    assert result["highlighted_rows"][0]["preview_values"] == ["100", "Ada"]
+    assert result["highlighted_rows"][0]["filled_cells"] == 2
+    assert result["highlighted_rows"][1]["source"] == "effectiveFormat"
 
 
 def test_sheets_write_table_writes_headers_and_rows_to_named_tab(monkeypatch):

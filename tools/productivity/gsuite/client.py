@@ -1836,6 +1836,74 @@ def _quote_sheet_title(title: str) -> str:
     return f"'{escaped_title}'"
 
 
+def _color_to_tuple(color: dict | None) -> tuple[float, float, float, float] | None:
+    if not color:
+        return None
+    return (
+        round(float(color.get("red", 0.0)), 4),
+        round(float(color.get("green", 0.0)), 4),
+        round(float(color.get("blue", 0.0)), 4),
+        round(float(color.get("alpha", 1.0)), 4),
+    )
+
+
+def _format_color(format_obj: dict | None) -> dict | None:
+    """Return a stable representation of a Sheets background color."""
+    if not format_obj:
+        return None
+
+    color_style = format_obj.get("backgroundColorStyle", {})
+    rgb_color = _color_to_tuple(color_style.get("rgbColor"))
+    if rgb_color:
+        source = "backgroundColorStyle.rgbColor"
+    elif color_style.get("themeColor"):
+        return {
+            "type": "theme",
+            "theme_color": color_style["themeColor"],
+            "name": color_style["themeColor"].lower(),
+            "source": "backgroundColorStyle.themeColor",
+        }
+    else:
+        rgb_color = _color_to_tuple(format_obj.get("backgroundColor"))
+        source = "backgroundColor"
+
+    if not rgb_color or rgb_color == (1.0, 1.0, 1.0, 1.0):
+        return None
+
+    known_colors = {
+        (1.0, 1.0, 0.0, 1.0): "yellow",
+        (0.0, 1.0, 0.0, 1.0): "green",
+        (1.0, 0.0, 0.0, 1.0): "red",
+    }
+    return {
+        "type": "rgb",
+        "red": rgb_color[0],
+        "green": rgb_color[1],
+        "blue": rgb_color[2],
+        "alpha": rgb_color[3],
+        "hex": "#%02X%02X%02X"
+        % (
+            round(rgb_color[0] * 255),
+            round(rgb_color[1] * 255),
+            round(rgb_color[2] * 255),
+        ),
+        "name": known_colors.get(rgb_color),
+        "source": source,
+    }
+
+
+def _color_key(color: dict) -> tuple:
+    if color["type"] == "theme":
+        return ("theme", color.get("theme_color"))
+    return (
+        "rgb",
+        color.get("red"),
+        color.get("green"),
+        color.get("blue"),
+        color.get("alpha"),
+    )
+
+
 def sheets_create(title: str, content: list[list[str]] | None = None) -> dict:
     """Create a new Google Sheet.
 
@@ -1904,6 +1972,118 @@ def sheets_add_tab(spreadsheet_id: str, title: str, index: int | None = None) ->
         "grid_properties": sheet_properties.get("gridProperties", {}),
         "sheet_properties": sheet_properties,
         "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={sheet_id}",
+    }
+
+
+def sheets_get_metadata(
+    spreadsheet_id: str,
+    fields: str | None = None,
+    ranges: list[str] | None = None,
+    include_grid_data: bool = False,
+) -> dict:
+    """Read spreadsheet metadata, optionally with a caller-supplied field mask."""
+    service = get_sheets_service()
+    request_kwargs: dict = {
+        "spreadsheetId": spreadsheet_id,
+        "includeGridData": include_grid_data,
+    }
+    if fields:
+        request_kwargs["fields"] = fields
+    if ranges:
+        request_kwargs["ranges"] = ranges
+
+    return service.spreadsheets().get(**request_kwargs).execute()
+
+
+def sheets_highlighted_rows(
+    spreadsheet_id: str,
+    range_notation: str = "A1:Z1000",
+) -> dict:
+    """Inspect row background fills for a range in a Google Sheet.
+
+    Returns rows where at least one cell has a non-white user-entered or
+    effective background. User-entered colors are preferred so manual row
+    highlights are not confused with conditional-format output.
+    """
+    fields = (
+        "sheets(properties(title,sheetId),conditionalFormats,"
+        "data(startRow,startColumn,rowData(values(formattedValue,"
+        "effectiveFormat(backgroundColor,backgroundColorStyle),"
+        "userEnteredFormat(backgroundColor,backgroundColorStyle)))))"
+    )
+    metadata = sheets_get_metadata(
+        spreadsheet_id,
+        fields=fields,
+        ranges=[range_notation],
+        include_grid_data=True,
+    )
+
+    highlighted_rows: list[dict] = []
+    row_numbers_by_color: dict[str, list[int]] = {}
+    conditional_format_count = 0
+
+    for sheet in metadata.get("sheets", []):
+        properties = sheet.get("properties", {})
+        conditional_format_count += len(sheet.get("conditionalFormats", []))
+
+        for grid in sheet.get("data", []):
+            start_row = int(grid.get("startRow", 0))
+            start_column = int(grid.get("startColumn", 0))
+
+            for row_offset, row_data in enumerate(grid.get("rowData", [])):
+                row_number = start_row + row_offset + 1
+                color_counts: dict[tuple, dict] = {}
+                formatted_values: list[str] = []
+                filled_cells = 0
+                source = None
+
+                for cell in row_data.get("values", []):
+                    formatted_value = cell.get("formattedValue")
+                    if formatted_value and len(formatted_values) < 8:
+                        formatted_values.append(formatted_value)
+
+                    user_color = _format_color(cell.get("userEnteredFormat"))
+                    effective_color = _format_color(cell.get("effectiveFormat"))
+                    color = user_color or effective_color
+                    if not color:
+                        continue
+
+                    filled_cells += 1
+                    source = "userEnteredFormat" if user_color else "effectiveFormat"
+                    key = _color_key(color)
+                    if key not in color_counts:
+                        color_counts[key] = {"color": color, "count": 0}
+                    color_counts[key]["count"] += 1
+
+                if not color_counts:
+                    continue
+
+                majority = max(color_counts.values(), key=lambda item: item["count"])
+                color = majority["color"]
+                color_name = color.get("name") or color.get("hex") or color.get("theme_color")
+                row_numbers_by_color.setdefault(str(color_name), []).append(row_number)
+                highlighted_rows.append(
+                    {
+                        "sheet_title": properties.get("title", ""),
+                        "sheet_id": properties.get("sheetId"),
+                        "row_number": row_number,
+                        "start_column_index": start_column,
+                        "color": color,
+                        "color_name": color_name,
+                        "filled_cells": filled_cells,
+                        "majority_color_cells": majority["count"],
+                        "source": source,
+                        "preview_values": formatted_values,
+                    }
+                )
+
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "range": range_notation,
+        "conditional_format_count": conditional_format_count,
+        "highlighted_row_count": len(highlighted_rows),
+        "row_numbers_by_color": row_numbers_by_color,
+        "highlighted_rows": highlighted_rows,
     }
 
 
@@ -3131,6 +3311,29 @@ class GSuiteClient:
             Dict with spreadsheet_id, range, headers, and rows (list of dicts)
         """
         return sheets_read(spreadsheet_id, range_notation=range_notation)
+
+    def sheets_get_metadata(
+        self,
+        spreadsheet_id: str,
+        fields: str | None = None,
+        ranges: list[str] | None = None,
+        include_grid_data: bool = False,
+    ) -> dict:
+        """Read spreadsheet metadata, optionally with a field mask."""
+        return sheets_get_metadata(
+            spreadsheet_id,
+            fields=fields,
+            ranges=ranges,
+            include_grid_data=include_grid_data,
+        )
+
+    def sheets_highlighted_rows(
+        self,
+        spreadsheet_id: str,
+        range_notation: str = "A1:Z1000",
+    ) -> dict:
+        """Inspect row background fills for a range in a Google Sheet."""
+        return sheets_highlighted_rows(spreadsheet_id, range_notation=range_notation)
 
     def sheets_update(
         self,
