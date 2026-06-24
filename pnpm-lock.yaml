@@ -9,8 +9,11 @@ patchedDependencies:
     hash: 8f4fbb770159f924570fbad681297fcb9f8f7a6353a705cfcb78e39ef9e3a3ab
     path: patches/@chat-adapter__discord@4.31.0.patch
   '@chat-adapter/slack@4.31.0':
-    hash: 7da250cea3e8a84e3fc21314f7be2059496de2add5724287495c3a1b5b1ef21b
+    hash: 4a13e39aa1f023696e9b930391146ffcb8ac50adfcf394dcf1905e4e445213f7
     path: patches/@chat-adapter__slack@4.31.0.patch
+  chat@4.31.0:
+    hash: af3488d2a7d0620bb5e8960feb423fd2a5211516e5b8a193df65bfe52a02c87c
+    path: patches/chat@4.31.0.patch
 
 importers:
 
@@ -79,7 +82,7 @@ importers:
         version: 4.31.0(zod@4.4.3)
       chat:
         specifier: ^4.31.0
-        version: 4.31.0(zod@4.4.3)
+        version: 4.31.0(patch_hash=af3488d2a7d0620bb5e8960feb423fd2a5211516e5b8a193df65bfe52a02c87c)(zod@4.4.3)
       discord.js:
         specifier: ^14.25.1
         version: 14.26.4
@@ -119,13 +122,13 @@ importers:
         version: link:../../packages/rendering
       '@chat-adapter/slack':
         specifier: ^4.31.0
-        version: 4.31.0(patch_hash=7da250cea3e8a84e3fc21314f7be2059496de2add5724287495c3a1b5b1ef21b)(zod@4.4.3)
+        version: 4.31.0(patch_hash=4a13e39aa1f023696e9b930391146ffcb8ac50adfcf394dcf1905e4e445213f7)(zod@4.4.3)
       '@chat-adapter/state-pg':
         specifier: ^4.31.0
         version: 4.31.0(zod@4.4.3)
       chat:
         specifier: ^4.31.0
-        version: 4.31.0(zod@4.4.3)
+        version: 4.31.0(patch_hash=af3488d2a7d0620bb5e8960feb423fd2a5211516e5b8a193df65bfe52a02c87c)(zod@4.4.3)
       hono:
         specifier: ^4.12.18
         version: 4.12.25
@@ -1255,7 +1258,7 @@ snapshots:
   '@chat-adapter/discord@4.31.0(patch_hash=8f4fbb770159f924570fbad681297fcb9f8f7a6353a705cfcb78e39ef9e3a3ab)(zod@4.4.3)':
     dependencies:
       '@chat-adapter/shared': 4.31.0(zod@4.4.3)
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=af3488d2a7d0620bb5e8960feb423fd2a5211516e5b8a193df65bfe52a02c87c)(zod@4.4.3)
       discord-api-types: 0.37.120
       discord-interactions: 4.4.0
       discord.js: 14.26.4
@@ -1268,18 +1271,18 @@ snapshots:
 
   '@chat-adapter/shared@4.31.0(zod@4.4.3)':
     dependencies:
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=af3488d2a7d0620bb5e8960feb423fd2a5211516e5b8a193df65bfe52a02c87c)(zod@4.4.3)
     transitivePeerDependencies:
       - ai
       - supports-color
       - zod
 
-  '@chat-adapter/slack@4.31.0(patch_hash=7da250cea3e8a84e3fc21314f7be2059496de2add5724287495c3a1b5b1ef21b)(zod@4.4.3)':
+  '@chat-adapter/slack@4.31.0(patch_hash=4a13e39aa1f023696e9b930391146ffcb8ac50adfcf394dcf1905e4e445213f7)(zod@4.4.3)':
     dependencies:
       '@chat-adapter/shared': 4.31.0(zod@4.4.3)
       '@slack/socket-mode': 2.0.7
       '@slack/web-api': 7.17.0
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=af3488d2a7d0620bb5e8960feb423fd2a5211516e5b8a193df65bfe52a02c87c)(zod@4.4.3)
     transitivePeerDependencies:
       - ai
       - bufferutil
@@ -1290,7 +1293,7 @@ snapshots:
 
   '@chat-adapter/state-memory@4.31.0(zod@4.4.3)':
     dependencies:
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=af3488d2a7d0620bb5e8960feb423fd2a5211516e5b8a193df65bfe52a02c87c)(zod@4.4.3)
     transitivePeerDependencies:
       - ai
       - supports-color
@@ -1298,7 +1301,7 @@ snapshots:
 
   '@chat-adapter/state-pg@4.31.0(zod@4.4.3)':
     dependencies:
-      chat: 4.31.0(zod@4.4.3)
+      chat: 4.31.0(patch_hash=af3488d2a7d0620bb5e8960feb423fd2a5211516e5b8a193df65bfe52a02c87c)(zod@4.4.3)
       pg: 8.21.0
     transitivePeerDependencies:
       - ai
@@ -1653,7 +1656,7 @@ snapshots:
 
   character-entities@2.0.2: {}
 
-  chat@4.31.0(zod@4.4.3):
+  chat@4.31.0(patch_hash=af3488d2a7d0620bb5e8960feb423fd2a5211516e5b8a193df65bfe52a02c87c)(zod@4.4.3):
     dependencies:
       '@workflow/serde': 4.1.0-beta.2
       mdast-util-to-string: 4.0.0

@@ -117,6 +117,7 @@ const SLACK_TASK_DETAILS_MAX_CHARS = 500
 const SLACK_FALLBACK_TEXT_MAX_CHARS = 35_000
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
+const SLACK_DEDUPE_BUCKETS = ['mention', 'dm', 'subscribed', 'pattern', 'history'] as const
 
 type RenderFallbackResult =
   | { status: 'delivered'; lastEventId: number }
@@ -484,6 +485,13 @@ function createDefaultState(options: SlackbotV2Options, logger: Logger): StateAd
   })
 }
 
+async function clearSlackMessageDedupe(state: StateAdapter, messageId: string): Promise<void> {
+  await Promise.all([
+    state.delete(`dedupe:slack:${messageId}`),
+    ...SLACK_DEDUPE_BUCKETS.map(bucket => state.delete(`dedupe:slack:${messageId}:${bucket}`))
+  ])
+}
+
 /**
  * Blocks until the state backend accepts a connection, retrying with exponential
  * backoff. The first DB connection fires within milliseconds of process start and
@@ -705,7 +713,7 @@ async function syncThreadMessageToSession(
         if (context) {
           context.retryableErrors.push(error)
           try {
-            await input.state.delete(`dedupe:slack:${message.id}`)
+            await clearSlackMessageDedupe(input.state, message.id)
           } catch (deleteError) {
             traceLog(input.options, 'slackbotv2_webhook_retry_dedupe_clear_failed', trace, {
               error: errorMessage(deleteError)
@@ -764,7 +772,7 @@ async function syncThreadMessageToSession(
       if (context) {
         context.retryableErrors.push(error)
         try {
-          await input.state.delete(`dedupe:slack:${message.id}`)
+          await clearSlackMessageDedupe(input.state, message.id)
         } catch (deleteError) {
           traceLog(input.options, 'slackbotv2_webhook_retry_dedupe_clear_failed', trace, {
             error: errorMessage(deleteError)

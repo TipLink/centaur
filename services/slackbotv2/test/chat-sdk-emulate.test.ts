@@ -214,6 +214,106 @@ describe('slackbotv2', () => {
       response_ok: true,
       response_status: 200
     })
+    expect(codexApi.executes).toHaveLength(1)
+  })
+
+  it('does not let a non-actionable message event suppress a later app_mention', async () => {
+    const text = `<@${BOT_USER_ID}> process the app mention after duplicate delivery`
+    const mention = await postUserMessage(text)
+
+    const messageWaits: Promise<unknown>[] = []
+    const messageResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-nonactionable-message-first',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text: ''
+        }
+      }),
+      {},
+      waitUntilContext(messageWaits)
+    )
+
+    expect(messageResponse.status).toBe(200)
+    await Promise.all(messageWaits)
+    expect(codexApi.executes).toHaveLength(0)
+
+    const appMentionWaits: Promise<unknown>[] = []
+    const appMentionResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-app-mention-after-nonactionable-message',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text
+        }
+      }),
+      {},
+      waitUntilContext(appMentionWaits)
+    )
+
+    expect(appMentionResponse.status).toBe(200)
+    await Promise.all(appMentionWaits)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]?.threadKey).toBe(threadKey(mention.ts))
+  })
+
+  it('dedupes app_mention after a message event that already triggered', async () => {
+    const text = `<@${BOT_USER_ID}> process only once`
+    const mention = await postUserMessage(text)
+
+    const messageWaits: Promise<unknown>[] = []
+    const messageResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-triggering-message-first',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text
+        }
+      }),
+      {},
+      waitUntilContext(messageWaits)
+    )
+
+    expect(messageResponse.status).toBe(200)
+    await Promise.all(messageWaits)
+    expect(codexApi.executes).toHaveLength(1)
+
+    const appMentionWaits: Promise<unknown>[] = []
+    const appMentionResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-app-mention-after-triggering-message',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text
+        }
+      }),
+      {},
+      waitUntilContext(appMentionWaits)
+    )
+
+    expect(appMentionResponse.status).toBe(200)
+    await Promise.all(appMentionWaits)
+    expect(codexApi.executes).toHaveLength(1)
   })
 
   it('syncs thread context, forwards subscribed messages, and renders execute streams', async () => {
@@ -3448,6 +3548,49 @@ describe('slackbotv2', () => {
     await Promise.all(allowedBotWaits)
     expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.executes).toHaveLength(1)
+
+    bot = createTestBot({ triggerBotAllowlist: ['bot:BOTHERBOT'] })
+    codexApi.reset()
+    const labeledBotMention = `<@${BOT_USER_ID}|centaur> from allowed bot message`
+    const allowedBotChannelMessage = await postUserMessage(labeledBotMention)
+    slackApi.reset()
+    const allowedBotChannelWaits: Promise<unknown>[] = []
+    const allowedBotChannelResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-bot-message-allowed',
+        event: {
+          type: 'message',
+          app_id: 'AOTHERBOT',
+          bot_id: 'BOTHERBOT',
+          bot_profile: {
+            app_id: 'AOTHERBOT',
+            id: 'BOTHERBOT',
+            user_id: 'UOTHERBOT'
+          },
+          channel: CHANNEL_ID,
+          subtype: 'bot_message',
+          team: TEAM_ID,
+          text: labeledBotMention,
+          ts: allowedBotChannelMessage.ts,
+          username: 'otherbot'
+        }
+      }),
+      {},
+      waitUntilContext(allowedBotChannelWaits)
+    )
+    expect(allowedBotChannelResponse.status).toBe(200)
+    await Promise.all(allowedBotChannelWaits)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(1)
+    const allowedBotChannelTranscripts = slackStreamTranscripts(slackApi.calls)
+    expect(allowedBotChannelTranscripts).toHaveLength(1)
+    expect(allowedBotChannelTranscripts[0]!.start.body).toEqual(
+      expect.objectContaining({
+        recipient_team_id: TEAM_ID,
+        recipient_user_id: 'UOTHERBOT'
+      })
+    )
   })
 })
 
