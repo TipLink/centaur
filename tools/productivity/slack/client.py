@@ -146,6 +146,14 @@ class SlackClient:
         status_code = getattr(error.response, "status_code", None)
         return status_code in {401, 403} or self._slack_error_code(error) in self._AUTH_ERROR_CODES
 
+    def _is_missing_private_channel_scope(self, error: SlackApiError) -> bool:
+        """Return whether a mixed public/private channel list only lacks private scope."""
+        if self._slack_error_code(error) != "missing_scope":
+            return False
+        needed = str(error.response.get("needed") or "")
+        scopes = {scope.strip() for scope in needed.split(",") if scope.strip()}
+        return bool(scopes & {"groups:read", "groups:history"})
+
     @classmethod
     def _api_timeout_seconds(cls) -> int:
         """Return Slack SDK request timeout in seconds."""
@@ -521,6 +529,10 @@ class SlackClient:
         the tool-call budget (so the cache below never warms and every call
         re-scans the whole workspace from scratch).
 
+        If the token lacks private-channel listing scope, retry with public
+        channels only so public-history search can still work without
+        requesting ``groups:read``.
+
         Args:
             limit: Maximum channels to return
             force_refresh: Ignore cache and fetch fresh data
@@ -537,17 +549,26 @@ class SlackClient:
 
         channels = []
         cursor = None
+        conversation_types = "public_channel,private_channel"
 
         while True:
             try:
                 response = self._retry_on_ratelimit(
                     self._client.users_conversations,
-                    types="public_channel,private_channel",
+                    types=conversation_types,
                     limit=min(limit - len(channels), 200),
                     cursor=cursor,
                     exclude_archived=True,
                 )
             except SlackApiError as e:
+                if (
+                    conversation_types == "public_channel,private_channel"
+                    and self._is_missing_private_channel_scope(e)
+                ):
+                    channels = []
+                    cursor = None
+                    conversation_types = "public_channel"
+                    continue
                 self._raise_slack_api_error(
                     e,
                     slack_method="users.conversations",

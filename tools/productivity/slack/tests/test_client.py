@@ -446,6 +446,54 @@ def test_search_messages_parses_channel_and_user_modifiers_locally() -> None:
     assert results[0]["user_id"] == "UGZCSQTPE"
 
 
+def test_search_messages_retries_public_channels_when_private_scope_missing() -> None:
+    client, fake_web_client = _make_client()
+    delattr(client, "list_bot_channels")
+    client._get_user_cache = lambda: {"U1": "alice"}  # type: ignore[method-assign]
+    client._save_channel_cache = lambda _result: None  # type: ignore[method-assign]
+
+    def fail_native_search(method: str, *, params: dict):
+        fake_web_client.api_calls.append((method, params))
+        raise _make_slack_error(error="invalid_auth", status_code=200)
+
+    def users_conversations(**kwargs):
+        fake_web_client.user_conversations_calls.append(kwargs)
+        if len(fake_web_client.user_conversations_calls) == 1:
+            response = _FakeSlackResponse(error="missing_scope", status_code=200)
+            response["needed"] = "groups:read"
+            raise SlackApiError(message="missing private scope", response=response)
+        return {
+            "channels": [
+                {"id": "C1", "name": "dev", "is_private": False, "num_members": 12},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    fake_web_client.api_call = fail_native_search  # type: ignore[method-assign]
+    fake_web_client.users_conversations = users_conversations  # type: ignore[method-assign]
+    fake_web_client.history_pages = [
+        {
+            "messages": [
+                {"user": "U1", "text": "deploy recap note", "ts": "300.000000"},
+            ]
+        }
+    ]
+
+    results = client.search_messages("deploy", max_results=5, messages_per_channel=25)
+
+    assert fake_web_client.api_calls == [
+        ("search.messages", {"query": "deploy", "count": 5, "sort": "timestamp"})
+    ]
+    assert [call["types"] for call in fake_web_client.user_conversations_calls] == [
+        "public_channel,private_channel",
+        "public_channel",
+    ]
+    assert fake_web_client.history_calls == [{"channel": "C1", "limit": 25}]
+    assert len(results) == 1
+    assert results[0]["channel_id"] == "C1"
+    assert results[0]["text"] == "deploy recap note"
+
+
 def test_list_channels_returns_cache_when_slack_rate_limited() -> None:
     client, fake_web_client = _make_client()
     cached_channels = [{"id": "C123", "name": "cached", "is_private": False}]
@@ -494,6 +542,47 @@ def test_list_bot_channels_uses_users_conversations() -> None:
     assert [c["name"] for c in result] == ["alpha", "zeta"]
     assert result[0]["is_private"] is True
     assert result[1]["member_count"] == 3
+
+
+def test_list_bot_channels_falls_back_to_public_when_private_scope_missing() -> None:
+    client, fake_web_client = _make_client()
+    saved: list[list[dict]] = []
+    client._save_channel_cache = lambda result: saved.append(result)  # type: ignore[method-assign]
+
+    def users_conversations(**kwargs):
+        fake_web_client.user_conversations_calls.append(kwargs)
+        if len(fake_web_client.user_conversations_calls) == 1:
+            response = _FakeSlackResponse(error="missing_scope", status_code=200)
+            response["needed"] = "groups:read"
+            response["provided"] = "channels:read,channels:history"
+            raise SlackApiError(message="missing private scope", response=response)
+        return {
+            "channels": [
+                {"id": "C1", "name": "dev", "is_private": False, "num_members": 12},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    fake_web_client.users_conversations = users_conversations  # type: ignore[method-assign]
+
+    result = SlackClient.list_bot_channels(client, force_refresh=True)
+
+    assert [call["types"] for call in fake_web_client.user_conversations_calls] == [
+        "public_channel,private_channel",
+        "public_channel",
+    ]
+    assert fake_web_client.list_calls == []
+    assert result == [
+        {
+            "id": "C1",
+            "name": "dev",
+            "purpose": "",
+            "topic": "",
+            "member_count": 12,
+            "is_private": False,
+        }
+    ]
+    assert saved == [result]
 
 
 def test_get_thread_replies_page_uses_bounded_default() -> None:
