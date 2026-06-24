@@ -522,7 +522,8 @@ describe('CodexAppServerRendererEventMapper', () => {
               }
             }
           }
-        ])
+        ]),
+        { taskOutput: 'full' }
       )
     )
 
@@ -541,6 +542,74 @@ describe('CodexAppServerRendererEventMapper', () => {
       id: 'cmd-1',
       status: 'complete'
     })
+  })
+
+  it('omits command output before task updates by default', async () => {
+    const largeOutput = 'large-context-line\n'.repeat(1_000)
+    const chunks = await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          {
+            method: 'item/started',
+            params: {
+              threadId: 'thread-1',
+              turnId: 'turn-1',
+              item: {
+                id: 'cmd-1',
+                type: 'commandExecution',
+                command: 'gh run view --log',
+                status: 'inProgress'
+              }
+            }
+          },
+          {
+            method: 'item/commandExecution/outputDelta',
+            params: {
+              threadId: 'thread-1',
+              turnId: 'turn-1',
+              itemId: 'cmd-1',
+              delta: largeOutput.slice(0, 5_000)
+            }
+          },
+          {
+            method: 'item/commandExecution/outputDelta',
+            params: {
+              threadId: 'thread-1',
+              turnId: 'turn-1',
+              itemId: 'cmd-1',
+              delta: largeOutput.slice(5_000)
+            }
+          },
+          {
+            method: 'item/completed',
+            params: {
+              threadId: 'thread-1',
+              turnId: 'turn-1',
+              item: {
+                id: 'cmd-1',
+                type: 'commandExecution',
+                command: 'gh run view --log',
+                status: 'completed',
+                aggregatedOutput: largeOutput,
+                exitCode: 0
+              }
+            }
+          }
+        ])
+      )
+    )
+
+    const taskChunks = chunks.filter(
+      (chunk): chunk is Extract<(typeof chunks)[number], { type: 'task_update' }> =>
+        chunk.type === 'task_update' && chunk.id === 'cmd-1'
+    )
+    expect(taskChunks.map(chunk => chunk.output).filter(Boolean)).toEqual([])
+    expect(taskChunks.some(chunk => chunk.details?.includes('gh run view --log'))).toBe(true)
+    expect(taskChunks.at(-1)).toMatchObject({
+      id: 'cmd-1',
+      status: 'complete'
+    })
+    expect(JSON.stringify(taskChunks)).not.toContain('large-context-line')
   })
 
   it('preserves full command output in task updates', async () => {
@@ -564,7 +633,8 @@ describe('CodexAppServerRendererEventMapper', () => {
               }
             }
           }
-        ])
+        ]),
+        { taskOutput: 'full' }
       )
     )
 
@@ -598,7 +668,8 @@ describe('CodexAppServerRendererEventMapper', () => {
               }
             }
           }
-        ])
+        ]),
+        { taskOutput: 'full' }
       )
     )
 
@@ -632,7 +703,8 @@ describe('CodexAppServerRendererEventMapper', () => {
               }
             }
           }
-        ])
+        ]),
+        { taskOutput: 'full' }
       )
     )
 
@@ -642,6 +714,45 @@ describe('CodexAppServerRendererEventMapper', () => {
     )
     expect(taskChunk?.output).toContain('[binary output omitted;')
     expect(taskChunk?.output).not.toContain('\u0000')
+  })
+
+  it('suppresses the live delta instead of interleaving when the recomposed answer diverges from streamed text', () => {
+    // Two concurrent final-answer items compose as A + B. Growing A (a
+    // non-trailing component) after B was already streamed shifts B's bytes, so
+    // a byte-offset slice would re-read and re-emit B, duplicating it
+    // ("Hello world." -> "Hello world.world."). The guard refuses the
+    // non-continuation and freezes at the clean prefix instead, and records the
+    // divergence once for the metric.
+    const logs: string[] = []
+    const mapper = new CodexAppServerRendererEventMapper({
+      logInfo: event => logs.push(event)
+    })
+
+    const deltas: string[] = []
+    const run = (event: unknown) => {
+      for (const out of mapper.process(event)) {
+        if (out.type === 'renderer.message.delta') deltas.push(out.delta)
+      }
+    }
+
+    // A task makes the plan visible so answer deltas stream immediately.
+    run({ type: 'item.started', item: { id: 'cmd-1', type: 'commandExecution', command: 'true' } })
+    run({ type: 'item.started', item: { id: 'A', type: 'agentMessage', phase: 'final_answer' } })
+    run({ type: 'item.started', item: { id: 'B', type: 'agentMessage', phase: 'final_answer' } })
+    run({ type: 'item.agentMessage.delta', itemId: 'A', delta: 'Hello ' })
+    run({ type: 'item.agentMessage.delta', itemId: 'B', delta: 'world.' })
+    // A grows after B was already streamed: a byte-offset slice would duplicate
+    // "world." here. The guard suppresses the non-continuation instead.
+    run({ type: 'item.agentMessage.delta', itemId: 'A', delta: 'there ' })
+
+    const streamed = deltas.join('')
+    expect(streamed).toBe('Hello world.')
+    expect(streamed).not.toContain('world.world.')
+    expect(logs).toContain('codex_renderer_stream_divergence_suppressed')
+    // The signal is recorded once per render, not on every subsequent event.
+    expect(logs.filter(event => event === 'codex_renderer_stream_divergence_suppressed')).toHaveLength(
+      1
+    )
   })
 
   it('marks open tasks as errors on Rust session failures and emits done', () => {
