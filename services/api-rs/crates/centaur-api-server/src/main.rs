@@ -38,11 +38,13 @@ async fn main() -> Result<(), ServerError> {
         info!("iron-control tool secret reconciliation enabled");
         tokio::spawn(reconciler.run());
     }
+    runtime = runtime.with_personas(args.persona_registry()?);
     if let Some(mut config) = args.warm_pool_config() {
         config.bootstrap_iron_control_principal = warm_pool_bootstrap_principal.clone();
         runtime = runtime.with_warm_pool(config);
     }
     runtime = runtime.with_sandbox_reaper(args.sandbox_reaper_config());
+    runtime = runtime.with_sandbox_cleanup(args.sandbox_cleanup_config());
     let workflow_host_sandbox = args
         .workflow_host_sandbox_runtime(workflow_host_principal.as_deref())
         .await?;
