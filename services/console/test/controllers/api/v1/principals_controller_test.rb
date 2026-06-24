@@ -330,6 +330,7 @@ module Api
 
         data = json_body.fetch("data")
         assert_equal principal.oid, data["id"]
+        assert_equal "120s", data.dig("proxy", "upstream_response_header_timeout")
         assert_equal 2, data.fetch("secrets").length
         assert_kind_of Array, data.fetch("transforms")
         assert_kind_of Array, data.fetch("postgres")

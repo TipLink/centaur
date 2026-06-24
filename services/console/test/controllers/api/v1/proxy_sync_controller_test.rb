@@ -43,10 +43,11 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
 
     body = json_body
     assert_match(/\Asha256:[0-9a-f]{64}\z/, body.fetch("config_hash"))
+    assert_equal "120s", body.dig("proxy", "upstream_response_header_timeout")
     secrets = body.fetch("secrets")
     assert_equal 2, secrets.length
 
-    # Omitted top-level fields stay absent so the proxy no-ops on them.
+    # Unsupported top-level fields stay absent so the proxy no-ops on them.
     refute body.key?("rules")
     refute body.key?("mcp")
     refute body.key?("ingest_token")
@@ -66,6 +67,22 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
       "SELECT payload FROM principal_sync_config_snapshots WHERE id = #{snapshot.id}"
     )
     refute_includes raw, "s3cr3t-db-pass"
+  end
+
+  test "sync overlays managed proxy settings onto cached snapshots" do
+    legacy_payload = Principal::EMPTY_CONFIG.deep_dup
+    legacy_payload.delete("proxy")
+
+    PrincipalSyncConfigSnapshot.create!(
+      principal: @proxy.principal,
+      principal_cache_version: @proxy.principal.sync_config_cache_version,
+      payload: legacy_payload
+    )
+
+    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+    assert_response :ok
+
+    assert_equal "120s", json_body.dig("proxy", "upstream_response_header_timeout")
   end
 
   test "secret changes bump principal cache version and build a new snapshot" do
@@ -268,6 +285,7 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     body = json_body
     assert_equal "unassigned", body.fetch("status")
     assert_nil body.fetch("principal_id")
+    assert_equal "120s", body.dig("proxy", "upstream_response_header_timeout")
     assert_empty body.fetch("secrets")
     assert_empty body.fetch("transforms")
   end
