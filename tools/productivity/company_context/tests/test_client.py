@@ -39,8 +39,8 @@ class _FakeSlackClient:
         self.messages = messages or []
         self.calls = []
 
-    def search_messages(self, query, max_results=20):
-        self.calls.append((query, max_results))
+    def search_messages(self, query, max_results=20, channels=None):
+        self.calls.append((query, max_results, channels))
         return self.messages
 
 
@@ -121,6 +121,7 @@ def test_search_queries_bm25_and_returns_compact_results(monkeypatch):
 
     monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
     monkeypatch.setattr(company_context_client, "_load_slack_client", lambda: fake_slack)
+    monkeypatch.setattr(company_context_client, "_current_slack_channel_id", lambda: "C123")
 
     result = CompanyContextClient("postgresql://example").search(
         "ParadeDB BM25",
@@ -134,7 +135,7 @@ def test_search_queries_bm25_and_returns_compact_results(monkeypatch):
     assert result["indexed_count"] == 1
     assert result["live_count"] == 0
     assert result["indexed_cutoff"] == "2026-05-10T15:30:00+00:00"
-    assert fake_slack.calls == [("ParadeDB BM25 after:2026-05-10", 5)]
+    assert fake_slack.calls == [("ParadeDB BM25 after:2026-05-10", 5, ["C123"])]
     assert result["results"][0] == {
         "document_id": "slack:thread:C123:1770000000.000000",
         "source": "slack",
@@ -207,6 +208,7 @@ def test_search_appends_live_slack_gap_results(monkeypatch):
 
     monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
     monkeypatch.setattr(company_context_client, "_load_slack_client", lambda: fake_slack)
+    monkeypatch.setattr(company_context_client, "_current_slack_channel_id", lambda: "C123")
 
     result = CompanyContextClient("postgresql://example").search(
         "state root mismatch",
@@ -220,7 +222,7 @@ def test_search_appends_live_slack_gap_results(monkeypatch):
     assert result["live_count"] == 1
     assert result["indexed_cutoff"] == "2026-05-10T15:30:00+00:00"
     assert result["live_error"] is None
-    assert fake_slack.calls == [("state root mismatch after:2026-05-10", 7)]
+    assert fake_slack.calls == [("state root mismatch after:2026-05-10", 7, ["C123"])]
     assert result["results"] == [
         {
             "document_id": "",
@@ -269,6 +271,7 @@ def test_search_preserves_existing_slack_after_modifier(monkeypatch):
 
     monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
     monkeypatch.setattr(company_context_client, "_load_slack_client", lambda: fake_slack)
+    monkeypatch.setattr(company_context_client, "_current_slack_channel_id", lambda: "C123")
 
     result = CompanyContextClient("postgresql://example").search(
         "state root after:2026-05-11",
@@ -276,7 +279,37 @@ def test_search_preserves_existing_slack_after_modifier(monkeypatch):
     )
 
     assert result["status"] == "ok"
-    assert fake_slack.calls == [("state root after:2026-05-11", 10)]
+    assert fake_slack.calls == [("state root after:2026-05-11", 10, ["C123"])]
+
+
+def test_search_skips_live_slack_without_channel_context(monkeypatch):
+    fake = _FakeConnection(
+        rows=[],
+        row={
+            "latest_date": dt.datetime(2026, 5, 10, 15, 30, tzinfo=dt.UTC),
+            "latest_source_updated_at": dt.datetime(2026, 5, 10, 15, 30, tzinfo=dt.UTC),
+            "latest_occurred_at": dt.datetime(2026, 5, 10, 14, 0, tzinfo=dt.UTC),
+            "document_count": 42,
+        },
+    )
+    fake_slack = _FakeSlackClient()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(company_context_client, "_load_slack_client", lambda: fake_slack)
+    monkeypatch.setattr(company_context_client, "_current_slack_channel_id", lambda: None)
+
+    result = CompanyContextClient("postgresql://example").search(
+        "state root mismatch",
+        source="slack",
+    )
+
+    assert result["status"] == "ok"
+    assert result["live_count"] == 0
+    assert result["live_error"] == "live Slack search requires a channel-scoped thread"
+    assert fake_slack.calls == []
 
 
 def test_search_uses_or_terms_and_drops_stop_words(monkeypatch):
@@ -346,6 +379,19 @@ def test_search_applies_occurred_at_filters(monkeypatch):
         dt.datetime(2026, 5, 8, 12, 30, tzinfo=dt.UTC),
         4,
     )
+
+
+def test_public_slack_docs_policy_keeps_private_channels_scoped():
+    migration = (
+        Path(__file__).resolve().parents[4]
+        / "services/api-rs/crates/centaur-session-sqlx/migrations"
+        / "0019_company_context_public_slack_docs.sql"
+    ).read_text()
+
+    assert "metadata ->> 'channel_id' like 'C%'" in migration
+    assert "channels.is_syncable" in migration
+    assert "metadata ->> 'channel_id' = nullif(current_setting" in migration
+    assert "slack_context_rls_admin_channels" not in migration
 
 
 def test_search_rejects_invalid_occurred_at_filter():
