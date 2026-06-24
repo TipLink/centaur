@@ -27,9 +27,21 @@ class Principal < ApplicationRecord
   # reports that a control_plane source carries a value without revealing it.
   REDACTED = "[redacted]".freeze
 
+  # Managed proxies do not read the baked local proxy YAML; they receive their
+  # runtime config from iron-control sync. Keep this in sync with
+  # services/iron-proxy/iron-proxy.yaml and the infra fragment.
+  MANAGED_PROXY_CONFIG = {
+    "upstream_response_header_timeout" => "120s"
+  }.freeze
+
   # The config of a principal with no effective grants; also what an unassigned
   # proxy resolves to.
-  EMPTY_CONFIG = { "secrets" => [], "transforms" => [], "postgres" => [] }.freeze
+  EMPTY_CONFIG = {
+    "proxy" => MANAGED_PROXY_CONFIG,
+    "secrets" => [].freeze,
+    "transforms" => [].freeze,
+    "postgres" => [].freeze
+  }.freeze
 
   # Every grant this principal resolves to: its own direct grants plus the
   # grants of every role it is assigned. Secrets reachable through more than one
@@ -112,12 +124,16 @@ class Principal < ApplicationRecord
   # var name, a secret_id, ...) that is configuration, not a live credential, so
   # it passes through untouched.
   def effective_config(redact_secrets: true)
-    config = {
+    config = self.class.with_managed_proxy_config(
       "secrets" => sync_secrets,
       "transforms" => sync_transforms,
       "postgres" => sync_postgres
-    }
+    )
     redact_secrets ? self.class.redact_live_secrets(config) : config
+  end
+
+  def self.with_managed_proxy_config(config)
+    config.merge("proxy" => MANAGED_PROXY_CONFIG)
   end
 
   def self.bump_sync_config_cache_versions(ids)
