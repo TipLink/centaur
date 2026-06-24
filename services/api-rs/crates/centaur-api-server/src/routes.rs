@@ -95,6 +95,8 @@ pub fn build_router_with_session_and_workflow_runtime(
             post(execute_session).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/session/{thread_key}/events", get(stream_events))
+        .route("/api/session/{thread_key}/release", post(release_thread))
+        .route("/agent/threads/{thread_key}/release", post(release_thread))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route("/workflows/schedules", get(list_workflow_schedules))
@@ -272,6 +274,32 @@ async fn execute_session(
         execution_id: execution.execution_id,
         thread_key: execution.thread_key,
         status: execution.status.to_string(),
+    }))
+}
+
+async fn release_thread(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<crate::types::ReleaseThreadRequest>,
+) -> Result<Json<crate::types::ReleaseThreadResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let outcome = state
+        .runtime
+        .release_thread(
+            &thread_key,
+            request.release_id.as_deref(),
+            request.cancel_inflight,
+        )
+        .await?;
+    Ok(Json(crate::types::ReleaseThreadResponse {
+        ok: true,
+        session: outcome.session,
+        release_id: outcome.release_id,
+        cancel_inflight: outcome.cancel_inflight,
+        sandbox_released: outcome.sandbox_released,
+        sandbox_release_error: outcome.sandbox_release_error,
+        execution_id: outcome.execution_id,
+        execution_cancelled: outcome.execution_cancelled,
     }))
 }
 
