@@ -18,6 +18,12 @@ pub fn load_fragment_str(contents: &str) -> Result<ProxyFragment> {
 /// — known in advance — so they are baked in rather than discovered from disk.
 /// Returns ``None`` for an unknown engine/mode pair.
 pub fn harness_auth_fragment(engine: &str, auth_mode: &str) -> Result<Option<ProxyFragment>> {
+    // Bedrock authenticates with AWS SigV4 rather than a static bearer token:
+    // codex's `amazon-bedrock` provider signs each request with placeholder AWS
+    // credentials, and iron-proxy re-signs it with the real IAM keys.
+    if engine == "amazon-bedrock" && normalize_auth_mode(auth_mode) == "api_key" {
+        return bedrock_aws_auth_fragment().map(Some);
+    }
     let yaml = match (engine, normalize_auth_mode(auth_mode).as_str()) {
         ("codex", "api_key") => CODEX_API_KEY_FRAGMENT,
         ("codex", "access_token") => CODEX_ACCESS_TOKEN_FRAGMENT,
@@ -27,6 +33,86 @@ pub fn harness_auth_fragment(engine: &str, auth_mode: &str) -> Result<Option<Pro
         _ => return Ok(None),
     };
     load_fragment_str(yaml).map(Some)
+}
+
+pub fn bedrock_region() -> String {
+    std::env::var("CODEX_BEDROCK_REGION")
+        .ok()
+        .map(|region| region.trim().to_owned())
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| "us-east-1".to_owned())
+}
+
+pub fn bedrock_enabled() -> bool {
+    std::env::var("CODEX_BEDROCK_REGION")
+        .ok()
+        .is_some_and(|region| !region.trim().is_empty())
+}
+
+fn bedrock_uses_session_token() -> bool {
+    std::env::var("CODEX_BEDROCK_SESSION_TOKEN")
+        .ok()
+        .is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && !value.eq_ignore_ascii_case("false") && value != "0"
+        })
+}
+
+pub fn bedrock_sandbox_env() -> Vec<(String, String)> {
+    if !bedrock_enabled() {
+        return Vec::new();
+    }
+    bedrock_sandbox_env_for(&bedrock_region(), bedrock_uses_session_token())
+}
+
+fn bedrock_sandbox_env_for(region: &str, uses_session_token: bool) -> Vec<(String, String)> {
+    let mut env = vec![
+        (
+            "AWS_ACCESS_KEY_ID".to_owned(),
+            "AWS_ACCESS_KEY_ID".to_owned(),
+        ),
+        (
+            "AWS_SECRET_ACCESS_KEY".to_owned(),
+            "AWS_SECRET_ACCESS_KEY".to_owned(),
+        ),
+        ("AWS_REGION".to_owned(), region.to_owned()),
+        ("CODEX_BEDROCK_REGION".to_owned(), region.to_owned()),
+    ];
+    if uses_session_token {
+        env.push((
+            "AWS_SESSION_TOKEN".to_owned(),
+            "AWS_SESSION_TOKEN".to_owned(),
+        ));
+    }
+    env
+}
+
+fn bedrock_aws_auth_fragment() -> Result<ProxyFragment> {
+    load_fragment_str(&bedrock_aws_auth_fragment_yaml(
+        &bedrock_region(),
+        bedrock_uses_session_token(),
+    ))
+}
+
+fn bedrock_aws_auth_fragment_yaml(region: &str, uses_session_token: bool) -> String {
+    let session_token_line = if uses_session_token {
+        "      session_token: { placeholder: AWS_SESSION_TOKEN }\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+transforms:
+  - name: aws_auth
+    config:
+      access_key_id: {{ placeholder: AWS_ACCESS_KEY_ID }}
+      secret_access_key: {{ placeholder: AWS_SECRET_ACCESS_KEY }}
+{session_token_line}      allowed_services: [bedrock, bedrock-mantle]
+      allowed_regions: [{region}]
+      rules:
+        - {{ host: bedrock-mantle.{region}.api.aws }}
+"#
+    )
 }
 
 const CODEX_API_KEY_FRAGMENT: &str = r#"
@@ -152,4 +238,59 @@ pub fn pg_sandbox_dsns(fragments: &[ProxyFragment]) -> Vec<(String, String)> {
     dsns.sort();
     dsns.dedup();
     dsns
+}
+
+#[cfg(test)]
+mod bedrock_tests {
+    use super::*;
+
+    #[test]
+    fn bedrock_fragment_long_term_keys_scopes_region_and_omits_session_token() {
+        let yaml = bedrock_aws_auth_fragment_yaml("us-east-1", false);
+        assert!(yaml.contains("bedrock-mantle.us-east-1.api.aws"));
+        assert!(yaml.contains("allowed_services: [bedrock, bedrock-mantle]"));
+        assert!(yaml.contains("allowed_regions: [us-east-1]"));
+        assert!(!yaml.contains("session_token"));
+
+        let fragment = load_fragment_str(&yaml).expect("bedrock fragment parses");
+        assert_eq!(fragment.transforms.len(), 1);
+        assert_eq!(fragment.transforms[0].name, "aws_auth");
+    }
+
+    #[test]
+    fn bedrock_fragment_temporary_keys_declare_session_token_and_region() {
+        let yaml = bedrock_aws_auth_fragment_yaml("eu-central-1", true);
+        assert!(yaml.contains("bedrock-mantle.eu-central-1.api.aws"));
+        assert!(yaml.contains("allowed_regions: [eu-central-1]"));
+        assert!(yaml.contains("session_token: { placeholder: AWS_SESSION_TOKEN }"));
+
+        let fragment = load_fragment_str(&yaml).expect("bedrock fragment parses");
+        assert_eq!(fragment.transforms[0].name, "aws_auth");
+    }
+
+    #[test]
+    fn bedrock_sandbox_env_injects_placeholders_and_real_region() {
+        let env = bedrock_sandbox_env_for("us-east-1", false);
+        assert!(env.contains(&(
+            "AWS_ACCESS_KEY_ID".to_owned(),
+            "AWS_ACCESS_KEY_ID".to_owned()
+        )));
+        assert!(env.contains(&(
+            "AWS_SECRET_ACCESS_KEY".to_owned(),
+            "AWS_SECRET_ACCESS_KEY".to_owned()
+        )));
+        assert!(env.contains(&("AWS_REGION".to_owned(), "us-east-1".to_owned())));
+        assert!(env.contains(&("CODEX_BEDROCK_REGION".to_owned(), "us-east-1".to_owned())));
+        assert!(!env.iter().any(|(name, _)| name == "AWS_SESSION_TOKEN"));
+    }
+
+    #[test]
+    fn bedrock_sandbox_env_adds_session_token_placeholder_when_temporary() {
+        let env = bedrock_sandbox_env_for("eu-central-1", true);
+        assert!(env.contains(&("AWS_REGION".to_owned(), "eu-central-1".to_owned())));
+        assert!(env.contains(&(
+            "AWS_SESSION_TOKEN".to_owned(),
+            "AWS_SESSION_TOKEN".to_owned()
+        )));
+    }
 }

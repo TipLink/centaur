@@ -8,8 +8,10 @@ use centaur_iron_proxy::{
     PgDsnSetting, PgDsnSettingValueFrom, PostgresListener, PostgresUpstream, ProxyFragment,
     SandboxEnv, Secret, SecretReplace, Transform, TransformConfig,
 };
+use centaur_session_runtime::{PersonaDefinition, PersonaRegistry};
 use serde::Serialize;
 use serde_yaml::Value as YamlValue;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use toml::Value as TomlValue;
 use tracing::{info, warn};
@@ -131,6 +133,15 @@ pub(crate) fn discover_tool_proxy_fragment(
         tool_count: tools.len(),
         secret_count,
     })
+}
+
+pub(crate) fn discover_persona_registry(
+    tool_dirs: &[PathBuf],
+    default_persona_id: Option<String>,
+) -> Result<PersonaRegistry, ToolDiscoveryError> {
+    let (personas, overlay_chain) = collect_personas(tool_dirs)?;
+    PersonaRegistry::new(personas, default_persona_id, overlay_chain)
+        .map_err(ToolDiscoveryError::Invalid)
 }
 
 fn split_tool_dirs(value: &str) -> Vec<PathBuf> {
@@ -258,6 +269,50 @@ fn collect_tools(tool_dirs: &[PathBuf]) -> Result<Vec<LoadedToolMeta>, ToolDisco
     Ok(tools)
 }
 
+fn collect_personas(
+    tool_dirs: &[PathBuf],
+) -> Result<(Vec<PersonaDefinition>, Vec<String>), ToolDiscoveryError> {
+    let mut seen = BTreeMap::<String, usize>::new();
+    let mut personas = Vec::<PersonaDefinition>::new();
+    let mut overlay_chain = Vec::new();
+    let mut existing = false;
+
+    for (dir_idx, base_dir) in tool_dirs.iter().enumerate() {
+        overlay_chain.push(base_dir.display().to_string());
+        if !base_dir.exists() {
+            continue;
+        }
+        existing = true;
+        for persona_dir in candidate_tool_dirs(base_dir)? {
+            let pyproject_path = persona_dir.join("pyproject.toml");
+            if !pyproject_path.exists() {
+                continue;
+            }
+            let Some(persona) = load_persona_meta(base_dir, &persona_dir, &pyproject_path)? else {
+                continue;
+            };
+            if let Some(prev_dir_idx) = seen.insert(persona.id.clone(), dir_idx) {
+                if let Some(prev_pos) = personas.iter().position(|item| item.id == persona.id) {
+                    warn!(
+                        persona = %persona.id,
+                        shadowed_dir = ?tool_dirs.get(prev_dir_idx),
+                        by_dir = ?base_dir,
+                        "api-rs persona metadata shadowed"
+                    );
+                    personas[prev_pos] = persona;
+                }
+            } else {
+                personas.push(persona);
+            }
+        }
+    }
+
+    if !existing {
+        info!(tool_dirs = ?tool_dirs, "api-rs tool dirs missing");
+    }
+    Ok((personas, overlay_chain))
+}
+
 fn candidate_tool_dirs(base_dir: &Path) -> Result<Vec<PathBuf>, ToolDiscoveryError> {
     let mut candidates = Vec::new();
     let mut children = read_dirs_sorted(base_dir)?;
@@ -353,6 +408,68 @@ fn load_tool_meta(
             }
         };
     Ok(Some(LoadedToolMeta { name, secrets }))
+}
+
+fn load_persona_meta(
+    source_root: &Path,
+    persona_dir: &Path,
+    pyproject_path: &Path,
+) -> Result<Option<PersonaDefinition>, ToolDiscoveryError> {
+    let contents =
+        fs::read_to_string(pyproject_path).map_err(|source| ToolDiscoveryError::Read {
+            path: pyproject_path.to_path_buf(),
+            source,
+        })?;
+    let pyproject = match parse_toml(pyproject_path, &contents) {
+        Ok(pyproject) => pyproject,
+        Err(error) => {
+            warn!(
+                persona_dir = ?persona_dir,
+                error = %error,
+                "api-rs persona pyproject parse failed"
+            );
+            return Ok(None);
+        }
+    };
+    let default_tool_conf = TomlValue::Table(Default::default());
+    let tool_conf = pyproject
+        .get("tool")
+        .and_then(|value| value.get("centaur"))
+        .unwrap_or(&default_tool_conf);
+    if tool_conf.get("type").and_then(TomlValue::as_str) != Some("persona") {
+        return Ok(None);
+    }
+
+    let id = persona_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            ToolDiscoveryError::Invalid(format!("invalid persona path {}", persona_dir.display()))
+        })?
+        .to_owned();
+    let prompt_file = tool_conf
+        .get("prompt_file")
+        .or_else(|| tool_conf.get("prompt"))
+        .and_then(TomlValue::as_str)
+        .unwrap_or("PROMPT.md");
+    let prompt_path = persona_dir.join(prompt_file);
+    let prompt = fs::read_to_string(&prompt_path).map_err(|source| ToolDiscoveryError::Read {
+        path: prompt_path.clone(),
+        source,
+    })?;
+    let prompt_hash = {
+        let digest = Sha256::digest(prompt.as_bytes());
+        format!("sha256:{digest:x}")
+    };
+
+    Ok(Some(PersonaDefinition {
+        id,
+        source_root: source_root.display().to_string(),
+        source_path: persona_dir.display().to_string(),
+        source_ref: None,
+        prompt_hash,
+        prompt,
+    }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1365,6 +1482,36 @@ secrets = [
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[test]
+    fn discovers_personas_with_overlay_shadowing_and_default_validation() {
+        let temp = temp_dir("api-rs-personas");
+        let base = temp.join("base");
+        let overlay = temp.join("overlay");
+        write_persona(&base.join("personas").join("eng"), "base prompt");
+        write_persona(&overlay.join("personas").join("eng"), "overlay prompt");
+        write_persona(&overlay.join("personas").join("ops"), "ops prompt");
+
+        let registry =
+            discover_persona_registry(&[base.clone(), overlay.clone()], Some("eng".to_owned()))
+                .unwrap();
+        let personas = registry.summaries();
+
+        assert_eq!(personas.len(), 2);
+        let eng = personas
+            .iter()
+            .find(|persona| persona.id == "eng")
+            .expect("eng persona");
+        assert_eq!(eng.source_root, overlay.display().to_string());
+        assert!(eng.source_path.ends_with("personas/eng"));
+        assert_eq!(
+            eng.prompt_hash,
+            "sha256:af70f573f4496a1cf92865966cb522c2c142a5789e075660a56bea66080bc738"
+        );
+        assert!(discover_persona_registry(&[base, overlay], Some("missing".to_owned())).is_err());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
     fn temp_dir(prefix: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1376,5 +1523,21 @@ secrets = [
     fn write_tool(path: &Path, pyproject: &str) {
         fs::create_dir_all(path).unwrap();
         fs::write(path.join("pyproject.toml"), pyproject).unwrap();
+    }
+
+    fn write_persona(path: &Path, prompt: &str) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(
+            path.join("pyproject.toml"),
+            r#"
+[project]
+description = "persona"
+
+[tool.centaur]
+type = "persona"
+"#,
+        )
+        .unwrap();
+        fs::write(path.join("PROMPT.md"), prompt).unwrap();
     }
 }
