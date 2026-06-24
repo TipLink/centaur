@@ -90,6 +90,33 @@ def test_default_database_url_does_not_fall_back_to_raw_database_url(monkeypatch
         reset_tool_context(token)
 
 
+def test_current_slack_channel_id_prefers_tool_context(monkeypatch):
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:CENV:1780000000.000000")
+    token = set_tool_context(
+        ToolContext(
+            name="company_context",
+            secrets={},
+            thread_key="slack:CTOOL:1780000000.000000",
+        )
+    )
+    try:
+        assert company_context_client._current_slack_channel_id() == "CTOOL"
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_slack_channel_id_falls_back_to_centaur_thread_key(monkeypatch):
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:CENV:1780000000.000000")
+
+    assert company_context_client._current_slack_channel_id() == "CENV"
+
+
+def test_current_slack_channel_id_ignores_dm_thread_key(monkeypatch):
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:D12345678:1780000000.000000")
+
+    assert company_context_client._current_slack_channel_id() is None
+
+
 def test_search_queries_bm25_and_returns_compact_results(monkeypatch):
     occurred_at = dt.datetime(2026, 5, 8, 12, 0, tzinfo=dt.UTC)
     source_updated_at = dt.datetime(2026, 5, 8, 12, 5, tzinfo=dt.UTC)
@@ -310,6 +337,35 @@ def test_search_skips_live_slack_without_channel_context(monkeypatch):
     assert result["live_count"] == 0
     assert result["live_error"] == "live Slack search requires a channel-scoped thread"
     assert fake_slack.calls == []
+
+
+def test_search_uses_centaur_thread_key_for_live_slack_gap(monkeypatch):
+    fake = _FakeConnection(
+        rows=[],
+        row={
+            "latest_date": dt.datetime(2026, 5, 10, 15, 30, tzinfo=dt.UTC),
+            "latest_source_updated_at": dt.datetime(2026, 5, 10, 15, 30, tzinfo=dt.UTC),
+            "latest_occurred_at": dt.datetime(2026, 5, 10, 14, 0, tzinfo=dt.UTC),
+            "document_count": 42,
+        },
+    )
+    fake_slack = _FakeSlackClient()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:CENV:1780000000.000000")
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(company_context_client, "_load_slack_client", lambda: fake_slack)
+
+    result = CompanyContextClient("postgresql://example").search(
+        "state root mismatch",
+        source="slack",
+    )
+
+    assert result["status"] == "ok"
+    assert result["live_error"] is None
+    assert fake_slack.calls == [("state root mismatch after:2026-05-10", 10, ["CENV"])]
 
 
 def test_search_uses_or_terms_and_drops_stop_words(monkeypatch):
