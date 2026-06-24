@@ -432,6 +432,35 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
+    pub async fn cancel_execution_if_active(
+        &self,
+        execution_id: &str,
+        error: &str,
+    ) -> Result<Option<SessionExecution>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            update session_executions
+            set status = $2, error = $3, completed_at = coalesce(completed_at, now()), updated_at = now()
+            where execution_id = $1 and status in ($4, $5)
+            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            "#,
+        )
+        .bind(execution_id)
+        .bind(ExecutionStatus::Cancelled.as_ref())
+        .bind(error)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        self.set_session_status(&row.thread_key, SessionStatus::Idle)
+            .await?;
+        row.try_into().map(Some)
+    }
+
     pub async fn append_event(
         &self,
         thread_key: &ThreadKey,
@@ -662,6 +691,34 @@ impl PgSessionStore {
         .bind(harness_thread_id)
         .fetch_one(&self.pool)
         .await?;
+
+        row.try_into()
+    }
+
+    pub async fn release_session(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Session, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionRow>(
+            r#"
+            update sessions
+            set sandbox_id = null,
+                status = $2,
+                updated_at = now()
+            where thread_key = $1
+            returning thread_key, sandbox_id, harness_type, harness_thread_id, persona_id, status, iron_control_principal, created_at, updated_at
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(SessionStatus::Idle.as_ref())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(SessionStoreError::NotFound {
+                thread_key: thread_key.as_str().to_owned(),
+            });
+        };
 
         row.try_into()
     }

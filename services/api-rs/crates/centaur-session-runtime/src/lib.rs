@@ -104,6 +104,18 @@ pub struct CreateOrGetSessionOutcome {
     pub harness_switched: bool,
 }
 
+/// Result of [`SessionRuntime::release_thread`].
+#[derive(Clone, Debug)]
+pub struct ReleaseThreadOutcome {
+    pub session: Session,
+    pub release_id: Option<String>,
+    pub cancel_inflight: bool,
+    pub sandbox_released: bool,
+    pub sandbox_release_error: Option<String>,
+    pub execution_id: Option<String>,
+    pub execution_cancelled: bool,
+}
+
 /// Outcome of [`SessionRuntime::drain`]: the sandboxes that were stopped and
 /// any that failed to stop (with the backend error text).
 #[derive(Debug, Default)]
@@ -510,6 +522,110 @@ impl SessionRuntime {
         Ok(report)
     }
 
+    pub async fn release_thread(
+        &self,
+        thread_key: &ThreadKey,
+        release_id: Option<&str>,
+        cancel_inflight: bool,
+    ) -> Result<ReleaseThreadOutcome, SessionRuntimeError> {
+        let session = self.store.get_session(thread_key).await?;
+        let sandbox_id = session.sandbox_id.clone();
+        let mut execution_id = None;
+        let mut execution_cancelled = false;
+
+        if let Some(active_execution) = self.store.active_execution_for_thread(thread_key).await? {
+            execution_id = Some(active_execution.execution_id.clone());
+            if cancel_inflight
+                && matches!(
+                    active_execution.status,
+                    ExecutionStatus::Queued | ExecutionStatus::Running
+                )
+            {
+                let cancel_error = Self::release_error_message(
+                    release_id,
+                    thread_key,
+                    sandbox_id.as_deref(),
+                    active_execution.execution_id.as_str(),
+                );
+                if let Some(cancelled) = self
+                    .store
+                    .cancel_execution_if_active(&active_execution.execution_id, &cancel_error)
+                    .await?
+                {
+                    execution_cancelled = true;
+                    self.execution_spans
+                        .lock()
+                        .await
+                        .remove(&cancelled.execution_id);
+                    self.store
+                        .append_event(
+                            thread_key,
+                            Some(&cancelled.execution_id),
+                            "session.execution_cancelled",
+                            json!({
+                                "execution_id": cancelled.execution_id.as_str(),
+                                "thread_key": thread_key.as_str(),
+                                "sandbox_id": sandbox_id.as_deref(),
+                                "release_id": release_id,
+                                "reason": "thread_released",
+                            }),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        let mut sandbox_released = false;
+        let mut sandbox_release_error = None;
+        if let Some(ref sandbox_id) = sandbox_id {
+            self.sandbox_pipes.lock().await.remove(sandbox_id);
+            let id = SandboxId::new(sandbox_id.clone());
+            match self.sandbox_runtime.manager.stop(&id).await {
+                Ok(()) | Err(SandboxError::NotFound(_)) => {
+                    sandbox_released = true;
+                }
+                Err(error) => {
+                    warn!(
+                        thread_key = %thread_key,
+                        sandbox_id = %sandbox_id,
+                        %error,
+                        "failed to release sandbox"
+                    );
+                    sandbox_release_error = Some(error.to_string());
+                }
+            }
+        }
+
+        let session = self.store.release_session(thread_key).await?;
+        self.store
+            .append_event(
+                thread_key,
+                execution_id.as_deref(),
+                "session.released",
+                json!({
+                    "thread_key": thread_key.as_str(),
+                    "release_id": release_id,
+                    "cancel_inflight": cancel_inflight,
+                    "sandbox_id": sandbox_id.as_deref(),
+                    "sandbox_released": sandbox_released,
+                    "sandbox_release_error": sandbox_release_error.as_deref(),
+                    "execution_id": execution_id.as_deref(),
+                    "execution_cancelled": execution_cancelled,
+                }),
+            )
+            .await?;
+
+        Ok(ReleaseThreadOutcome {
+            session,
+            release_id: release_id.map(ToOwned::to_owned),
+            cancel_inflight,
+            sandbox_released,
+            sandbox_release_error,
+            execution_id,
+            execution_cancelled,
+        })
+    }
+
     pub async fn execute_session(
         &self,
         thread_key: &ThreadKey,
@@ -721,25 +837,45 @@ impl SessionRuntime {
     ) {
         self.execution_spans.lock().await.remove(execution_id);
         let error_message = error.to_string();
-        let _ = self
+        if let Ok(Some(execution)) = self
             .store
-            .append_event(
-                thread_key,
-                Some(execution_id),
-                "session.execution_failed",
-                json!({
-                    "execution_id": execution_id,
-                    "thread_key": thread_key.as_str(),
-                    "error": error_message,
-                }),
-            )
-            .await;
-        if let Ok(execution) = self
-            .store
-            .fail_execution(execution_id, &error_message)
+            .fail_execution_if_active(execution_id, &error_message)
             .await
         {
+            let _ = self
+                .store
+                .append_event(
+                    thread_key,
+                    Some(execution_id),
+                    "session.execution_failed",
+                    json!({
+                        "execution_id": execution_id,
+                        "thread_key": thread_key.as_str(),
+                        "error": error_message,
+                    }),
+                )
+                .await;
             record_finished_execution_metric(&self.store, thread_key, &execution, "failed").await;
+        }
+    }
+
+    fn release_error_message(
+        release_id: Option<&str>,
+        thread_key: &ThreadKey,
+        sandbox_id: Option<&str>,
+        execution_id: &str,
+    ) -> String {
+        match release_id {
+            Some(release_id) => format!(
+                "thread released (release_id={release_id}, thread_key={}, sandbox_id={:?}, execution_id={execution_id})",
+                thread_key.as_str(),
+                sandbox_id,
+            ),
+            None => format!(
+                "thread released (thread_key={}, sandbox_id={:?}, execution_id={execution_id})",
+                thread_key.as_str(),
+                sandbox_id,
+            ),
         }
     }
 
@@ -4356,6 +4492,7 @@ mod adoption_tests {
         ios: Mutex<VecDeque<SandboxIo>>,
         recorded_output: Vec<String>,
         open_count: AtomicUsize,
+        stop_count: AtomicUsize,
         status: std::sync::Mutex<SandboxStatus>,
     }
 
@@ -4365,6 +4502,7 @@ mod adoption_tests {
                 ios: Mutex::new(VecDeque::new()),
                 recorded_output,
                 open_count: AtomicUsize::new(0),
+                stop_count: AtomicUsize::new(0),
                 status: std::sync::Mutex::new(status),
             }
         }
@@ -4375,6 +4513,10 @@ mod adoption_tests {
 
         fn opens(&self) -> usize {
             self.open_count.load(Ordering::SeqCst)
+        }
+
+        fn stops(&self) -> usize {
+            self.stop_count.load(Ordering::SeqCst)
         }
     }
 
@@ -4419,6 +4561,7 @@ mod adoption_tests {
         }
 
         async fn stop(&self, _id: &SandboxId) -> SandboxResult<()> {
+            self.stop_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -4651,5 +4794,44 @@ mod adoption_tests {
             "unexpected error: {error}"
         );
         assert_eq!(backend.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_thread_cancels_active_execution_and_clears_sandbox() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:release-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-release"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+
+        let outcome = runtime
+            .release_thread(&thread_key, Some("rel-test-1"), true)
+            .await
+            .expect("release thread");
+
+        assert_eq!(outcome.release_id.as_deref(), Some("rel-test-1"));
+        assert!(outcome.cancel_inflight);
+        assert!(outcome.sandbox_released);
+        assert!(outcome.execution_cancelled);
+        assert_eq!(backend.stops(), 1);
+
+        let session = store.get_session(&thread_key).await.expect("get session");
+        assert_eq!(session.sandbox_id, None);
+        assert_eq!(session.status.as_ref(), "idle");
+
+        let execution = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("latest execution")
+            .expect("execution row");
+        assert_eq!(execution.status.as_ref(), "cancelled");
+
+        wait_for_event(&store, &thread_key, "session.execution_cancelled").await;
+        wait_for_event(&store, &thread_key, "session.released").await;
     }
 }
