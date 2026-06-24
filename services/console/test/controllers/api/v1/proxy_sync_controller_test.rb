@@ -70,10 +70,13 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "sync overlays managed proxy settings onto cached snapshots" do
+    legacy_payload = Principal::EMPTY_CONFIG.deep_dup
+    legacy_payload.delete("proxy")
+
     PrincipalSyncConfigSnapshot.create!(
       principal: @proxy.principal,
       principal_cache_version: @proxy.principal.sync_config_cache_version,
-      payload: { "secrets" => [], "transforms" => [], "postgres" => [] }
+      payload: legacy_payload
     )
 
     post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
