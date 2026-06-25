@@ -126,7 +126,7 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # ── Browser automation deps (must run as root before USER agent) ─────────────
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    playwright install --with-deps chromium \
+    playwright install --with-deps --only-shell chromium \
     && chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH"
 
 USER agent
