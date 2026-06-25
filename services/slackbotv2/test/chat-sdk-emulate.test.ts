@@ -2253,6 +2253,61 @@ describe('slackbotv2', () => {
     expect(await threadText(parent.ts)).toContain('STREAM_CONTINUATION_END')
   })
 
+  it('rewrites markdown pipe tables before streaming to Slack', async () => {
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a markdown table answer.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> update these Attio leads`, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-markdown-table-output',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> update these Attio leads`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+
+    const answer = [
+      'Done. Verified notes/address/tasks in Attio.',
+      '',
+      '| Lead | Attio record | Task |',
+      '|---|---|---|',
+      '| SolitaireNY (Sohil Bhansali) | https://app.attio.com/fin/custom/pipeline/record/51d31937-ed2a-457e-8088-9d17cba9189f | Created: call/go to office on 2026-07-09, assigned to Lucas |',
+      '| Nooga Timepieces (Steven Chaffin) | https://app.attio.com/fin/custom/pipeline/record/eb40d3b7-a225-4d0d-b32f-51cccc5f0e32 | Completed current task; created follow-up on 2026-07-02 |'
+    ].join('\n')
+    codexApi.emitOutputLines(key, sampleCodexOutputLines(answer))
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-markdown-table-output',
+      status: 'completed',
+      result_text: answer
+    })
+
+    await Promise.all(waits)
+    const text = await threadText(parent.ts)
+    expect(text).toContain('Done. Verified notes/address/tasks in Attio.')
+    expect(text).toContain('• *SolitaireNY (Sohil Bhansali)*')
+    expect(text).toContain('*Attio record:* https://app.attio.com/fin/custom/pipeline/record/51d31937-ed2a-457e-8088-9d17cba9189f')
+    expect(text).toContain('*Task:* Created: call/go to office on 2026-07-09, assigned to Lucas')
+    expect(text).toContain('• *Nooga Timepieces (Steven Chaffin)*')
+    expect(text).not.toContain('| Lead | Attio record | Task |')
+    expect(text).not.toContain('|---|---|---|')
+  })
+
   it('conflates rapid task updates instead of one Slack call per event', async () => {
     codexApi.autoRespond = false
 
