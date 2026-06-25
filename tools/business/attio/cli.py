@@ -2,6 +2,7 @@
 
 import json
 import sys
+from typing import Any
 
 import typer
 from dotenv import load_dotenv
@@ -35,6 +36,142 @@ def _extract_value(val: dict | list | None) -> str:
         if "first_name" in val:
             return f"{val.get('first_name', '')} {val.get('last_name', '')}".strip()
     return str(val)
+
+
+def _record_id(record: dict) -> str:
+    return record.get("id", {}).get("record_id", "")
+
+
+def _value_list(values: dict, slug: str) -> list[dict]:
+    value = values.get(slug)
+    return value if isinstance(value, list) else []
+
+
+def _first_text(values: dict, slug: str) -> str:
+    return _extract_value(_value_list(values, slug))
+
+
+def _status_title(values: dict, slug: str = "deal_stage") -> str:
+    values_list = _value_list(values, slug)
+    if not values_list:
+        return ""
+    status = values_list[0].get("status", {})
+    return status.get("title", "")
+
+
+def _option_titles(values: dict, slug: str) -> list[str]:
+    titles: list[str] = []
+    for value in _value_list(values, slug):
+        option = value.get("option", {})
+        title = option.get("title")
+        if title:
+            titles.append(title)
+    return titles
+
+
+def _actor_id(values: dict, slug: str = "deal_owner") -> str:
+    values_list = _value_list(values, slug)
+    if not values_list:
+        return ""
+    return values_list[0].get("referenced_actor_id", "")
+
+
+def _record_refs(values: dict, slug: str) -> list[str]:
+    return [
+        value.get("target_record_id", "")
+        for value in _value_list(values, slug)
+        if value.get("target_record_id")
+    ]
+
+
+def _phone_values(values: dict) -> list[str]:
+    phones: list[str] = []
+    for value in _value_list(values, "phone_numbers"):
+        phone = value.get("original_phone_number") or value.get("phone_number")
+        if phone:
+            phones.append(phone)
+    return phones
+
+
+def _email_values(values: dict) -> list[str]:
+    emails: list[str] = []
+    for value in _value_list(values, "email_addresses"):
+        email = value.get("email_address")
+        if email:
+            emails.append(email)
+    return emails
+
+
+def _matches_any(actual: list[str], expected: list[str]) -> bool:
+    if not expected:
+        return True
+    actual_norm = {item.casefold() for item in actual}
+    return any(item.casefold() in actual_norm for item in expected)
+
+
+def _csv_option(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _pipeline_filter(
+    owner_id: str | None,
+    stage_id: str | None,
+) -> dict[str, Any] | None:
+    filters: list[dict[str, Any]] = []
+    if owner_id:
+        filters.append(
+            {
+                "deal_owner": {
+                    "referenced_actor_type": "workspace-member",
+                    "referenced_actor_id": owner_id,
+                }
+            }
+        )
+    if stage_id:
+        filters.append({"deal_stage": {"status": stage_id}})
+    if not filters:
+        return None
+    if len(filters) == 1:
+        return filters[0]
+    return {"$and": filters}
+
+
+def _shape_pipeline_record(record: dict, people_by_id: dict[str, dict] | None = None) -> dict:
+    values = record.get("values", {})
+    people_by_id = people_by_id or {}
+    person_ids = _record_refs(values, "associated_people")
+    people: list[str] = []
+    phones: list[str] = []
+    emails: list[str] = []
+    for person_id in person_ids:
+        person = people_by_id.get(person_id)
+        if not person:
+            continue
+        person_values = person.get("values", {})
+        name = _first_text(person_values, "name")
+        if name:
+            people.append(name)
+        phones.extend(_phone_values(person_values))
+        emails.extend(_email_values(person_values))
+
+    return {
+        "record_id": _record_id(record),
+        "web_url": record.get("web_url", ""),
+        "deal_name": _first_text(values, "deal_name"),
+        "stage": _status_title(values),
+        "owner_id": _actor_id(values),
+        "source": _option_titles(values, "source_v2"),
+        "channel": _option_titles(values, "channel"),
+        "crypto_platforms": _option_titles(values, "crypto_platforms"),
+        "location": _first_text(values, "location"),
+        "people": people,
+        "phones": phones,
+        "emails": emails,
+        "associated_people": person_ids,
+        "associated_company": _record_refs(values, "associated_company"),
+    }
 
 
 @app.command()
@@ -209,6 +346,128 @@ def records(
         for key, val in list(values.items())[:5]:
             console.print(f"  {key}: {_extract_value(val)}")
         console.print()
+
+
+@app.command("pipeline-export")
+def pipeline_export(
+    owner_id: str | None = typer.Option(None, "--owner-id", help="Workspace member UUID for deal_owner"),
+    stage_id: str | None = typer.Option(None, "--stage-id", help="Pipeline stage status UUID"),
+    source_title: str | None = typer.Option(
+        None,
+        "--source-title",
+        help="Comma-separated source_v2 option titles to match locally",
+    ),
+    channel_title: str | None = typer.Option(
+        None,
+        "--channel-title",
+        help="Comma-separated channel option titles to match locally",
+    ),
+    platform_title: str | None = typer.Option(
+        None,
+        "--platform-title",
+        help="Comma-separated crypto_platforms option titles to match locally",
+    ),
+    stage_title: str | None = typer.Option(
+        None,
+        "--stage-title",
+        help="Comma-separated stage titles to match locally when stage-id is unavailable",
+    ),
+    has_phone: bool = typer.Option(
+        False, "--has-phone", help="Only include rows with linked person phone numbers"
+    ),
+    has_email: bool = typer.Option(False, "--has-email", help="Only include rows with linked person emails"),
+    include_people: bool = typer.Option(
+        False,
+        "--include-people",
+        help="Fetch linked people and include names, phones, and emails",
+    ),
+    max_records: int = typer.Option(500, "--max-records", min=1, help="Max pipeline records to scan"),
+    page_size: int = typer.Option(200, "--page-size", min=1, help="Attio page size"),
+    max_people: int = typer.Option(500, "--max-people", min=1, help="Max linked people to fetch"),
+    limit: int = typer.Option(50, "--limit", "-n", min=1, help="Max shaped rows to print"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output shaped JSON"),
+):
+    """Export shaped pipeline rows for common CRM list/filter questions.
+
+    Server-side filters are used for stable IDs such as owner and stage. Select
+    title filters are applied locally because Attio rejects title/value filters
+    for select attributes in this workspace.
+    """
+    client = _get_client()
+    filter_obj = _pipeline_filter(owner_id, stage_id)
+    records_list = client.query_all_records(
+        "pipeline",
+        filter_obj=filter_obj,
+        page_size=page_size,
+        max_records=max_records,
+    )
+
+    source_titles = _csv_option(source_title)
+    channel_titles = _csv_option(channel_title)
+    platform_titles = _csv_option(platform_title)
+    stage_titles = _csv_option(stage_title)
+
+    filtered: list[dict] = []
+    for record in records_list:
+        values = record.get("values", {})
+        if source_titles and not _matches_any(_option_titles(values, "source_v2"), source_titles):
+            continue
+        if channel_titles and not _matches_any(_option_titles(values, "channel"), channel_titles):
+            continue
+        if platform_titles and not _matches_any(
+            _option_titles(values, "crypto_platforms"), platform_titles
+        ):
+            continue
+        if stage_titles and not _matches_any([_status_title(values)], stage_titles):
+            continue
+        filtered.append(record)
+
+    people_by_id: dict[str, dict] = {}
+    if include_people or has_phone or has_email:
+        person_ids: list[str] = []
+        for record in filtered:
+            person_ids.extend(_record_refs(record.get("values", {}), "associated_people"))
+        unique_person_ids = list(dict.fromkeys(person_ids))[:max_people]
+        people_by_id = client.get_records("people", unique_person_ids)
+
+    shaped = [_shape_pipeline_record(record, people_by_id=people_by_id) for record in filtered]
+    if has_phone:
+        shaped = [row for row in shaped if row["phones"]]
+    if has_email:
+        shaped = [row for row in shaped if row["emails"]]
+
+    result = {
+        "scanned_count": len(records_list),
+        "matched_count": len(shaped),
+        "returned_count": min(len(shaped), limit),
+        "truncated": len(shaped) > limit,
+        "records": shaped[:limit],
+    }
+
+    if json_output:
+        print(json.dumps(result, indent=2, ensure_ascii=False), file=sys.stdout)
+        raise typer.Exit()
+
+    table = Table(title=f"Pipeline Records ({result['matched_count']} matched)")
+    table.add_column("Lead", style="cyan", max_width=34)
+    table.add_column("Stage", style="green", max_width=22)
+    table.add_column("Source", style="white", max_width=28)
+    table.add_column("People", style="white", max_width=28)
+    table.add_column("Phone", style="yellow", max_width=22)
+    table.add_column("URL", style="blue", max_width=48)
+
+    for row in result["records"]:
+        table.add_row(
+            row["deal_name"],
+            row["stage"],
+            ", ".join(row["source"]),
+            ", ".join(row["people"]),
+            ", ".join(row["phones"]),
+            row["web_url"],
+        )
+    console.print(table)
+    if result["truncated"]:
+        console.print(f"[yellow]Showing {result['returned_count']} of {result['matched_count']} rows.[/]")
 
 
 @app.command()
