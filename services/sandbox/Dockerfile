@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     tomli-w==1.2.0 \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
-# ── GitHub CLI + Node.js 24 (LTS) + Docker CLI (single layer, cached) ─────────────
+# ── GitHub CLI + Node.js 24 (LTS) + Docker CLI + Terraform (single layer, cached) ─
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -54,7 +54,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
       | tee /etc/apt/sources.list.d/docker.list > /dev/null \
-    && apt-get update && apt-get install -y --no-install-recommends gh nodejs docker-ce-cli \
+    && curl -fsSL https://apt.releases.hashicorp.com/gpg \
+      | gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+      | tee /etc/apt/sources.list.d/hashicorp.list > /dev/null \
+    && apt-get update && apt-get install -y --no-install-recommends gh nodejs docker-ce-cli terraform \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info
 
 # ── Non-root agent user ─────────────────────────────────────────────────────
@@ -66,6 +70,7 @@ ARG CODEX_VERSION=0.139.0
 ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
+ARG PLAYWRIGHT_VERSION=1.58.0
 # Bootstrap pnpm for agents working in JS monorepos. The exact baked version
 # doesn't constrain repos: when a repo's `packageManager` field declares a
 # different version, pnpm downloads and runs that one (v11 `pmOnFail=download`
@@ -103,35 +108,26 @@ RUN set -eux; \
     nu --version | grep -F "${NUSHELL_VERSION}"
 
 # ── Global npm CLIs (root) ──────────────────────────────────────────────────
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm install -g --prefer-online --force \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
       "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
+      "playwright@${PLAYWRIGHT_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
       agent-browser@0.26.0 \
     && find /usr/lib/node_modules -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
+    && playwright --version | grep -F "${PLAYWRIGHT_VERSION}" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
 
-# ── agent-browser system deps (must run as root before USER agent) ───────────
-# Chrome for Testing doesn't provide Linux ARM64 builds; fall back to system chromium
+# ── Browser automation deps (must run as root before USER agent) ─────────────
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
-      apt-get update && apt-get install -y --no-install-recommends \
-        libxcb-shm0 libx11-xcb1 libx11-6 libxcb1 libxext6 libxrandr2 \
-        libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libxi6 \
-        libgtk-3-0t64 libpangocairo-1.0-0 libpango-1.0-0 libatk1.0-0t64 \
-        libcairo-gobject2 libcairo2 libgdk-pixbuf-2.0-0 libxrender1 \
-        libasound2t64 libfreetype6 libfontconfig1 libdbus-1-3 libnss3 \
-        libnspr4 libatk-bridge2.0-0t64 libdrm2 libxkbcommon0 \
-        libatspi2.0-0t64 libcups2t64 libxshmfence1 libgbm1 \
-        fonts-noto-color-emoji fonts-noto-cjk fonts-freefont-ttf; \
-    else \
-      echo "Skipping browser install: Chrome for Testing does not publish Linux ARM64 builds"; \
-    fi
+    playwright install --with-deps chromium \
+    && chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH"
 
 USER agent
 WORKDIR /home/agent
