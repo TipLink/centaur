@@ -247,12 +247,18 @@ def _slack_after_query(query: str, latest_date: str | None) -> str:
     return f"{query} after:{latest_date[:10]}"
 
 
-def _current_slack_channel_id() -> str | None:
-    """Return the channel/group id for the active Slack thread, or None for DMs."""
+def _current_thread_key() -> str | None:
+    """Return the active thread key from the tool context or sandbox environment."""
     try:
         thread_key = get_tool_context().thread_key
     except LookupError:
-        return None
+        thread_key = None
+    return thread_key or os.getenv("CENTAUR_THREAD_KEY")
+
+
+def _current_slack_channel_id() -> str | None:
+    """Return the channel/group id for the active Slack thread, or None for DMs."""
+    thread_key = _current_thread_key()
     if not thread_key:
         return None
     for segment in str(thread_key).split(":")[1:]:
