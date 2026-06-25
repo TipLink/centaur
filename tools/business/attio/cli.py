@@ -102,6 +102,38 @@ def _email_values(values: dict) -> list[str]:
     return emails
 
 
+def _normalize_phone(value: str) -> str:
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if value.strip().startswith("+") and digits:
+        return f"+{digits}"
+    return value.strip()
+
+
+def _person_name_value(name: str) -> dict[str, str]:
+    parts = [part for part in name.strip().split() if part]
+    first_name = parts[0] if parts else name.strip()
+    last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+    return {
+        "first_name": first_name,
+        "last_name": last_name,
+        "full_name": name.strip(),
+    }
+
+
+def _option_values(csv_value: str | None) -> list[dict[str, str]]:
+    return [{"option": value} for value in _csv_option(csv_value)]
+
+
+def _record_reference(object_slug: str, record_id: str) -> dict[str, str]:
+    return {"target_object": object_slug, "target_record_id": record_id}
+
+
+def _record_url(record: dict) -> str:
+    return record.get("web_url", "")
+
+
 def _matches_any(actual: list[str], expected: list[str]) -> bool:
     if not expected:
         return True
@@ -172,6 +204,30 @@ def _shape_pipeline_record(record: dict, people_by_id: dict[str, dict] | None = 
         "associated_people": person_ids,
         "associated_company": _record_refs(values, "associated_company"),
     }
+
+
+def _first_record(records: list[dict]) -> dict | None:
+    return records[0] if records else None
+
+
+def _existing_record_refs(record: dict, slug: str) -> list[dict[str, str]]:
+    values = record.get("values", {})
+    refs: list[dict[str, str]] = []
+    for value in _value_list(values, slug):
+        target_record_id = value.get("target_record_id")
+        target_object = value.get("target_object")
+        if target_record_id and target_object:
+            refs.append(_record_reference(target_object, target_record_id))
+    return refs
+
+
+def _merge_record_refs(*groups: list[dict[str, str]]) -> list[dict[str, str]]:
+    merged: dict[tuple[str, str], dict[str, str]] = {}
+    for refs in groups:
+        for ref in refs:
+            key = (ref["target_object"], ref["target_record_id"])
+            merged[key] = ref
+    return list(merged.values())
 
 
 @app.command()
@@ -468,6 +524,249 @@ def pipeline_export(
     console.print(table)
     if result["truncated"]:
         console.print(f"[yellow]Showing {result['returned_count']} of {result['matched_count']} rows.[/]")
+
+
+@app.command("lead-upsert")
+def lead_upsert(
+    company_name: str = typer.Argument(..., help="Company or account name"),
+    contact_name: str | None = typer.Option(None, "--contact-name", help="Contact person name"),
+    phone: list[str] = typer.Option([], "--phone", help="Phone number; repeat for multiple"),
+    email: list[str] = typer.Option([], "--email", help="Email address; repeat for multiple"),
+    owner_id: str = typer.Option(..., "--owner-id", help="Workspace member UUID for deal_owner"),
+    stage_id: str = typer.Option(..., "--stage-id", help="Pipeline stage status UUID"),
+    source_option: str | None = typer.Option(
+        None,
+        "--source-option",
+        help="Comma-separated source_v2 option titles/values",
+    ),
+    channel_option: str | None = typer.Option(
+        None,
+        "--channel-option",
+        help="Comma-separated channel option titles/values",
+    ),
+    platform_option: str | None = typer.Option(
+        None,
+        "--platform-option",
+        help="Comma-separated crypto_platforms option titles/values",
+    ),
+    current_setup: str | None = typer.Option(None, "--current-setup", help="Pipeline current_setup text"),
+    note: str | None = typer.Option(None, "--note", help="Note content to attach to the pipeline record"),
+    task: str | None = typer.Option(None, "--task", help="Follow-up task content"),
+    task_deadline: str | None = typer.Option(None, "--task-deadline", help="Task deadline ISO timestamp"),
+    task_assignee_email: str | None = typer.Option(
+        None,
+        "--task-assignee-email",
+        help="Task assignee email address",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the planned payload without writing"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output shaped JSON"),
+):
+    """Create or update one lead through the company/person/pipeline chain."""
+    phones = [_normalize_phone(item) for item in phone if item.strip()]
+    emails = [item.strip() for item in email if item.strip()]
+    person_name = contact_name or (company_name if phones or emails else None)
+    deal_name = f"{company_name} ({contact_name})" if contact_name else company_name
+
+    plan = {
+        "company_name": company_name,
+        "person_name": person_name,
+        "deal_name": deal_name,
+        "owner_id": owner_id,
+        "stage_id": stage_id,
+        "phones": phones,
+        "emails": emails,
+        "source": _csv_option(source_option),
+        "channel": _csv_option(channel_option),
+        "crypto_platforms": _csv_option(platform_option),
+        "current_setup": current_setup,
+        "note": note,
+        "task": task,
+        "task_deadline": task_deadline,
+        "task_assignee_email": task_assignee_email,
+    }
+    if dry_run:
+        print(json.dumps({"dry_run": True, "plan": plan}, indent=2, ensure_ascii=False))
+        raise typer.Exit()
+
+    client = _get_client()
+    company = _first_record(
+        client.query_records("companies", filter_obj={"name": {"value": company_name}}, limit=1)
+    )
+    company_created = False
+    if not company:
+        company = client.create_record("companies", {"name": [{"value": company_name}]})
+        company_created = True
+    company_id = _record_id(company)
+
+    person = None
+    person_created = False
+    if person_name:
+        if emails:
+            person = _first_record(
+                client.query_records(
+                    "people",
+                    filter_obj={"email_addresses": {"email_address": emails[0]}},
+                    limit=1,
+                )
+            )
+        if not person and phones:
+            person = _first_record(
+                client.query_records(
+                    "people",
+                    filter_obj={"phone_numbers": {"phone_number": phones[0]}},
+                    limit=1,
+                )
+            )
+        if not person and contact_name:
+            person = _first_record(
+                client.query_records(
+                    "people",
+                    filter_obj={"name": {"full_name": person_name}},
+                    limit=1,
+                )
+            )
+
+        person_values: dict[str, list[dict[str, Any]]] = {
+            "name": [_person_name_value(person_name)],
+            "company": [_record_reference("companies", company_id)],
+        }
+        if phones:
+            person_values["phone_numbers"] = [
+                {"original_phone_number": item} for item in phones
+            ]
+        if emails:
+            person_values["email_addresses"] = [{"email_address": item} for item in emails]
+
+        if person:
+            client.update_record("people", _record_id(person), person_values)
+            person = client.get_record("people", _record_id(person))
+        else:
+            person = client.create_record("people", person_values)
+            person_created = True
+
+    company_ref = _record_reference("companies", company_id)
+    person_refs = [_record_reference("people", _record_id(person))] if person else []
+
+    pipeline = _first_record(
+        client.query_records("pipeline", filter_obj={"deal_name": {"value": deal_name}}, limit=1)
+    )
+    if not pipeline and person_refs:
+        pipeline = _first_record(
+            client.query_records(
+                "pipeline",
+                filter_obj={"associated_people": person_refs[0]},
+                limit=1,
+            )
+        )
+    if not pipeline:
+        pipeline = _first_record(
+            client.query_records(
+                "pipeline",
+                filter_obj={"associated_company": company_ref},
+                limit=1,
+            )
+        )
+
+    pipeline_values: dict[str, list[dict[str, Any]]] = {
+        "deal_name": [{"value": deal_name}],
+        "deal_owner": [
+            {
+                "referenced_actor_type": "workspace-member",
+                "referenced_actor_id": owner_id,
+            }
+        ],
+        "deal_stage": [{"status": stage_id}],
+        "associated_company": [company_ref],
+    }
+    if person_refs:
+        existing_people = _existing_record_refs(pipeline, "associated_people") if pipeline else []
+        pipeline_values["associated_people"] = _merge_record_refs(existing_people, person_refs)
+    if current_setup:
+        pipeline_values["current_setup"] = [{"value": current_setup}]
+    source_values = _option_values(source_option)
+    if source_values:
+        pipeline_values["source_v2"] = source_values
+    channel_values = _option_values(channel_option)
+    if channel_values:
+        pipeline_values["channel"] = channel_values
+    platform_values = _option_values(platform_option)
+    if platform_values:
+        pipeline_values["crypto_platforms"] = platform_values
+
+    pipeline_created = False
+    if pipeline:
+        client.update_record("pipeline", _record_id(pipeline), pipeline_values)
+        pipeline = client.get_record("pipeline", _record_id(pipeline))
+    else:
+        pipeline = client.create_record("pipeline", pipeline_values)
+        pipeline_created = True
+    pipeline_id = _record_id(pipeline)
+
+    note_id = None
+    if note:
+        existing_notes = client.list_notes("pipeline", pipeline_id)
+        duplicate_note = any((item.get("content") or "") == note for item in existing_notes)
+        if not duplicate_note:
+            created_note = client.create_note("pipeline", pipeline_id, "Lead context", note)
+            note_id = created_note.get("id", {}).get("note_id")
+
+    task_id = None
+    if task:
+        task_payload: dict[str, Any] = {
+            "data": {
+                "content": task,
+                "format": "plaintext",
+                "is_completed": False,
+                "linked_records": [_record_reference("pipeline", pipeline_id)],
+            }
+        }
+        if task_deadline:
+            task_payload["data"]["deadline_at"] = task_deadline
+        if task_assignee_email:
+            task_payload["data"]["assignees"] = [
+                {"workspace_member_email_address": task_assignee_email}
+            ]
+        created_task = client.raw_request("POST", "/tasks", json=task_payload)
+        task_id = created_task.get("data", {}).get("id", {}).get("task_id")
+
+    result = {
+        "company": {
+            "record_id": company_id,
+            "web_url": _record_url(company),
+            "created": company_created,
+        },
+        "person": {
+            "record_id": _record_id(person) if person else None,
+            "web_url": _record_url(person) if person else None,
+            "created": person_created,
+        },
+        "pipeline": {
+            "record_id": pipeline_id,
+            "web_url": _record_url(pipeline),
+            "created": pipeline_created,
+        },
+        "note_id": note_id,
+        "task_id": task_id,
+    }
+
+    if json_output:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        raise typer.Exit()
+
+    table = Table(title="Lead Upsert")
+    table.add_column("Object", style="cyan", max_width=12)
+    table.add_column("Record ID", style="white", max_width=36)
+    table.add_column("Created", style="green", max_width=8)
+    table.add_column("URL", style="blue", max_width=56)
+    table.add_row("company", company_id, str(company_created), _record_url(company))
+    if person:
+        table.add_row("person", _record_id(person), str(person_created), _record_url(person))
+    table.add_row("pipeline", pipeline_id, str(pipeline_created), _record_url(pipeline))
+    console.print(table)
+    if note_id:
+        console.print(f"[cyan]Note:[/] {note_id}")
+    if task_id:
+        console.print(f"[cyan]Task:[/] {task_id}")
 
 
 @app.command()
