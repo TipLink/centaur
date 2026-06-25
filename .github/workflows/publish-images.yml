@@ -25,6 +25,7 @@ concurrency:
 permissions:
   contents: read
   packages: write
+  pull-requests: read
 
 env:
   REGISTRY: ghcr.io
@@ -253,6 +254,7 @@ jobs:
         id: promote
         env:
           FINEAS_INFRA_TOKEN: ${{ steps.fineas_token.outputs.token }}
+          CENTAUR_TOKEN: ${{ github.token }}
           CENTAUR_SHA: ${{ github.sha }}
           CENTAUR_REPO: ${{ github.repository }}
           CENTAUR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -263,6 +265,7 @@ jobs:
           import base64
           import json
           import os
+          import re
           import subprocess
           import urllib.error
           import urllib.parse
@@ -279,18 +282,6 @@ jobs:
           branch = f"automation/promote-centaur-{centaur_short}"
           message = f"chore: promote centaur {centaur_short}"
           title = f"Promote Centaur {centaur_short} to Fineas"
-          body = f"""## Summary
-          - update Fineas Centaur base image pins to `{centaur_tag}`
-          - pin the Centaur chart source to `{centaur_sha}`
-
-          ## Source
-          - Centaur commit: https://github.com/{os.environ["CENTAUR_REPO"]}/commit/{centaur_sha}
-          - Image publish run: {os.environ["CENTAUR_RUN_URL"]}
-
-          ## Tests
-          - `bash scripts/bump-centaur-pins.sh {centaur_sha}`
-          - `scripts/audit-supply-chain.sh`
-          """
 
           headers = {
               "Authorization": f"Bearer {os.environ['FINEAS_INFRA_TOKEN']}",
@@ -299,6 +290,8 @@ jobs:
               "User-Agent": "centaur-promote-fineas",
           }
           api = f"https://api.github.com/repos/{owner}/{repo}"
+          centaur_headers = dict(headers)
+          centaur_headers["Authorization"] = f"Bearer {os.environ['CENTAUR_TOKEN']}"
 
           def request(
               method: str,
@@ -306,9 +299,10 @@ jobs:
               payload: dict | None = None,
               *,
               ok: tuple[int, ...] = (200, 201, 204),
+              request_headers: dict[str, str] | None = None,
           ):
               data = None
-              req_headers = dict(headers)
+              req_headers = dict(request_headers or headers)
               if payload is not None:
                   data = json.dumps(payload).encode()
                   req_headers["Content-Type"] = "application/json"
@@ -327,8 +321,83 @@ jobs:
                       return json.loads(body_text) if body_text else None
                   raise RuntimeError(f"{method} {url} returned {exc.code}: {body_text}") from None
 
+          def centaur_pr_url_for_commit() -> str:
+              repo_full = os.environ["CENTAUR_REPO"]
+              url = f"https://api.github.com/repos/{repo_full}/commits/{centaur_sha}/pulls"
+              try:
+                  pulls = request("GET", url, request_headers=centaur_headers)
+              except RuntimeError as exc:
+                  print(f"warning: could not look up Centaur PR for {centaur_sha}: {exc}")
+                  return ""
+
+              merged_pulls = [pull for pull in pulls if pull.get("merged_at")]
+              pull = (merged_pulls or pulls or [None])[0]
+              return pull["html_url"] if pull else ""
+
           def git(*args: str) -> str:
               return subprocess.check_output(["git", "-C", str(root), *args], text=True)
+
+          def set_application_annotation(key: str, value: str) -> bool:
+              application_path = root / "clusters/centaur-sandbox/argocd/applications/centaur-sandbox.yaml"
+              text = application_path.read_text(encoding="utf-8")
+              pattern = re.compile(rf"^    {re.escape(key)}: .*$", flags=re.MULTILINE)
+
+              if value:
+                  line = f"    {key}: {json.dumps(value)}"
+                  if pattern.search(text):
+                      new_text = pattern.sub(line, text, count=1)
+                  else:
+                      marker = "    argocd.argoproj.io/compare-options: ServerSideDiff=true\n"
+                      if marker not in text:
+                          raise RuntimeError(f"could not place Application annotation {key}")
+                      new_text = text.replace(marker, f"{marker}{line}\n", 1)
+              else:
+                  new_text = pattern.sub("", text)
+                  new_text = re.sub(r"\n{3,}", "\n\n", new_text)
+
+              if new_text == text:
+                  return False
+              application_path.write_text(new_text, encoding="utf-8")
+              return True
+
+          def put_file_to_branch(rel: str, encoded_branch: str) -> bool:
+              encoded_path = urllib.parse.quote(rel, safe="")
+              existing = request("GET", f"{api}/contents/{encoded_path}?ref={encoded_branch}", ok=(200, 404))
+              content_bytes = (root / rel).read_bytes()
+              if existing:
+                  current = base64.b64decode(existing["content"]).replace(b"\r\n", b"\n")
+                  if current == content_bytes:
+                      return False
+
+              payload = {
+                  "message": message,
+                  "content": base64.b64encode(content_bytes).decode(),
+                  "branch": branch,
+              }
+              if existing:
+                  payload["sha"] = existing["sha"]
+              request("PUT", f"{api}/contents/{encoded_path}", payload)
+              return True
+
+          centaur_pr_url = centaur_pr_url_for_commit()
+          source_lines = [
+              f"- Centaur commit: https://github.com/{os.environ['CENTAUR_REPO']}/commit/{centaur_sha}",
+              f"- Image publish run: {os.environ['CENTAUR_RUN_URL']}",
+          ]
+          if centaur_pr_url:
+              source_lines.append(f"- Centaur PR: {centaur_pr_url}")
+
+          body = f"""## Summary
+          - update Fineas Centaur base image pins to `{centaur_tag}`
+          - pin the Centaur chart source to `{centaur_sha}`
+
+          ## Source
+          {chr(10).join(source_lines)}
+
+          ## Tests
+          - `bash scripts/bump-centaur-pins.sh {centaur_sha}`
+          - `scripts/audit-supply-chain.sh`
+          """
 
           status_lines = [line for line in git("status", "--porcelain").splitlines() if line]
           changed_paths: list[tuple[str, str]] = []
@@ -402,6 +471,16 @@ jobs:
               pr = request("POST", f"{api}/pulls", {"title": title, "head": branch, "base": base_branch, "body": body})
           else:
               pr = None
+
+          if pr:
+              annotations_changed = False
+              annotations_changed |= set_application_annotation("fineas.dev/deployment-pr-url", pr["html_url"])
+              annotations_changed |= set_application_annotation("fineas.dev/centaur-pr-url", centaur_pr_url)
+              if annotations_changed:
+                  put_file_to_branch(
+                      "clusters/centaur-sandbox/argocd/applications/centaur-sandbox.yaml",
+                      encoded_branch,
+                  )
 
           with open(output_path, "a", encoding="utf-8") as output:
               output.write(f"changed={'true' if changed else 'false'}\n")
