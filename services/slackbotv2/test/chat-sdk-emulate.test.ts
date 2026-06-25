@@ -608,6 +608,85 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('includes native Slack table attachments from the current mention', async () => {
+    const parent = await postUserMessage('Root context before a native table.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> summarize this table`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-current-native-table',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> summarize this table`,
+          attachments: [nativeSlackTableAttachment()]
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    const texts = sessionMessageTexts(codexApi.appends[0]!.body.messages)
+    const mentionText = texts.find(text => text.includes('summarize this table')) ?? ''
+    expect(mentionText).toContain('Slack table:')
+    expect(mentionText).toContain('| Business Name | Contact Person | Website |')
+    expect(mentionText).toContain(
+      '| Exclusive Timepieces NYC Inc. | Roma Yusupov | https://exclusive.example |'
+    )
+    const executeInput = JSON.stringify(JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!))
+    expect(executeInput).toContain('Exclusive Timepieces NYC Inc.')
+    expect(executeInput).toContain('Roma Yusupov')
+  })
+
+  it('includes native Slack table attachments from preceding Slack thread messages', async () => {
+    const parent = await postUserMessage('Root context before native tables.')
+    const priorReply = await postUserMessage('Leads are in the Slack table below.', parent.ts)
+    slackApi.addAttachmentToMessage(CHANNEL_ID, priorReply.ts, nativeSlackTableAttachment())
+
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> inspect the earlier table`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-history-native-table',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> inspect the earlier table`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    const texts = sessionMessageTexts(codexApi.appends[0]!.body.messages)
+    const priorReplyText = texts.find(text => text.includes('Leads are in the Slack table')) ?? ''
+    expect(priorReplyText).toContain('Slack table:')
+    expect(priorReplyText).toContain('| Business Name | Contact Person | Website |')
+    expect(priorReplyText).toContain(
+      '| Exclusive Timepieces NYC Inc. | Roma Yusupov | https://exclusive.example |'
+    )
+    const executeInput = JSON.stringify(JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!))
+    expect(executeInput).toContain('Leads are in the Slack table below.')
+    expect(executeInput).toContain('Exclusive Timepieces NYC Inc.')
+    expect(executeInput).toContain('Roma Yusupov')
+  })
+
   it('injects Slack requester identity and verified GitHub handle into Codex input', async () => {
     slackApi.setUserProfile(USER_ID, {
       name: 'akshaan',
@@ -3888,6 +3967,36 @@ function apiMessageFromSlackEvent(input: {
   }
 }
 
+function nativeSlackTableAttachment(): Record<string, unknown> {
+  return {
+    blocks: [
+      {
+        type: 'table',
+        rows: [
+          [
+            { type: 'raw_text', text: 'Business Name' },
+            { type: 'raw_text', text: 'Contact Person' },
+            { type: 'raw_text', text: 'Website' }
+          ],
+          [
+            { type: 'raw_text', text: 'Exclusive Timepieces NYC Inc.' },
+            {
+              type: 'rich_text',
+              elements: [
+                {
+                  type: 'rich_text_section',
+                  elements: [{ type: 'text', text: 'Roma Yusupov' }]
+                }
+              ]
+            },
+            { type: 'raw_text', text: 'https://exclusive.example' }
+          ]
+        ]
+      }
+    ]
+  }
+}
+
 async function postUserMessage(
   text: string,
   threadTs?: string,
@@ -4320,6 +4429,7 @@ function writeMockSseEvent(stream: ServerResponse, event: MockSessionEvent): voi
 }
 
 type PatchedSlackApi = {
+  addAttachmentToMessage(channel: string, ts: string, attachment: Record<string, unknown>): void
   addFileToMessage(channel: string, ts: string, file: Record<string, unknown>): void
   calls: StreamCall[]
   close(): Promise<void>
@@ -4364,6 +4474,7 @@ type SlackStreamTranscript = {
 async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackApi> {
   const upstreamUrl = loopbackUrl(emulatorUrl)
   const calls: StreamCall[] = []
+  const threadMessageAttachments = new Map<string, Record<string, unknown>[]>()
   const threadMessageFiles = new Map<string, Record<string, unknown>[]>()
   const userProfiles = new Map<string, Record<string, unknown>>()
   const userProfileRequests = new Map<string, number>()
@@ -4381,6 +4492,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       maxStreamStopChars,
       port,
       streams,
+      threadMessageAttachments,
       threadNotFoundReplies,
       threadMessageFiles,
       userProfiles,
@@ -4393,6 +4505,13 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
   })
   await listen(server, port)
   return {
+    addAttachmentToMessage(channel: string, ts: string, attachment: Record<string, unknown>) {
+      const key = slackReplyKey(channel, ts)
+      threadMessageAttachments.set(key, [
+        ...(threadMessageAttachments.get(key) ?? []),
+        attachment
+      ])
+    },
     addFileToMessage(channel: string, ts: string, file: Record<string, unknown>) {
       const key = slackReplyKey(channel, ts)
       threadMessageFiles.set(key, [...(threadMessageFiles.get(key) ?? []), file])
@@ -4419,6 +4538,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       appendFailure.error = ''
       chatPostMessageSocketFailures.remaining = 0
       threadNotFoundReplies.clear()
+      threadMessageAttachments.clear()
       threadMessageFiles.clear()
       streams.clear()
       userProfiles.clear()
@@ -4447,6 +4567,7 @@ async function handlePatchedSlackRequest(
     maxStreamStopChars: number | null
     port: number
     streams: Map<string, StreamRecord>
+    threadMessageAttachments: Map<string, Record<string, unknown>[]>
     threadNotFoundReplies: Set<string>
     threadMessageFiles: Map<string, Record<string, unknown>[]>
     userProfiles: Map<string, Record<string, unknown>>
@@ -4558,7 +4679,7 @@ async function handlePatchedSlackRequest(
       await sendWebResponse(res, Response.json({ ok: false, error: 'thread_not_found' }))
       return
     }
-    if (input.threadMessageFiles.size > 0) {
+    if (input.threadMessageFiles.size > 0 || input.threadMessageAttachments.size > 0) {
       const rawBody = await request.arrayBuffer()
       const proxied = await fetch(slackApiProxyUrl(path, url.search, input.upstreamUrl), {
         method: request.method,
@@ -4573,7 +4694,17 @@ async function handlePatchedSlackRequest(
           const files = input.threadMessageFiles.get(
             slackReplyKey(stringField(body.channel), stringField(item.ts))
           )
-          return files ? { ...item, files: [...slackFileArray(item.files), ...files] } : item
+          const attachments = input.threadMessageAttachments.get(
+            slackReplyKey(stringField(body.channel), stringField(item.ts))
+          )
+          if (!files && !attachments) return item
+          return {
+            ...item,
+            ...(files ? { files: [...slackRecordArray(item.files), ...files] } : {}),
+            ...(attachments
+              ? { attachments: [...slackRecordArray(item.attachments), ...attachments] }
+              : {})
+          }
         })
       }
       await sendWebResponse(res, Response.json(payload, { status: proxied.status }))
@@ -5031,7 +5162,7 @@ function stringField(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
-function slackFileArray(value: unknown): Record<string, unknown>[] {
+function slackRecordArray(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value)
     ? (value.filter(item =>
         item && typeof item === 'object' && !Array.isArray(item)
