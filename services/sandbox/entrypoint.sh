@@ -22,6 +22,11 @@ if [ -n "${TOOL_DIRS:-}" ]; then
     export TOOL_DIRS
 fi
 
+case " ${NODE_OPTIONS:-} " in
+    *" --use-env-proxy "*) ;;
+    *) export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--use-env-proxy" ;;
+esac
+
 _add_pythonpath_entry() {
     local entry="$1"
     [ -d "$entry" ] || return 0
