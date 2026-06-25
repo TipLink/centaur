@@ -1130,7 +1130,11 @@ async function renderFallbackFinalAnswer(
       })
       return { status: 'failed', error: 'empty fallback final answer', lastEventId }
     }
-    const fallbackText = truncateSlackText(text, SLACK_FALLBACK_TEXT_MAX_CHARS, 'Slack final answer')
+    const fallbackText = truncateSlackText(
+      slackFriendlyText(text),
+      SLACK_FALLBACK_TEXT_MAX_CHARS,
+      'Slack final answer'
+    )
     if (replacement) {
       await thread.adapter.editMessage(thread.id, replacement.replaceMessageId, fallbackText)
     } else {
@@ -1755,11 +1759,13 @@ async function renderExecutionStream(
   const capture = { diverged: false }
   try {
     const visibleStream = await streamAfterFirstChunk(
-      conflateChatSdkStream(
-        slackSafeChatSdkStream(
-          codexAppServerToChatSdkStream(
-            stream,
-            rendererOptions(thread, options, capture)
+      slackFriendlyChatSdkStream(
+        conflateChatSdkStream(
+          slackSafeChatSdkStream(
+            codexAppServerToChatSdkStream(
+              stream,
+              rendererOptions(thread, options, capture)
+            )
           )
         )
       )
@@ -1801,11 +1807,13 @@ async function renderRecoveredExecutionStream(
   const capture = { diverged: false }
   try {
     const visibleStream = await streamAfterFirstChunk(
-      conflateChatSdkStream(
-        slackSafeChatSdkStream(
-          codexAppServerToChatSdkStream(
-            stream,
-            rendererOptions(thread, options, capture)
+      slackFriendlyChatSdkStream(
+        conflateChatSdkStream(
+          slackSafeChatSdkStream(
+            codexAppServerToChatSdkStream(
+              stream,
+              rendererOptions(thread, options, capture)
+            )
           )
         )
       )
@@ -1857,7 +1865,7 @@ async function renderPlainTextExecutionStream(
       void _chunk
     }
     const text = truncateSlackText(
-      fallback.text() || 'Execution completed, but no final text was captured.',
+      slackFriendlyText(fallback.text() || 'Execution completed, but no final text was captured.'),
       SLACK_FALLBACK_TEXT_MAX_CHARS,
       'Slack final answer'
     )
@@ -1924,6 +1932,26 @@ async function* slackSafeChatSdkStream(
   }
 }
 
+async function* slackFriendlyChatSdkStream(
+  stream: AsyncIterable<ChatSDKStreamChunk>
+): AsyncIterable<ChatSDKStreamChunk> {
+  let markdownText = ''
+  for await (const chunk of stream) {
+    if (chunk.type === 'markdown_text') {
+      markdownText += chunk.text
+      continue
+    }
+    if (markdownText) {
+      yield { type: 'markdown_text', text: slackFriendlyText(markdownText) }
+      markdownText = ''
+    }
+    yield chunk
+  }
+  if (markdownText) {
+    yield { type: 'markdown_text', text: slackFriendlyText(markdownText) }
+  }
+}
+
 function slackSafeChatSdkChunk(chunk: ChatSDKStreamChunk): ChatSDKStreamChunk {
   if (chunk.type !== 'task_update') return chunk
   const { output: _output, details, ...safeChunk } = chunk
@@ -1932,6 +1960,116 @@ function slackSafeChatSdkChunk(chunk: ChatSDKStreamChunk): ChatSDKStreamChunk {
     ...safeChunk,
     ...(details ? { details: truncateSlackTaskField(details) } : {})
   }
+}
+
+function slackFriendlyText(text: string): string {
+  return rewriteMarkdownPipeTables(text)
+}
+
+function rewriteMarkdownPipeTables(text: string): string {
+  const lines = text.split('\n')
+  const output: string[] = []
+  let index = 0
+  let inCodeFence = false
+
+  while (index < lines.length) {
+    const line = lines[index]!
+    if (line.trimStart().startsWith('```')) {
+      inCodeFence = !inCodeFence
+      output.push(line)
+      index += 1
+      continue
+    }
+
+    const separatorLine = lines[index + 1]
+    if (
+      !inCodeFence
+      && separatorLine
+      && isMarkdownTableRow(line)
+      && isMarkdownTableSeparator(separatorLine)
+    ) {
+      const headers = parseMarkdownTableRow(line)
+      const rows: string[][] = []
+      let cursor = index + 2
+      while (cursor < lines.length) {
+        const rowLine = lines[cursor]!
+        if (!rowLine.trim()) {
+          if (cursor + 1 < lines.length && isMarkdownTableRow(lines[cursor + 1]!)) {
+            cursor += 1
+            continue
+          }
+          break
+        }
+        if (!isMarkdownTableRow(rowLine)) break
+        rows.push(parseMarkdownTableRow(rowLine))
+        cursor += 1
+      }
+
+      if (headers.length >= 2 && rows.length > 0) {
+        output.push(...markdownTableToSlackList(headers, rows))
+        index = cursor
+        continue
+      }
+    }
+
+    output.push(line)
+    index += 1
+  }
+
+  return output.join('\n')
+}
+
+function isMarkdownTableRow(line: string): boolean {
+  const trimmed = line.trim()
+  return trimmed.includes('|') && parseMarkdownTableRow(trimmed).length >= 2
+}
+
+function isMarkdownTableSeparator(line: string): boolean {
+  const cells = parseMarkdownTableRow(line)
+  return cells.length >= 2 && cells.every(cell => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, '')))
+}
+
+function parseMarkdownTableRow(line: string): string[] {
+  const trimmed = line.trim()
+  const body = trimmed.startsWith('|') && trimmed.endsWith('|')
+    ? trimmed.slice(1, -1)
+    : trimmed
+  const cells: string[] = []
+  let cell = ''
+  let escaped = false
+  for (const char of body) {
+    if (escaped) {
+      cell += char
+      escaped = false
+      continue
+    }
+    if (char === '\\') {
+      escaped = true
+      continue
+    }
+    if (char === '|') {
+      cells.push(cell.trim())
+      cell = ''
+      continue
+    }
+    cell += char
+  }
+  cells.push(cell.trim())
+  return cells
+}
+
+function markdownTableToSlackList(headers: string[], rows: string[][]): string[] {
+  return rows.flatMap((row, rowIndex) => {
+    const title = row[0]?.trim() || `Row ${rowIndex + 1}`
+    const lines = [`• *${title}*`]
+    for (let column = 1; column < Math.max(headers.length, row.length); column += 1) {
+      const value = row[column]?.trim()
+      if (!value) continue
+      const header = headers[column]?.trim() || `Column ${column + 1}`
+      lines.push(`  *${header}:* ${value}`)
+    }
+    return rowIndex === 0 ? lines : ['', ...lines]
+  })
 }
 
 function isPlainTextOnlyRequest(text: string): boolean {
