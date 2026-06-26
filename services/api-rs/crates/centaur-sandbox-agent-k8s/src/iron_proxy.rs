@@ -336,7 +336,10 @@ impl AgentSandboxBackend {
             )
             .await
             .map_err(|err| map_kube_error("create iron-proxy pod", err))?;
-        self.wait_until_proxy_running(resolved).await
+        self.wait_until_proxy_running(resolved).await?;
+        self.wait_for_cold_proxy_principal_applied(id, &resolved.principal_id)
+            .await;
+        Ok(())
     }
 
     /// Register a per-sandbox proxy in iron-control and return the env (URL +
@@ -502,27 +505,115 @@ impl AgentSandboxBackend {
     /// brief 503 window rather than a failed execution.
     async fn wait_for_proxy_principal_applied(&self, id: &SandboxId, principal_id: &str) {
         let started = Instant::now();
-        let endpoint = match self.proxy_management_endpoint(id).await {
-            Ok(Some(endpoint)) => endpoint,
-            Ok(None) => {
+        match self
+            .proxy_principal_ack(id, principal_id, "claim barrier")
+            .await
+        {
+            Ok(ProxyAck::Applied) => {
+                tracing::info!(
+                    sandbox_id = id.as_str(),
+                    principal_id,
+                    barrier = "claim barrier",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "iron-proxy acknowledged the claimed principal's config"
+                );
+            }
+            Ok(ProxyAck::ManagementUnavailable) => {
+                tracing::info!(
+                    sandbox_id = id.as_str(),
+                    "iron-proxy management API is unavailable (image without \
+                     managed status support?); using the fixed reassign delay"
+                );
+                sleep(proxy_fallback_delay_remaining(started.elapsed())).await;
+            }
+            Ok(ProxyAck::TimedOut) => {
+                // The ack timeout already waited longer than the fixed
+                // fallback delay, so do not add another sleep here.
                 tracing::warn!(
                     sandbox_id = id.as_str(),
-                    "no running iron-proxy pod found for the claim barrier; \
-                     using the fixed reassign delay"
+                    principal_id,
+                    "iron-proxy did not acknowledge the claimed principal's \
+                     config before the deadline; proceeding (managed proxies \
+                     fail closed until synced)"
                 );
-                sleep(PROXY_REASSIGN_FALLBACK_DELAY).await;
-                return;
             }
             Err(error) => {
                 tracing::warn!(
                     sandbox_id = id.as_str(),
                     %error,
-                    "failed to look up the iron-proxy management endpoint; \
-                     using the fixed reassign delay"
+                    "failed to check the iron-proxy management API for the \
+                     claim barrier; using the fixed reassign delay"
                 );
-                sleep(PROXY_REASSIGN_FALLBACK_DELAY).await;
-                return;
+                sleep(proxy_fallback_delay_remaining(started.elapsed())).await;
             }
+        }
+    }
+
+    /// Cold-created sandboxes do not go through the warm-pool claim barrier,
+    /// but the harness can make credentialed calls immediately after create
+    /// returns. Ask the proxy to report the requested principal's config before
+    /// creating the sandbox pod. If the management API cannot prove readiness,
+    /// fall back to the fixed delay instead of failing the sandbox create.
+    async fn wait_for_cold_proxy_principal_applied(&self, id: &SandboxId, principal_id: &str) {
+        let started = Instant::now();
+        match self
+            .proxy_principal_ack(id, principal_id, "cold create barrier")
+            .await
+        {
+            Ok(ProxyAck::Applied) => {
+                tracing::info!(
+                    sandbox_id = id.as_str(),
+                    principal_id,
+                    barrier = "cold create barrier",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "iron-proxy acknowledged the claimed principal's config"
+                );
+            }
+            Ok(ProxyAck::ManagementUnavailable) => {
+                tracing::info!(
+                    sandbox_id = id.as_str(),
+                    "iron-proxy management API is unavailable (image without \
+                     managed status support?); using the fixed cold-create delay"
+                );
+                sleep(proxy_fallback_delay_remaining(started.elapsed())).await;
+            }
+            Ok(ProxyAck::TimedOut) => {
+                // The ack timeout already waited longer than the fixed
+                // fallback delay, so do not add another sleep here.
+                tracing::warn!(
+                    sandbox_id = id.as_str(),
+                    principal_id,
+                    "iron-proxy did not acknowledge the cold-created principal's \
+                     config before the deadline; proceeding (managed proxies \
+                     fail closed until synced)"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    sandbox_id = id.as_str(),
+                    %error,
+                    "failed to check the iron-proxy management API for the \
+                     cold create barrier; using the fixed cold-create delay"
+                );
+                sleep(proxy_fallback_delay_remaining(started.elapsed())).await;
+            }
+        }
+    }
+
+    async fn proxy_principal_ack(
+        &self,
+        id: &SandboxId,
+        principal_id: &str,
+        barrier: &'static str,
+    ) -> SandboxResult<ProxyAck> {
+        let endpoint = match self.proxy_management_endpoint(id).await {
+            Ok(Some(endpoint)) => endpoint,
+            Ok(None) => {
+                return Err(SandboxError::NotReady(format!(
+                    "no running iron-proxy pod found for the {barrier}"
+                )));
+            }
+            Err(error) => return Err(error),
         };
         let Ok(client) = reqwest::Client::builder()
             // Pod-IP call inside the cluster: never route via env-configured
@@ -532,10 +623,11 @@ impl AgentSandboxBackend {
             .timeout(Duration::from_secs(2))
             .build()
         else {
-            sleep(PROXY_REASSIGN_FALLBACK_DELAY).await;
-            return;
+            return Err(SandboxError::backend(
+                "failed to build iron-proxy management client",
+            ));
         };
-        match wait_for_proxy_ack(
+        Ok(wait_for_proxy_ack(
             &client,
             &endpoint,
             principal_id,
@@ -543,34 +635,7 @@ impl AgentSandboxBackend {
             PROXY_ACK_PROBE_WINDOW,
             PROXY_ACK_POLL_INTERVAL,
         )
-        .await
-        {
-            ProxyAck::Applied => {
-                tracing::info!(
-                    sandbox_id = id.as_str(),
-                    principal_id,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "iron-proxy acknowledged the claimed principal's config"
-                );
-            }
-            ProxyAck::ManagementUnavailable => {
-                tracing::info!(
-                    sandbox_id = id.as_str(),
-                    "iron-proxy management API is unavailable (image without \
-                     managed status support?); using the fixed reassign delay"
-                );
-                sleep(PROXY_REASSIGN_FALLBACK_DELAY.saturating_sub(started.elapsed())).await;
-            }
-            ProxyAck::TimedOut => {
-                tracing::warn!(
-                    sandbox_id = id.as_str(),
-                    principal_id,
-                    "iron-proxy did not acknowledge the claimed principal's \
-                     config before the deadline; proceeding (managed proxies \
-                     fail closed until synced)"
-                );
-            }
-        }
+        .await)
     }
 
     /// Locate the management API of the sandbox's running proxy pod. The
@@ -732,6 +797,10 @@ enum ProxyAck {
     /// The management API answered but the expected principal's config was
     /// not applied before the deadline.
     TimedOut,
+}
+
+fn proxy_fallback_delay_remaining(elapsed: Duration) -> Duration {
+    PROXY_REASSIGN_FALLBACK_DELAY.saturating_sub(elapsed)
 }
 
 /// Poll the proxy's management API until it reports `principal_id`'s config
@@ -1863,6 +1932,18 @@ mod tests {
         .await;
 
         assert_eq!(ack, ProxyAck::ManagementUnavailable);
+    }
+
+    #[test]
+    fn proxy_fallback_delay_subtracts_elapsed_probe_time() {
+        assert_eq!(
+            proxy_fallback_delay_remaining(Duration::from_secs(2)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            proxy_fallback_delay_remaining(Duration::from_secs(10)),
+            Duration::ZERO
+        );
     }
 
     #[test]

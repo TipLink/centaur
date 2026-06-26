@@ -261,6 +261,172 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal static_secrets(:acme_prod_api_key).id, ids.last
   end
 
+  # --- cross-type conflict resolution -------------------------------------
+
+  # Builds a static secret injecting `header` on `host`, granted directly to
+  # globex_user (priority 100).
+  def grant_direct_static(host:, header:)
+    credential = StaticSecret.new(namespace: "globex", foreign_id: "static-#{SecureRandom.hex(4)}",
+                                  inject_config: { "header" => header, "formatter" => "Bearer {{ .Value }}" },
+                                  created_by: users(:globex_admin))
+    credential.build_source(source_type: "control_plane", secret: "direct-token")
+    credential.rules.build(host: host, position: 0)
+    credential.save!
+    grant_to_globex_principal(credential)
+    credential
+  end
+
+  # Builds a gcp_auth secret (writes Authorization) matching `host`, granted to
+  # globex_user through the globex_infra role (priority 0).
+  def grant_role_gcp(host:)
+    PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
+    credential = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
+                                   credentials_provider: { "type" => "workload_identity" },
+                                   scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
+                                   created_by: users(:globex_admin))
+    credential.rules.build(host: host, position: 0)
+    credential.save!
+    grant_to_globex_infra(credential)
+    credential
+  end
+
+  def grant_direct_gcp(host:)
+    credential = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
+                                   credentials_provider: { "type" => "workload_identity" },
+                                   scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
+                                   created_by: users(:globex_admin))
+    credential.rules.build(host: host, position: 0)
+    credential.save!
+    grant_to_globex_principal(credential)
+    credential
+  end
+
+  def grant_role_oauth(oauth_record = nil)
+    PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
+    unless oauth_record
+      oauth_record = OauthTokenSecret.new(
+        namespace: "globex",
+        foreign_id: "oauth-#{SecureRandom.hex(4)}",
+        name: "gmail",
+        grant: "refresh_token",
+        token_endpoint: "https://oauth2.googleapis.com/token",
+        scopes: [ "https://www.googleapis.com/auth/gmail.readonly" ],
+        created_by: users(:globex_admin)
+      )
+      oauth_record.sources.build(source_type: "1password", config: { "secret_ref" => "op://eng/gmail/refresh-token" },
+                                 role: "refresh_token", role_kind: "credential_field")
+      oauth_record.sources.build(source_type: "env", config: { "var" => "GMAIL_CLIENT_ID" },
+                                 role: "client_id", role_kind: "credential_field")
+      oauth_record.rules.build(host: "gmail.googleapis.com", http_methods: [ "GET" ], paths: [], position: 0)
+      oauth_record.save!
+    end
+    grant_to_globex_infra(oauth_record)
+    oauth_record
+  end
+
+  def grant_to_globex_principal(credential)
+    Grant.create!(principal: principals(:globex_user), grantable_assoc(credential) => credential,
+                  created_by: users(:globex_admin))
+  end
+
+  def grant_to_globex_infra(credential)
+    Grant.create!(role: roles(:globex_infra), grantable_assoc(credential) => credential,
+                  created_by: users(:globex_admin))
+  end
+
+  def grantable_assoc(credential)
+    credential.class.model_name.singular.to_sym
+  end
+
+  test "a direct static secret suppresses a role-granted transform on the same host and header" do
+    grant_direct_static(host: "api.test.com", header: "Authorization")
+    grant_role_gcp(host: "api.test.com")
+    principal = principals(:globex_user)
+
+    assert_equal 1, principal.sync_secrets.length
+    assert_empty principal.sync_transforms, "the lower-priority role gcp_auth should be withheld"
+  end
+
+  test "credentials writing different headers on the same host both serve" do
+    grant_direct_static(host: "api.test.com", header: "X-Api-Key")
+    grant_role_gcp(host: "api.test.com")
+    principal = principals(:globex_user)
+
+    assert_equal 1, principal.sync_secrets.length
+    assert_equal 1, principal.sync_transforms.count { |t| t["name"] == "gcp_auth" }
+  end
+
+  test "credentials writing the same header on different hosts both serve" do
+    grant_direct_static(host: "api.test.com", header: "Authorization")
+    grant_role_gcp(host: "other.test.com")
+    principal = principals(:globex_user)
+
+    assert_equal 1, principal.sync_secrets.length
+    assert_equal 1, principal.sync_transforms.count { |t| t["name"] == "gcp_auth" }
+  end
+
+  test "same-priority credentials writing the same header on the same host both serve" do
+    grant_direct_static(host: "api.test.com", header: "Authorization")
+    grant_direct_gcp(host: "api.test.com")
+    principal = principals(:globex_user)
+
+    assert_equal 1, principal.sync_secrets.length
+    assert_equal 1, principal.sync_transforms.count { |t| t["name"] == "gcp_auth" }
+  end
+
+  test "a wildcard static secret suppresses a role-granted transform on a matching exact host" do
+    grant_direct_static(host: "*.test.com", header: "Authorization")
+    grant_role_gcp(host: "api.test.com")
+    principal = principals(:globex_user)
+
+    assert_equal 1, principal.sync_secrets.length
+    assert_empty principal.sync_transforms, "the lower-priority role gcp_auth should be withheld"
+  end
+
+  test "a wildcard googleapis static secret suppresses oauth token entries on matching exact hosts" do
+    grant_direct_static(host: "*.googleapis.com", header: "Authorization")
+    grant_role_oauth
+    principal = principals(:globex_user)
+
+    assert_equal 1, principal.sync_secrets.length
+    assert_empty principal.sync_transforms, "the lower-priority google oauth_token should be withheld"
+  end
+
+  test "a higher-priority wildcard googleapis static secret suppresses all google auth transforms" do
+    grant_direct_static(host: "*.googleapis.com", header: "Authorization")
+    grant_role_gcp(host: "bigquery.googleapis.com")
+    grant_role_oauth
+    grant_role_gcp(host: "*.googleapis.com")
+    principal = principals(:globex_user)
+
+    assert_equal 1, principal.sync_secrets.length
+    assert_empty principal.sync_transforms, "lower-priority google auth transforms should be withheld"
+  end
+
+  test "equal-priority google auth transforms all serve without a stronger wildcard static secret" do
+    grant_role_gcp(host: "bigquery.googleapis.com")
+    grant_role_oauth
+    grant_role_gcp(host: "*.googleapis.com")
+    principal = principals(:globex_user)
+
+    transforms = principal.sync_transforms
+    assert_equal 2, transforms.count { |t| t["name"] == "gcp_auth" }
+    assert_equal 1, transforms.count { |t| t["name"] == "oauth_token" }
+    assert_equal 1, transforms.find { |t| t["name"] == "oauth_token" }.dig("config", "tokens").length
+  end
+
+  test "a promoted role transform suppresses a lower-priority direct static secret" do
+    grant_direct_static(host: "api.test.com", header: "Authorization")
+    gcp = grant_role_gcp(host: "api.test.com")
+    # Promote the role grant above the direct grant (priority 100): now the
+    # transform wins the conflict and the static secret is withheld.
+    Grant.find_by!(gcp_auth_secret: gcp).update!(priority: 900)
+    principal = principals(:globex_user)
+
+    assert_empty principal.sync_secrets, "the now-lower-priority direct static secret should be withheld"
+    assert_equal 1, principal.sync_transforms.count { |t| t["name"] == "gcp_auth" }
+  end
+
   test "effective_config redacts inline control_plane values by default but not when asked for live secrets" do
     principal = principals(:acme_channel)
     SecretSource.create!(source_type: "control_plane", secret: "s3cr3t",
