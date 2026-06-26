@@ -1118,29 +1118,30 @@ function parsePlanText(value: string): Array<{ step: string; status: RendererTas
     .split('\n')
     .map(line => {
       const trimmed = line.trim()
-      if (!isPlanListItem(trimmed)) return null
+      if (!isPlanListLine(trimmed)) return null
       return {
         step: trimmed,
-        status:
-          trimmed.includes('[x]') || trimmed.includes('[X]')
-            ? ('complete' as const)
-            : ('pending' as const)
+        status: /\[[xX]\]/.test(trimmed) ? ('complete' as const) : ('pending' as const)
       }
     })
     .filter(item => item !== null)
 }
 
-function isPlanListItem(value: string): boolean {
+function isPlanListLine(value: string): boolean {
   if (value.startsWith('- ') || value.startsWith('* ')) return true
   let index = 0
-  while (index < value.length && isDigit(value.charCodeAt(index))) index += 1
-  if (index === 0 || index + 1 >= value.length) return false
+  while (index < value.length && isAsciiDigit(value.charCodeAt(index))) index += 1
+  if (index === 0) return false
   const marker = value[index]
-  return (marker === '.' || marker === ')') && value[index + 1] === ' '
+  return (marker === '.' || marker === ')') && isWhitespace(value.charCodeAt(index + 1))
 }
 
-function isDigit(code: number): boolean {
+function isAsciiDigit(code: number): boolean {
   return code >= 48 && code <= 57
+}
+
+function isWhitespace(code: number): boolean {
+  return code === 32 || code === 9
 }
 
 function planStatus(value: string | undefined): RendererTaskStatus {
@@ -1573,14 +1574,51 @@ function languageFromPath(path: string): string {
 
 function languageFromContent(value: string): string {
   const trimmed = value.trim()
-  if (
-    /^(export\s+)?(async\s+)?function\s|^type\s+\w+\s*=|^interface\s+\w+|^const\s+\w+\s*[:=]/m.test(
-      trimmed
-    )
-  )
-    return 'ts'
+  if (trimmed.split('\n').some(line => isTypescriptDeclaration(line.trimStart()))) return 'ts'
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) return 'json'
   return 'text'
+}
+
+function isTypescriptDeclaration(line: string): boolean {
+  return (
+    startsWithNamedDeclaration(line, 'function')
+    || startsWithNamedDeclaration(line, 'async function')
+    || startsWithNamedDeclaration(line, 'export function')
+    || startsWithNamedDeclaration(line, 'export async function')
+    || startsWithNamedDeclaration(line, 'interface')
+    || startsWithAliasDeclaration(line, 'type', '=')
+    || startsWithAliasDeclaration(line, 'const', '=')
+    || startsWithAliasDeclaration(line, 'const', ':')
+  )
+}
+
+function startsWithNamedDeclaration(line: string, keyword: string): boolean {
+  if (!line.startsWith(`${keyword} `)) return false
+  return readIdentifier(line.slice(keyword.length).trimStart()).length > 0
+}
+
+function startsWithAliasDeclaration(line: string, keyword: string, marker: string): boolean {
+  if (!line.startsWith(`${keyword} `)) return false
+  const rest = line.slice(keyword.length).trimStart()
+  const identifier = readIdentifier(rest)
+  if (!identifier) return false
+  return rest.slice(identifier.length).trimStart().startsWith(marker)
+}
+
+function readIdentifier(value: string): string {
+  let index = 0
+  while (index < value.length) {
+    const code = value.charCodeAt(index)
+    const isIdentifierChar =
+      (code >= 65 && code <= 90)
+      || (code >= 97 && code <= 122)
+      || (code >= 48 && code <= 57)
+      || code === 36
+      || code === 95
+    if (!isIdentifierChar) break
+    index += 1
+  }
+  return value.slice(0, index)
 }
 
 function oneLine(value: string, max: number = limits.finalPlan.taskTitleChars): string {
@@ -1592,14 +1630,13 @@ function unwrapShellCommand(command: string): string {
   const trimmed = command.trim()
   if (!trimmed) return trimmed
 
-  let index = consumeLiteralIgnoreCase(trimmed, 0, '/bin/bash')
-  if (index < 0) return trimmed
-  index = consumeShellWhitespace(trimmed, index)
-  index = consumeLiteralIgnoreCase(trimmed, index, '-lc')
-  if (index < 0) return trimmed
-  if (index >= trimmed.length || !isShellWhitespace(trimmed[index])) return trimmed
+  const prefix = '/bin/bash'
+  if (!trimmed.toLowerCase().startsWith(prefix)) return trimmed
+  const afterShell = trimmed.slice(prefix.length).trimStart()
+  if (!afterShell.toLowerCase().startsWith('-lc')) return trimmed
 
-  let inner = trimmed.slice(consumeShellWhitespace(trimmed, index)).trim()
+  let inner = afterShell.slice(3).trim()
+  if (!inner) return trimmed
   if (
     (inner.startsWith("'") && inner.endsWith("'")) ||
     (inner.startsWith('"') && inner.endsWith('"'))
@@ -1607,21 +1644,6 @@ function unwrapShellCommand(command: string): string {
     inner = inner.slice(1, -1)
   }
   return inner.trim() || trimmed
-}
-
-function consumeLiteralIgnoreCase(value: string, index: number, literal: string): number {
-  return value.slice(index, index + literal.length).toLowerCase() === literal.toLowerCase()
-    ? index + literal.length
-    : -1
-}
-
-function consumeShellWhitespace(value: string, index: number): number {
-  while (index < value.length && isShellWhitespace(value[index])) index += 1
-  return index
-}
-
-function isShellWhitespace(value: string | undefined): boolean {
-  return value === ' ' || value === '\t' || value === '\n' || value === '\r'
 }
 
 function commandExecutionTitle(index?: number): string {
