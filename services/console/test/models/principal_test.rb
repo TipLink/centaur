@@ -266,45 +266,45 @@ class PrincipalTest < ActiveSupport::TestCase
   # Builds a static secret injecting `header` on `host`, granted directly to
   # globex_user (priority 100).
   def grant_direct_static(host:, header:)
-    secret = StaticSecret.new(namespace: "globex", foreign_id: "static-#{SecureRandom.hex(4)}",
-                              inject_config: { "header" => header, "formatter" => "Bearer {{ .Value }}" },
-                              created_by: users(:globex_admin))
-    secret.build_source(source_type: "control_plane", secret: "direct-token")
-    secret.rules.build(host: host, position: 0)
-    secret.save!
-    Grant.create!(principal: principals(:globex_user), static_secret: secret, created_by: users(:globex_admin))
-    secret
+    credential = StaticSecret.new(namespace: "globex", foreign_id: "static-#{SecureRandom.hex(4)}",
+                                  inject_config: { "header" => header, "formatter" => "Bearer {{ .Value }}" },
+                                  created_by: users(:globex_admin))
+    credential.build_source(source_type: "control_plane", secret: "direct-token")
+    credential.rules.build(host: host, position: 0)
+    credential.save!
+    grant_to_globex_principal(credential)
+    credential
   end
 
   # Builds a gcp_auth secret (writes Authorization) matching `host`, granted to
   # globex_user through the globex_infra role (priority 0).
   def grant_role_gcp(host:)
     PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
-    secret = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
-                               credentials_provider: { "type" => "workload_identity" },
-                               scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
-                               created_by: users(:globex_admin))
-    secret.rules.build(host: host, position: 0)
-    secret.save!
-    Grant.create!(role: roles(:globex_infra), gcp_auth_secret: secret, created_by: users(:globex_admin))
-    secret
+    credential = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
+                                   credentials_provider: { "type" => "workload_identity" },
+                                   scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
+                                   created_by: users(:globex_admin))
+    credential.rules.build(host: host, position: 0)
+    credential.save!
+    grant_to_globex_infra(credential)
+    credential
   end
 
   def grant_direct_gcp(host:)
-    secret = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
-                               credentials_provider: { "type" => "workload_identity" },
-                               scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
-                               created_by: users(:globex_admin))
-    secret.rules.build(host: host, position: 0)
-    secret.save!
-    Grant.create!(principal: principals(:globex_user), gcp_auth_secret: secret, created_by: users(:globex_admin))
-    secret
+    credential = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
+                                   credentials_provider: { "type" => "workload_identity" },
+                                   scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
+                                   created_by: users(:globex_admin))
+    credential.rules.build(host: host, position: 0)
+    credential.save!
+    grant_to_globex_principal(credential)
+    credential
   end
 
-  def grant_role_oauth(secret = nil)
+  def grant_role_oauth(oauth_record = nil)
     PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
-    unless secret
-      secret = OauthTokenSecret.new(
+    unless oauth_record
+      oauth_record = OauthTokenSecret.new(
         namespace: "globex",
         foreign_id: "oauth-#{SecureRandom.hex(4)}",
         name: "gmail",
@@ -313,15 +313,29 @@ class PrincipalTest < ActiveSupport::TestCase
         scopes: [ "https://www.googleapis.com/auth/gmail.readonly" ],
         created_by: users(:globex_admin)
       )
-      secret.sources.build(source_type: "1password", config: { "secret_ref" => "op://eng/gmail/refresh-token" },
-                           role: "refresh_token", role_kind: "credential_field")
-      secret.sources.build(source_type: "env", config: { "var" => "GMAIL_CLIENT_ID" },
-                           role: "client_id", role_kind: "credential_field")
-      secret.rules.build(host: "gmail.googleapis.com", http_methods: [ "GET" ], paths: [], position: 0)
-      secret.save!
+      oauth_record.sources.build(source_type: "1password", config: { "secret_ref" => "op://eng/gmail/refresh-token" },
+                                 role: "refresh_token", role_kind: "credential_field")
+      oauth_record.sources.build(source_type: "env", config: { "var" => "GMAIL_CLIENT_ID" },
+                                 role: "client_id", role_kind: "credential_field")
+      oauth_record.rules.build(host: "gmail.googleapis.com", http_methods: [ "GET" ], paths: [], position: 0)
+      oauth_record.save!
     end
-    Grant.create!(role: roles(:globex_infra), oauth_token_secret: secret, created_by: users(:globex_admin))
-    secret
+    grant_to_globex_infra(oauth_record)
+    oauth_record
+  end
+
+  def grant_to_globex_principal(credential)
+    Grant.create!(principal: principals(:globex_user), grantable_assoc(credential) => credential,
+                  created_by: users(:globex_admin))
+  end
+
+  def grant_to_globex_infra(credential)
+    Grant.create!(role: roles(:globex_infra), grantable_assoc(credential) => credential,
+                  created_by: users(:globex_admin))
+  end
+
+  def grantable_assoc(credential)
+    credential.class.model_name.singular.to_sym
   end
 
   test "a direct static secret suppresses a role-granted transform on the same host and header" do
