@@ -1,4 +1,4 @@
-"""Slack API client for bot-token Slack tool operations."""
+"""Slack API client for Slack tool operations."""
 
 import base64
 import json
@@ -72,9 +72,9 @@ class SlackRateLimitError(RuntimeError):
 class SlackClient:
     """Slack API client.
 
-    Most operations use the bot token. Native Slack search and Slack ETL can
-    optionally use dedicated user tokens so workspace-wide reads stay separate
-    from the interactive bot's access model.
+    Most direct Slack operations use the bot token. Workspace-wide native Slack
+    search uses a dedicated user token so broad search stays separate from the
+    interactive bot's private-channel access model.
     """
 
     # Cache settings
@@ -110,20 +110,26 @@ class SlackClient:
         bot_token: str | None = None,
         search_token: str | None = None,
     ):
-        token = (bot_token or secret("SLACK_BOT_TOKEN", default="")).strip()
-        if not token:
+        token = (
+            bot_token if bot_token is not None else secret("SLACK_BOT_TOKEN", default="")
+        ).strip()
+        self.search_token = (
+            search_token
+            if search_token is not None
+            else secret("SLACK_SEARCH_TOKEN", default="")
+        ).strip()
+        if not token and not self.search_token:
             raise RuntimeError(
-                "SLACK_BOT_TOKEN not set.\n"
-                "Get one at https://api.slack.com/apps → OAuth & Permissions → Bot User OAuth Token"
+                "SLACK_BOT_TOKEN or SLACK_SEARCH_TOKEN not set.\n"
+                "Get Slack tokens at https://api.slack.com/apps → OAuth & Permissions"
             )
         self.token = token
-        self.search_token = (search_token or secret("SLACK_SEARCH_TOKEN", default="")).strip()
         timeout = self._api_timeout_seconds()
         self._client = WebClient(token=token, timeout=timeout)
         self._search_client = (
             WebClient(token=self.search_token, timeout=timeout)
             if self.search_token
-            else self._client
+            else None
         )
         self._user_cache: dict[str, str] = {}
         self._ratelimit_deadlines: dict[str, float] = {}
@@ -664,9 +670,10 @@ class SlackClient:
         """Search messages using Slack's native search.messages API.
 
         Uses Slack's native search.messages API for fast, workspace-wide
-        search. When ``SLACK_SEARCH_TOKEN`` is configured, the native call runs
-        with that dedicated user token and its ``search:read`` scope. Falls
-        back to local channel scanning if the native API fails.
+        search. Workspace-wide search requires ``SLACK_SEARCH_TOKEN`` and will
+        not fall back to bot-token channel scanning. A local bot-token scan is
+        only used when the caller explicitly scopes the search to channel IDs or
+        ``in:#channel`` modifiers.
 
         Supports Slack search modifiers in the query string:
             in:#channel, from:@user, before:YYYY-MM-DD, after:YYYY-MM-DD,
@@ -694,6 +701,12 @@ class SlackClient:
                 messages_per_channel,
             )
 
+        if not self.search_token:
+            raise RuntimeError(
+                "SLACK_SEARCH_TOKEN not set; refusing workspace Slack search with "
+                "SLACK_BOT_TOKEN because it can include bot-visible private channels"
+            )
+
         # Build the search query with modifiers
         search_query = query
         if from_user:
@@ -701,11 +714,14 @@ class SlackClient:
 
         try:
             return self._search_messages_native(search_query, max_results)
-        except (SlackApiError, RuntimeError, SlackRateLimitError):
-            # Fall back to local scanning if native search fails
-            return self._search_messages_local(
-                local_query, max_results, local_channels, local_from_user, messages_per_channel
-            )
+        except SlackRateLimitError:
+            raise
+        except (SlackApiError, RuntimeError) as exc:
+            raise RuntimeError(
+                "Slack native search failed via SLACK_SEARCH_TOKEN; refusing "
+                "SLACK_BOT_TOKEN fallback because it can include bot-visible "
+                "private channels"
+            ) from exc
 
     def _search_messages_native(
         self,
@@ -713,6 +729,8 @@ class SlackClient:
         max_results: int = 20,
     ) -> list[dict]:
         """Search using Slack's native search.messages API."""
+        if not self.search_token or self._search_client is None:
+            raise RuntimeError("SLACK_SEARCH_TOKEN not set")
         response = self._retry_on_ratelimit(
             self._search_client.api_call,
             "search.messages",
@@ -2146,7 +2164,7 @@ def _client() -> SlackClient:
     from centaur_sdk import secret
 
     return SlackClient(
-        bot_token=secret("SLACK_BOT_TOKEN"),
+        bot_token=secret("SLACK_BOT_TOKEN", ""),
         search_token=secret("SLACK_SEARCH_TOKEN", ""),
     )
 

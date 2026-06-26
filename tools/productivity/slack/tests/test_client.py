@@ -128,6 +128,8 @@ def _make_client() -> tuple[SlackClient, _FakeWebClient]:
     fake_web_client = _FakeWebClient()
     client._client = fake_web_client
     client._search_client = fake_web_client
+    client.token = "SLACK_BOT_TOKEN"
+    client.search_token = "SLACK_SEARCH_TOKEN"
     client._user_cache = {}
     client._ratelimit_deadlines = {}
     client._resolve_channel = lambda channel: "C123"  # type: ignore[method-assign]
@@ -143,6 +145,26 @@ def _make_slack_error(
         message=message,
         response=_FakeSlackResponse(error=error, status_code=status_code),
     )
+
+
+def test_client_can_initialize_with_search_token_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    clients: list[_FakeWebClient] = []
+
+    def fake_web_client(**kwargs):
+        client = _FakeWebClient()
+        client.last_kwargs = kwargs
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("slack.client.WebClient", fake_web_client)
+
+    client = SlackClient(bot_token="", search_token="SLACK_SEARCH_TOKEN")
+
+    assert client.token == ""
+    assert client.search_token == "SLACK_SEARCH_TOKEN"
+    assert client._search_client is clients[1]
+    assert clients[0].last_kwargs["token"] == ""
+    assert clients[1].last_kwargs["token"] == "SLACK_SEARCH_TOKEN"
 
 
 def test_send_message_forwards_unfurl_flags() -> None:
@@ -444,6 +466,40 @@ def test_search_messages_parses_channel_and_user_modifiers_locally() -> None:
     assert fake_web_client.history_calls == [{"channel": "C042WDDP89Y", "limit": 25}]
     assert len(results) == 1
     assert results[0]["user_id"] == "UGZCSQTPE"
+
+
+def test_workspace_search_requires_search_token() -> None:
+    client, _ = _make_client()
+    client.search_token = ""
+    client._search_client = None
+    client.list_bot_channels = lambda **_: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("workspace search must not scan bot-visible channels")
+    )
+
+    with pytest.raises(RuntimeError, match="SLACK_SEARCH_TOKEN not set"):
+        client.search_messages("deploy", max_results=5)
+
+
+def test_workspace_search_refuses_bot_token_fallback_when_native_search_fails() -> None:
+    client, fake_web_client = _make_client()
+    client.list_bot_channels = lambda **_: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("workspace search must not scan bot-visible channels")
+    )
+
+    def fail_native_search(method: str, *, params: dict):
+        fake_web_client.api_calls.append((method, params))
+        raise _make_slack_error(error="invalid_auth", status_code=200)
+
+    fake_web_client.api_call = fail_native_search  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="refusing SLACK_BOT_TOKEN fallback"):
+        client.search_messages("deploy", max_results=5)
+
+    assert fake_web_client.api_calls == [
+        ("search.messages", {"query": "deploy", "count": 5, "sort": "timestamp"})
+    ]
+    assert fake_web_client.user_conversations_calls == []
+    assert fake_web_client.history_calls == []
 
 
 def test_list_channels_returns_cache_when_slack_rate_limited() -> None:
