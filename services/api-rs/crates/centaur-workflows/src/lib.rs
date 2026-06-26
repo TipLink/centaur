@@ -2699,7 +2699,7 @@ async fn run_python_workflow_host_local(
             }
             Some(message_type) if message_type.starts_with("ctx.") => {
                 let response =
-                    handle_python_context_request(&message, &ctx, &session_runtime, &input).await?;
+                    handle_python_context_request(&message, &ctx, &session_runtime, &input).await;
                 write_host_message(&mut stdin, &response).await?;
             }
             other => {
@@ -2831,7 +2831,7 @@ where
             }
             Some(message_type) if message_type.starts_with("ctx.") => {
                 let response =
-                    handle_python_context_request(&message, &ctx, &session_runtime, &input).await?;
+                    handle_python_context_request(&message, &ctx, &session_runtime, &input).await;
                 write_host_message(stdin, &response).await?;
             }
             other => {
@@ -2956,45 +2956,12 @@ fn is_valid_prometheus_name(value: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn python_sleep_step(message: &Value) -> String {
-    message
-        .get("step")
-        .or_else(|| message.get("name"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("sleep")
-        .to_owned()
-}
-
-fn parse_python_wake_at(message: &Value) -> Result<DateTime<Utc>, String> {
-    let raw = message
-        .get("wake_at")
-        .or_else(|| message.get("when"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| "ctx.sleep_until requires wake_at".to_owned())?;
-    DateTime::parse_from_rfc3339(raw)
-        .map(|value| value.with_timezone(&Utc))
-        .map_err(|error| format!("invalid ctx.sleep_until wake_at: {error}"))
-}
-
-fn parse_python_sleep_duration(message: &Value) -> Result<Duration, String> {
-    let seconds = message
-        .get("seconds")
-        .and_then(Value::as_f64)
-        .or_else(|| message.get("duration_seconds").and_then(Value::as_f64))
-        .ok_or_else(|| "ctx.sleep_for requires seconds".to_owned())?;
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err("ctx.sleep_for seconds must be finite and non-negative".to_owned());
-    }
-    Ok(Duration::from_secs_f64(seconds))
-}
-
 async fn handle_python_context_request(
     message: &Value,
     ctx: &TaskContext,
     session_runtime: &SessionRuntime,
     input: &WorkflowTaskInput,
-) -> Result<Value, WorkflowRuntimeError> {
+) -> Value {
     let request_id = message
         .get("request_id")
         .and_then(Value::as_str)
@@ -3050,28 +3017,6 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
-        Some("ctx.sleep_until") => {
-            let step = python_sleep_step(message);
-            match parse_python_wake_at(message) {
-                Ok(wake_at) => match ctx.sleep_until(&step, wake_at).await {
-                    Ok(()) => Ok(json!({"slept": true})),
-                    Err(absurd::Error::Suspend) => return Err(WorkflowRuntimeError::Suspended),
-                    Err(error) => Err(error.to_string()),
-                },
-                Err(error) => Err(error),
-            }
-        }
-        Some("ctx.sleep_for") => {
-            let step = python_sleep_step(message);
-            match parse_python_sleep_duration(message) {
-                Ok(duration) => match ctx.sleep_for(&step, duration).await {
-                    Ok(()) => Ok(json!({"slept": true})),
-                    Err(absurd::Error::Suspend) => return Err(WorkflowRuntimeError::Suspended),
-                    Err(error) => Err(error.to_string()),
-                },
-                Err(error) => Err(error),
-            }
-        }
         Some("ctx.call_tool") => match call_python_workflow_tool(message).await {
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
@@ -3084,7 +3029,7 @@ async fn handle_python_context_request(
         }
         other => Err(format!("unsupported context request type {other:?}")),
     };
-    Ok(match result {
+    match result {
         Ok(value) => json!({
             "type": "ctx.response",
             "request_id": request_id,
@@ -3097,7 +3042,7 @@ async fn handle_python_context_request(
             "ok": false,
             "error": error,
         }),
-    })
+    }
 }
 
 async fn run_python_agent_turn(
@@ -3638,16 +3583,11 @@ fn workflow_checkpoint_from_row(
 }
 
 fn absurd_error(error: WorkflowRuntimeError) -> absurd::Error {
-    match error {
-        WorkflowRuntimeError::Suspended => absurd::Error::Suspend,
-        error => absurd::Error::TaskFailed(Box::new(error)),
-    }
+    absurd::Error::TaskFailed(Box::new(error))
 }
 
 #[derive(Debug, Error)]
 pub enum WorkflowRuntimeError {
-    #[error("workflow suspended")]
-    Suspended,
     /// The caller supplied an invalid request or workflow configuration.
     /// Maps to HTTP 400.
     #[error("{0}")]
@@ -3854,47 +3794,6 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "metric name missing or invalid");
-    }
-
-    #[test]
-    fn parses_python_sleep_until_request() {
-        let wake_at = parse_python_wake_at(&json!({
-            "type": "ctx.sleep_until",
-            "step": "wait",
-            "wake_at": "2026-06-26T11:00:00-04:00",
-        }))
-        .unwrap();
-
-        assert_eq!(
-            wake_at,
-            Utc.with_ymd_and_hms(2026, 6, 26, 15, 0, 0).unwrap()
-        );
-    }
-
-    #[test]
-    fn parses_python_sleep_for_request() {
-        let duration = parse_python_sleep_duration(&json!({
-            "type": "ctx.sleep_for",
-            "step": "pause",
-            "seconds": 2.5,
-        }))
-        .unwrap();
-
-        assert_eq!(duration, Duration::from_millis(2500));
-    }
-
-    #[test]
-    fn rejects_invalid_python_sleep_for_request() {
-        let error = parse_python_sleep_duration(&json!({
-            "type": "ctx.sleep_for",
-            "seconds": -1,
-        }))
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            "ctx.sleep_for seconds must be finite and non-negative"
-        );
     }
 
     #[tokio::test]
