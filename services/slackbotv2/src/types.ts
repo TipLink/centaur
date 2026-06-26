@@ -2,6 +2,7 @@ import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { CodexAppServerToChatStreamOptions } from '@centaur/rendering'
 import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
 import type { Hono } from 'hono'
+import type { SlackDisplayTextSource } from './slack-display-text'
 
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[]
@@ -29,12 +30,26 @@ export type SlackbotV2ApiAttachment = {
   width?: number
 }
 
+export type SlackbotV2ApiMessageLink = {
+  description?: string
+  imageUrl?: string
+  isSlackMessage?: boolean
+  siteName?: string
+  title?: string
+  url: string
+}
+
 export type SlackbotV2ApiMessage = {
   attachments: SlackbotV2ApiAttachment[]
   author: SlackbotV2ApiAuthor
+  displayText?: string
+  displayTextSource?: SlackDisplayTextSource
   id: string
   isMention: boolean
+  links?: SlackbotV2ApiMessageLink[]
   raw: unknown
+  rawSlackAttachmentCount?: number
+  rawSlackBlockCount?: number
   teamId: string
   text: string
   threadId: string
@@ -100,8 +115,12 @@ export type SlackbotV2Options = {
   renderRecoveryMaxObligationAgeMs?: number
   /** Per-thread deadline for one recovery attempt during the startup scan. */
   renderRecoveryThreadTimeoutMs?: number
+  /** Deadline for Centaur session API HTTP calls made during Slack handoff. */
+  sessionApiTimeoutMs?: number
   signingSecret: string
   slackApiUrl?: string
+  /** Deadline for optional Slack Web API metadata lookups. */
+  slackApiTimeoutMs?: number
   state?: StateAdapter
   stateKeyPrefix?: string
   streamTaskDisplayMode?: 'plan' | 'timeline'
@@ -139,6 +158,7 @@ export type SlackbotV2Trace = {
   messageId: string
   mode: SlackbotV2MessageMode
   openStream: boolean
+  slackUserId?: string
   startedAtMs: number
   threadId: string
 }
@@ -159,6 +179,8 @@ export type ForwardSessionInput = {
   messages: SlackbotV2ApiMessage[]
   /** Per-turn model override parsed from message flags (--model/--opus/...). */
   model?: string
+  /** Model provider override parsed from message flags (--bedrock); codex only. */
+  provider?: string
   /** Per-turn reasoning effort parsed from the `-rsn` flag (codex only). */
   reasoning?: string
   onEventId(eventId: number): void
