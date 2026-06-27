@@ -31,14 +31,6 @@ class ProtocolError(RuntimeError):
     pass
 
 
-@dataclasses.dataclass
-class RetryPolicy:
-    limit: int = 1
-    delay: Any = None
-    backoff: str | None = None
-    max_delay: Any = None
-
-
 class WorkflowContext:
     def __init__(
         self,
@@ -64,16 +56,7 @@ class WorkflowContext:
             }
         )
 
-    async def step(
-        self,
-        name: str,
-        fn: Any,
-        *,
-        retry: Any = None,
-        timeout: Any = None,
-        **kwargs: Any,
-    ) -> Any:
-        del retry, timeout, kwargs
+    async def step(self, name: str, fn: Any) -> Any:
         started = await self._rpc.request({"type": "ctx.step.get", "step": name})
         if started.get("done"):
             return started.get("value")
@@ -98,16 +81,6 @@ class WorkflowContext:
 
     async def run_agent(self, text: str | None = None, **kwargs: Any) -> Any:
         return await self.agent_turn(text, **kwargs)
-
-    async def start_agent(
-        self, name: str | None = None, text: str | None = None, **kwargs: Any
-    ) -> Any:
-        del name
-        args = dict(kwargs)
-        if "trigger_key" in args and "idempotency_key" not in args:
-            args["idempotency_key"] = args["trigger_key"]
-        args.pop("eager_start", None)
-        return await self.agent_turn(text, **args)
 
     async def sleep_until(self, name: str, when: Any) -> Any:
         if isinstance(when, dt.datetime):
@@ -267,7 +240,6 @@ def install_api_compat_module() -> None:
             sys.modules["api"] = api_mod
 
     workflow_engine = types.ModuleType("api.workflow_engine")
-    workflow_engine.RetryPolicy = RetryPolicy
     workflow_engine.WorkflowContext = WorkflowContext
     sys.modules["api.workflow_engine"] = workflow_engine
     setattr(api_mod, "workflow_engine", workflow_engine)
@@ -330,6 +302,38 @@ _COMPANY_CONTEXT_DOCUMENT_SIZE_BUCKETS = [
     250_000,
     500_000,
 ]
+_SLACK_ARCHIVE_IMPORT_BATCH_SIZE_BUCKETS = [
+    1,
+    10,
+    100,
+    500,
+    1_000,
+    5_000,
+    10_000,
+]
+_SLACK_ARCHIVE_IMPORT_DURATION_BUCKETS = [
+    1,
+    5,
+    10,
+    30,
+    60,
+    120,
+    300,
+    600,
+    1_200,
+    3_600,
+]
+_SLACK_RETENTION_DURATION_BUCKETS = [
+    1,
+    5,
+    10,
+    30,
+    60,
+    120,
+    300,
+    600,
+    1_200,
+]
 
 
 def install_vm_metrics_compat_module(api_mod: types.ModuleType) -> None:
@@ -350,6 +354,75 @@ def install_vm_metrics_compat_module(api_mod: types.ModuleType) -> None:
     vm_metrics.record_etl_items_failed = record_etl_items_failed
     vm_metrics.record_etl_items_seen = record_etl_items_seen
     vm_metrics.record_etl_items_upserted = record_etl_items_upserted
+    vm_metrics.record_slack_etl_rate_limit = record_slack_etl_rate_limit
+    vm_metrics.record_slack_archive_import_batch_failure = (
+        record_slack_archive_import_batch_failure
+    )
+    vm_metrics.record_slack_archive_import_batch_size = (
+        record_slack_archive_import_batch_size
+    )
+    vm_metrics.record_slack_archive_import_bytes = record_slack_archive_import_bytes
+    vm_metrics.record_slack_archive_import_channels = (
+        record_slack_archive_import_channels
+    )
+    vm_metrics.record_slack_archive_import_failure = (
+        record_slack_archive_import_failure
+    )
+    vm_metrics.record_slack_archive_import_message_files = (
+        record_slack_archive_import_message_files
+    )
+    vm_metrics.record_slack_archive_import_messages = (
+        record_slack_archive_import_messages
+    )
+    vm_metrics.record_slack_archive_import_attachments = (
+        record_slack_archive_import_attachments
+    )
+    vm_metrics.record_slack_archive_import_run = record_slack_archive_import_run
+    vm_metrics.record_slack_archive_import_skipped_items = (
+        record_slack_archive_import_skipped_items
+    )
+    vm_metrics.record_slack_archive_import_users = record_slack_archive_import_users
+    vm_metrics.observe_slack_archive_import_batch_duration = (
+        observe_slack_archive_import_batch_duration
+    )
+    vm_metrics.observe_slack_archive_import_duration = (
+        observe_slack_archive_import_duration
+    )
+    vm_metrics.record_slack_retention_backfill_job = (
+        record_slack_retention_backfill_job
+    )
+    vm_metrics.record_slack_retention_backfill_job_failure = (
+        record_slack_retention_backfill_job_failure
+    )
+    vm_metrics.record_slack_retention_backfill_terminal_skip = (
+        record_slack_retention_backfill_terminal_skip
+    )
+    vm_metrics.record_slack_retention_channel_failure = (
+        record_slack_retention_channel_failure
+    )
+    vm_metrics.record_slack_retention_failure = record_slack_retention_failure
+    vm_metrics.record_slack_retention_messages_processed = (
+        record_slack_retention_messages_processed
+    )
+    vm_metrics.record_slack_retention_api_request = (
+        record_slack_retention_api_request
+    )
+    vm_metrics.record_slack_retention_api_rate_limited = (
+        record_slack_retention_api_rate_limited
+    )
+    vm_metrics.record_slack_retention_run = record_slack_retention_run
+    vm_metrics.observe_slack_retention_run_duration = (
+        observe_slack_retention_run_duration
+    )
+    vm_metrics.set_slack_archive_import_last_failure_timestamp = (
+        set_slack_archive_import_last_failure_timestamp
+    )
+    vm_metrics.set_slack_retention_last_failure_timestamp = (
+        set_slack_retention_last_failure_timestamp
+    )
+    vm_metrics.set_slack_retention_watermark_lag_seconds = (
+        set_slack_retention_watermark_lag_seconds
+    )
     vm_metrics.set_etl_active_scopes = set_etl_active_scopes
     vm_metrics.set_etl_backfill_job_age_seconds = set_etl_backfill_job_age_seconds
     vm_metrics.set_etl_backfill_jobs = set_etl_backfill_jobs
@@ -432,6 +505,289 @@ def record_etl_items_failed(
         source_type=source_type,
         item_type=item_type,
         reason=reason,
+    )
+
+
+def record_slack_etl_rate_limit(
+    workflow: str,
+    method: str,
+    outcome: str,
+    retry_after_seconds: int | float,
+) -> None:
+    retry_after = max(float(retry_after_seconds), 0.0)
+    labels = {
+        "workflow": workflow,
+        "method": method,
+        "outcome": outcome,
+    }
+    increment_metric("slack_etl_rate_limits_total", 1, **labels)
+    increment_metric(
+        "slack_etl_rate_limit_retry_after_seconds_total",
+        retry_after,
+        **labels,
+    )
+
+
+def record_slack_archive_import_run(
+    status: str,
+    reason: str = "none",
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_archive_import_runs_total",
+        count,
+        status=status,
+        reason=reason,
+    )
+
+
+def observe_slack_archive_import_duration(status: str, duration_s: float) -> None:
+    observe_histogram(
+        "slack_archive_import_duration_seconds",
+        max(duration_s, 0.0),
+        _SLACK_ARCHIVE_IMPORT_DURATION_BUCKETS,
+        status=status,
+    )
+
+
+def record_slack_archive_import_bytes(count: int) -> None:
+    increment_metric("slack_archive_import_bytes_total", count)
+
+
+def record_slack_archive_import_channels(result: str, count: int) -> None:
+    increment_metric("slack_archive_import_channels_total", count, result=result)
+
+
+def record_slack_archive_import_users(result: str, count: int) -> None:
+    increment_metric("slack_archive_import_users_total", count, result=result)
+
+
+def record_slack_archive_import_messages(result: str, count: int) -> None:
+    increment_metric("slack_archive_import_messages_total", count, result=result)
+
+
+def record_slack_archive_import_message_files(result: str, count: int) -> None:
+    increment_metric("slack_archive_import_message_files_total", count, result=result)
+
+
+def record_slack_archive_import_attachments(result: str, count: int) -> None:
+    increment_metric("slack_archive_import_attachments_total", count, result=result)
+
+
+def observe_slack_archive_import_batch_duration(entity: str, duration_s: float) -> None:
+    observe_histogram(
+        "slack_archive_import_batch_duration_seconds",
+        max(duration_s, 0.0),
+        _SLACK_ARCHIVE_IMPORT_DURATION_BUCKETS,
+        entity=entity,
+    )
+
+
+def record_slack_archive_import_batch_size(entity: str, count: int) -> None:
+    observe_histogram(
+        "slack_archive_import_batch_size",
+        max(count, 0),
+        _SLACK_ARCHIVE_IMPORT_BATCH_SIZE_BUCKETS,
+        entity=entity,
+    )
+
+
+def record_slack_archive_import_failure(
+    stage: str,
+    reason: str,
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_archive_import_failures_total",
+        count,
+        stage=stage,
+        reason=reason,
+    )
+
+
+def record_slack_archive_import_skipped_items(
+    item_type: str,
+    reason: str,
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_archive_import_skipped_items_total",
+        count,
+        item_type=item_type,
+        reason=reason,
+    )
+
+
+def record_slack_archive_import_batch_failure(
+    entity: str,
+    reason: str,
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_archive_import_batch_failures_total",
+        count,
+        entity=entity,
+        reason=reason,
+    )
+
+
+def set_slack_archive_import_last_failure_timestamp(timestamp_s: float) -> None:
+    set_gauge("slack_archive_import_last_failure_timestamp_seconds", timestamp_s)
+
+
+def record_slack_retention_run(
+    workflow: str,
+    status: str,
+    mode: str,
+    reason: str = "none",
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_retention_runs_total",
+        count,
+        workflow=workflow,
+        status=status,
+        mode=mode,
+        reason=reason,
+    )
+
+
+def observe_slack_retention_run_duration(
+    workflow: str,
+    mode: str,
+    status: str,
+    duration_s: float,
+) -> None:
+    observe_histogram(
+        "slack_retention_run_duration_seconds",
+        max(duration_s, 0.0),
+        _SLACK_RETENTION_DURATION_BUCKETS,
+        workflow=workflow,
+        mode=mode,
+        status=status,
+    )
+
+
+def record_slack_retention_messages_processed(
+    workflow: str,
+    mode: str,
+    result: str,
+    count: int,
+) -> None:
+    increment_metric(
+        "slack_retention_messages_processed_total",
+        count,
+        workflow=workflow,
+        mode=mode,
+        result=result,
+    )
+
+
+def record_slack_retention_backfill_job(
+    job_type: str,
+    result: str,
+    reason: str = "none",
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_retention_backfill_jobs_total",
+        count,
+        job_type=job_type,
+        result=result,
+        reason=reason,
+    )
+
+
+def record_slack_retention_failure(
+    workflow: str,
+    operation: str,
+    reason: str,
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_retention_failures_total",
+        count,
+        workflow=workflow,
+        operation=operation,
+        reason=reason,
+    )
+
+
+def record_slack_retention_api_request(
+    operation: str,
+    result: str,
+    reason: str = "none",
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_retention_api_requests_total",
+        count,
+        operation=operation,
+        result=result,
+        reason=reason,
+    )
+
+
+def record_slack_retention_api_rate_limited(operation: str, count: int = 1) -> None:
+    increment_metric(
+        "slack_retention_api_rate_limited_total",
+        count,
+        operation=operation,
+    )
+
+
+def record_slack_retention_backfill_job_failure(
+    job_type: str,
+    reason: str,
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_retention_backfill_job_failures_total",
+        count,
+        job_type=job_type,
+        reason=reason,
+    )
+
+
+def record_slack_retention_backfill_terminal_skip(
+    job_type: str,
+    reason: str,
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_retention_backfill_terminal_skips_total",
+        count,
+        job_type=job_type,
+        reason=reason,
+    )
+
+
+def record_slack_retention_channel_failure(
+    workflow: str,
+    reason: str,
+    count: int = 1,
+) -> None:
+    increment_metric(
+        "slack_retention_channel_failures_total",
+        count,
+        workflow=workflow,
+        reason=reason,
+    )
+
+
+def set_slack_retention_last_failure_timestamp(workflow: str, timestamp_s: float) -> None:
+    set_gauge(
+        "slack_retention_last_failure_timestamp_seconds",
+        timestamp_s,
+        workflow=workflow,
+    )
+
+
+def set_slack_retention_watermark_lag_seconds(mode: str, lag_s: float) -> None:
+    set_gauge(
+        "slack_retention_watermark_lag_seconds",
+        max(lag_s, 0.0),
+        mode=mode,
     )
 
 
@@ -737,6 +1093,24 @@ def workflow_dirs() -> list[Path]:
     return dirs
 
 
+def workflow_allowed_names() -> set[str]:
+    raw = os.getenv("WORKFLOW_ALLOWED_NAMES", "")
+    return {
+        name
+        for name in (part.strip() for part in raw.replace(",", " ").split())
+        if name
+    }
+
+
+def workflow_enabled(workflow_name: str) -> bool:
+    mode = os.getenv("WORKFLOW_ENABLE_MODE", "").strip().lower()
+    if not mode or mode == "all":
+        return True
+    if mode == "allowlist":
+        return workflow_name.strip() in workflow_allowed_names()
+    raise RuntimeError(f'WORKFLOW_ENABLE_MODE must be "all" or "allowlist", got {mode!r}')
+
+
 def configure_workflow_import_paths(dirs: list[Path]) -> None:
     for directory in dirs:
         candidate_paths = [directory.parent, directory]
@@ -807,6 +1181,8 @@ def discover_workflows() -> dict[str, RegisteredWorkflow]:
                 print(f"workflow_load_error path={path} error={exc}", file=sys.stderr)
                 continue
             if registered is None:
+                continue
+            if not workflow_enabled(registered.workflow_name):
                 continue
             if registered.workflow_name in discovered:
                 raise RuntimeError(f"duplicate workflow name {registered.workflow_name!r}")
@@ -942,7 +1318,15 @@ async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any
         result = registered.handler(inp, ctx)
         if inspect.isawaitable(result):
             result = await result
-        return {"type": "workflow.result", "result": jsonable(result)}
+        return {
+            "type": "workflow.result",
+            "workflow_run_id": ctx.run_id,
+            "run_id": ctx.run_id,
+            "workflow_task_id": ctx.task_id,
+            "task_id": ctx.task_id,
+            "workflow_name": ctx.workflow_name,
+            "result": jsonable(result),
+        }
     finally:
         await rpc.drain_notifications()
         _METRIC_RPC = previous_metric_rpc

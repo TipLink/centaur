@@ -59,7 +59,7 @@ Supported v2 primitives:
 | `handler(inp, ctx)` | Supported |
 | `ctx.step(name, fn)` | Supported |
 | `ctx.agent_turn(...)` / `ctx.run_agent(...)` | Supported |
-| `ctx.call_tool(...)` | Supported through the configured tool API proxy |
+| `ctx.call_tool(...)` | Supported through the generated `centaur-tools call` bridge in the workflow-host sandbox |
 | `ctx.post_to_slack(...)` | Supported |
 | `ctx._pool` | Supported when the workflow-host sandbox receives `DATABASE_URL` |
 | `WEBHOOKS` | Supported |
@@ -89,10 +89,12 @@ Python API package.
 If a workflow needs a helper, move it into the workflow file, a shared overlay
 module, or a supported workflow-host compatibility shim.
 
-### Put side effects behind steps
+### Make stepped side effects idempotent
 
-The handler may be replayed after a crash or retry. Any external write should
-be wrapped in `ctx.step(...)` so the result is checkpointed:
+The handler may be replayed after a crash or retry. `ctx.step(...)`
+checkpoints only after the callback returns. If the callback performs an
+external write, use a stable provider-side idempotency key or upsert so replay
+does not duplicate the side effect:
 
 ```python
 async def handler(inp: dict, ctx: WorkflowContext) -> dict:
@@ -182,8 +184,8 @@ For each existing workflow:
    `api.workflow_engine.WorkflowContext`.
 3. Confirm third-party Python packages are installed in the workflow-host
    sandbox image.
-4. Wrap Slack posts, database writes, external HTTP calls, and tool calls in
-   `ctx.step(...)` when they must not repeat.
+4. Make Slack posts, database writes, external HTTP calls, and tool calls
+   idempotent before putting them in `ctx.step(...)`.
 5. Replace direct agent-control-plane calls with `ctx.agent_turn(...)`.
 6. If the workflow uses `ctx._pool`, confirm the workflow-host sandbox receives
    `DATABASE_URL`.
@@ -199,9 +201,10 @@ Python API package. Workflows that import `api.runtime_control`, `api.vm_metrics
 or other Python API internals need a compatibility shim or a small local helper
 before they are v2-ready.
 
-The tool runtime is also still proxied. `ctx.call_tool(...)` works through the
-configured tool API, but a fully native `api-rs` tool runtime is a separate
-migration step.
+`ctx.call_tool(...)` is a compatibility surface in the Python workflow host. It
+uses the generated `centaur-tools call` bridge against the installed tool
+package; agent sandboxes should use direct tool CLIs instead of deprecated
+`/tools/...` HTTP routes.
 
 ## Verify a migration
 
@@ -219,7 +222,6 @@ Then create a real run:
 ```bash
 curl -s "$CENTAUR_API_URL/api/workflows/runs" \
   -H "Content-Type: application/json" \
-  -H "X-Api-Key: $CENTAUR_API_KEY" \
   -d '{
     "workflow_name": "nightly_report",
     "input": {"topic": "open incidents"}

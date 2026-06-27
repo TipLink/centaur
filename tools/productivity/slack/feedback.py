@@ -29,7 +29,7 @@ from .client import (
 
 # Feedback database location
 FEEDBACK_DB_PATH = Path.home() / ".cache" / "paradigm-slack" / "feedback.db"
-SANDBOX_API_KEY_PATH = Path("/home/agent/.api_key")
+CENTAUR_API_KEY_FILE = Path("/home/agent/.api_key")
 
 # Heuristic signals for feedback detection
 NEGATIVE_REACTIONS = {"thumbsdown", "-1", "x", "confused", "thinking_face", "bug", "facepalm"}
@@ -120,7 +120,7 @@ class CentaurAgentClient:
         self.base_url = (base_url or os.environ.get("CENTAUR_API_URL") or "http://api:8000").rstrip("/")
         self.api_key = api_key or _load_centaur_api_key()
         if not self.api_key:
-            raise RuntimeError("CENTAUR_API_KEY not set")
+            raise RuntimeError("CENTAUR_API_KEY is required to start an improvement agent run")
 
     def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         headers = {
@@ -245,11 +245,15 @@ def _severity_filter_clause(min_severity: str | None) -> tuple[str, list[str]]:
 
 
 def _load_centaur_api_key() -> str | None:
-    if SANDBOX_API_KEY_PATH.exists():
-        token = SANDBOX_API_KEY_PATH.read_text(encoding="utf-8").strip()
-        if token:
-            return token
-    return os.environ.get("CENTAUR_API_KEY")
+    for env_name in ("CENTAUR_AGENT_API_KEY", "CENTAUR_API_KEY"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+    try:
+        value = CENTAUR_API_KEY_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
 
 
 def _bot_message_looks_like_error(text: str) -> bool:
@@ -843,7 +847,7 @@ def build_improvement_prompt(items: list[FeedbackItem], channels: list[str]) -> 
     prompt = [
         "You are working on paradigmxyz/centaur.",
         "Investigate and fix the highest-leverage issues surfaced by Slack feedback.",
-        "Use git-branch paradigmxyz/centaur before editing because the host mount is read-only.",
+        "Use git-branch paradigmxyz/centaur fix-slack-feedback before editing because the host mount is read-only.",
         "Read the linked Slack permalinks and Amp threads when they are relevant, then make code changes in the repo.",
         "Prefer the smallest fixes that materially improve agent behavior.",
         "When done, open a PR with a concise summary of the fixes.",

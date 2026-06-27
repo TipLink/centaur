@@ -12,13 +12,13 @@ Centaur ships with a set of tool integrations under `tools/`. Deployments can en
 The repo inventory is not the same as a live deployment. To see what an agent can use in a running sandbox, ask it to run:
 
 ```bash
-call tools
+centaur-tools list
 ```
 
-To inspect a specific tool's methods and parameters:
+To inspect a specific tool's CLI:
 
 ```bash
-call discover linear
+linear --help
 ```
 
 The `API key / credential` column uses the secret names declared by each tool's `[tool.centaur]` config. `None` means the base tool declares no required tool-specific credential; optional credentials are called out separately.
@@ -31,7 +31,7 @@ These are broadly useful across most deployments and are good candidates to conf
 |---|---|---|
 | `linear` | Search, create, update, and comment on Linear issues, projects, cycles, teams, and labels | `LINEAR_API_KEY` |
 | `notion` | Search and update Notion pages, databases, blocks, and comments | `NOTION_API_KEY` |
-| `slack` | Search Slack, read threads, inspect channels/users, and send or upload messages | `SLACK_BOT_TOKEN`; optional: `SLACK_SEARCH_TOKEN`, `SLACK_ETL_TOKEN` |
+| `slack` | Search Slack, read threads, inspect channels/users, and send or upload messages | `SLACK_BOT_TOKEN`; optional: `SLACK_SEARCH_TOKEN`, `SLACK_UPLOAD_TOKEN`, `SLACK_ETL_TOKEN` |
 | `gsuite` | Use Gmail, Calendar, Drive, Docs, Sheets, Slides, and Google Analytics | `GOOGLE_TOKEN_JSON` |
 | `websearch` | Free web search via Parallel and deep research | None; `PARALLEL_API_KEY` for `deep_research`; `ANTHROPIC_API_KEY` for search synthesis |
 | `company_context` | Search indexed company history across internal sources | None |
@@ -82,7 +82,7 @@ These are broadly useful across most deployments and are good candidates to conf
 | `linear` | Linear issues, projects, cycles, teams, workflow states, and labels | `LINEAR_API_KEY` |
 | `notion` | Notion pages, databases, blocks, comments, and users | `NOTION_API_KEY` |
 | `opentable` | Search OpenTable restaurant reservations | None |
-| `slack` | Slack messages, files, channels, threads, users, and usergroups | `SLACK_BOT_TOKEN`; optional: `SLACK_SEARCH_TOKEN`, `SLACK_ETL_TOKEN` |
+| `slack` | Slack messages, files, channels, threads, users, and usergroups | `SLACK_BOT_TOKEN`; optional: `SLACK_SEARCH_TOKEN`, `SLACK_UPLOAD_TOKEN`, `SLACK_ETL_TOKEN` |
 
 ## Research
 

@@ -50,15 +50,15 @@ toolServer:
   ref: ""
   # Subdirectory in the repo holding the tools tree (mounted at /app/tools).
   subdir: tools
-  # Additional repo/subdir sources copied after the base tools source. Later
-  # sources shadow earlier ones when tool directory names collide. These repos
-  # are cached automatically when repoCache.enabled=true.
+  # Additional repo/subdir sources copied after the base tools source. Duplicate
+  # tool names are skipped by the sandbox copy helper. These repos are cached
+  # automatically when repoCache.enabled=true.
   extraSources: []
   # - repo: tempoxyz/centaur-tempo
   #   ref: ""
   #   subdir: tools
-  # Git-capable image the clone init container runs in; empty fields fall back to
-  # sandbox.image (which carries git).
+  # Image the tools-bootstrap init container runs in; empty fields fall back to
+  # sandbox.image, which carries git and install-tool-shims.
   runnerImage:
     repository: ""
     tag: ""
@@ -106,6 +106,10 @@ console:
   # _SECRET), which must exist or the console pods CreateContainerConfigError.
   googleOauth:
     enabled: false
+  # OAuth app slug whose user-level Slack credentials are used by the DM sync
+  # worker. Keep this aligned with the Console OAuth app users authorize.
+  slackDmSync:
+    oauthAppSlug: slack
   service:
     httpPort: 3000
   # Optional Ingress for the console. Bring your own controller — Tailscale
@@ -191,6 +195,7 @@ secrets:
 
 overlay:
   mountPath: /app/overlay/org
+  sandboxMountPath: /home/agent/overlay/org
   systemPrompt: ""
   image:
     repository: ""
@@ -260,6 +265,20 @@ sandbox:
 repoCache:
   enabled: true
   hostPath: /var/lib/centaur/repos
+  storage:
+    # hostPath preserves the existing DaemonSet/node-local behavior. Set to
+    # persistentVolumeClaim for GKE Autopilot or other clusters that disallow
+    # writable hostPath.
+    type: hostPath
+    persistentVolumeClaim:
+      # When set, use this existing claim. It must support ReadWriteMany if
+      # repo-cache, api-rs, and sandboxes can schedule on different nodes.
+      existingClaim: ""
+      create: false
+      accessModes:
+        - ReadWriteMany
+      storageClassName: ""
+      size: 20Gi
   # Additional repos to cache. toolServer.repo is cached automatically when the
   # tool server is enabled.
   repositories: []
@@ -317,6 +336,16 @@ apiRs:
   sandboxReadyTimeoutSecs: 90
   sandboxWarmPoolSize: 3
   sandboxWarmPoolReplenishIntervalSecs: 5
+  # When true, api-rs upserts the shared iron-control infra role and its
+  # backing secrets at startup and on tool-secret reconciliation intervals.
+  # Set false when multiple Centaur instances share one console/1Password
+  # Connect control plane and infra secrets are managed out of band.
+  syncInfraSecrets: true
+  # Workflow enablement policy. Production defaults to all workflows enabled.
+  # Set workflowEnableMode: allowlist in staging and list allowed workflow names
+  # in workflowAllowedNames as a comma/whitespace-separated string.
+  workflowEnableMode: all
+  workflowAllowedNames: ""
   # Reaper: stop sandboxes idle-paused longer than the idle TTL or older than
   # the max lifetime. 0 disables that sweep. Interval must be >= 1.
   sandboxIdleStopTtlSecs: 10800 # 3 hours
@@ -378,6 +407,22 @@ slackbotv2:
   extraEnv: {}
   resources: {}
 
+# Chat SDK Linear bot — Linear agent (actor=app) ingress. Receives
+# AgentSessionEvent webhooks on /api/webhooks/linear, forwards sessions to the
+# api-rs control plane (:8080), and renders runs as Linear agent activities.
+# Disabled by default: requires the LINEAR_ACCESS_TOKEN / LINEARBOT_WEBHOOK_SECRET
+# secrets from the Linear OAuth app install (see contrib/scripts/bootstrap-k8s-secrets.sh).
+linearbot:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-linearbot
+    tag: latest
+    pullPolicy: Always
+  userName: centaur
+  extraEnv: {}
+  resources: {}
+
 # Discord chat ingress — mirrors slackbotv2, forwards to the api-rs control plane (:8080) over a
 # persistent Discord Gateway connection. Off by default; needs a Discord app + Message Content
 # Intent + a guild allowlist. Always exactly one replica (singleton Gateway session).
@@ -394,6 +439,30 @@ discordbot:
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.
   nameThreads: true
+  extraEnv: {}
+  resources: {}
+
+# Microsoft Teams chat ingress. Forwards Teams Bot Framework activities to the
+# api-rs control plane (:8080) and renders session events back to Teams. Off by
+# default; needs a Teams app registration and Bot Framework endpoint routing.
+teamsbot:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-teamsbot
+    tag: latest
+    pullPolicy: Always
+  allowedTeamIds: ""
+  allowedChannelIds: ""
+  allowedTenantIds: ""
+  requireMention: true
+  downloadAttachments: false
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    tls: []
   extraEnv: {}
   resources: {}
 
@@ -419,6 +488,11 @@ postgres:
     size: 20Gi
     storageClassName: ""
     subPath: ""
+  # PostgreSQL uses /dev/shm for dynamic shared memory during parallel queries.
+  # This memory-backed volume counts against the pod's memory limit.
+  sharedMemory:
+    enabled: true
+    sizeLimit: 1Gi
   resources: {}
 
 ingress:

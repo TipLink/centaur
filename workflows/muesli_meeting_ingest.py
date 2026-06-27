@@ -124,7 +124,10 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 
     channel = (inp.slack_channel or "").strip()
     if channel:
-        notified = await ctx.post_to_slack(channel, _format_slack_message(inp))
+        notified = await ctx.step(
+            "notify_slack",
+            lambda: ctx.post_to_slack(channel, _format_slack_message(inp)),
+        )
     else:
         notified = {"sent": False, "reason": "no_slack_channel"}
 

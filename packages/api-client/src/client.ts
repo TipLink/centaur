@@ -24,15 +24,20 @@ export interface SpawnOptions {
 }
 
 export interface SpawnResult {
-  ok: boolean;
-  runtime_id: string;
   thread_key: string;
-  trace_id?: string;
-  assignment_state: string;
-  assignment_generation: number;
+  sandbox_id?: string | null;
+  sandbox_capabilities?: {
+    repo_cache_enabled: boolean;
+    observability_enabled: boolean;
+  } | null;
+  harness_type: string;
+  harness_thread_id?: string | null;
   persona_id?: string | null;
-  prompt_ref?: string | null;
-  effective_agents_md_sha256?: string | null;
+  status: string;
+  iron_control_principal?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  harness_switched: boolean;
 }
 
 export interface MessageOptions {
@@ -40,7 +45,6 @@ export interface MessageOptions {
   assignmentGeneration: number;
   messageId?: string;
   role?: string;
-  event?: Record<string, unknown>;
   parts?: InputContentBlock[];
   userId?: string;
   metadata?: Record<string, unknown>;
@@ -60,12 +64,8 @@ export interface ExecuteOptions {
 export interface ExecutionAccepted {
   ok: boolean;
   execution_id: string;
-  execute_id: string;
-  assignment_generation: number;
   status: string;
-  final_key: string;
-  delivery_token: string;
-  idempotent?: boolean;
+  thread_key: string;
 }
 
 export interface WorkflowRunOptions {
@@ -138,48 +138,62 @@ export class CentaurClient {
   }
 
   async spawn(opts: SpawnOptions): Promise<SpawnResult> {
-    const { data } = await this.http.post("/agent/spawn", {
-      thread_key: opts.threadKey,
-      spawn_id: opts.spawnId,
-      harness: opts.harness,
-      engine: opts.engine,
+    const metadata: Record<string, unknown> = {
+      ...(opts.spawnId === undefined ? {} : { spawn_id: opts.spawnId }),
+      ...(opts.agentsMdOverride === undefined
+        ? {}
+        : { agents_md_override: opts.agentsMdOverride }),
+    };
+    const { data } = await this.http.post(`/api/session/${encodeURIComponent(opts.threadKey)}`, {
+      harness_type: opts.harness ?? opts.engine ?? "codex",
       persona_id: opts.personaId,
-      agents_md_override: opts.agentsMdOverride,
+      metadata,
     });
     return data as SpawnResult;
   }
 
-  async message(opts: MessageOptions): Promise<{ ok: boolean; message_id: string; attachment_ids: string[] }> {
-    const body: Record<string, unknown> = {
-      thread_key: opts.threadKey,
-      assignment_generation: opts.assignmentGeneration,
-      message_id: opts.messageId,
-      metadata: opts.metadata,
-      user_id: opts.userId,
-    };
-
-    if (opts.event) {
-      body.event = opts.event;
-    } else {
-      body.role = opts.role ?? "user";
-      body.parts = opts.parts ?? [];
-    }
-
-    const { data } = await this.http.post("/agent/message", body);
-    return data as { ok: boolean; message_id: string; attachment_ids: string[] };
+  async message(opts: MessageOptions): Promise<{ ok: boolean; message_ids: string[] }> {
+    const { data } = await this.http.post(
+      `/api/session/${encodeURIComponent(opts.threadKey)}/messages`,
+      {
+        messages: [
+          {
+            client_message_id: opts.messageId,
+            role: opts.role ?? "user",
+            parts: opts.parts ?? [],
+            metadata: {
+              ...(opts.metadata ?? {}),
+              ...(opts.assignmentGeneration === undefined
+                ? {}
+                : { assignment_generation: opts.assignmentGeneration }),
+              ...(opts.userId === undefined ? {} : { user_id: opts.userId }),
+            },
+          },
+        ],
+      },
+    );
+    return data as { ok: boolean; message_ids: string[] };
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecutionAccepted> {
-    const { data } = await this.http.post("/agent/execute", {
-      thread_key: opts.threadKey,
-      assignment_generation: opts.assignmentGeneration,
-      execute_id: opts.executeId,
-      harness: opts.harness,
-      platform: opts.platform,
-      user_id: opts.userId,
-      metadata: opts.metadata,
-      delivery: opts.delivery,
-    });
+    const metadata = {
+      ...(opts.metadata ?? {}),
+      ...(opts.assignmentGeneration === undefined
+        ? {}
+        : { assignment_generation: opts.assignmentGeneration }),
+      ...(opts.harness === undefined ? {} : { harness: opts.harness }),
+      ...(opts.platform === undefined ? {} : { platform: opts.platform }),
+      ...(opts.userId === undefined ? {} : { user_id: opts.userId }),
+      ...(opts.delivery === undefined ? {} : { delivery: opts.delivery }),
+    };
+    const { data } = await this.http.post(
+      `/api/session/${encodeURIComponent(opts.threadKey)}/execute`,
+      {
+        idempotency_key: opts.executeId,
+        metadata,
+        input_lines: [],
+      },
+    );
     return data as ExecutionAccepted;
   }
 
@@ -220,10 +234,7 @@ export class CentaurClient {
   }
 
   async getWorkflowChildren(runId: string, limit = 200): Promise<{ ok: boolean; items: WorkflowRunAccepted[] }> {
-    const { data } = await this.http.get(`/workflows/runs/${encodeURIComponent(runId)}/children`, {
-      params: { limit },
-    });
-    return data as { ok: boolean; items: WorkflowRunAccepted[] };
+    return this.listWorkflowRuns({ parentRunId: runId, limit });
   }
 
   async cancelWorkflowRun(runId: string): Promise<WorkflowRunAccepted> {
@@ -232,13 +243,11 @@ export class CentaurClient {
   }
 
   async sendWorkflowEvent(opts: {
-    eventType: string;
-    correlationId: string;
+    eventName: string;
     payload?: Record<string, unknown>;
   }): Promise<Record<string, unknown>> {
     const { data } = await this.http.post("/workflows/events", {
-      event_type: opts.eventType,
-      correlation_id: opts.correlationId,
+      event_name: opts.eventName,
       payload: opts.payload ?? {},
     });
     return data as Record<string, unknown>;
@@ -256,8 +265,12 @@ export class CentaurClient {
     if (opts.executionId) params.set("execution_id", opts.executionId);
     if (opts.pollMs !== undefined) params.set("poll_ms", String(opts.pollMs));
 
-    const url = `${this.http.defaults.baseURL}/agent/threads/${encodeURIComponent(opts.threadKey)}/events?${params.toString()}`;
-    const res = await fetch(url, {
+    const url = new URL(
+      `/api/session/${encodeURIComponent(opts.threadKey)}/events`,
+      this.ensureBaseUrl(),
+    );
+    for (const [key, value] of params) url.searchParams.set(key, value);
+    const res = await fetch(url.toString(), {
       method: "GET",
       headers: {
         Authorization: this.authHeader,
@@ -268,7 +281,7 @@ export class CentaurClient {
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`/agent/threads/{thread}/events failed (${res.status}): ${text.slice(0, 300)}`);
+      throw new Error(`/api/session/{thread}/events failed (${res.status}): ${text.slice(0, 300)}`);
     }
     if (!res.body) return;
 
@@ -292,66 +305,9 @@ export class CentaurClient {
     }
   }
 
-  async getExecution(executionId: string) {
-    const { data } = await this.http.get(`/agent/executions/${encodeURIComponent(executionId)}`);
-    return data as Record<string, unknown>;
-  }
-
-  async getMessages(threadKey: string, opts?: { cursor?: string; limit?: number }) {
-    const { data } = await this.http.get("/agent/messages", {
-      params: {
-        thread_key: threadKey,
-        cursor: opts?.cursor,
-        limit: opts?.limit ?? 50,
-      },
-    });
-    return data as {
-      messages: ThreadMessageRecord[];
-      cursor: string | null;
-      has_more: boolean;
-    };
-  }
-
-  async listExecutions(threadKey: string, limit = 20) {
-    const { data } = await this.http.get(
-      `/agent/threads/${encodeURIComponent(threadKey)}/executions`,
-      { params: { limit } },
-    );
-    return data as { thread_key: string; executions: Array<Record<string, unknown>> };
-  }
-
-  async cancelExecution(executionId: string) {
-    const { data } = await this.http.post(`/agent/executions/${encodeURIComponent(executionId)}/cancel`);
-    return data as Record<string, unknown>;
-  }
-
-  async steerExecution(
-    executionId: string,
-    opts?: {
-      contentBlocks?: Array<Record<string, unknown>>;
-      messageId?: string;
-      userId?: string;
-      metadata?: Record<string, unknown>;
-      suppressCancellationDelivery?: boolean;
-    },
-  ) {
-    const { data } = await this.http.post(`/agent/executions/${encodeURIComponent(executionId)}/steer`, {
-      content_blocks: opts?.contentBlocks,
-      message_id: opts?.messageId,
-      user_id: opts?.userId,
-      metadata: {
-        ...(opts?.metadata || {}),
-        ...(opts?.suppressCancellationDelivery === undefined
-          ? {}
-          : { steer_replacement: opts.suppressCancellationDelivery }),
-      },
-    });
-    return data as Record<string, unknown>;
-  }
-
   async releaseThread(threadKey: string, opts?: { releaseId?: string; cancelInflight?: boolean }) {
     const { data } = await this.http.post(
-      `/agent/threads/${encodeURIComponent(threadKey)}/release`,
+      `/api/session/${encodeURIComponent(threadKey)}/release`,
       {
         release_id: opts?.releaseId,
         cancel_inflight: opts?.cancelInflight ?? false,
@@ -360,60 +316,9 @@ export class CentaurClient {
     return data as Record<string, unknown>;
   }
 
-  async claimFinalDeliveries(opts: { consumerId: string; limit?: number; leaseSeconds?: number; platform?: string }) {
-    const { data } = await this.http.post("/agent/final-deliveries/claim", {
-      consumer_id: opts.consumerId,
-      limit: opts.limit ?? 1,
-      lease_seconds: opts.leaseSeconds ?? 60,
-      platform: opts.platform,
-    });
-    return data as { deliveries: Array<Record<string, unknown>> };
-  }
-
-  async renewFinalDeliveryLease(executionId: string, opts: { consumerId: string; leaseSeconds?: number }) {
-    const { data } = await this.http.post(
-      `/agent/final-deliveries/${encodeURIComponent(executionId)}/heartbeat`,
-      {
-        consumer_id: opts.consumerId,
-        lease_seconds: opts.leaseSeconds ?? 60,
-      },
-    );
-    return data as Record<string, unknown>;
-  }
-
-  async markFinalDelivered(executionId: string, consumerId?: string) {
-    const { data } = await this.http.post(
-      `/agent/final-deliveries/${encodeURIComponent(executionId)}/delivered`,
-      { consumer_id: consumerId },
-    );
-    return data as Record<string, unknown>;
-  }
-
-  async markFinalFailed(
-    executionId: string,
-    error: string,
-    opts?: {
-      consumerId?: string;
-      retryAfterSeconds?: number;
-      nonRetryable?: boolean;
-      errorClass?: string;
-    },
-  ) {
-    const { data } = await this.http.post(
-      `/agent/final-deliveries/${encodeURIComponent(executionId)}/failed`,
-      {
-        consumer_id: opts?.consumerId,
-        error,
-        retry_after_seconds: opts?.retryAfterSeconds ?? 15,
-        non_retryable: opts?.nonRetryable ?? false,
-        error_class: opts?.errorClass,
-      },
-    );
-    return data as Record<string, unknown>;
-  }
-
-  async getStatus(threadKey: string) {
-    const { data } = await this.http.get("/agent/status", { params: { key: threadKey } });
-    return data as Record<string, unknown>;
+  private ensureBaseUrl(): string {
+    const baseURL = this.http.defaults.baseURL;
+    if (!baseURL) throw new Error("CentaurClient apiUrl is required");
+    return baseURL.endsWith("/") ? baseURL : `${baseURL}/`;
   }
 }

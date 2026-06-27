@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 import sys
 from pathlib import Path
 
@@ -10,16 +11,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 import client as company_context_client
-from centaur_sdk.tool_sdk import ToolContext, reset_tool_context, set_tool_context
 from client import CompanyContextClient
+
+from centaur_sdk.tool_sdk import ToolContext, reset_tool_context, set_tool_context
 
 
 class _FakeConnection:
-    def __init__(self, *, rows=None, row=None) -> None:
+    def __init__(self, *, rows=None, row=None, val=None) -> None:
         self.rows = rows or []
         self.row = row
+        self.val = val
         self.fetch_calls = []
         self.fetchrow_calls = []
+        self.fetchval_calls = []
         self.closed = False
 
     async def fetch(self, query, *args):
@@ -29,6 +33,10 @@ class _FakeConnection:
     async def fetchrow(self, query, *args):
         self.fetchrow_calls.append((query, args))
         return self.row
+
+    async def fetchval(self, query, *args):
+        self.fetchval_calls.append((query, args))
+        return self.val
 
     async def close(self):
         self.closed = True
@@ -52,7 +60,7 @@ def test_search_rejects_empty_query(query):
 
 
 def test_default_database_url_uses_company_context_dsn_env(monkeypatch):
-    monkeypatch.setenv("COMPANY_CONTEXT_DSN", "postgresql://scoped")
+    monkeypatch.setenv("CENTAUR_POSTGRES_DSN", "postgresql://scoped")
     monkeypatch.setenv("DATABASE_URL", "postgresql://raw-app-db")
 
     client = CompanyContextClient()
@@ -61,12 +69,12 @@ def test_default_database_url_uses_company_context_dsn_env(monkeypatch):
 
 
 def test_default_database_url_uses_tool_context_secret(monkeypatch):
-    monkeypatch.delenv("COMPANY_CONTEXT_DSN", raising=False)
+    monkeypatch.delenv("CENTAUR_POSTGRES_DSN", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://raw-app-db")
     token = set_tool_context(
         ToolContext(
             name="company_context",
-            secrets={"COMPANY_CONTEXT_DSN": "postgresql://context-scoped"},
+            secrets={"CENTAUR_POSTGRES_DSN": "postgresql://context-scoped"},
         )
     )
     try:
@@ -78,16 +86,34 @@ def test_default_database_url_uses_tool_context_secret(monkeypatch):
 
 
 def test_default_database_url_does_not_fall_back_to_raw_database_url(monkeypatch):
-    monkeypatch.delenv("COMPANY_CONTEXT_DSN", raising=False)
+    monkeypatch.delenv("CENTAUR_POSTGRES_DSN", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://raw-app-db")
     token = set_tool_context(ToolContext(name="company_context", secrets={}))
     try:
         client = CompanyContextClient()
 
-        with pytest.raises(RuntimeError, match="COMPANY_CONTEXT_DSN is required"):
+        with pytest.raises(RuntimeError, match="CENTAUR_POSTGRES_DSN is required"):
             client._require_database_url()
     finally:
         reset_tool_context(token)
+
+
+def test_postgres_database_name_defaults_to_ai_v2(monkeypatch):
+    monkeypatch.delenv("COMPANY_CONTEXT_POSTGRES_DATABASE", raising=False)
+
+    assert company_context_client._postgres_database_name() == "ai_v2"
+
+
+def test_postgres_database_name_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("COMPANY_CONTEXT_POSTGRES_DATABASE", "centaur")
+
+    assert company_context_client._postgres_database_name() == "centaur"
+
+
+def test_postgres_database_name_uses_default_for_blank_override(monkeypatch):
+    monkeypatch.setenv("COMPANY_CONTEXT_POSTGRES_DATABASE", " ")
+
+    assert company_context_client._postgres_database_name() == "ai_v2"
 
 
 def test_search_queries_bm25_and_returns_compact_results(monkeypatch):
@@ -157,13 +183,14 @@ def test_search_queries_bm25_and_returns_compact_results(monkeypatch):
     }
     query, args = fake.fetch_calls[0]
     assert "title ||| $1::text::pdb.boost(8) OR body ||| $1::text::pdb.boost(2)" in query
-    assert "title ||| $2::text::pdb.boost(4) OR body ||| $2" in query
-    assert "title ||| $3::text::pdb.boost(4) OR body ||| $3" in query
+    assert "title ||| $2::text::pdb.boost(4) OR body ||| $2::text" in query
+    assert "title ||| $3::text::pdb.boost(4) OR body ||| $3::text" in query
     assert ") OR (" in query
     assert "WHEN 'slack_thread' THEN 1.25" in query
     assert "WHEN 'slack_channel_day' THEN 0.75" in query
     assert "END DESC" in query
     assert "paradedb.score(document_id)" in query
+    assert "metadata ->> 'channel_id'" not in query
     assert args == (
         "ParadeDB BM25",
         "ParadeDB",
@@ -328,11 +355,14 @@ def test_search_uses_or_terms_and_drops_stop_words(monkeypatch):
     assert result["status"] == "ok"
     query, args = fake.fetch_calls[0]
     assert "WHERE (title ||| $1::text::pdb.boost(8) OR body ||| $1::text::pdb.boost(2))" in query
-    assert "OR (title ||| $2::text::pdb.boost(4) OR body ||| $2)" in query
-    assert "OR (title ||| $3::text::pdb.boost(4) OR body ||| $3)" in query
-    assert "OR (title ||| $4::text::pdb.boost(4) OR body ||| $4)" in query
-    assert "OR (title ||| $5::text::pdb.boost(4) OR body ||| $5)" in query
+    assert "OR (title ||| $2::text::pdb.boost(4) OR body ||| $2::text)" in query
+    assert "OR (title ||| $3::text::pdb.boost(4) OR body ||| $3::text)" in query
+    assert "OR (title ||| $4::text::pdb.boost(4) OR body ||| $4::text)" in query
+    assert "OR (title ||| $5::text::pdb.boost(4) OR body ||| $5::text)" in query
     assert "title ||| $6::text::pdb.boost(4)" not in query
+    placeholders = {int(match.group(1)) for match in re.finditer(r"\$(\d+)", query)}
+    assert placeholders == set(range(1, len(args) + 1))
+    assert "metadata ->> 'channel_id'" not in query
     assert args == (
         "what is the state root state mismatch in prod",
         "state",
@@ -370,6 +400,7 @@ def test_search_applies_occurred_at_filters(monkeypatch):
     query, args = fake.fetch_calls[0]
     assert "OR occurred_at >= $5" in query
     assert "OR occurred_at < $6" in query
+    assert "metadata ->> 'channel_id'" not in query
     assert args == (
         "planning",
         "planning",
@@ -408,6 +439,233 @@ def test_search_rejects_invalid_occurred_at_filter():
 
 def test_search_rejects_inverted_occurred_at_filter():
     result = CompanyContextClient("postgresql://example").search(
+        "planning",
+        occurred_after="2026-05-08",
+        occurred_before="2026-05-01",
+    )
+
+    assert result == {
+        "status": "error",
+        "error": "occurred_after must be earlier than occurred_before",
+    }
+
+
+@pytest.mark.parametrize("query", ["", "   "])
+def test_search_dms_rejects_empty_query(query):
+    result = CompanyContextClient("postgresql://example").search_dms(query)
+
+    assert result == {"status": "error", "error": "query cannot be empty"}
+
+
+@pytest.mark.parametrize("query", ["", "   "])
+def test_search_dm_conversations_rejects_empty_query(query):
+    result = CompanyContextClient("postgresql://example").search_dm_conversations(query)
+
+    assert result == {"status": "error", "error": "query cannot be empty"}
+
+
+def test_search_dm_conversations_queries_projection(monkeypatch):
+    last_seen_at = dt.datetime(2026, 5, 8, 12, 0, tzinfo=dt.UTC)
+    source_updated_at = dt.datetime(2026, 5, 8, 12, 5, tzinfo=dt.UTC)
+    fake = _FakeConnection(
+        rows=[
+            {
+                "document_id": "slack_dm_conversation:T_HOME:D123",
+                "home_team_id": "T_HOME",
+                "conversation_id": "D123",
+                "conversation_type": "im",
+                "title": "Slack DM: Akshaan, Tom",
+                "body": "D123 U_SELF Akshaan U_TOM Tom tom@example.com",
+                "is_ext_shared": False,
+                "last_seen_at": last_seen_at,
+                "source_updated_at": source_updated_at,
+                "participant_user_ids": ["U_SELF", "U_TOM"],
+                "participant_labels": ["Akshaan", "Tom"],
+                "participant_count": 2,
+                "metadata": {"source": "slack_dm_conversation"},
+                "score": 3.25,
+            }
+        ]
+    )
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+
+    result = CompanyContextClient("postgresql://example").search_dm_conversations(
+        " Tom ",
+        limit=500,
+    )
+
+    assert result == {
+        "status": "ok",
+        "query": "Tom",
+        "source": "slack_dm",
+        "count": 1,
+        "results": [
+            {
+                "document_id": "slack_dm_conversation:T_HOME:D123",
+                "source": "slack_dm",
+                "source_type": "slack_dm_conversation",
+                "home_team_id": "T_HOME",
+                "conversation_id": "D123",
+                "conversation_type": "im",
+                "title": "Slack DM: Akshaan, Tom",
+                "is_ext_shared": False,
+                "last_seen_at": "2026-05-08T12:00:00+00:00",
+                "source_updated_at": "2026-05-08T12:05:00+00:00",
+                "participant_user_ids": ["U_SELF", "U_TOM"],
+                "participant_labels": ["Akshaan", "Tom"],
+                "participant_count": 2,
+                "matched_labels": ["Tom"],
+                "metadata": {"source": "slack_dm_conversation"},
+                "score": 3.25,
+                "preview": "D123 U_SELF Akshaan U_TOM Tom tom@example.com",
+            }
+        ],
+    }
+    query, args = fake.fetch_calls[0]
+    assert "FROM slack_dm_conversation_context_documents" in query
+    assert "title ||| $1::text::pdb.boost(8) OR body ||| $1::text::pdb.boost(2)" in query
+    assert "OR (title ||| $2::text::pdb.boost(4) OR body ||| $2::text)" in query
+    assert "LIMIT $3" in query
+    assert "centaur_search_slack_dm_conversations" not in query
+    assert args == ("Tom", "Tom", 50)
+    assert fake.closed is True
+
+
+def test_search_dms_queries_bm25_and_returns_compact_results(monkeypatch):
+    occurred_at = dt.datetime(2026, 5, 8, 12, 0, tzinfo=dt.UTC)
+    source_updated_at = dt.datetime(2026, 5, 8, 12, 5, tzinfo=dt.UTC)
+    fake = _FakeConnection(
+        rows=[
+            {
+                "document_id": "slack_dm:T_HOME:D123:1770000000.000000",
+                "home_team_id": "T_HOME",
+                "conversation_id": "D123",
+                "message_ts": "1770000000.000000",
+                "conversation_type": "im",
+                "thread_ts": None,
+                "user_id": "U123",
+                "bot_id": "",
+                "title": "Slack DM",
+                "body": "launch plan\nAlpha attachment",
+                "permalink": "https://slack.example/archives/D123/p1770000000000000",
+                "occurred_at": occurred_at,
+                "source_updated_at": source_updated_at,
+                "metadata": {"attachment_count": 1, "conversation_type": "im"},
+                "score": 2.5,
+            }
+        ]
+    )
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+
+    result = CompanyContextClient("postgresql://example").search_dms(
+        "launch plan",
+        limit=5,
+        conversation_id=" D123 ",
+    )
+
+    assert result == {
+        "status": "ok",
+        "query": "launch plan",
+        "source": "slack_dm",
+        "conversation_id": "D123",
+        "occurred_after": None,
+        "occurred_before": None,
+        "count": 1,
+        "results": [
+            {
+                "document_id": "slack_dm:T_HOME:D123:1770000000.000000",
+                "source": "slack_dm",
+                "source_type": "slack_im",
+                "source_document_id": "D123",
+                "source_chunk_id": "1770000000.000000",
+                "parent_document_id": None,
+                "title": "Slack DM",
+                "url": "https://slack.example/archives/D123/p1770000000000000",
+                "author_name": "U123",
+                "access_scope": "slack_dm",
+                "occurred_at": "2026-05-08T12:00:00+00:00",
+                "source_updated_at": "2026-05-08T12:05:00+00:00",
+                "conversation_id": "D123",
+                "conversation_type": "im",
+                "message_ts": "1770000000.000000",
+                "thread_ts": None,
+                "user_id": "U123",
+                "bot_id": "",
+                "attachment_count": 1,
+                "metadata": {"attachment_count": 1, "conversation_type": "im"},
+                "score": 2.5,
+                "preview": "launch plan Alpha attachment",
+                "lane": "indexed",
+                "result_type": "slack_im",
+            }
+        ],
+    }
+    query, args = fake.fetch_calls[0]
+    assert "FROM slack_dm_context_documents" in query
+    assert "title ||| $1::text::pdb.boost(8) OR body ||| $1::text::pdb.boost(2)" in query
+    assert "OR (title ||| $2::text::pdb.boost(4) OR body ||| $2::text)" in query
+    assert "OR (title ||| $3::text::pdb.boost(4) OR body ||| $3::text)" in query
+    assert "conversation_id = $4" in query
+    assert "OR occurred_at >= $5" in query
+    assert "OR occurred_at < $6" in query
+    assert "LIMIT $7" in query
+    assert "centaur.slack_user_id" not in query
+    assert "centaur.slack_team_id" not in query
+    assert args == ("launch plan", "launch", "plan", "D123", None, None, 5)
+    assert fake.closed is True
+
+
+def test_search_dms_applies_occurred_at_filters(monkeypatch):
+    fake = _FakeConnection(rows=[])
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+
+    result = CompanyContextClient("postgresql://example").search_dms(
+        "planning",
+        limit=4,
+        occurred_after="2026-05-01",
+        occurred_before="2026-05-08T12:30:00Z",
+    )
+
+    assert result["status"] == "ok"
+    assert result["occurred_after"] == "2026-05-01T00:00:00+00:00"
+    assert result["occurred_before"] == "2026-05-08T12:30:00+00:00"
+    _, args = fake.fetch_calls[0]
+    assert args == (
+        "planning",
+        "planning",
+        None,
+        dt.datetime(2026, 5, 1, tzinfo=dt.UTC),
+        dt.datetime(2026, 5, 8, 12, 30, tzinfo=dt.UTC),
+        4,
+    )
+
+
+def test_search_dms_rejects_invalid_occurred_at_filter():
+    result = CompanyContextClient("postgresql://example").search_dms(
+        "planning",
+        occurred_after="not-a-date",
+    )
+
+    assert result == {
+        "status": "error",
+        "error": "occurred_after must be an ISO 8601 date or timestamp",
+    }
+
+
+def test_search_dms_rejects_inverted_occurred_at_filter():
+    result = CompanyContextClient("postgresql://example").search_dms(
         "planning",
         occurred_after="2026-05-08",
         occurred_before="2026-05-01",
@@ -482,6 +740,7 @@ def test_list_documents_returns_date_bounded_document_summaries(monkeypatch):
     }
     query, args = fake.fetch_calls[0]
     assert "ORDER BY occurred_at ASC NULLS LAST" in query
+    assert "metadata ->> 'channel_id'" not in query
     assert args == (
         "google_calendar",
         "calendar_event",

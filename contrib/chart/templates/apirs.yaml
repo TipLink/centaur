@@ -1,6 +1,7 @@
 {{- if .Values.apiRs.enabled }}
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $sandboxOverlayMountPath := .Values.overlay.sandboxMountPath | default "/home/agent/overlay/org" -}}
 {{- $githubAppBrokerBootstrapEnabled := and (or .Values.tokenBroker.enabled .Values.tokenBroker.githubApp.enabled) .Values.tokenBroker.githubApp.enabled .Values.tokenBroker.githubApp.bootstrap.enabled -}}
 {{- if and $githubAppBrokerBootstrapEnabled (not $console.enabled) -}}
 {{- fail "console.enabled must be true when tokenBroker.githubApp bootstrap is enabled" -}}
@@ -20,6 +21,9 @@
 {{- end -}}
 {{- $githubAppBrokerCredentialIds = uniq $githubAppBrokerCredentialIds -}}
 {{- $githubAppBrokerNamespaces := default (list "default") .Values.tokenBroker.githubApp.credentialNamespaces -}}
+{{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
+{{- $repoCacheUsePvc := eq $repoCacheStorageType "persistentVolumeClaim" -}}
+{{- $repoCachePvcName := include "centaur.repoCachePvcName" . -}}
 {{- $reposPath := .Values.sandbox.reposPath -}}
 {{- if and .Values.repoCache.enabled (not $reposPath) -}}
 {{- $reposPath = .Values.repoCache.hostPath -}}
@@ -70,9 +74,9 @@
 {{- end -}}
 {{- if .Values.overlay.image.repository -}}
 {{- if $sandboxWorkflowDirs -}}
-{{- $sandboxWorkflowDirs = printf "%s:%s" $sandboxWorkflowDirs "/home/agent/overlay/org/workflows" -}}
+{{- $sandboxWorkflowDirs = printf "%s:%s" $sandboxWorkflowDirs (printf "%s/workflows" $sandboxOverlayMountPath) -}}
 {{- else -}}
-{{- $sandboxWorkflowDirs = "/home/agent/overlay/org/workflows" -}}
+{{- $sandboxWorkflowDirs = printf "%s/workflows" $sandboxOverlayMountPath -}}
 {{- end -}}
 {{- end -}}
 {{- $apiRsMetricsAnnotations := dict -}}
@@ -257,7 +261,7 @@ spec:
                           "app.kubernetes.io/managed-by": "Helm",
                           "centaur.ai/token-broker-bootstrap": "github-app"
                         },
-                        credential_kind: "github_app_installation",
+                        grant: "github_app_installation",
                         token_endpoint: $endpoint,
                         scopes: [],
                         client_id: $app_id,
@@ -325,6 +329,8 @@ spec:
               value: {{ printf "0.0.0.0:%v" .Values.apiRs.port | quote }}
             - name: RUN_MIGRATIONS
               value: {{ .Values.apiRs.runMigrations | quote }}
+            - name: IRON_CONTROL_SYNC_INFRA_SECRETS
+              value: {{ .Values.apiRs.syncInfraSecrets | quote }}
             - name: RUST_LOG
               value: info
             - name: TOOL_DIRS
@@ -334,6 +340,14 @@ spec:
 {{- if $sandboxWorkflowDirs }}
             - name: KUBERNETES_WORKFLOW_DIRS
               value: {{ $sandboxWorkflowDirs | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "WORKFLOW_ENABLE_MODE") }}
+            - name: WORKFLOW_ENABLE_MODE
+              value: {{ .Values.apiRs.workflowEnableMode | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "WORKFLOW_ALLOWED_NAMES") }}
+            - name: WORKFLOW_ALLOWED_NAMES
+              value: {{ .Values.apiRs.workflowAllowedNames | quote }}
 {{- end }}
 {{- if or .Values.overlay.systemPrompt .Values.overlay.image.repository }}
             - name: CENTAUR_OVERLAY_DIR
@@ -348,14 +362,8 @@ spec:
               value: {{ .Values.overlay.image.pullPolicy | quote }}
             - name: CENTAUR_OVERLAY_IMAGE_SOURCE_PATH
               value: {{ .Values.overlay.image.sourcePath | quote }}
-            - name: SESSION_SANDBOX_OVERLAY_IMAGE
-              value: {{ printf "%s:%s" .Values.overlay.image.repository .Values.overlay.image.tag | quote }}
-            - name: SESSION_SANDBOX_OVERLAY_IMAGE_PULL_POLICY
-              value: {{ .Values.overlay.image.pullPolicy | quote }}
-            - name: SESSION_SANDBOX_OVERLAY_IMAGE_SOURCE_PATH
-              value: {{ .Values.overlay.image.sourcePath | quote }}
-            - name: SESSION_SANDBOX_OVERLAY_MOUNT_PATH
-              value: "/home/agent/overlay/org"
+            - name: CENTAUR_SANDBOX_OVERLAY_DIR
+              value: {{ $sandboxOverlayMountPath | quote }}
 {{- end }}
             - name: SESSION_SANDBOX_BACKEND
               value: {{ .Values.apiRs.sandboxBackend | quote }}
@@ -397,6 +405,10 @@ spec:
 {{- if $reposPath }}
             - name: REPOS_PATH
               value: {{ $reposPath | quote }}
+{{- if $repoCacheUsePvc }}
+            - name: REPOS_PVC
+              value: {{ $repoCachePvcName | quote }}
+{{- end }}
 {{- end }}
             - name: KUBERNETES_SANDBOX_IRON_PROXY_MODE
               value: {{ .Values.apiRs.ironProxy.mode | quote }}
@@ -503,6 +515,10 @@ spec:
 {{- if $toolsUseRepoCache }}
             - name: KUBERNETES_TOOLS_REPO_CACHE_PATH
               value: {{ .Values.repoCache.hostPath | quote }}
+{{- if $repoCacheUsePvc }}
+            - name: KUBERNETES_TOOLS_REPO_CACHE_PVC
+              value: {{ $repoCachePvcName | quote }}
+{{- end }}
 {{- end }}
             - name: KUBERNETES_TOOLS_RUNNER_IMAGE
               value: {{ printf "%s:%s" (default .Values.sandbox.image.repository .Values.toolServer.runnerImage.repository) (default .Values.sandbox.image.tag .Values.toolServer.runnerImage.tag) | quote }}
@@ -538,7 +554,7 @@ spec:
             timeoutSeconds: {{ .Values.apiRs.startupProbe.timeoutSeconds }}
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: {{ .Values.apiRs.port }}
             failureThreshold: {{ .Values.apiRs.readinessProbe.failureThreshold }}
             periodSeconds: {{ .Values.apiRs.readinessProbe.periodSeconds }}
@@ -575,9 +591,15 @@ spec:
       volumes:
 {{- if $useOverlayRepoCache }}
         - name: repo-cache
+{{- if $repoCacheUsePvc }}
+          persistentVolumeClaim:
+            claimName: {{ $repoCachePvcName | quote }}
+            readOnly: true
+{{- else }}
           hostPath:
             path: {{ .Values.repoCache.hostPath | quote }}
             type: DirectoryOrCreate
+{{- end }}
 {{- end }}
 {{- if .Values.overlay.image.repository }}
         - name: overlay-root

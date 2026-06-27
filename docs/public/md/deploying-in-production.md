@@ -63,6 +63,7 @@ Minimum keys:
 | `IRON_MANAGEMENT_API_KEY` | [iron-proxy](https://docs.iron.sh) management API | Generate with `openssl rand -hex 32`. |
 | `SANDBOX_SIGNING_KEY` | Sandbox API tokens | Generate with `openssl rand -hex 32`; keeps sandbox tokens valid across API restarts. |
 | `SLACK_BOT_TOKEN` | Slackbot | Bot User OAuth Token from the Slack app. |
+| `SLACK_UPLOAD_TOKEN` | Slack file uploads | Dedicated Slack token for tool-driven file upload and verification. |
 | `SLACK_SIGNING_SECRET` | Slackbot/API | Used to verify Slack webhook signatures. |
 | `SLACKBOT_API_KEY` | Slackbot to API | Static service token; API bootstraps it into Postgres on startup with `agent` scope. |
 | `OP_CONNECT_TOKEN` | [iron-proxy](https://docs.iron.sh) 1Password Connect source (preferred) | Needed when `ironProxy.secretSource` is `onepassword-connect`. |
@@ -203,9 +204,10 @@ Use the app page to install the bot, copy the Bot User OAuth Token for
 1. Add the bot scopes required by the Slackbot features you enable.
 2. Install the app to the workspace.
 3. Store the Bot User OAuth Token as `SLACK_BOT_TOKEN`.
-4. Store the app Signing Secret as `SLACK_SIGNING_SECRET`.
-5. Enable Event Subscriptions.
-6. Set the Request URL to `https://<your-host>/api/webhooks/slack`.
+4. Store a dedicated upload-capable Slack token as `SLACK_UPLOAD_TOKEN` if Slack file uploads are enabled.
+5. Store the app Signing Secret as `SLACK_SIGNING_SECRET`.
+6. Enable Event Subscriptions.
+7. Set the Request URL to `https://<your-host>/api/webhooks/slack`.
 7. Subscribe to `app_mention` and to the message events you want Centaur to see:
    `message.channels`, `message.groups`, and `message.im`.
 
@@ -267,59 +269,37 @@ helm upgrade --install centaur contrib/chart \
 
 ## 6. Verify the deployment
 
-Check health from inside the API deployment first. Localhost is accepted for
-operator-only routes, so this avoids needing an external admin key for the first
-smoke check:
+Check health from inside the api-rs deployment first:
 
 ```bash
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
-  curl -fsS http://localhost:8000/health
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  curl -fsS http://localhost:8080/healthz
 
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
-  curl -fsS http://localhost:8000/health/ready | jq
-
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
-  curl -fsS http://localhost:8000/health/tools | jq
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  curl -fsS http://localhost:8080/readyz | jq
 ```
 
-If you need to call operator routes from outside the cluster, create an admin
-API key from inside the API deployment and save the returned plaintext key:
+Run one agent turn from inside the api-rs deployment:
 
 ```bash
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- \
-  curl -fsS -X POST http://localhost:8000/admin/api-keys \
-    -H "Content-Type: application/json" \
-    -d '{"name":"operator","scopes":["admin"],"created_by":"ops"}' | jq
-```
+THREAD_KEY=cli:production-smoke-codex
+THREAD_PATH=$(jq -rn --arg v "$THREAD_KEY" '$v|@uri')
 
-External operator calls then use:
-
-```bash
-curl -s "$CENTAUR_API_URL/health/tools" \
-  -H "X-Api-Key: $ADMIN_KEY" | jq
-```
-
-Run one agent turn from inside the API deployment:
-
-```bash
-THREAD_KEY=production-smoke-codex
-
-SPAWN=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s -X POST http://localhost:8000/agent/spawn \
+SESSION=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}" \
   -H "Content-Type: application/json" \
-  -d "{\"thread_key\":\"${THREAD_KEY}\"}")
-ASSIGNMENT_GENERATION=$(printf '%s' "$SPAWN" | jq -r '.assignment_generation')
+  -d '{"harness_type":"codex","on_harness_conflict":"restart"}')
 
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s -X POST http://localhost:8000/agent/message \
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}/messages" \
   -H "Content-Type: application/json" \
-  -d "{\"thread_key\":\"${THREAD_KEY}\",\"assignment_generation\":${ASSIGNMENT_GENERATION},\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"Reply with exactly PONG.\"}]}"
+  -d '{"messages":[{"role":"user","parts":[{"type":"text","text":"Reply with exactly PONG."}]}]}'
 
-EXECUTE=$(kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s -X POST http://localhost:8000/agent/execute \
+EXECUTE=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}/execute" \
   -H "Content-Type: application/json" \
-  -d "{\"thread_key\":\"${THREAD_KEY}\",\"assignment_generation\":${ASSIGNMENT_GENERATION},\"delivery\":{\"platform\":\"dev\"}}")
+  -d '{"input_lines":["{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reply with exactly PONG.\"}]}}"]}')
 EXECUTION_ID=$(printf '%s' "$EXECUTE" | jq -r '.execution_id')
 
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s \
-  "http://localhost:8000/agent/executions/${EXECUTION_ID}" | jq
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -N \
+  "http://localhost:8080/api/session/${THREAD_PATH}/events?execution_id=${EXECUTION_ID}&after_event_id=0"
 ```
 
 Then run the same prompt through Slack:
@@ -335,16 +315,17 @@ Inspect sandbox pods with the labels Centaur actually sets:
 
 ```bash
 kubectl get pods -n centaur-system -l centaur.ai/managed=true
+kubectl exec -n centaur-system <agent-sandbox-pod> -- centaur-tools list
 ```
 
 If a run fails because the sandbox pod exits or is deleted, inspect the durable
-execution before retrying:
+session and api-rs logs before retrying:
 
 ```bash
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- curl -s \
-  "http://localhost:8000/agent/executions/${EXECUTION_ID}" | jq
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s \
+  "http://localhost:8080/api/session/${THREAD_PATH}" | jq
 
-kubectl logs -n centaur-system deploy/centaur-centaur-api --tail=200
+kubectl logs -n centaur-system deploy/centaur-centaur-api-rs --tail=200
 kubectl get pods -n centaur-system -l centaur.ai/managed=true
 ```
 

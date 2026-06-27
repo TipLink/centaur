@@ -27,9 +27,7 @@ module Api
       # PUT/PATCH upserts: an opaque id updates that record, any other identifier
       # is a foreign_id that is created when absent.
       def update
-        ref = resolve_for_upsert(StaticSecret)
-        was_new = ref.new_record?
-        assign_and_save!(ref, data_params)
+        ref, was_new = assign_upsert_with_retry
         render status: (was_new ? :created : :ok), json: { data: record_payload(ref) }
       rescue ActiveRecord::RecordInvalid => e
         render_validation_error(e.record)
@@ -47,6 +45,22 @@ module Api
 
       private
 
+      def assign_upsert_with_retry
+        attempts = 0
+
+        begin
+          attempts += 1
+          ref = resolve_for_upsert(StaticSecret)
+          was_new = ref.new_record?
+          assign_and_save!(ref, data_params)
+          [ ref, was_new ]
+        rescue ActiveRecord::RecordNotUnique
+          raise if attempts >= 2
+
+          retry
+        end
+      end
+
       def assign_and_save!(ref, attrs)
         ss_attrs = permit_document(
           ref, attrs, :name, :description,
@@ -57,13 +71,10 @@ module Api
           attrs.require(:source).permit(:source_type, :secret, config: {})
         end
 
-        rules_attrs = Array(attrs[:rules]).map do |r|
-          ActionController::Parameters.new(r.to_unsafe_h).permit(
-            :host, :cidr, http_methods: [], paths: []
-          )
-        end
+        rules_attrs = request_rule_attributes(attrs)
 
         StaticSecret.transaction do
+          ref.lock! unless ref.new_record?
           ref.assign_attributes(ss_attrs)
           ref.save!
 
@@ -73,8 +84,8 @@ module Api
           end
 
           ref.rules.destroy_all
-          rules_attrs.each_with_index do |r, i|
-            RequestRule.create!(r.to_h.merge(position: i, static_secret: ref))
+          rules_attrs.each do |r|
+            RequestRule.create!(r.merge(static_secret: ref))
           end
 
           ref.reload

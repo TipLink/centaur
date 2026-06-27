@@ -128,10 +128,15 @@ overlay:
     Add deployment-specific agent guidance here.
 ```
 
-For larger prompt/persona sets, keep files in an overlay repo and expose their
-paths through `overlays.sources` as that surface is wired into your deployment.
-Do not rely on `overlay.image.*`; repo-cache-backed overlays are the default
-delivery path.
+When using a legacy overlay image, `overlay.mountPath` is the api-rs mount and
+`overlay.sandboxMountPath` is the matching sandbox/workflow-host mount. Keep
+them separate unless your deployment intentionally uses the same filesystem
+layout in both containers.
+
+For larger prompt/persona sets, keep files in an overlay repo and expose tool,
+workflow, and skill paths through `overlays.sources` where possible. Existing
+deployments can continue using `overlay.image.*` while they migrate remaining
+prompt, harness, and persona assets onto repo-cache-backed overlay sources.
 
 ## Verify the overlay
 

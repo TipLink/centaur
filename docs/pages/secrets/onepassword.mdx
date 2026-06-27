@@ -73,6 +73,7 @@ It must also include infrastructure secrets such as:
 DATABASE_URL
 SLACKBOT_API_KEY
 SLACK_BOT_TOKEN
+SLACK_UPLOAD_TOKEN
 SLACK_SIGNING_SECRET
 SANDBOX_SIGNING_KEY
 IRON_MANAGEMENT_API_KEY
@@ -121,7 +122,7 @@ Each item should live in `OP_VAULT` with its value in `credential`.
 Check that the API and [iron-proxy](https://docs.iron.sh) received the expected source mode:
 
 ```bash
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- env | \
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- env | \
   grep -E 'FIREWALL_MANAGER_SECRET_SOURCE|OP_VAULT'
 ```
 

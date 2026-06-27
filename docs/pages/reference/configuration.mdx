@@ -6,7 +6,7 @@ description: Centaur environment variables grouped by requirement and service.
 # Configuration
 
 Most Centaur settings come from Helm values and are rendered into service
-environment variables by `contrib/chart/templates/workloads.yaml`.
+environment variables by service-specific templates under `contrib/chart/templates/`.
 
 Use these as the main extension points:
 
@@ -49,6 +49,8 @@ Optional required-by-mode variables:
 | `OP_CONNECT_CREDENTIALS_FILE` | Local shell before `just deploy`. | Enables the 1Password Connect subchart and creates its credentials Secret. |
 | `OP_CONNECT_TOKEN` | Secret or local bootstrap shell env. | Token used by iron-proxy when `ironProxy.secretSource=onepassword-connect`. |
 | `LOCAL_DEV_API_KEY` | API env. | Static local admin/dev key bootstrapped into Postgres. |
+| `TEAMS_BOT_APP_ID`, `TEAMS_BOT_APP_PASSWORD`, `TEAMS_BOT_APP_TENANT_ID` | Local shell before `just bootstrap-secrets`; production Secret. | Required by Teamsbot when `teamsbot.enabled=true`. |
+| `TEAMSBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when Teams credentials are present and it is omitted. | Static API key used by Teamsbot. |
 
 ## API
 
@@ -107,7 +109,6 @@ Execution tuning:
 | `PORT` | Runtime env. | Slackbot HTTP port. |
 | `SLACK_API_URL` | `slackbot.extraEnv`. | Optional Slack Web API base URL override. |
 | `CENTAUR_API_URL` | Chart-rendered API service URL. | API base URL used by Slackbot. |
-| `CENTAUR_API_KEY` | Secret/env fallback. | Used only when `SLACKBOT_API_KEY` is unset. |
 | `CENTAUR_SLACK_EVENTS_PATH` | `slackbot.extraEnv`. | Slack Events API route; defaults to `/api/webhooks/slack`. |
 | `RUNTIME_ERROR_ALERT_CHANNEL` | `slackbot.runtimeErrorAlertChannel`. | Slack channel for runtime error alerts. |
 | `SLACK_EVENT_DEDUP_TTL_MS` | `slackbot.extraEnv`. | Slack event dedupe window. |
@@ -119,6 +120,26 @@ Execution tuning:
 | `SLACK_TEAM_ID` | `slackbot.extraEnv`. | Workspace team ID (e.g. `T01ABCD2EFG`) used to rewrite `https://*.slack.com/archives/...` URLs in final-delivery messages into native `slack://channel?team=...` deep links that open in the Slack app. Leave unset to keep archive URLs unchanged. |
 | `COMMIT_SHA` | Build/deploy env. | Commit shown in Slackbot metadata. |
 
+## Teamsbot
+
+| Env var | Set from | Controls |
+| --- | --- | --- |
+| `PORT` | Runtime env. | Teamsbot HTTP port; defaults to `3100`. |
+| `LOG_LEVEL` | Runtime env. | Teamsbot JSON log level: `debug`, `info`, `warn`, `error`, or `silent`. |
+| `CENTAUR_API_URL` | Chart-rendered API service URL. | API base URL used by Teamsbot; local default is `http://127.0.0.1:8080`. |
+| `CENTAUR_API_KEY`, `TEAMSBOT_API_KEY` | Secret/env fallback. | Static API key used by Teamsbot to call the API. |
+| `TEAMSBOT_DATABASE_URL`, `DATABASE_URL`, `POSTGRES_URL` | Secret. | Teamsbot Postgres state store. The service refuses to boot without one unless tests/dev inject a state store. |
+| `TEAMSBOT_STATE_KEY_PREFIX` | Runtime env. | Postgres state namespace; defaults to `centaur-teamsbot`. |
+| `TEAMS_BOT_APP_ID`, `TEAMS_BOT_APP_PASSWORD`, `TEAMS_BOT_APP_TENANT_ID` | Secret. | Required Bot Framework app credentials. |
+| `TEAMS_ALLOWED_TEAM_IDS`, `TEAMS_ALLOWED_CHANNEL_IDS`, `TEAMS_ALLOWED_TENANT_IDS` | `teamsbot.allowedTeamIds`, `teamsbot.allowedChannelIds`, `teamsbot.allowedTenantIds`. | Comma-separated allowlists. Empty means Teamsbot ignores all Teams messages. Personal chats require an allowed tenant id. |
+| `TEAMS_REQUIRE_MENTION` | `teamsbot.requireMention`. | Requires a bot mention before activating a thread; defaults to `true`. |
+| `TEAMS_DEFAULT_HARNESS_TYPE` | `sandbox.harnessEngine`. | Default harness requested for new Teams sessions. Existing harness conflicts retry on the session's current harness. |
+| `SESSION_IDLE_TIMEOUT_MS`, `SESSION_MAX_DURATION_MS` | Runtime env. | Forwarded to api-rs execute. `TEAMS_IDLE_TIMEOUT_MS` and `TEAMS_MAX_DURATION_MS` override these for Teams only. |
+| `TEAMS_ACTIVE_EXECUTION_TTL_MS` | Runtime env. | Stale execution timeout used to unwedge Teams threads after crashes. |
+| `TEAMS_DOWNLOAD_ATTACHMENTS` | `teamsbot.downloadAttachments`. | Enables allowed Teams attachment downloads into base64 payloads; defaults to `false`. |
+| `TEAMS_ATTACHMENT_MAX_BYTES`, `TEAMS_ATTACHMENT_ALLOWED_HOSTS` | Runtime env. | Attachment download size cap and HTTPS host allowlist. |
+| `TEAMS_GRAPH_BEARER_TOKEN`, `TEAMS_GRAPH_TOKEN_SCOPE` | Runtime env or Secret. | Optional Graph auth fallback for Graph/SharePoint-backed attachment URLs. |
+
 ## Sandbox
 
 API-set variables:
@@ -127,7 +148,7 @@ API-set variables:
 | --- | --- | --- |
 | `AGENT_IMAGE` | `sandbox.image.*`. | Sandbox image used by the Kubernetes backend. |
 | `AGENT_API_URL` | Chart-rendered API service URL. | Source for sandbox `CENTAUR_API_URL`; required by Kubernetes backend. |
-| `CENTAUR_API_URL`, `CENTAUR_API_KEY`, `CENTAUR_THREAD_KEY`, `CENTAUR_TRACE_ID` | API sandbox creation. | API callback, short-lived sandbox token, thread key, and trace id. |
+| `CENTAUR_API_URL`, `CENTAUR_THREAD_KEY`, `CENTAUR_TRACE_ID` | API sandbox creation. | API callback, thread key, and trace id. |
 | `AMP_MODE`, `AMP_THREAD_VISIBILITY`, `AMP_CONTINUE_THREAD_ID` | API env or resume path. | Amp mode and resume behavior. |
 | `FIREWALL_HOST`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` and lowercase variants | API sandbox creation. | Routes sandbox egress through per-sandbox iron-proxy. |
 | `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `GIT_SSL_CAINFO` | API sandbox creation. | Trust bundle for proxied TLS. |
@@ -193,6 +214,7 @@ Slack ETL workflows:
 | `SLACK_SYNC_BACKFILL_LOOKBACK_DAYS`, `SLACK_SYNC_THREAD_LOOKBACK_DAYS` | `api.slackSync*LookbackDays`. | Slack history/thread lookback windows. |
 | `SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS` | `api.slackEtlExcludedChannelPatterns`. | Comma-separated channel-name globs to skip. |
 | `SLACK_BACKFILL_ENABLED`, `SLACK_BACKFILL_CHANNEL_BATCH_LIMIT`, `SLACK_BACKFILL_CHANNEL_PAGES_PER_JOB` | `api.extraEnv` or chart batch limit. | Backfill enablement and batch sizing. |
+| `SLACK_RETENTION_INTERVAL_MINUTES`, `SLACK_ETL_RETENTION_DAYS`, `SLACK_DM_RETENTION_DAYS` | `api.extraEnv`. | Slack retention cadence and separate public ETL/DM TTLs. |
 | `COMPANY_CONTEXT_DOCUMENTS_ENABLED` | `api.extraEnv`. | Enables company-context projection when Slack ETL is on. |
 
 Google Workspace ETL workflows:
@@ -220,5 +242,6 @@ Google Workspace ETL workflows:
 | --- | --- | --- |
 | `CENTAUR_NAMESPACE`, `CENTAUR_RELEASE` | Local shell or `.env`. | Namespace/release used by `just` and debug scripts. |
 | `JUST_BUILD_SEQUENTIAL` | Local shell. | Builds service images sequentially. |
-| `CENTAUR_API_URL`, `CENTAUR_API_KEY` | Local shell. | API target/key for contrib scripts. |
+| `CENTAUR_API_URL` | Local shell. | API target for contrib scripts. |
+| `MUESLI_API_KEY` | Local shell. | API key for the Muesli meeting ingest helper. |
 | `MUESLI_CLI`, `MUESLI_HOST`, `MUESLI_PUSH_LOG`, `MUESLI_SLACK_CHANNEL` | Local shell. | Muesli meeting ingest helper behavior. |

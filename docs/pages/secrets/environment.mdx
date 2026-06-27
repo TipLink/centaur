@@ -32,6 +32,7 @@ kubectl create secret generic centaur-infra-env \
   --from-literal=DATABASE_URL='postgres://...' \
   --from-literal=SLACKBOT_API_KEY='...' \
   --from-literal=SLACK_BOT_TOKEN='xoxb-...' \
+  --from-literal=SLACK_UPLOAD_TOKEN='xoxp-...' \
   --from-literal=SLACK_SIGNING_SECRET='...' \
   --from-literal=SANDBOX_SIGNING_KEY="$(openssl rand -hex 32)" \
   --from-literal=IRON_MANAGEMENT_API_KEY="$(openssl rand -hex 32)" \
@@ -90,7 +91,7 @@ endpoint, and inject a short-lived bearer token for matching API hosts.
 Check the API pod environment:
 
 ```bash
-kubectl exec -n centaur-system deploy/centaur-centaur-api -- env | \
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- env | \
   grep -E 'FIREWALL_MANAGER_SECRET_SOURCE|WAREHOUSE_API_KEY'
 ```
 

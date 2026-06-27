@@ -71,7 +71,7 @@ def test_run_improvement_cycle_dispatches_only_actionable_items(tmp_path, monkey
 
     class FakeAgentClient:
         def start_improvement_run(self, prompt: str, **kwargs):
-            assert "git-branch paradigmxyz/centaur" in prompt
+            assert "git-branch paradigmxyz/centaur fix-slack-feedback" in prompt
             return {
                 "thread_key": "feedback-improvement:test",
                 "assignment_generation": 7,
@@ -141,3 +141,29 @@ def test_classify_feedback_prefers_success_for_positive_follow_up_without_error(
     assert signals.has_bot_error is False
     assert category == "success"
     assert severity == "low"
+
+
+def test_load_centaur_api_key_prefers_existing_agent_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("CENTAUR_AGENT_API_KEY", "agent-key")
+    monkeypatch.setenv("CENTAUR_API_KEY", "sandbox-key")
+    monkeypatch.setattr(feedback, "CENTAUR_API_KEY_FILE", tmp_path / ".api_key")
+
+    assert feedback._load_centaur_api_key() == "agent-key"
+
+
+def test_load_centaur_api_key_uses_sandbox_control_plane_key(monkeypatch, tmp_path):
+    monkeypatch.delenv("CENTAUR_AGENT_API_KEY", raising=False)
+    monkeypatch.setenv("CENTAUR_API_KEY", "sandbox-key")
+    monkeypatch.setattr(feedback, "CENTAUR_API_KEY_FILE", tmp_path / ".api_key")
+
+    assert feedback._load_centaur_api_key() == "sandbox-key"
+
+
+def test_load_centaur_api_key_uses_refreshed_key_file(monkeypatch, tmp_path):
+    key_file = tmp_path / ".api_key"
+    key_file.write_text("file-key\n")
+    monkeypatch.delenv("CENTAUR_AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("CENTAUR_API_KEY", raising=False)
+    monkeypatch.setattr(feedback, "CENTAUR_API_KEY_FILE", key_file)
+
+    assert feedback._load_centaur_api_key() == "file-key"

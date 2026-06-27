@@ -74,6 +74,10 @@ once Slack ETL is enabled, but can be tuned independently.
 | `SLACK_ETL_ATTACHMENTS_ENABLED` | `true` | Download Slack message attachment bytes into Postgres. Metadata rows are still written when downloads are disabled. |
 | `SLACK_ETL_ATTACHMENT_MAX_BYTES` | `10485760` | Per-file byte cap for Slack attachment downloads. Oversized files keep metadata with `skipped_too_large` status. |
 | `SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS` | empty | Comma-separated channel-name globs to skip, without needing the leading `#`. |
+| `SLACK_RETENTION_ENABLED` | `true` | Allows the `slack_retention` schedule to run when at least one Slack retention TTL is positive. |
+| `SLACK_RETENTION_INTERVAL_MINUTES` | `60` | How often to prune Slack retention-managed rows. |
+| `SLACK_ETL_RETENTION_DAYS` | `0` | Deletes public Slack ETL messages, derived Slack documents, and terminal ETL run/job rows older than this many days. `0` disables public ETL retention. |
+| `SLACK_DM_RETENTION_DAYS` | `0` | Deletes Slack DM messages, stale empty DM conversations, and terminal DM run/job rows older than this many days. `0` disables DM retention. |
 | `COMPANY_CONTEXT_DOCUMENTS_ENABLED` | `true` | Enables projection from Slack sync rows into company context documents. |
 | `COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS` | `14400` | How often to project changed Slack rows into documents. |
 
@@ -113,6 +117,11 @@ The lookback values are read windows, not retention windows. Lowering
 future backfill and refresh work, but it does not delete Slack rows or company
 context documents that were already synced.
 
+Retention is handled by the separate `slack_retention` workflow. Public Slack
+ETL and Slack DM data have independent TTLs so deployments can keep DM data for
+a shorter period than channel ETL data. The workflow only runs when at least one
+TTL is positive.
+
 ## Run it manually
 
 Use a manual run when enabling the feature or testing a configuration change.
@@ -120,8 +129,8 @@ From inside the API deployment, localhost bypass avoids needing an external API
 key:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- curl -s -X POST \
-  http://localhost:8000/workflows/runs \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
+  http://localhost:8080/api/workflows/runs \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_name": "slack_sync",
@@ -135,15 +144,15 @@ Then inspect the run:
 ```bash
 RUN_ID=wfr_...
 
-kubectl exec -n centaur deploy/centaur-centaur-api -- curl -s \
-  "http://localhost:8000/workflows/runs/${RUN_ID}" | jq
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
+  "http://localhost:8080/api/workflows/runs/${RUN_ID}" | jq
 ```
 
 To drain pending historical work immediately:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- curl -s -X POST \
-  http://localhost:8000/workflows/runs \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
+  http://localhost:8080/api/workflows/runs \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_name": "slack_backfill",
@@ -155,8 +164,8 @@ kubectl exec -n centaur deploy/centaur-centaur-api -- curl -s -X POST \
 To force document projection after rows have synced:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- curl -s -X POST \
-  http://localhost:8000/workflows/runs \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
+  http://localhost:8080/api/workflows/runs \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_name": "company_context_documents",
@@ -170,18 +179,31 @@ kubectl exec -n centaur deploy/centaur-centaur-api -- curl -s -X POST \
 Check the workflow schedules:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- \
-  psql "$DATABASE_URL" -c \
-  "SELECT schedule_id, workflow_name, enabled, interval_seconds, next_run_at
-   FROM workflow_schedules
-   WHERE schedule_id IN ('slack_sync', 'slack_backfill', 'company_context_documents')
-   ORDER BY schedule_id;"
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
+  http://localhost:8080/api/workflows/schedules | jq \
+  '.schedules[]
+   | select(.schedule_id == "slack_sync"
+     or .schedule_id == "slack_backfill"
+     or .schedule_id == "company_context_documents")
+   | {schedule_id, workflow_name, enabled, interval_seconds}'
+```
+
+Check recent workflow runs:
+
+```bash
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
+  "http://localhost:8080/api/workflows/runs?limit=20" | jq \
+  '.runs[]
+   | select(.workflow_name == "slack_sync"
+     or .workflow_name == "slack_backfill"
+     or .workflow_name == "company_context_documents")
+   | {workflow_name, status, created_at, attempts}'
 ```
 
 Check sync health:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
   psql "$DATABASE_URL" -c \
   "SELECT channel_id, watermark_ts, last_success_at, last_error
    FROM slack_sync_checkpoints
@@ -192,7 +214,7 @@ kubectl exec -n centaur deploy/centaur-centaur-api -- \
 Check backfill pressure:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
   psql "$DATABASE_URL" -c \
   "SELECT job_type, status, count(*), min(updated_at) AS oldest_updated_at
    FROM slack_sync_backfill_jobs
@@ -203,7 +225,7 @@ kubectl exec -n centaur deploy/centaur-centaur-api -- \
 Check document projection:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
   psql "$DATABASE_URL" -c \
   "SELECT source_type, count(*), max(source_updated_at)
    FROM company_context_documents

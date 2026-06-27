@@ -144,6 +144,43 @@ fi
 HARNESS_CONFIG_DIR="${CENTAUR_HARNESS_CONFIG_DIR:-$HOME_DIR/harness}"
 if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
     cp "$HARNESS_CONFIG_DIR/codex/config.toml" "$HOME_DIR/.codex/config.toml"
+    # Keep upstream's Bedrock region patch while letting the extracted helper
+    # remain the single place that rewrites and validates Codex config.
+    if [ -n "${CODEX_BEDROCK_REGION:-}" ]; then
+        CODEX_CONFIG_OVERLAY="$(python3 - <<'PYEOF'
+import os
+import sys
+import tomllib
+
+import tomli_w
+
+
+def _deep_merge(base, overlay):
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+bedrock_region = os.environ.get("CODEX_BEDROCK_REGION", "").strip()
+overlay_raw = os.environ.get("CODEX_CONFIG_OVERLAY", "").strip()
+base = {}
+if bedrock_region:
+    base = {"model_providers": {"amazon-bedrock": {"aws": {"region": bedrock_region}}}}
+
+if overlay_raw:
+    try:
+        _deep_merge(base, tomllib.loads(overlay_raw))
+    except tomllib.TOMLDecodeError as exc:
+        print(f"ignoring invalid CODEX_CONFIG_OVERLAY: {exc}", file=sys.stderr)
+
+print(tomli_w.dumps(base), end="")
+PYEOF
+)"
+        export CODEX_CONFIG_OVERLAY
+    fi
     CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" configure-codex-config
 else
     echo "missing Codex harness config: $HARNESS_CONFIG_DIR/codex/config.toml" >&2
@@ -285,6 +322,16 @@ elif [ -n "${CENTAUR_OVERLAY_DIR:-}" ] \
     && [ -f "$TARGET_PROMPT" ]; then
     printf '\n\n---\n\n' >> "$TARGET_PROMPT"
     cat "${CENTAUR_OVERLAY_DIR}/services/sandbox/SYSTEM_PROMPT.md" >> "$TARGET_PROMPT"
+fi
+
+if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
+    cat >> "$TARGET_PROMPT" <<'EOF'
+
+---
+
+[Observability access]
+This sandbox does not have Centaur observability access. Do not use vlogs, vmetrics, Grafana, or related internal logs/metrics tools.
+EOF
 fi
 
 # Persona prompt injection is done by the API when it writes AGENTS_BASE.md.
