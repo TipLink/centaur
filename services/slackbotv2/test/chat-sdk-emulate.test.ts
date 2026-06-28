@@ -156,6 +156,81 @@ describe('slackbotv2', () => {
     expect(codexApi.executes[0]?.threadKey).toBe(threadKey(parent.ts))
   })
 
+  it('sets a per-thread reasoning default through a slash command with thread context', async () => {
+    const parent = await postUserMessage('Thread context for reasoning steering.')
+    const commandResponse = await bot.app.request(
+      '/api/slack/commands',
+      signedSlackCommand('/xhigh', '', { threadTs: parent.ts })
+    )
+
+    expect(commandResponse.status).toBe(200)
+    const commandBody = await commandResponse.json() as { text: string }
+    expect(commandBody.text).toContain('Set reasoning to xhigh')
+
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> use the thread default`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-slash-medium-default',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> use the thread default`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(1)
+    const input = executeInputLine(codexApi.executes[0]!)
+    expect(input.reasoning).toBe('xhigh')
+  })
+
+  it('lets inline reasoning override a per-thread slash command default', async () => {
+    const parent = await postUserMessage('Thread context for inline steering.')
+    await bot.app.request(
+      '/api/slack/commands',
+      signedSlackCommand('/medium', slackThreadUrl(parent.ts))
+    )
+
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> use high here -rsn high`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-inline-reasoning-overrides-default',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> use high here -rsn high`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(1)
+    const input = executeInputLine(codexApi.executes[0]!)
+    expect(input.reasoning).toBe('high')
+    expect(sessionMessageTexts(codexApi.appends[0]!.body.messages).join('\n')).not.toContain(
+      '-rsn high'
+    )
+  })
+
   it('does not let a non-actionable message event suppress a later app_mention', async () => {
     const text = `<@${BOT_USER_ID}> process the app mention after duplicate delivery`
     const mention = await postUserMessage(text)
@@ -3753,6 +3828,16 @@ function threadKey(threadTs: string): string {
   return `slack:${CHANNEL_ID}:${threadTs}`
 }
 
+function slackThreadUrl(threadTs: string): string {
+  return `https://slackbot-v2.slack.com/archives/${CHANNEL_ID}/p${threadTs.replace('.', '')}`
+}
+
+function executeInputLine(
+  execute: MockSessionRequest<SlackbotV2ExecuteSessionRequest>
+): Record<string, unknown> {
+  return JSON.parse(execute.body.input_lines.at(-1)!) as Record<string, unknown>
+}
+
 function threadTsFromThreadKey(threadId: string, fallback: string): string {
   const parts = threadId.split(':')
   if (parts[0] !== 'slack') return fallback
@@ -3840,6 +3925,38 @@ function signedSlackEvent(input: {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
+      'x-slack-request-timestamp': String(timestamp),
+      'x-slack-signature': `v0=${signature}`
+    },
+    body
+  }
+}
+
+function signedSlackCommand(
+  command: string,
+  text: string,
+  options: { threadTs?: string } = {}
+): RequestInit {
+  const timestamp = Math.floor(Date.now() / 1000)
+  const params = new URLSearchParams({
+    channel_id: CHANNEL_ID,
+    command,
+    response_url: 'https://hooks.slack.test/commands',
+    team_id: TEAM_ID,
+    text,
+    token: 'verification-token',
+    trigger_id: 'trigger-1',
+    user_id: USER_ID
+  })
+  if (options.threadTs) params.set('thread_ts', options.threadTs)
+  const body = params.toString()
+  const signature = createHmac('sha256', SIGNING_SECRET)
+    .update(`v0:${timestamp}:${body}`)
+    .digest('hex')
+  return {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
       'x-slack-request-timestamp': String(timestamp),
       'x-slack-signature': `v0=${signature}`
     },

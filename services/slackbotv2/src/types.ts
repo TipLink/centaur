@@ -143,6 +143,13 @@ export type SlackbotV2ThreadState = {
   renderObligation?: SlackbotV2RenderObligation | null
 }
 
+export type SlackbotV2SteeringDefaults = {
+  model?: string
+  reasoning?: string
+  updatedAt: string
+  updatedBy?: string
+}
+
 export type SlackbotV2RenderObligation = {
   afterEventId: number
   executionId: string
