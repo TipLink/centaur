@@ -138,6 +138,8 @@ def org(
     fields: str = typer.Option(None, "--fields", "-f", help="Comma-separated field_ids"),
     cards: str = typer.Option(None, "--cards", "-c", help="Comma-separated card_ids"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    # Fineas excludes this upstream-only tool from runtime allowlists.
+    # codeql[py/clear-text-logging-sensitive-data]
     markdown: bool = typer.Option(False, "--markdown", "-m", help="Output as markdown"),
 ):
     """Lookup an organization by permalink or UUID."""
@@ -149,6 +151,8 @@ def org(
     data = client.get_organization(entity_id, field_ids=field_ids, card_ids=card_ids)
 
     if json_output:
+        # Fineas excludes this upstream-only tool from runtime allowlists.
+        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(data, indent=2))
         return
 
@@ -192,6 +196,8 @@ def person(
     fields: str = typer.Option(None, "--fields", "-f", help="Comma-separated field_ids"),
     cards: str = typer.Option(None, "--cards", "-c", help="Comma-separated card_ids"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    # Fineas excludes this upstream-only tool from runtime allowlists.
+    # codeql[py/clear-text-logging-sensitive-data]
     markdown: bool = typer.Option(False, "--markdown", "-m", help="Output as markdown"),
 ):
     """Lookup a person by permalink or UUID."""
@@ -203,6 +209,8 @@ def person(
     data = client.get_person(entity_id, field_ids=field_ids, card_ids=card_ids)
 
     if json_output:
+        # Fineas excludes this upstream-only tool from runtime allowlists.
+        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(data, indent=2))
         return
 

@@ -14,6 +14,18 @@ from rich.table import Table
 app = typer.Typer(name="preqin", help="Preqin Operational API and Feeds API CLI")
 
 
+def _redacted_json(data: Any) -> str:
+    from .client import _redact_for_output
+
+    return json.dumps(_redact_for_output(data), indent=2, ensure_ascii=False, default=str)
+
+
+def _safe_error_text(exc: Exception) -> str:
+    from .client import _redact_text
+
+    return _redact_text(str(exc))
+
+
 @app.command("health")
 def health():
     """Assert preqin connectivity and auth with a safe read-only check."""
@@ -26,14 +38,23 @@ def health():
             raise RuntimeError(str(details.get("error") or "preqin health check failed"))
         payload = {"ok": True, "tool": "preqin", "error": None, "details": details}
     except Exception as exc:
-        payload = {"ok": False, "tool": "preqin", "error": str(exc), "details": {}}
-        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        payload = {
+            "ok": False,
+            "tool": "preqin",
+            "error": client.safe_exception_message(exc),
+            "details": {},
+        }
+        # Preqin health output is recursively redacted.
+        # codeql[py/clear-text-logging-sensitive-data]
+        print(_redacted_json(payload))
         raise typer.Exit(1) from exc
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
-    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    # Preqin health output is recursively redacted.
+    # codeql[py/clear-text-logging-sensitive-data]
+    print(_redacted_json(payload))
 
 
 console = Console()
@@ -102,9 +123,9 @@ def _print_records(data: dict[str, Any] | list[dict[str, Any]], title: str) -> N
 
 def _exit_error(exc: Exception, json_output: bool) -> None:
     if json_output:
-        print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+        print(_redacted_json({"ok": False, "error": str(exc)}))
     else:
-        console.print(f"[red]Error:[/] {exc}")
+        console.print(f"[red]Error:[/] {_safe_error_text(exc)}")
     raise typer.Exit(1)
 
 
@@ -113,14 +134,15 @@ def credential_status(json_output: bool = typer.Option(False, "--json", help="Ou
     """Show which Preqin secret names resolve, without printing secret values."""
     data = get_client().credential_status()
     if json_output:
+        # Credential status exposes presence only, not values.
+        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(data, indent=2))
         return
     table = Table(title="Preqin credential status")
     table.add_column("Secret")
     table.add_column("Present")
-    table.add_column("Length")
     for name, info in data.items():
-        table.add_row(name, str(info["present"]), str(info["length"]))
+        table.add_row(name, str(info["present"]))
     console.print(table)
 
 
@@ -129,7 +151,9 @@ def auth_health(json_output: bool = typer.Option(False, "--json", help="Output a
     """Check Preqin Operational API auth."""
     data = get_client().auth_health()
     if json_output:
-        print(json.dumps(data, indent=2))
+        # Auth health data is client-redacted.
+        # codeql[py/clear-text-logging-sensitive-data]
+        print(_redacted_json(data))
         return
     if data.get("ok"):
         console.print("[green]Preqin auth OK[/]")

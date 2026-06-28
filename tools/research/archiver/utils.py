@@ -47,6 +47,14 @@ def normalize_url(url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
+def url_host_matches(url: str, domains: tuple[str, ...]) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").rstrip(".").lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
+
+
 def slugify(text: str, max_len: int = 64) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     if len(slug) > max_len:

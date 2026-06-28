@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import pytest
+
 from centaur_sdk.backends import StubBackend, configure
 
 from centaur_tool_preqin.client import OPERATIONAL_TOKEN_PLACEHOLDER, PreqinClient
 
 
 class FakeResponse:
-    def __init__(self, payload: dict, status_code: int = 200):
+    def __init__(
+        self,
+        payload: dict | None,
+        status_code: int = 200,
+        text: str = "",
+        json_error: bool = False,
+    ):
         self._payload = payload
         self.status_code = status_code
-        self.text = ""
+        self.text = text
+        self._json_error = json_error
 
     def json(self) -> dict:
+        if self._json_error:
+            raise ValueError("not json")
+        assert self._payload is not None
         return self._payload
 
     def raise_for_status(self) -> None:
@@ -40,6 +52,16 @@ def test_credential_status_does_not_treat_stub_placeholders_as_present():
     assert status["PREQIN_OPERATIONAL_TOKEN"]["present"] is False
     assert status["PREQIN_USERNAME"]["present"] is False
     assert status["PREQIN_API_KEY"]["present"] is False
+    assert "length" not in status["PREQIN_OPERATIONAL_TOKEN"]
+
+
+def test_credential_status_does_not_disclose_secret_lengths():
+    client = PreqinClient(username="user@example.com", api_key="super-secret-api-key")
+
+    status = client.credential_status()
+
+    assert status["PREQIN_USERNAME"] == {"present": True}
+    assert status["PREQIN_API_KEY"] == {"present": True}
 
 
 def test_auth_uses_username_and_api_key_multipart_form():
@@ -53,6 +75,109 @@ def test_auth_uses_username_and_api_key_multipart_form():
     assert request["url"] == "https://api.preqin.com/connect/token"
     assert request["files"] == {"username": (None, "user"), "apikey": (None, "api-key")}
     assert request["headers"] == {"Accept": "application/json"}
+
+
+def test_auth_error_redacts_response_body_and_known_secret_values():
+    class FailingAuthClient(FakeHttpClient):
+        def post(self, url: str, **kwargs):
+            self.posts.append({"url": url, **kwargs})
+            return FakeResponse(
+                {
+                    "error": "invalid_client",
+                    "username": "user@example.com",
+                    "apikey": "super-secret-api-key",
+                    "access_token": "leaked-token",
+                },
+                status_code=401,
+            )
+
+    client = PreqinClient(username="user@example.com", api_key="super-secret-api-key")
+    client._client = FailingAuthClient()
+
+    with pytest.raises(RuntimeError) as error:
+        client._operational_access_token(force_refresh=True)
+
+    message = str(error.value)
+    assert "user@example.com" not in message
+    assert "super-secret-api-key" not in message
+    assert "leaked-token" not in message
+    assert "<redacted>" in message
+
+
+def test_auth_error_redacts_known_secret_values_from_neutral_json_fields():
+    class FailingAuthClient(FakeHttpClient):
+        def post(self, url: str, **kwargs):
+            self.posts.append({"url": url, **kwargs})
+            return FakeResponse(
+                {
+                    "message": (
+                        "bad token super-secret-api-key for user@example.com "
+                        "with bearer brokered-operational-token"
+                    ),
+                },
+                status_code=401,
+            )
+
+    client = PreqinClient(username="user@example.com", api_key="super-secret-api-key")
+    client._operational_token = "brokered-operational-token"
+    client._client = FailingAuthClient()
+
+    with pytest.raises(RuntimeError) as error:
+        client._operational_access_token(force_refresh=True)
+
+    message = str(error.value)
+    assert "user@example.com" not in message
+    assert "super-secret-api-key" not in message
+    assert "brokered-operational-token" not in message
+    assert "<redacted>" in message
+
+
+def test_operational_get_error_redacts_raw_response_text(monkeypatch):
+    class FailingGetClient(FakeHttpClient):
+        def get(self, url: str, **kwargs):
+            self.gets.append({"url": url, **kwargs})
+            return FakeResponse(
+                None,
+                status_code=403,
+                text="Authorization: Bearer operational-secret-token username=user@example.com",
+                json_error=True,
+            )
+
+    monkeypatch.setenv(OPERATIONAL_TOKEN_PLACEHOLDER, "")
+    client = PreqinClient(username="user@example.com", api_key="super-secret-api-key")
+    client._operational_token = "operational-secret-token"
+    client._client = FailingGetClient()
+
+    with pytest.raises(RuntimeError) as error:
+        client.get_funds(fund_name="Paradigm", size=1)
+
+    message = str(error.value)
+    assert "operational-secret-token" not in message
+    assert "user@example.com" not in message
+    assert "<redacted>" in message
+
+
+def test_operational_get_error_redacts_brokered_token_from_raw_response_text(monkeypatch):
+    class FailingGetClient(FakeHttpClient):
+        def get(self, url: str, **kwargs):
+            self.gets.append({"url": url, **kwargs})
+            return FakeResponse(
+                None,
+                status_code=403,
+                text="Authorization: Bearer brokered-operational-token",
+                json_error=True,
+            )
+
+    monkeypatch.setenv(OPERATIONAL_TOKEN_PLACEHOLDER, "brokered-operational-token")
+    client = PreqinClient()
+    client._client = FailingGetClient()
+
+    with pytest.raises(RuntimeError) as error:
+        client.get_funds(fund_name="Paradigm", size=1)
+
+    message = str(error.value)
+    assert "brokered-operational-token" not in message
+    assert "Bearer <redacted>" in message
 
 
 def test_operational_get_uses_proxy_token_placeholder_before_direct_auth():

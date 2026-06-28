@@ -17,6 +17,7 @@ from ..utils import (
     detect_mime_type,
     file_record_to_dict,
     normalize_url,
+    url_host_matches,
 )
 from .docsend import route_all_docsends
 from .google import (
@@ -484,7 +485,7 @@ def download_source(
 ) -> dict:
     canonical_url = normalize_url(source_url)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if "docsend.com" in canonical_url:
+    if url_host_matches(source_url, ("docsend.com",)):
         docsend_dir = output_dir / "docsend"
         docsend_dir.mkdir(parents=True, exist_ok=True)
         payload = download_docsend(source_url, docsend_dir, company, password, email)
@@ -501,7 +502,7 @@ def download_source(
             response["blocker"] = payload["blocker"]
         return response
 
-    if "google.com" in canonical_url:
+    if url_host_matches(source_url, ("docs.google.com", "drive.google.com")):
         if not account:
             return {
                 "status": "error",

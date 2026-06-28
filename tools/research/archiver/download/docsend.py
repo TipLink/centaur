@@ -410,10 +410,14 @@ async def _intercept_cloudfront_download(
     def on_response(response):
         nonlocal download_url, suggested_filename
         # Skip Dropbox analytics noise
-        if "dropbox.com/log" in response.url:
+        response_host = (urlparse(response.url).hostname or "").rstrip(".").lower()
+        if response_host == "dropbox.com" and urlparse(response.url).path.startswith("/log"):
             return
         content_disp = response.headers.get("content-disposition", "")
-        if "cloudfront.net" in response.url and "attachment" in content_disp:
+        if (
+            (response_host == "cloudfront.net" or response_host.endswith(".cloudfront.net"))
+            and "attachment" in content_disp
+        ):
             download_url = response.url
             fn_match = re.search(r'filename="?([^";\n]+)"?', content_disp)
             if fn_match:

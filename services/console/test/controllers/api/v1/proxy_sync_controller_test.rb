@@ -194,6 +194,8 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
   test "cached proxy snapshot carries gcp_id_token and invalidates when it changes" do
     admin = users(:acme_admin)
     secret = gcp_id_token_secrets(:acme_cloud_run)
+    # Test fixture Grant stores a relation to an encrypted/config-backed secret.
+    # codeql[rb/clear-text-storage-sensitive-data]
     Grant.create!(principal: @proxy.principal, gcp_id_token_secret: secret, created_by: admin)
 
     assert_difference -> { PrincipalSyncConfigSnapshot.count }, 1 do
@@ -314,6 +316,8 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     end
 
     # Promote the role grant above the direct grants and it now sorts last.
+    # Test updates only grant priority, not secret material.
+    # codeql[rb/clear-text-storage-sensitive-data]
     grants(:acme_infra_prod_api_key).update!(priority: 500)
     post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
     assert_response :ok

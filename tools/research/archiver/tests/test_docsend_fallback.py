@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import tempfile
 import types
 import unittest
 from dataclasses import dataclass
@@ -19,6 +20,31 @@ def _clear_archiver_modules() -> None:
 
 
 def _stub_modules() -> dict[str, types.ModuleType]:
+    typer_module = types.ModuleType("typer")
+
+    class Exit(SystemExit):
+        pass
+
+    class Typer:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002
+            pass
+
+        def command(self, *args, **kwargs):  # noqa: ARG002
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+    typer_module.Argument = lambda default=None, *args, **kwargs: default  # noqa: ARG005,E731
+    typer_module.Exit = Exit
+    typer_module.Option = lambda default=None, *args, **kwargs: default  # noqa: ARG005,E731
+    typer_module.Typer = Typer
+    typer_module.prompt = lambda *args, **kwargs: ""  # noqa: ARG005,E731
+
+    centaur_sdk_module = types.ModuleType("centaur_sdk")
+    centaur_sdk_module.save_attachment_from_path = lambda *args, **kwargs: {}  # noqa: ARG005,E731
+    centaur_sdk_module.secret = lambda _name, default=None: default  # noqa: E731
+
     docsend_module = types.ModuleType("tools.research.archiver.download.docsend")
 
     async def route_all_docsends(*args, **kwargs):  # noqa: ARG001
@@ -49,6 +75,8 @@ def _stub_modules() -> dict[str, types.ModuleType]:
     }
 
     return {
+        typer_module.__name__: typer_module,
+        centaur_sdk_module.__name__: centaur_sdk_module,
         docsend_module.__name__: docsend_module,
         google_module.__name__: google_module,
         parse_module.__name__: parse_module,
@@ -56,6 +84,62 @@ def _stub_modules() -> dict[str, types.ModuleType]:
 
 
 class DocsendFallbackTest(unittest.TestCase):
+    def test_source_kind_uses_hostname_boundaries(self) -> None:
+        _clear_archiver_modules()
+        stubs = _stub_modules()
+
+        sys.path.insert(0, str(REPO_ROOT))
+        try:
+            with patch.dict(sys.modules, stubs):
+                cli = importlib.import_module("tools.research.archiver.cli")
+
+                self.assertEqual(cli._source_kind("https://docsend.com/view/example"), "docsend")
+                self.assertEqual(cli._source_kind("https://secure.docsend.com/view/example"), "docsend")
+                self.assertEqual(
+                    cli._source_kind("https://drive.google.com/file/d/example/view"),
+                    "google_drive",
+                )
+                self.assertEqual(
+                    cli._source_kind("https://docs.google.com/document/d/example/edit"),
+                    "google_drive",
+                )
+                self.assertEqual(cli._source_kind("https://docsend.com.evil.test/view"), "unknown")
+                self.assertEqual(cli._source_kind("https://evil-docsend.com/?u=docsend.com"), "unknown")
+                self.assertEqual(cli._source_kind("https://google.com.evil.test/file"), "unknown")
+        finally:
+            sys.path = [entry for entry in sys.path if entry != str(REPO_ROOT)]
+            _clear_archiver_modules()
+
+    def test_download_source_rejects_docsend_and_google_lookalikes(self) -> None:
+        _clear_archiver_modules()
+        stubs = _stub_modules()
+
+        sys.path.insert(0, str(REPO_ROOT))
+        try:
+            with patch.dict(sys.modules, stubs):
+                orchestrator = importlib.import_module("tools.research.archiver.download.orchestrator")
+
+                with tempfile.TemporaryDirectory() as directory:
+                    output_dir = Path(directory)
+                    for source_url in (
+                        "https://docsend.com.evil.test/view/example",
+                        "https://evil-docsend.com/?u=docsend.com",
+                        "https://google.com.evil.test/file",
+                    ):
+                        result = orchestrator.download_source(
+                            source_url=source_url,
+                            output_dir=output_dir,
+                            company=None,
+                            account="user@example.com",
+                            password=None,
+                            email=None,
+                            max_depth=1,
+                        )
+                        self.assertEqual(result["source_type"], "unknown")
+        finally:
+            sys.path = [entry for entry in sys.path if entry != str(REPO_ROOT)]
+            _clear_archiver_modules()
+
     def test_extract_source_surfaces_docsend_blocker_and_manifest(self) -> None:
         _clear_archiver_modules()
         stubs = _stub_modules()

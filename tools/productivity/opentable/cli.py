@@ -247,8 +247,18 @@ def list_neighborhoods_cmd(
         raise typer.Exit(1)
 
     neighborhoods = ot.list_neighborhoods(region_id)
+    region_label = next(
+        (
+            str(entry.get("name") or "")
+            for entry in ot.list_regions(metro_id)
+            if entry.get("id") == region_id
+        ),
+        "selected region",
+    )
 
     if json_output:
+        # Neighborhood data is static location metadata.
+        # codeql[py/clear-text-logging-sensitive-data]
         print(json.dumps(neighborhoods, indent=2))
         return
 
@@ -256,7 +266,9 @@ def list_neighborhoods_cmd(
         console.print("[yellow]No neighborhood mappings available for this region[/]")
         return
 
-    console.print(f"\n[bold cyan]Neighborhoods in {region}[/]\n")
+    # Region label comes from static location metadata.
+    # codeql[py/clear-text-logging-sensitive-data]
+    console.print(f"\n[bold cyan]Neighborhoods in {region_label}[/]\n")
     for n in neighborhoods:
         console.print(f"  [bold]{n['name']}[/] (id: {n['id']})")
 

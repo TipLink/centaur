@@ -11,7 +11,7 @@ from typing import Optional
 import typer
 
 from .client import _client
-from .utils import dump_json, normalize_url
+from .utils import dump_json, url_host_matches
 
 app = typer.Typer(
     name="archiver", help="Reducto-first document extraction for investment materials."
@@ -69,10 +69,9 @@ def _is_interactive() -> bool:
 
 
 def _source_kind(source_url: str) -> str:
-    canonical = normalize_url(source_url).lower()
-    if "docsend.com" in canonical:
+    if url_host_matches(source_url, ("docsend.com",)):
         return "docsend"
-    if "google.com" in canonical:
+    if url_host_matches(source_url, ("docs.google.com", "drive.google.com")):
         return "google_drive"
     return "unknown"
 
