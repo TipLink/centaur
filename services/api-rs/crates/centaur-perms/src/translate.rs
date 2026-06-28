@@ -37,7 +37,23 @@ pub struct ToolLabels {
 }
 
 fn rules_from_hosts(hosts: &[String]) -> Vec<RequestRule> {
-    hosts.iter().map(RequestRule::host).collect()
+    rules_from_hosts_with_scope(hosts, &[], &[])
+}
+
+fn rules_from_hosts_with_scope(
+    hosts: &[String],
+    methods: &[String],
+    paths: &[String],
+) -> Vec<RequestRule> {
+    hosts
+        .iter()
+        .map(|host| RequestRule {
+            host: Some(host.clone()),
+            cidr: None,
+            http_methods: methods.to_vec(),
+            paths: paths.to_vec(),
+        })
+        .collect()
 }
 
 /// Translate every secret declared by a tool into iron-control inputs to grant
@@ -209,7 +225,7 @@ fn static_input(
         inject_config,
         replace_config,
         source: source_from_placeholder(policy, &http.secret_ref, None),
-        rules: rules_from_hosts(&http.hosts),
+        rules: rules_from_hosts_with_scope(&http.hosts, &http.methods, &http.paths),
     }
 }
 

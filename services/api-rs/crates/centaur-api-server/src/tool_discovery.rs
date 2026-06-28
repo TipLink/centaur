@@ -36,6 +36,9 @@ const DEFAULT_MATCH_HEADERS: &[&str] = &[
     "X-CB-ACCESS-SIGNATURE",
     "/^x-[a-z0-9-]*(api-key|apikey|secret|token|auth|key)$/",
 ];
+const HTTP_METHODS: &[&str] = &[
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "*",
+];
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ToolDiscoveryConfig {
@@ -523,6 +526,8 @@ struct HttpSecret {
     labels: BTreeMap<String, String>,
     mode: HttpSecretMode,
     hosts: Vec<String>,
+    methods: Vec<String>,
+    paths: Vec<String>,
     replacer: String,
     match_headers: Vec<String>,
     match_path: bool,
@@ -643,6 +648,8 @@ fn parse_secret(
             labels: labels.clone(),
             mode: HttpSecretMode::Replace,
             hosts: default_hosts.to_vec(),
+            methods: Vec::new(),
+            paths: Vec::new(),
             replacer: name,
             match_headers: DEFAULT_MATCH_HEADERS
                 .iter()
@@ -695,6 +702,8 @@ fn parse_http_secret(
              iron-proxy"
         )));
     }
+    let methods = request_methods(table, &name)?;
+    let paths = request_paths(table, &name)?;
     let mode = optional_str(table, "mode").unwrap_or("replace");
     match mode {
         "replace" => {
@@ -714,6 +723,8 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Replace,
                 hosts,
+                methods,
+                paths,
                 replacer,
                 match_headers,
                 match_path,
@@ -749,6 +760,8 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Inject,
                 hosts,
+                methods,
+                paths,
                 replacer: String::new(),
                 match_headers: Vec::new(),
                 match_path: false,
@@ -762,6 +775,63 @@ fn parse_http_secret(
             "unknown HTTP secret mode {other:?}"
         ))),
     }
+}
+
+fn request_methods(table: &toml::Table, name: &str) -> Result<Vec<String>, ToolDiscoveryError> {
+    if table.contains_key("methods") && table.contains_key("http_methods") {
+        return Err(ToolDiscoveryError::Invalid(format!(
+            "HTTP secret {name:?} must declare only one of methods or http_methods"
+        )));
+    }
+    let (key, raw) = if table.contains_key("methods") {
+        ("methods", optional_string_array(table.get("methods"))?)
+    } else {
+        (
+            "http_methods",
+            optional_string_array(table.get("http_methods"))?,
+        )
+    };
+    let raw = match raw {
+        Some(raw) if raw.is_empty() => {
+            return Err(ToolDiscoveryError::Invalid(format!(
+                "HTTP secret {name:?} {key:?} must not be empty"
+            )));
+        }
+        Some(raw) => raw,
+        None => Vec::new(),
+    };
+    raw.into_iter()
+        .map(|method| {
+            let method = method.to_ascii_uppercase();
+            if HTTP_METHODS.contains(&method.as_str()) {
+                Ok(method)
+            } else {
+                Err(ToolDiscoveryError::Invalid(format!(
+                    "HTTP secret {name:?} method {method:?} must be one of {HTTP_METHODS:?}"
+                )))
+            }
+        })
+        .collect()
+}
+
+fn request_paths(table: &toml::Table, name: &str) -> Result<Vec<String>, ToolDiscoveryError> {
+    let paths = match optional_string_array(table.get("paths"))? {
+        Some(paths) if paths.is_empty() => {
+            return Err(ToolDiscoveryError::Invalid(format!(
+                "HTTP secret {name:?} 'paths' must not be empty"
+            )));
+        }
+        Some(paths) => paths,
+        None => Vec::new(),
+    };
+    for path in &paths {
+        if !path.starts_with('/') {
+            return Err(ToolDiscoveryError::Invalid(format!(
+                "HTTP secret {name:?} path {path:?} must start with '/'"
+            )));
+        }
+    }
+    Ok(paths)
 }
 
 fn parse_oauth_token_secret(
@@ -1008,7 +1078,7 @@ fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, To
         let mut entry = Secret {
             id: Some(key.name.clone()),
             source: Some(yaml_map([("placeholder", yaml_string(&key.secret_ref))])?),
-            rules: host_rules(hosts)?,
+            rules: scoped_host_rules(hosts, &key.methods, &key.paths)?,
             ..Default::default()
         };
         entry.extra.insert("labels".to_owned(), yaml_value(labels)?);
@@ -1061,6 +1131,8 @@ struct HttpSecretKey {
     match_headers: Vec<String>,
     match_path: bool,
     match_query: bool,
+    methods: Vec<String>,
+    paths: Vec<String>,
     inject_header: String,
     inject_formatter: String,
     inject_query_param: String,
@@ -1076,6 +1148,8 @@ impl From<&HttpSecret> for HttpSecretKey {
             match_headers: secret.match_headers.clone(),
             match_path: secret.match_path,
             match_query: secret.match_query,
+            methods: secret.methods.clone(),
+            paths: secret.paths.clone(),
             inject_header: secret.inject_header.clone(),
             inject_formatter: secret.inject_formatter.clone(),
             inject_query_param: secret.inject_query_param.clone(),
@@ -1357,9 +1431,30 @@ fn oauth_field_source(source: &OAuthFieldSource) -> Result<YamlValue, ToolDiscov
 }
 
 fn host_rules(hosts: BTreeSet<String>) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
+    scoped_host_rules(hosts, &[], &[])
+}
+
+fn scoped_host_rules(
+    hosts: BTreeSet<String>,
+    methods: &[String],
+    paths: &[String],
+) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
     hosts
         .into_iter()
-        .map(|host| yaml_map([("host", yaml_string(&host))]))
+        .map(|host| {
+            let mut rule = serde_yaml::Mapping::new();
+            rule.insert(YamlValue::String("host".to_owned()), yaml_string(&host));
+            if !methods.is_empty() {
+                rule.insert(
+                    YamlValue::String("methods".to_owned()),
+                    yaml_value(methods)?,
+                );
+            }
+            if !paths.is_empty() {
+                rule.insert(YamlValue::String("paths".to_owned()), yaml_value(paths)?);
+            }
+            Ok(YamlValue::Mapping(rule))
+        })
         .collect()
 }
 
@@ -1558,7 +1653,7 @@ secrets = [{type = "http", name = "BASE_TOKEN", match_headers = ["Authorization"
 description = "overlay alpha"
 
 [tool.centaur]
-secrets = [{type = "http", name = "OVERLAY_TOKEN", match_query = true, hosts = ["api.overlay.test"]}]
+secrets = [{type = "http", name = "OVERLAY_TOKEN", match_query = true, hosts = ["api.overlay.test"], methods = ["POST"], paths = ["/api/search.messages"]}]
 "#,
         );
         write_tool(
@@ -1581,6 +1676,27 @@ secrets = [
         let secrets = discovered.fragment.transforms[0].config.secrets.clone();
         assert_eq!(secrets.len(), 1);
         assert_eq!(secrets[0].id.as_deref(), Some("OVERLAY_TOKEN"));
+        let rules = secrets[0].rules.as_slice();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["host"].as_str(), Some("api.overlay.test"));
+        assert_eq!(
+            rules[0]["methods"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(YamlValue::as_str)
+                .collect::<Vec<_>>(),
+            vec!["POST"]
+        );
+        assert_eq!(
+            rules[0]["paths"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(YamlValue::as_str)
+                .collect::<Vec<_>>(),
+            vec!["/api/search.messages"]
+        );
         let labels = secrets[0]
             .extra
             .get("labels")
@@ -1645,6 +1761,32 @@ secrets = [
         );
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn rejects_explicit_empty_http_request_scope() {
+        for scope in ["methods = []", "http_methods = []", "paths = []"] {
+            let pyproject = parse_toml(
+                std::path::Path::new("pyproject.toml"),
+                &format!(
+                    r#"
+[project]
+description = "bad scope"
+
+[tool.centaur]
+secrets = [{{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["slack.com"], {scope}}}]
+"#
+                ),
+            )
+            .unwrap();
+            let labels = tool_labels("slack", "centaur");
+            let centaur = pyproject
+                .get("tool")
+                .and_then(|value| value.get("centaur"))
+                .expect("tool.centaur metadata");
+            let err = parse_secret_list(centaur.get("secrets"), &[], &labels).unwrap_err();
+            assert!(err.to_string().contains("must not be empty"), "{err}");
+        }
     }
 
     #[test]
