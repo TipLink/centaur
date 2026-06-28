@@ -73,9 +73,10 @@ class SlackClient:
     """Slack API client.
 
     Most direct Slack operations use the bot token. Workspace-wide native Slack
-    search uses a dedicated user token, and file uploads use a dedicated upload
-    token, so broad search/upload grants stay separate from the interactive
-    bot's private-channel access model.
+    search uses a dedicated user token with Slack's public-channel Real-time
+    Search scope, and file uploads use a dedicated upload token, so broad
+    search/upload grants stay separate from the interactive bot's
+    private-channel access model.
     """
 
     # Cache settings
@@ -527,10 +528,10 @@ class SlackClient:
         — Centaur is intentionally added to private investing / sourcing /
         legal channels and search/history calls only work on channels the bot
         actually belongs to. Filtering to ``types="public_channel"`` silently
-        drops every private channel from this list and from every caller
-        that depends on it (e.g. ``_search_messages_local`` scans this list
-        as the fallback when native search lacks ``search:read``, and
-        ``gather_context``'s Slack grab walks the bot's member channels).
+        drops every private channel from callers that intentionally depend on
+        bot membership, such as ``gather_context``'s Slack grab. Public search
+        does not use this list; it goes through Slack RTS with public-channel
+        scope only.
 
         Uses ``users.conversations``, which returns only the conversations the
         bot is a member of. ``conversations.list`` would instead page through
@@ -671,6 +672,35 @@ class SlackClient:
 
         return score
 
+    def _slack_search_channel_modifier(self, channel: str) -> str:
+        """Format an RTS channel filter without resolving private channel names."""
+        normalized = self._clean_channel_ref(channel)
+        if self._looks_like_channel_id(normalized):
+            return f"in:<#{normalized.upper()}>"
+        return f"in:#{normalized}"
+
+    def _slack_search_user_modifier(self, user: str) -> str:
+        """Format an RTS user filter without needing users.list lookups."""
+        normalized = self._clean_user_ref(user).lstrip("@")
+        if self._looks_like_user_id(normalized):
+            return f"from:<@{normalized.upper()}>"
+        return f"from:@{normalized}"
+
+    def _build_rts_search_query(
+        self,
+        query: str,
+        channels: list[str] | None,
+        from_user: str | None,
+    ) -> str:
+        parts = [query.strip()]
+        for channel in channels or []:
+            modifier = self._slack_search_channel_modifier(channel)
+            if modifier != "in:#":
+                parts.append(modifier)
+        if from_user:
+            parts.append(self._slack_search_user_modifier(from_user))
+        return " ".join(part for part in parts if part).strip()
+
     def search_messages(
         self,
         query: str,
@@ -679,13 +709,12 @@ class SlackClient:
         from_user: str | None = None,
         messages_per_channel: int = 200,
     ) -> list[dict]:
-        """Search messages using Slack's native search.messages API.
+        """Search public Slack messages using Slack's Real-time Search API.
 
-        Uses Slack's native search.messages API for fast, workspace-wide
-        search. Workspace-wide search requires ``SLACK_SEARCH_TOKEN`` and will
-        not fall back to bot-token channel scanning. A local bot-token scan is
-        only used when the caller explicitly scopes the search to channel IDs or
-        ``in:#channel`` modifiers.
+        Search requires ``SLACK_SEARCH_TOKEN`` with ``search:read.public`` and
+        always restricts RTS to ``channel_types=["public_channel"]``. It never
+        falls back to bot-token channel scanning because the bot can be invited
+        to private channels whose contents must not leak into public search.
 
         Supports Slack search modifiers in the query string:
             in:#channel, from:@user, before:YYYY-MM-DD, after:YYYY-MM-DD,
@@ -696,33 +725,18 @@ class SlackClient:
             max_results: Maximum results to return
             channels: Optional list of channel names to filter by
             from_user: Optional username to filter by
-            messages_per_channel: Messages per channel (only used in fallback)
+            messages_per_channel: Ignored; retained for CLI compatibility
 
         Returns:
-            List of matching message dicts, sorted by relevance
+            List of matching public-channel message dicts
         """
-        local_query, local_channels, local_from_user = self._extract_local_search_filters(
-            query, channels, from_user
-        )
-        if local_channels:
-            return self._search_messages_local(
-                local_query,
-                max_results,
-                local_channels,
-                local_from_user,
-                messages_per_channel,
-            )
-
         if not self.search_token:
             raise RuntimeError(
                 "SLACK_SEARCH_TOKEN not set; refusing workspace Slack search with "
                 "SLACK_BOT_TOKEN because it can include bot-visible private channels"
             )
 
-        # Build the search query with modifiers
-        search_query = query
-        if from_user:
-            search_query += f" from:@{from_user.lstrip('@')}"
+        search_query = self._build_rts_search_query(query, channels, from_user)
 
         try:
             return self._search_messages_native(search_query, max_results)
@@ -730,7 +744,7 @@ class SlackClient:
             raise
         except (SlackApiError, RuntimeError) as exc:
             raise RuntimeError(
-                "Slack native search failed via SLACK_SEARCH_TOKEN; refusing "
+                "Slack public search failed via SLACK_SEARCH_TOKEN; refusing "
                 "SLACK_BOT_TOKEN fallback because it can include bot-visible "
                 "private channels"
             ) from exc
@@ -740,31 +754,43 @@ class SlackClient:
         query: str,
         max_results: int = 20,
     ) -> list[dict]:
-        """Search using Slack's native search.messages API."""
+        """Search public channels using Slack's Real-time Search API."""
         if not self.search_token or self._search_client is None:
             raise RuntimeError("SLACK_SEARCH_TOKEN not set")
+        limit = max(1, min(int(max_results), 20))
         response = self._retry_on_ratelimit(
             self._search_client.api_call,
-            "search.messages",
-            method_key="search.messages",
-            params={"query": query, "count": max_results, "sort": "timestamp"},
+            "assistant.search.context",
+            method_key="assistant.search.context",
+            json={
+                "query": query,
+                "content_types": ["messages"],
+                "channel_types": ["public_channel"],
+                "limit": limit,
+                "sort": "timestamp",
+                "sort_dir": "desc",
+                "disable_semantic_search": True,
+            },
         )
 
         if not response.get("ok"):
-            raise RuntimeError(response.get("error", "search.messages failed"))
+            error = response.get("error", "assistant.search.context failed")
+            needed = response.get("needed")
+            if needed:
+                error = f"{error}: needed {needed}"
+            raise RuntimeError(error)
 
-        matches = response.get("messages", {}).get("matches", [])
-        user_cache = self._get_user_cache()
+        matches = response.get("results", {}).get("messages", [])
+        user_cache = self._get_user_cache() if matches else {}
 
         results = []
         for m in matches:
-            user_id = m.get("user", "")
-            username = user_cache.get(user_id, m.get("username", user_id))
-            channel_info = m.get("channel", {})
-            channel_id = channel_info.get("id", "") if isinstance(channel_info, dict) else ""
-            channel_name = channel_info.get("name", "") if isinstance(channel_info, dict) else ""
-            ts = m.get("ts", "")
-            text = self._resolve_mentions(m.get("text", ""), user_cache)
+            user_id = m.get("author_user_id", "")
+            username = m.get("author_name") or user_cache.get(user_id, user_id)
+            channel_id = m.get("channel_id", "")
+            channel_name = m.get("channel_name", "")
+            ts = m.get("message_ts", "")
+            text = self._resolve_mentions(m.get("content", ""), user_cache)
 
             results.append(
                 {
@@ -775,7 +801,7 @@ class SlackClient:
                     "text": text,
                     "timestamp": ts,
                     "permalink": m.get("permalink", ""),
-                    "thread_ts": m.get("thread_ts"),
+                    "thread_ts": m.get("thread_ts") or ts,
                     "reply_count": m.get("reply_count", 0),
                 }
             )

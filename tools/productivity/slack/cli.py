@@ -112,20 +112,22 @@ def search(
         None, "--channels", "-c", help="Comma-separated channel names to search"
     ),
     from_user: str = typer.Option(None, "--from", help="Filter by username"),
-    depth: int = typer.Option(200, "--depth", "-d", help="Messages per channel to scan"),
+    depth: int = typer.Option(
+        200,
+        "--depth",
+        "-d",
+        help="Deprecated compatibility option; public search uses Slack RTS",
+    ),
 ):
-    """Search messages in bot-accessible channels.
+    """Search public Slack messages.
 
-    Searches across all channels the bot is a member of. Results are ranked by
-    relevance (exact phrase matches score higher). Use --channels to limit scope.
-
-    Note: Only searches channels where the bot is a member. To search more channels,
-    invite the bot to those channels first.
+    Uses Slack Real-time Search with public-channel scope only. Use --channels
+    to add public channel filters without scanning bot-visible private history.
 
     Examples:
         slack search "deploy"
         slack search "kubernetes error" --channels eng-infra,eng-ai
-        slack search "database migration" --from alice --depth 500
+        slack search "database migration" --from alice
     """
     from .client import search_messages
 
