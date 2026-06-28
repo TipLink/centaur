@@ -114,8 +114,11 @@ class _FakeWebClient:
         self.files_delete_calls.append(kwargs)
         return {"ok": True}
 
-    def api_call(self, method: str, *, params: dict):
-        self.api_calls.append((method, params))
+    def api_call(self, method: str, *, params: dict | None = None, json: dict | None = None):
+        payload = json if json is not None else params or {}
+        self.api_calls.append((method, payload))
+        if method == "assistant.search.context":
+            return {"ok": True, "results": {"messages": []}}
         return {"ok": True, "messages": {"matches": []}}
 
 
@@ -397,29 +400,8 @@ def test_get_channel_history_page_preserves_non_auth_error_shape() -> None:
         client.get_channel_history_page("paradigm-pulse")
 
 
-def test_search_messages_with_channel_ids_scans_history_without_listing() -> None:
+def test_search_messages_with_channel_ids_uses_rts_without_history_scan() -> None:
     client, fake_web_client = _make_client()
-    client._get_user_cache = lambda: {"UGZCSQTPE": "matt", "U1": "alice"}  # type: ignore[method-assign]
-    history_by_channel = {
-        "C05HUE4KLF2": {
-            "messages": [
-                {"user": "UGZCSQTPE", "text": "Matt note about inference", "ts": "300.000000"},
-                {"user": "U1", "text": "unrelated", "ts": "299.000000"},
-            ]
-        },
-        "C042WDDP89Y": {
-            "messages": [{"user": "U1", "text": "Matt mentioned here", "ts": "200.000000"}]
-        },
-        "C0A174PPJDS": {
-            "messages": [{"user": "UGZCSQTPE", "text": "nothing relevant", "ts": "100.000000"}]
-        },
-    }
-
-    def history(**kwargs):
-        fake_web_client.history_calls.append(kwargs)
-        return history_by_channel[kwargs["channel"]]
-
-    fake_web_client.conversations_history = history  # type: ignore[method-assign]
 
     results = client.search_messages(
         "Matt",
@@ -428,30 +410,30 @@ def test_search_messages_with_channel_ids_scans_history_without_listing() -> Non
         messages_per_channel=25,
     )
 
-    assert fake_web_client.api_calls == []
-    assert fake_web_client.list_calls == []
-    assert sorted(call["channel"] for call in fake_web_client.history_calls) == sorted(
-        [
-            "C05HUE4KLF2",
-            "C042WDDP89Y",
-            "C0A174PPJDS",
-        ]
-    )
-    assert sorted(call["limit"] for call in fake_web_client.history_calls) == [25, 25, 25]
-    assert sorted(item["channel_id"] for item in results) == ["C042WDDP89Y", "C05HUE4KLF2"]
-
-
-def test_search_messages_parses_channel_and_user_modifiers_locally() -> None:
-    client, fake_web_client = _make_client()
-    client._get_user_cache = lambda: {"UGZCSQTPE": "matt", "U1": "alice"}  # type: ignore[method-assign]
-    fake_web_client.history_pages = [
-        {
-            "messages": [
-                {"user": "UGZCSQTPE", "text": "Scott Wu on inference", "ts": "300.000000"},
-                {"user": "U1", "text": "also about inference", "ts": "301.000000"},
-            ]
-        }
+    assert fake_web_client.api_calls == [
+        (
+            "assistant.search.context",
+            {
+                "query": (
+                    "Matt in:<#C05HUE4KLF2> in:<#C042WDDP89Y> "
+                    "in:<#C0A174PPJDS>"
+                ),
+                "content_types": ["messages"],
+                "channel_types": ["public_channel"],
+                "limit": 10,
+                "sort": "timestamp",
+                "sort_dir": "desc",
+                "disable_semantic_search": True,
+            },
+        )
     ]
+    assert fake_web_client.list_calls == []
+    assert fake_web_client.history_calls == []
+    assert results == []
+
+
+def test_search_messages_passes_channel_and_user_modifiers_to_rts() -> None:
+    client, fake_web_client = _make_client()
 
     results = client.search_messages(
         "from:<@UGZCSQTPE> in:<#C042WDDP89Y>",
@@ -459,11 +441,23 @@ def test_search_messages_parses_channel_and_user_modifiers_locally() -> None:
         messages_per_channel=25,
     )
 
-    assert fake_web_client.api_calls == []
+    assert fake_web_client.api_calls == [
+        (
+            "assistant.search.context",
+            {
+                "query": "from:<@UGZCSQTPE> in:<#C042WDDP89Y>",
+                "content_types": ["messages"],
+                "channel_types": ["public_channel"],
+                "limit": 5,
+                "sort": "timestamp",
+                "sort_dir": "desc",
+                "disable_semantic_search": True,
+            },
+        )
+    ]
     assert fake_web_client.list_calls == []
-    assert fake_web_client.history_calls == [{"channel": "C042WDDP89Y", "limit": 25}]
-    assert len(results) == 1
-    assert results[0]["user_id"] == "UGZCSQTPE"
+    assert fake_web_client.history_calls == []
+    assert results == []
 
 
 def test_workspace_search_requires_search_token() -> None:
@@ -478,14 +472,14 @@ def test_workspace_search_requires_search_token() -> None:
         client.search_messages("deploy", max_results=5)
 
 
-def test_workspace_search_refuses_bot_token_fallback_when_native_search_fails() -> None:
+def test_workspace_search_refuses_bot_token_fallback_when_rts_fails() -> None:
     client, fake_web_client = _make_client()
     client.list_bot_channels = lambda **_: (_ for _ in ()).throw(  # type: ignore[method-assign]
         AssertionError("workspace search must not scan bot-visible channels")
     )
 
-    def fail_native_search(method: str, *, params: dict):
-        fake_web_client.api_calls.append((method, params))
+    def fail_native_search(method: str, *, json: dict):
+        fake_web_client.api_calls.append((method, json))
         raise _make_slack_error(error="invalid_auth", status_code=200)
 
     fake_web_client.api_call = fail_native_search  # type: ignore[method-assign]
@@ -494,7 +488,18 @@ def test_workspace_search_refuses_bot_token_fallback_when_native_search_fails() 
         client.search_messages("deploy", max_results=5)
 
     assert fake_web_client.api_calls == [
-        ("search.messages", {"query": "deploy", "count": 5, "sort": "timestamp"})
+        (
+            "assistant.search.context",
+            {
+                "query": "deploy",
+                "content_types": ["messages"],
+                "channel_types": ["public_channel"],
+                "limit": 5,
+                "sort": "timestamp",
+                "sort_dir": "desc",
+                "disable_semantic_search": True,
+            },
+        )
     ]
     assert fake_web_client.user_conversations_calls == []
     assert fake_web_client.history_calls == []
@@ -1003,19 +1008,21 @@ def test_download_file_stores_slack_file_as_attachment(monkeypatch: pytest.Monke
     }
 
 
-def test_native_search_uses_dedicated_search_client() -> None:
+def test_native_search_uses_dedicated_rts_search_client() -> None:
     client, fake_bot_client = _make_client()
     fake_search_client = _FakeWebClient()
-    fake_search_client.api_call = lambda method, *, params: {  # type: ignore[method-assign]
+    fake_search_client.api_call = lambda method, *, json: {  # type: ignore[method-assign]
         "ok": True,
-        "messages": {
-            "matches": [
+        "results": {
+            "messages": [
                 {
-                    "user": "U1",
-                    "text": "deploy <@U2>",
-                    "ts": "200.000000",
+                    "author_user_id": "U1",
+                    "author_name": "alice",
+                    "content": "deploy <@U2>",
+                    "message_ts": "200.000000",
                     "permalink": "https://slack.com/archives/C123/p200000000",
-                    "channel": {"id": "C123", "name": "paradigm-pulse"},
+                    "channel_id": "C123",
+                    "channel_name": "paradigm-pulse",
                     "thread_ts": "200.000000",
                     "reply_count": 2,
                 }
