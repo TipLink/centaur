@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import {
   Chat,
@@ -48,7 +48,6 @@ import type {
   SlackbotV2Options,
   SlackbotV2RenderObligation,
   SlackbotV2RendererSource,
-  SlackbotV2SteeringDefaults,
   SlackbotV2ThreadState,
   SlackbotV2Trace
 } from './types'
@@ -93,22 +92,6 @@ type SlackAssistantAdapter = {
   setAssistantTitle?(channelId: string, threadTs: string, title: string): Promise<void>
 }
 
-type SlackCommandPayload = {
-  channelId: string
-  command: string
-  teamId?: string
-  text: string
-  threadTs?: string
-  userId?: string
-}
-
-type SlackThreadTarget = {
-  channelId: string
-  display: string
-  threadKeys: string[]
-  threadTs: string
-}
-
 const MAX_SLACK_MESSAGE_ATTACHMENTS = 20
 
 type SlackbotV2RequestContext = {
@@ -132,32 +115,6 @@ const SLACK_FALLBACK_TEXT_MAX_CHARS = 35_000
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
 const SLACK_DEDUPE_BUCKETS = ['mention', 'dm', 'subscribed', 'pattern', 'history'] as const
-const SLACK_SIGNATURE_MAX_AGE_SECONDS = 5 * 60
-const STEERING_STATE_KEY_PREFIX = 'steering'
-const REASONING_EFFORT_ALIASES: Record<string, string> = {
-  none: 'none',
-  minimal: 'minimal',
-  min: 'minimal',
-  low: 'low',
-  medium: 'medium',
-  med: 'medium',
-  high: 'high',
-  hi: 'high',
-  xhigh: 'xhigh',
-  xhi: 'xhigh',
-  'x-high': 'xhigh'
-}
-const REASONING_COMMANDS: Record<string, string> = {
-  minimal: 'minimal',
-  min: 'minimal',
-  low: 'low',
-  medium: 'medium',
-  med: 'medium',
-  high: 'high',
-  hi: 'high',
-  xhigh: 'xhigh',
-  xhi: 'xhigh'
-}
 
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
@@ -295,7 +252,6 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   }
   app.post('/api/webhooks/slack', handleSlackWebhook)
   app.post('/api/slack/events', handleSlackWebhook)
-  app.post('/api/slack/commands', c => handleSlackCommand(c, state, options))
 
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options)
@@ -540,301 +496,6 @@ async function ensureStateConnected(state: StateAdapter, options: SlackbotV2Opti
   }
 }
 
-async function handleSlackCommand(
-  c: Context,
-  state: StateAdapter,
-  options: SlackbotV2Options
-): Promise<Response> {
-  const rawBody = await c.req.raw.clone().text()
-  if (!verifySlackRequestSignature(c, rawBody, options.signingSecret)) {
-    return new globalThis.Response('invalid Slack signature', { status: 401 })
-  }
-
-  const payload = slackCommandPayload(rawBody)
-  if (!payload.command) return slackCommandResponse('Unknown command.')
-
-  try {
-    await ensureStateConnected(state, options)
-    const text = await applySlackCommand(payload, state)
-    traceLog(options, 'slackbotv2_slash_command_applied', undefined, {
-      command: payload.command,
-      channel_id: payload.channelId,
-      team_id: payload.teamId,
-      user_id: payload.userId
-    })
-    return slackCommandResponse(text)
-  } catch (error) {
-    traceWarn(options, 'slackbotv2_slash_command_failed', undefined, {
-      command: payload.command,
-      error: errorMessage(error)
-    })
-    return slackCommandResponse(errorMessage(error))
-  }
-}
-
-function verifySlackRequestSignature(c: Context, rawBody: string, signingSecret: string): boolean {
-  const timestamp = c.req.header('x-slack-request-timestamp') ?? ''
-  const signature = c.req.header('x-slack-signature') ?? ''
-  const parsedTimestamp = Number.parseInt(timestamp, 10)
-  if (!Number.isFinite(parsedTimestamp)) return false
-  if (Math.abs(Date.now() / 1000 - parsedTimestamp) > SLACK_SIGNATURE_MAX_AGE_SECONDS) return false
-
-  const expected = `v0=${createHmac('sha256', signingSecret)
-    .update(`v0:${timestamp}:${rawBody}`)
-    .digest('hex')}`
-  const expectedBuffer = Buffer.from(expected)
-  const signatureBuffer = Buffer.from(signature)
-  return (
-    expectedBuffer.length === signatureBuffer.length
-    && timingSafeEqual(expectedBuffer, signatureBuffer)
-  )
-}
-
-function slackCommandPayload(rawBody: string): SlackCommandPayload {
-  const params = new URLSearchParams(rawBody)
-  return {
-    channelId: params.get('channel_id')?.trim() ?? '',
-    command: params.get('command')?.trim() ?? '',
-    teamId: params.get('team_id')?.trim() || undefined,
-    text: params.get('text') ?? '',
-    threadTs: params.get('thread_ts')?.trim() || undefined,
-    userId: params.get('user_id')?.trim() || undefined
-  }
-}
-
-async function applySlackCommand(
-  payload: SlackCommandPayload,
-  state: StateAdapter
-): Promise<string> {
-  const command = payload.command.replace(/^\//, '').toLowerCase()
-  const parsed = extractThreadTarget(
-    payload.text,
-    payload.channelId,
-    payload.teamId,
-    payload.threadTs
-  )
-  if (!parsed.target) return steeringUsage(command)
-
-  const commandReasoning = reasoningCommandEffort(command)
-  if (commandReasoning) {
-    const reasoning = commandReasoning
-    await updateThreadSteeringDefaults(state, parsed.target, { reasoning }, payload.userId)
-    return `Set reasoning to ${reasoning} for ${parsed.target.display}.`
-  }
-
-  if (command === 'reasoning' || command === 'think' || command === 'thinking') {
-    const reasoning = firstReasoningEffort(parsed.remainder)
-    if (!reasoning) return steeringUsage(command)
-    await updateThreadSteeringDefaults(state, parsed.target, { reasoning }, payload.userId)
-    return `Set reasoning to ${reasoning} for ${parsed.target.display}.`
-  }
-
-  return steeringUsage(command)
-}
-
-function reasoningCommandEffort(command: string): string | undefined {
-  return REASONING_COMMANDS[command]
-}
-
-function firstReasoningEffort(text: string): string | undefined {
-  for (const token of text.trim().split(/\s+/)) {
-    const reasoning = normalizeReasoningEffort(token)
-    if (reasoning) return reasoning
-  }
-  return undefined
-}
-
-function normalizeReasoningEffort(value: string): string | undefined {
-  return REASONING_EFFORT_ALIASES[value.replace(/^--?/, '').toLowerCase()]
-}
-
-function extractThreadTarget(
-  text: string,
-  defaultChannelId: string,
-  teamId?: string,
-  defaultThreadTs?: string
-): { remainder: string; target?: SlackThreadTarget } {
-  const tokens = text.trim().split(/\s+/).filter(Boolean)
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = slackCommandToken(tokens[index]!)
-    const fromToken = threadTargetFromToken(token, defaultChannelId, teamId)
-    if (fromToken) return { target: fromToken, remainder: tokensWithoutRange(tokens, index, 1) }
-
-    const next = tokens[index + 1] ? slackCommandToken(tokens[index + 1]!) : ''
-    if (isSlackChannelId(token) && next) {
-      const threadTs = slackTimestampFromToken(next)
-      if (threadTs) {
-        return {
-          target: slackThreadTarget(token, threadTs, teamId),
-          remainder: tokensWithoutRange(tokens, index, 2)
-        }
-      }
-    }
-  }
-  const fallbackThreadTs = defaultThreadTs ? slackTimestampFromToken(defaultThreadTs) : undefined
-  if (defaultChannelId && fallbackThreadTs) {
-    return {
-      target: slackThreadTarget(defaultChannelId, fallbackThreadTs, teamId),
-      remainder: text.trim()
-    }
-  }
-  return { remainder: text.trim() }
-}
-
-function tokensWithoutRange(tokens: string[], index: number, deleteCount: number): string {
-  return [...tokens.slice(0, index), ...tokens.slice(index + deleteCount)].join(' ')
-}
-
-function threadTargetFromToken(
-  token: string,
-  defaultChannelId: string,
-  teamId?: string
-): SlackThreadTarget | undefined {
-  const archiveMatch = /\/archives\/([CGD][A-Z0-9]+)\/p(\d{11,})/i.exec(token)
-  if (archiveMatch?.[1] && archiveMatch[2]) {
-    const threadTs = slackTimestampFromCompact(archiveMatch[2])
-    if (threadTs) return slackThreadTarget(archiveMatch[1], threadTs, teamId)
-  }
-
-  try {
-    const url = new URL(token)
-    if (url.protocol === 'slack:') {
-      const channelId = url.searchParams.get('id') || url.searchParams.get('channel') || defaultChannelId
-      const message = url.searchParams.get('message') || url.searchParams.get('thread_ts')
-      const threadTs = message ? slackTimestampFromToken(message) : undefined
-      if (channelId && threadTs) return slackThreadTarget(channelId, threadTs, teamId)
-    }
-  } catch {
-    // Not a URL-shaped token; try the compact forms below.
-  }
-
-  const combined = /^([CGD][A-Z0-9]+)[:/|](p?\d{10}(?:\.\d{6})?|\d{16,})$/i.exec(token)
-  if (combined?.[1] && combined[2]) {
-    const threadTs = slackTimestampFromToken(combined[2])
-    if (threadTs) return slackThreadTarget(combined[1], threadTs, teamId)
-  }
-
-  const threadTs = defaultChannelId ? slackTimestampFromToken(token) : undefined
-  return threadTs ? slackThreadTarget(defaultChannelId, threadTs, teamId) : undefined
-}
-
-function slackCommandToken(token: string): string {
-  const trimmed = token.trim().replace(/^<|>$/g, '')
-  return trimmed.includes('|') ? trimmed.split('|')[0]! : trimmed
-}
-
-function slackTimestampFromToken(token: string): string | undefined {
-  const cleaned = token.replace(/^p/i, '')
-  if (/^\d{10}\.\d{6}$/.test(cleaned)) return cleaned
-  return slackTimestampFromCompact(cleaned)
-}
-
-function slackTimestampFromCompact(value: string): string | undefined {
-  const digits = value.replace(/\D/g, '')
-  if (digits.length < 16) return undefined
-  return `${digits.slice(0, -6)}.${digits.slice(-6)}`
-}
-
-function slackThreadTarget(channelId: string, threadTs: string, teamId?: string): SlackThreadTarget {
-  const threadKeys = [`slack:${channelId}:${threadTs}`]
-  if (teamId) threadKeys.push(`slack:${teamId}:${channelId}:${threadTs}`)
-  return {
-    channelId,
-    display: `${channelId}/${threadTs}`,
-    threadKeys: Array.from(new Set(threadKeys)),
-    threadTs
-  }
-}
-
-function isSlackChannelId(value: string): boolean {
-  return /^[CGD][A-Z0-9]+$/i.test(value)
-}
-
-async function updateThreadSteeringDefaults(
-  state: StateAdapter,
-  target: SlackThreadTarget,
-  patch: Partial<Pick<SlackbotV2SteeringDefaults, 'model' | 'reasoning'>>,
-  updatedBy?: string
-): Promise<void> {
-  const existing = await getThreadSteeringDefaultsByKeys(state, target.threadKeys)
-  const next: SlackbotV2SteeringDefaults = {
-    ...existing,
-    ...patch,
-    updatedAt: new Date().toISOString(),
-    ...(updatedBy ? { updatedBy } : {})
-  }
-  await Promise.all(target.threadKeys.map(threadKey => state.set(steeringStateKey(threadKey), next)))
-}
-
-async function getThreadSteeringDefaults(
-  state: StateAdapter,
-  threadKey: string,
-  options: SlackbotV2Options,
-  trace?: SlackbotV2Trace
-): Promise<SlackbotV2SteeringDefaults | undefined> {
-  const keys = steeringLookupKeys(threadKey)
-  try {
-    return await getThreadSteeringDefaultsByKeys(state, keys)
-  } catch (error) {
-    traceWarn(options, 'slackbotv2_steering_defaults_load_failed', trace, {
-      error: errorMessage(error),
-      thread_key: threadKey
-    })
-    return undefined
-  }
-}
-
-async function getThreadSteeringDefaultsByKeys(
-  state: StateAdapter,
-  threadKeys: readonly string[]
-): Promise<SlackbotV2SteeringDefaults | undefined> {
-  for (const threadKey of threadKeys) {
-    const value = await state.get<SlackbotV2SteeringDefaults>(steeringStateKey(threadKey))
-    if (value?.model || value?.reasoning) return value
-  }
-  return undefined
-}
-
-function steeringLookupKeys(threadKey: string): string[] {
-  const keys = [threadKey]
-  const parsed = parseSlackAssistantThreadId(threadKey)
-  if (parsed) keys.push(`slack:${parsed.channel}:${parsed.threadTs}`)
-  return Array.from(new Set(keys))
-}
-
-function steeringStateKey(threadKey: string): string {
-  return `${STEERING_STATE_KEY_PREFIX}:${threadKey}`
-}
-
-function steeringUsage(command: string): string {
-  const prefix = command ? `/${command}` : '/reasoning'
-  if (reasoningCommandEffort(command)) {
-    return `Usage: ${prefix} [Slack thread link or thread timestamp]`
-  }
-  if (command === 'reasoning' || command === 'think' || command === 'thinking') {
-    return `Usage: ${prefix} <effort> [Slack thread link or thread timestamp]`
-  }
-  return [
-    'Usage:',
-    '/medium [Slack thread link or thread timestamp]',
-    '/xhigh [Slack thread link or thread timestamp]',
-    '/reasoning medium [Slack thread link or thread timestamp]'
-  ].join('\n')
-}
-
-function slackCommandResponse(text: string, status = 200): Response {
-  return new globalThis.Response(
-    JSON.stringify({
-      response_type: 'ephemeral',
-      text
-    }),
-    {
-      headers: { 'content-type': 'application/json; charset=utf-8' },
-      status
-    }
-  )
-}
-
 /**
  * Persists a Slack thread update into the session API. In execute mode the create/append/execute
  * handoff completes before Slack is acknowledged; SSE rendering continues in background.
@@ -893,23 +554,12 @@ async function syncThreadMessageToSession(
   const serializedMessage = await serializeMessage(message)
   const overrides = extractMessageOverrides(serializedMessage.text)
   setMessageText(serializedMessage, overrides.cleanedText)
-  const steeringDefaults = await getThreadSteeringDefaults(input.state, thread.id, input.options, trace)
-  const model = overrides.model ?? steeringDefaults?.model
-  const reasoning = overrides.reasoning ?? steeringDefaults?.reasoning
   if (overrides.harnessType || overrides.model || overrides.provider || overrides.reasoning) {
     traceLog(input.options, 'slackbotv2_forward_overrides_parsed', trace, {
       harness_type: overrides.harnessType,
       model: overrides.model,
       provider: overrides.provider,
       reasoning: overrides.reasoning
-    })
-  }
-  if (steeringDefaults?.model || steeringDefaults?.reasoning) {
-    traceLog(input.options, 'slackbotv2_forward_steering_defaults_loaded', trace, {
-      model: steeringDefaults.model,
-      reasoning: steeringDefaults.reasoning,
-      model_applied: overrides.model ? false : Boolean(steeringDefaults.model),
-      reasoning_applied: overrides.reasoning ? false : Boolean(steeringDefaults.reasoning)
     })
   }
   traceLog(input.options, 'slackbotv2_forward_message_serialized', trace, {
@@ -956,9 +606,9 @@ async function syncThreadMessageToSession(
     // restarting the thread out from under an active execution would kill it.
     harnessType: shouldStartExecution ? overrides.harnessType : undefined,
     messages: messagesToAppend,
-    model,
+    model: overrides.model,
     provider: overrides.provider,
-    reasoning,
+    reasoning: overrides.reasoning,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },
