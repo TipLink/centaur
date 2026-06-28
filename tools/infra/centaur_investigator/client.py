@@ -18,6 +18,8 @@ from centaur_sdk import secret
 
 CENTAUR_POSTGRES_DSN_ENV = "CENTAUR_POSTGRES_DSN"
 CENTAUR_INVESTIGATOR_DATABASE_ENV = "CENTAUR_INVESTIGATOR_POSTGRES_DATABASE"
+CENTAUR_CURRENT_THREAD_ENV = "CENTAUR_THREAD_KEY"
+CENTAUR_INVESTIGATOR_OPERATOR_ENV = "CENTAUR_INVESTIGATOR_OPERATOR_MODE"
 DEFAULT_POSTGRES_DATABASE = "ai_v2"
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 200
@@ -89,6 +91,19 @@ def _connection_role(connection: dict[str, Any]) -> str | None:
     if not isinstance(row, dict):
         return None
     return str(row.get("active_role") or row.get("current_user") or "") or None
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _operator_mode_enabled() -> bool:
+    return _truthy_env(CENTAUR_INVESTIGATOR_OPERATOR_ENV)
+
+
+def _current_thread_key() -> str | None:
+    value = os.getenv(CENTAUR_CURRENT_THREAD_ENV, "").strip()  # noqa: TID251
+    return value or None
 
 
 def _normalize_ts(value: str | None) -> str | None:
@@ -285,6 +300,45 @@ def parse_slack_reference(reference: str) -> dict[str, Any]:
     }
 
 
+def _thread_key_equivalents(thread_key: str | None) -> list[str]:
+    if not thread_key:
+        return []
+    text = thread_key.strip()
+    if not text:
+        return []
+    values = [text]
+    parsed = parse_slack_reference(text)
+    if parsed.get("status") == "ok":
+        values.extend(str(value) for value in parsed.get("thread_key_candidates") or [] if value)
+    return _dedupe(values)
+
+
+def _thread_keys_intersect(left: list[str], right: list[str]) -> bool:
+    left_values: set[str] = set()
+    for value in left:
+        left_values.update(_thread_key_equivalents(value))
+    right_values: set[str] = set()
+    for value in right:
+        right_values.update(_thread_key_equivalents(value))
+    return bool(left_values & right_values)
+
+
+def _parsed_for_thread_key(thread_key: str) -> dict[str, Any]:
+    parsed = parse_slack_reference(thread_key)
+    if parsed.get("status") == "ok":
+        return parsed
+    return {
+        "status": "ok",
+        "kind": "thread_key",
+        "thread_key": thread_key.strip(),
+        "thread_key_candidates": [thread_key.strip()],
+        "thread_key_like": None,
+        "channel_key_like": None,
+        "channel_id": None,
+        "thread_ts": None,
+    }
+
+
 def _safe_load_module(module_name: str, path: Path) -> Any | None:
     if not path.exists():
         return None
@@ -301,6 +355,63 @@ class CentaurInvestigatorClient:
 
     def __init__(self, database_url: str | None = None) -> None:
         self._database_url = (database_url or _scoped_database_url()).strip()
+
+    @staticmethod
+    def _scope_error(target: str) -> dict[str, Any]:
+        current = _current_thread_key()
+        if current:
+            error = (
+                "centaur-investigator is self-scoped by default and cannot inspect "
+                f"{target!r} from current thread {current!r}. "
+                f"Set {CENTAUR_INVESTIGATOR_OPERATOR_ENV}=1 only in an operator sandbox."
+            )
+        else:
+            error = (
+                "centaur-investigator is self-scoped by default and requires "
+                f"{CENTAUR_CURRENT_THREAD_ENV}. Set {CENTAUR_INVESTIGATOR_OPERATOR_ENV}=1 "
+                "only in an operator sandbox for cross-thread investigation."
+            )
+        return {"status": "error", "error": error}
+
+    @staticmethod
+    def _authorize_thread_candidates(
+        candidates: list[str],
+        *,
+        target: str,
+    ) -> dict[str, Any]:
+        if _operator_mode_enabled():
+            return {
+                "status": "ok",
+                "scope": "operator",
+                "current_thread_key": _current_thread_key(),
+            }
+        current = _current_thread_key()
+        if not current:
+            return CentaurInvestigatorClient._scope_error(target)
+        if not _thread_keys_intersect([current], candidates):
+            return CentaurInvestigatorClient._scope_error(target)
+        return {"status": "ok", "scope": "self", "current_thread_key": current}
+
+    @staticmethod
+    def _apply_self_scope(parsed: dict[str, Any], authz: dict[str, Any]) -> dict[str, Any]:
+        if authz.get("scope") != "self":
+            return parsed
+        current = str(authz.get("current_thread_key") or "").strip()
+        candidates = _dedupe(
+            _thread_key_equivalents(current)
+            + [
+                str(value)
+                for value in parsed.get("thread_key_candidates") or []
+                if value and _thread_keys_intersect([current], [str(value)])
+            ]
+        )
+        scoped = dict(parsed)
+        scoped["thread_key"] = current or scoped.get("thread_key")
+        scoped["thread_key_candidates"] = candidates or [current]
+        scoped["thread_key_like"] = None
+        scoped["channel_key_like"] = None
+        scoped["scope"] = "self"
+        return scoped
 
     def _require_database_url(self) -> str:
         if not self._database_url:
@@ -359,24 +470,26 @@ class CentaurInvestigatorClient:
         if not thread_key.strip() or not _KEY_SOURCE_RE.match(thread_key):
             return {"status": "error", "error": "thread_key must be namespaced"}
 
+        parsed = _parsed_for_thread_key(thread_key.strip())
+        authz = self._authorize_thread_candidates(
+            [str(value) for value in parsed.get("thread_key_candidates") or [thread_key.strip()]],
+            target=thread_key.strip(),
+        )
+        if authz.get("status") != "ok":
+            return authz
+        parsed = self._apply_self_scope(parsed, authz)
+
         conn = await self._connect()
         try:
             result = await self._collect_state(
                 conn,
-                parsed={
-                    "kind": "thread_key",
-                    "thread_key": thread_key.strip(),
-                    "thread_key_candidates": [thread_key.strip()],
-                    "thread_key_like": None,
-                    "channel_key_like": None,
-                    "channel_id": None,
-                    "thread_ts": None,
-                },
+                parsed=parsed,
                 limit=limit,
             )
         finally:
             await conn.close()
 
+        result["scope"] = authz.get("scope")
         if include_observability:
             result["observability"] = self._observability(
                 thread_keys=result.get("thread_keys") or [thread_key.strip()],
@@ -407,6 +520,84 @@ class CentaurInvestigatorClient:
             )
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
+
+    def self_state(
+        self,
+        limit: int = DEFAULT_LIMIT,
+        include_observability: bool = True,
+        window_hours: int = DEFAULT_WINDOW_HOURS,
+        logs_limit: int = 100,
+    ) -> dict[str, Any]:
+        """Inspect only the current sandbox thread."""
+        thread_key = _current_thread_key()
+        if not thread_key:
+            return self._scope_error("current thread")
+        result = self.session_state(
+            thread_key,
+            limit=limit,
+            include_observability=include_observability,
+            window_hours=window_hours,
+            logs_limit=logs_limit,
+        )
+        if result.get("status") == "error" and not _operator_mode_enabled():
+            return self._local_self_state(
+                thread_key,
+                postgres_error=str(result.get("error") or "Postgres state unavailable"),
+                include_observability=include_observability,
+                window_hours=_clamp(window_hours, minimum=1, maximum=MAX_WINDOW_HOURS),
+                logs_limit=_clamp(logs_limit, minimum=1, maximum=MAX_LOG_LIMIT),
+            )
+        return result
+
+    def _local_self_state(
+        self,
+        thread_key: str,
+        *,
+        postgres_error: str,
+        include_observability: bool,
+        window_hours: int,
+        logs_limit: int,
+    ) -> dict[str, Any]:
+        parsed = self._apply_self_scope(
+            _parsed_for_thread_key(thread_key),
+            {"status": "ok", "scope": "self", "current_thread_key": thread_key},
+        )
+        thread_keys = parsed.get("thread_key_candidates") or [thread_key]
+        result: dict[str, Any] = {
+            "status": "ok",
+            "scope": "self",
+            "parsed": parsed,
+            "thread_keys": thread_keys,
+            "execution_ids": [],
+            "analysis": {
+                "summary": (
+                    "Current sandbox thread scope resolved. Postgres session state is unavailable."
+                ),
+                "findings": ["Resolved current sandbox thread key from CENTAUR_THREAD_KEY."],
+                "warnings": [postgres_error],
+                "primary_source": "local_sandbox_context",
+            },
+            "sandbox": {
+                "hostname": os.getenv("HOSTNAME", ""),
+                "workload": os.getenv("CENTAUR_WORKLOAD", ""),
+                "harness_type": os.getenv("CENTAUR_HARNESS_TYPE", ""),
+                "observability_enabled": os.getenv("CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", ""),
+                "repo_cache_enabled": os.getenv("CENTAUR_SANDBOX_REPO_CACHE_ENABLED", ""),
+                "cwd": str(Path.cwd()),
+            },
+            "postgres": {
+                "status": "unavailable",
+                "error": postgres_error,
+            },
+        }
+        if include_observability:
+            result["observability"] = self._observability(
+                thread_keys=[str(value) for value in thread_keys if value],
+                execution_ids=[],
+                window_hours=window_hours,
+                logs_limit=logs_limit,
+            )
+        return result
 
     async def _collect_state(
         self,
@@ -1059,6 +1250,13 @@ class CentaurInvestigatorClient:
         parsed = parse_slack_reference(reference)
         if parsed.get("status") != "ok":
             return parsed
+        authz = self._authorize_thread_candidates(
+            [str(value) for value in parsed.get("thread_key_candidates") or [] if value],
+            target=reference,
+        )
+        if authz.get("status") != "ok":
+            return authz
+        parsed = self._apply_self_scope(parsed, authz)
 
         conn = await self._connect()
         try:
@@ -1066,6 +1264,7 @@ class CentaurInvestigatorClient:
         finally:
             await conn.close()
 
+        result["scope"] = authz.get("scope")
         if include_observability:
             result["observability"] = self._observability(
                 thread_keys=result.get("thread_keys") or parsed.get("thread_key_candidates") or [],
@@ -1137,6 +1336,15 @@ class CentaurInvestigatorClient:
         status: str,
         limit: int,
     ) -> dict[str, Any]:
+        if not _operator_mode_enabled():
+            return {
+                "status": "error",
+                "error": (
+                    "search-sessions is an operator-only command because it scans multiple "
+                    f"threads. Use `centaur-investigator self`, or set "
+                    f"{CENTAUR_INVESTIGATOR_OPERATOR_ENV}=1 only in an operator sandbox."
+                ),
+            }
         conn = await self._connect()
         try:
             rows = await conn.fetch(
