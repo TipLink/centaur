@@ -21,7 +21,7 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, ToolSource, ToolsConfig,
+    OtlpEgressTarget, OverlayImageConfig, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -580,6 +580,8 @@ struct SandboxArgs {
     centaur_api_url: Option<String>,
     #[arg(long = "repos-path", env = "REPOS_PATH")]
     repos_path: Option<String>,
+    #[arg(long = "repos-pvc", env = "REPOS_PVC")]
+    repos_pvc: Option<String>,
     #[arg(
         long = "session-sandbox-passthrough-env",
         env = "SESSION_SANDBOX_PASSTHROUGH_ENV",
@@ -593,6 +595,31 @@ struct SandboxArgs {
     /// `OTEL_SERVICE_NAME`, NO_PROXY extras) into every codex sandbox.
     #[arg(long = "session-sandbox-extra-env", env = "SESSION_SANDBOX_EXTRA_ENV")]
     extra_env_json: Option<String>,
+    #[arg(long = "centaur-overlay-image", env = "CENTAUR_OVERLAY_IMAGE")]
+    overlay_image: Option<String>,
+    #[arg(
+        long = "centaur-overlay-image-pull-policy",
+        env = "CENTAUR_OVERLAY_IMAGE_PULL_POLICY"
+    )]
+    overlay_image_pull_policy: Option<String>,
+    #[arg(
+        long = "centaur-overlay-image-source-path",
+        env = "CENTAUR_OVERLAY_IMAGE_SOURCE_PATH",
+        default_value = "/overlay"
+    )]
+    overlay_image_source_path: String,
+    #[arg(
+        long = "centaur-overlay-dir",
+        env = "CENTAUR_OVERLAY_DIR",
+        default_value = "/app/overlay/org"
+    )]
+    _overlay_dir: String,
+    #[arg(
+        long = "centaur-sandbox-overlay-dir",
+        env = "CENTAUR_SANDBOX_OVERLAY_DIR",
+        default_value = "/home/agent/overlay/org"
+    )]
+    sandbox_overlay_dir: String,
     #[command(flatten)]
     tools: ToolDiscoveryArgs,
     #[command(flatten)]
@@ -839,13 +866,7 @@ impl SandboxArgs {
             && let Some(repos_path) = clean_optional_value(self.repos_path.as_deref())
         {
             spec = spec.mount(
-                Mount::new(
-                    MountKind::Bind {
-                        source_path: repos_path,
-                    },
-                    SANDBOX_REPOS_MOUNT_PATH,
-                )
-                .read_only(),
+                Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH).read_only(),
             );
         }
         for (name, value) in self.workflow_host_env_template()? {
@@ -920,17 +941,21 @@ impl SandboxArgs {
                 );
                 if let Some(repos_path) = clean_optional_value(self.repos_path.as_deref()) {
                     workload = workload.mount(
-                        Mount::new(
-                            MountKind::Bind {
-                                source_path: repos_path,
-                            },
-                            SANDBOX_REPOS_MOUNT_PATH,
-                        )
-                        .read_only(),
+                        Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH)
+                            .read_only(),
                     );
                 }
                 Ok(workload)
             }
+        }
+    }
+
+    fn repos_mount_kind(&self, repos_path: String) -> MountKind {
+        if let Some(claim_name) = clean_optional_value(self.repos_pvc.as_deref()) {
+            return MountKind::NamedVolume(claim_name);
+        }
+        MountKind::Bind {
+            source_path: repos_path,
         }
     }
 
@@ -1340,6 +1365,16 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         }
         config.iron_control = args.iron_control.settings();
         config.tools = args.tools_source.to_config();
+        if let Some(image) = clean_optional_value(args.overlay_image.as_deref()) {
+            config.overlay_image = Some(OverlayImageConfig {
+                image,
+                image_pull_policy: clean_optional_value(args.overlay_image_pull_policy.as_deref()),
+                source_path: clean_optional_value(Some(args.overlay_image_source_path.as_str()))
+                    .unwrap_or_else(|| "/overlay".to_owned()),
+                mount_path: clean_optional_value(Some(args.sandbox_overlay_dir.as_str()))
+                    .unwrap_or_else(|| "/home/agent/overlay/org".to_owned()),
+            });
+        }
         // Direct harness OTLP export (codex usage/cost spans) needs a hole in
         // the per-sandbox egress NetworkPolicy; derived from the sandbox's own
         // OTLP endpoint env so there is a single source of truth.
@@ -1417,6 +1452,14 @@ struct ToolsArgs {
         env = "KUBERNETES_TOOLS_REPO_CACHE_PATH"
     )]
     repo_cache_path: Option<String>,
+    // Optional PVC claim backing the repo-cache root. When set, sandbox pods mount
+    // the repo cache from this PVC instead of using a hostPath.
+    #[arg(
+        id = "tools_repo_cache_pvc",
+        long = "kubernetes-tools-repo-cache-pvc",
+        env = "KUBERNETES_TOOLS_REPO_CACHE_PVC"
+    )]
+    repo_cache_pvc: Option<String>,
     #[arg(
         id = "tools_extra_sources",
         long = "kubernetes-tools-extra-sources",
@@ -1469,6 +1512,7 @@ impl ToolsArgs {
             });
         }
         config.repo_cache_path = clean_optional_value(self.repo_cache_path.as_deref());
+        config.repo_cache_pvc = clean_optional_value(self.repo_cache_pvc.as_deref());
         config.extra_sources = self.extra_sources();
         Some(config)
     }
@@ -2075,6 +2119,40 @@ mod tests {
     }
 
     #[test]
+    fn agent_k8s_config_reads_overlay_image_from_flags() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--centaur-overlay-image",
+            "ghcr.io/tiplink/fineas-centaur-overlay:sha-test",
+            "--centaur-overlay-image-pull-policy",
+            "Always",
+            "--centaur-overlay-image-source-path",
+            "/overlay",
+            "--centaur-overlay-dir",
+            "/app/overlay/org",
+            "--centaur-sandbox-overlay-dir",
+            "/home/agent/overlay/org",
+        ])
+        .unwrap();
+
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let overlay = config.overlay_image.expect("overlay image should be set");
+        assert_eq!(
+            overlay.image,
+            "ghcr.io/tiplink/fineas-centaur-overlay:sha-test"
+        );
+        assert_eq!(overlay.image_pull_policy.as_deref(), Some("Always"));
+        assert_eq!(overlay.source_path, "/overlay");
+        assert_eq!(overlay.mount_path, "/home/agent/overlay/org");
+    }
+
+    #[test]
     fn tools_config_read_from_flags() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2215,6 +2293,32 @@ mod tests {
                 "/home/agent/github/paradigmxyz/centaur/workflows:/home/agent/github/tempoxyz/centaur-tempo/workflows"
             )
         );
+    }
+
+    #[test]
+    fn agent_k8s_workflow_host_mounts_repos_pvc_read_only() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--repos-path",
+            "/var/lib/centaur/repos",
+            "--repos-pvc",
+            "centaur-repo-cache",
+        ])
+        .unwrap();
+
+        let spec = args.sandbox.workflow_host_spec(None).unwrap();
+
+        assert!(spec.mounts.iter().any(|mount| {
+            mount.target_path == SANDBOX_REPOS_MOUNT_PATH
+                && mount.read_only
+                && mount.kind == MountKind::NamedVolume("centaur-repo-cache".to_owned())
+        }));
     }
 
     #[test]
@@ -2633,6 +2737,33 @@ mod tests {
                     == (MountKind::Bind {
                         source_path: "/var/lib/centaur/repos".to_owned(),
                     })
+        }));
+    }
+
+    #[test]
+    fn codex_workload_mounts_repos_pvc_read_only() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--repos-path",
+            "/var/lib/centaur/repos",
+            "--repos-pvc",
+            "centaur-repo-cache",
+        ])
+        .unwrap();
+
+        let workload = args.sandbox.container_workload_mode().unwrap();
+        let SandboxWorkloadMode::CodexAppServer { mounts, .. } = workload else {
+            panic!("expected codex app server workload");
+        };
+
+        assert!(mounts.iter().any(|mount| {
+            mount.target_path == SANDBOX_REPOS_MOUNT_PATH
+                && mount.read_only
+                && mount.kind == MountKind::NamedVolume("centaur-repo-cache".to_owned())
         }));
     }
 

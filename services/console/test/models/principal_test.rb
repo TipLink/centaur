@@ -50,6 +50,14 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal({}, principal.reload.labels)
   end
 
+  test "sandbox access defaults to enabled" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-default-sandbox-access"))
+    principal.reload
+
+    assert_predicate principal, :sandbox_repo_cache_enabled
+    assert_predicate principal, :sandbox_observability_enabled
+  end
+
   test "labels accepts arbitrary string map" do
     principal = Principal.create!(default_attrs(
       namespace: "acme",
@@ -153,6 +161,16 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal({ "type" => "workload_identity" }, transforms.first.dig("config", "credentials_provider"))
   end
 
+  test "sync_transforms emits a gcp_id_token transform per granted GcpIdTokenSecret" do
+    transforms = principal_with_grants(gcp_id_token_secrets(:acme_cloud_run)).sync_transforms
+    assert_equal 1, transforms.length
+    transform = transforms.first
+    assert_equal "gcp_id_token", transform["name"]
+    assert_equal({ "type" => "env", "var" => "CLOUD_RUN_SA_KEYFILE" }, transform.dig("config", "keyfile"))
+    assert_equal "https://my-service-abc123-uc.a.run.app", transform.dig("config", "audience")
+    assert_equal "x-serverless-authorization", transform.dig("config", "header")
+  end
+
   test "sync_transforms emits an aws_auth transform per granted AwsAuthSecret" do
     transforms = principal_with_grants(aws_auth_secrets(:acme_cloudwatch_aws)).sync_transforms
     aws = transforms.find { |t| t["name"] == "aws_auth" }
@@ -176,7 +194,7 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_empty principals(:globex_user).sync_transforms
   end
 
-  test "sync_postgres emits a DSN entry per granted PgDsnSecret, keyed by foreign_id" do
+  test "sync_postgres emits a DSN entry per granted PgDsnSecret with foreign_id" do
     entries = principal_with_grants(pg_dsn_secrets(:acme_analytics_pg)).sync_postgres
     assert_equal 1, entries.length
     assert_equal pg_dsn_secrets(:acme_analytics_pg).foreign_id, entries.first["foreign_id"]
@@ -204,6 +222,29 @@ class PrincipalTest < ActiveSupport::TestCase
       ],
       entry["settings"]
     )
+  end
+
+  test "sync_postgres emits only the highest-priority route for each database" do
+    principal = principals(:globex_user)
+    low = pg_dsn_secrets(:acme_analytics_pg)
+    high = PgDsnSecret.new(
+      namespace: low.namespace,
+      foreign_id: "pg-analytics-privileged",
+      name: "analytics privileged",
+      database: low.database,
+      role: "centaur_readonly",
+      created_by: users(:acme_admin)
+    )
+    high.build_dsn_source(source_type: "env", config: { "var" => "PG_PRIVILEGED_DSN" })
+    high.save!
+
+    Grant.create!(principal: principal, pg_dsn_secret: low, created_by: users(:acme_admin), priority: 0)
+    Grant.create!(principal: principal, pg_dsn_secret: high, created_by: users(:acme_admin), priority: 100)
+
+    entries = principal.sync_postgres
+    assert_equal 1, entries.length
+    assert_equal "pg-analytics-privileged", entries.first["foreign_id"]
+    assert_equal "PG_PRIVILEGED_DSN", entries.first.dig("dsn", "var")
   end
 
   test "sync_postgres is empty without pg_dsn grants" do
@@ -266,45 +307,45 @@ class PrincipalTest < ActiveSupport::TestCase
   # Builds a static secret injecting `header` on `host`, granted directly to
   # globex_user (priority 100).
   def grant_direct_static(host:, header:)
-    credential = StaticSecret.new(namespace: "globex", foreign_id: "static-#{SecureRandom.hex(4)}",
-                                  inject_config: { "header" => header, "formatter" => "Bearer {{ .Value }}" },
-                                  created_by: users(:globex_admin))
-    credential.build_source(source_type: "control_plane", secret: "direct-token")
-    credential.rules.build(host: host, position: 0)
-    credential.save!
-    grant_to_globex_principal(credential)
-    credential
+    secret = StaticSecret.new(namespace: "globex", foreign_id: "static-#{SecureRandom.hex(4)}",
+                              inject_config: { "header" => header, "formatter" => "Bearer {{ .Value }}" },
+                              created_by: users(:globex_admin))
+    secret.build_source(source_type: "control_plane", secret: "direct-token")
+    secret.rules.build(host: host, position: 0)
+    secret.save!
+    Grant.create!(principal: principals(:globex_user), static_secret: secret, created_by: users(:globex_admin))
+    secret
   end
 
   # Builds a gcp_auth secret (writes Authorization) matching `host`, granted to
   # globex_user through the globex_infra role (priority 0).
   def grant_role_gcp(host:)
     PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
-    credential = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
-                                   credentials_provider: { "type" => "workload_identity" },
-                                   scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
-                                   created_by: users(:globex_admin))
-    credential.rules.build(host: host, position: 0)
-    credential.save!
-    grant_to_globex_infra(credential)
-    credential
+    secret = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
+                               credentials_provider: { "type" => "workload_identity" },
+                               scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
+                               created_by: users(:globex_admin))
+    secret.rules.build(host: host, position: 0)
+    secret.save!
+    Grant.create!(role: roles(:globex_infra), gcp_auth_secret: secret, created_by: users(:globex_admin))
+    secret
   end
 
   def grant_direct_gcp(host:)
-    credential = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
-                                   credentials_provider: { "type" => "workload_identity" },
-                                   scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
-                                   created_by: users(:globex_admin))
-    credential.rules.build(host: host, position: 0)
-    credential.save!
-    grant_to_globex_principal(credential)
-    credential
+    secret = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
+                               credentials_provider: { "type" => "workload_identity" },
+                               scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
+                               created_by: users(:globex_admin))
+    secret.rules.build(host: host, position: 0)
+    secret.save!
+    Grant.create!(principal: principals(:globex_user), gcp_auth_secret: secret, created_by: users(:globex_admin))
+    secret
   end
 
-  def grant_role_oauth(oauth_record = nil)
+  def grant_role_oauth(secret = nil)
     PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
-    unless oauth_record
-      oauth_record = OauthTokenSecret.new(
+    unless secret
+      secret = OauthTokenSecret.new(
         namespace: "globex",
         foreign_id: "oauth-#{SecureRandom.hex(4)}",
         name: "gmail",
@@ -313,29 +354,15 @@ class PrincipalTest < ActiveSupport::TestCase
         scopes: [ "https://www.googleapis.com/auth/gmail.readonly" ],
         created_by: users(:globex_admin)
       )
-      oauth_record.sources.build(source_type: "1password", config: { "secret_ref" => "op://eng/gmail/refresh-token" },
-                                 role: "refresh_token", role_kind: "credential_field")
-      oauth_record.sources.build(source_type: "env", config: { "var" => "GMAIL_CLIENT_ID" },
-                                 role: "client_id", role_kind: "credential_field")
-      oauth_record.rules.build(host: "gmail.googleapis.com", http_methods: [ "GET" ], paths: [], position: 0)
-      oauth_record.save!
+      secret.sources.build(source_type: "1password", config: { "secret_ref" => "op://eng/gmail/refresh-token" },
+                           role: "refresh_token", role_kind: "credential_field")
+      secret.sources.build(source_type: "env", config: { "var" => "GMAIL_CLIENT_ID" },
+                           role: "client_id", role_kind: "credential_field")
+      secret.rules.build(host: "gmail.googleapis.com", http_methods: [ "GET" ], paths: [], position: 0)
+      secret.save!
     end
-    grant_to_globex_infra(oauth_record)
-    oauth_record
-  end
-
-  def grant_to_globex_principal(credential)
-    Grant.create!(principal: principals(:globex_user), grantable_assoc(credential) => credential,
-                  created_by: users(:globex_admin))
-  end
-
-  def grant_to_globex_infra(credential)
-    Grant.create!(role: roles(:globex_infra), grantable_assoc(credential) => credential,
-                  created_by: users(:globex_admin))
-  end
-
-  def grantable_assoc(credential)
-    credential.class.model_name.singular.to_sym
+    Grant.create!(role: roles(:globex_infra), oauth_token_secret: secret, created_by: users(:globex_admin))
+    secret
   end
 
   test "a direct static secret suppresses a role-granted transform on the same host and header" do

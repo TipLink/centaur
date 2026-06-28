@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/publish-images.yml
       - services/**
+      - crates/harness-server/**
       - centaur_sdk/**
       - packages/**
       - tools/**
@@ -24,6 +25,7 @@ concurrency:
 
 permissions:
   contents: read
+  id-token: write
   packages: write
   pull-requests: read
 
@@ -31,24 +33,24 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: tiplink/centaur
   IMAGE_SOURCE: https://github.com/TipLink/centaur
-  # Main/tags keep optimized release images. PRs and manual branch publishes
-  # use debug builds so staging/dev iteration does not spend minutes optimizing
-  # Rust binaries that are immediately replaced by the next test build.
-  RUST_BUILD_PROFILE: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && 'debug' || 'release' }}
+  # Main/tags keep optimized release images. PRs and manual non-release
+  # branch publishes use debug builds so staging/dev iteration does not spend
+  # minutes optimizing Rust binaries that are immediately replaced by the next
+  # test build.
+  RUST_BUILD_PROFILE: ${{ (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v'))) && 'debug' || 'release' }}
 
 jobs:
-  # Build each image natively per platform (amd64 on x64 runners, arm64 on
-  # arm runners — no QEMU emulation), push by digest, and hand the digests
-  # to the merge job below which assembles the multi-arch manifest.
-  # arm64 is only built on pushes to main and release tags — PR and manual
-  # dispatch builds stay amd64-only to keep iteration fast.
+  # Build each image with Depot's hosted builders, push by digest, and hand
+  # the digests to the merge job below which assembles the multi-arch manifest.
+  # arm64 is built for release publishes. PR and manual non-release branch
+  # builds stay amd64-only to keep iteration fast.
   build:
-    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16' }}
     strategy:
       fail-fast: false
       matrix:
-        service: [api-rs, slackbotv2, agent, iron-proxy, console]
-        platform: ${{ github.event_name == 'push' && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
+        service: [api-rs, slackbotv2, linearbot, discordbot, teamsbot, agent, iron-proxy, console]
+        platform: ${{ (github.event_name == 'push' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
         include:
           - service: api-rs
             image: centaur-api-rs
@@ -60,10 +62,20 @@ jobs:
             context: .
             dockerfile: services/slackbotv2/Dockerfile
             target: ""
+          - service: linearbot
+            image: centaur-linearbot
+            context: .
+            dockerfile: services/linearbot/Dockerfile
+            target: ""
           - service: discordbot
             image: centaur-discordbot
             context: .
             dockerfile: services/discordbot/Dockerfile
+            target: ""
+          - service: teamsbot
+            image: centaur-teamsbot
+            context: .
+            dockerfile: services/teamsbot/Dockerfile
             target: ""
           - service: agent
             image: centaur-agent
@@ -92,8 +104,8 @@ jobs:
           platform="${{ matrix.platform }}"
           echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Set up Depot
+        uses: depot/setup-action@15c09a5f77a0840ad4bce955686522a257853461 # v1.7.1
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -115,8 +127,9 @@ jobs:
 
       - name: Build and push ${{ matrix.image }} (${{ matrix.platform }})
         id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: depot/build-push-action@98e78adca7817480b8185f474a400b451d74e287 # v1.18.0
         with:
+          project: d8qqlh1bmq
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
@@ -128,14 +141,6 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ !github.event.pull_request.head.repo.fork }}
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.PLATFORM_SLUG }}
-            type=gha,scope=${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
-          # Fork PRs run with a read-only GITHUB_TOKEN: exporting the registry
-          # cache would fail the build, so only export it when we can push.
-          cache-to: |
-            ${{ !github.event.pull_request.head.repo.fork && format('type=registry,ref={0}/{1}/{2}:buildcache-{3},mode=max', env.REGISTRY, env.IMAGE_NAMESPACE, matrix.image, env.PLATFORM_SLUG) || '' }}
-            type=gha,mode=max,scope=${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
 
       - name: Export digest
         if: ${{ !github.event.pull_request.head.repo.fork }}
@@ -154,7 +159,7 @@ jobs:
           retention-days: 1
 
   merge:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: build
     if: ${{ !github.event.pull_request.head.repo.fork }}
     strategy:
@@ -163,10 +168,12 @@ jobs:
         include:
           - image: centaur-api-rs
           - image: centaur-slackbotv2
+          - image: centaur-linearbot
           - image: centaur-agent
           - image: centaur-iron-proxy
           - image: centaur-console
           - image: centaur-discordbot
+          - image: centaur-teamsbot
 
     steps:
       - name: Download digests
@@ -210,9 +217,18 @@ jobs:
       - name: Create multi-arch manifest for ${{ matrix.image }}
         working-directory: ${{ runner.temp }}/digests
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}@sha256:%s ' *)
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=("-t" "$tag")
+          done
+
+          image_refs=()
+          for digest in *; do
+            image_refs+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${image_refs[@]}"
 
       - name: Inspect manifest
         run: |

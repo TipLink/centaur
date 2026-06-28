@@ -1,6 +1,6 @@
 [project]
 name = "company_context"
-description = "Search indexed company history across multiple sources. Prefer this over direct Slack search for historical queries. Current sources: Slack, Google Drive, Google Calendar, Linear."
+description = "Search indexed company history and user-visible Slack DMs. Prefer this over direct Slack search for historical queries. Current sources: Slack, Slack DMs, Google Drive, Google Calendar, Linear."
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -8,6 +8,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
     "slack-sdk>=3.27.0",
+    "structlog>=24.4.0",
     "typer>=0.12.0",
 ]
 
@@ -27,5 +28,14 @@ packages = ["."]
 [tool.centaur]
 module = "client.py"
 secrets = [
-    {type = "pg_dsn", name = "COMPANY_CONTEXT_DSN", database = "ai_v2", secret_ref = "DATABASE_URL", role = "centaur_slack_reader", settings = [{name = "centaur.slack_channel_id", value_from = {principal_label = "slack_channel_id"}}]},
+    {type = "pg_dsn", name = "CENTAUR_POSTGRES_DSN", secret_ref = "DATABASE_URL", database = "ai_v2", role = "centaur_slack_reader", settings = [
+        {name = "centaur.slack_channel_id", value_from = {principal_label = "slack_channel_id"}},
+        {name = "centaur.slack_team_id", value_from = {principal_label = "slack_team_id"}},
+        {name = "centaur.slack_user_id", value_from = {principal_label = "slack_user_id"}},
+        {name = "centaur.google_subject", value_from = {principal_label = "google_subject"}},
+        {name = "centaur.google_email", value_from = {principal_label = "google_email"}},
+    ]},
+]
+optional_secrets = [
+    {type = "http", name = "SLACK_SEARCH_TOKEN", mode = "inject", inject_header = "Authorization", inject_formatter = "Bearer {{ .Value }}", hosts = ["slack.com"]},
 ]

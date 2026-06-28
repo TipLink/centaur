@@ -4,17 +4,39 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import json
-from datetime import datetime
+import json  # noqa: E402
+from datetime import datetime  # noqa: E402
 
-import typer
-from rich.console import Console
+import typer  # noqa: E402
+from rich.console import Console  # noqa: E402
 
-from centaur_sdk import Table
+from centaur_sdk import Table  # noqa: E402
 
-from .client import _client
+from .client import _client  # noqa: E402
 
 app = typer.Typer(name="twitter", help="Twitter CLI")
+
+
+@app.command("health")
+def health():
+    """Assert twitter connectivity and auth with a safe read-only check."""
+    from .client import _client
+
+    client = _client()
+    try:
+        details = client.get_usage()
+        payload = {"ok": True, "tool": "twitter", "error": None, "details": details}
+    except Exception as exc:
+        payload = {"ok": False, "tool": "twitter", "error": str(exc), "details": {}}
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        raise typer.Exit(1) from exc
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+
+
 console = Console()
 
 
@@ -454,7 +476,7 @@ def usage():
     api_usage = client.get_usage()
 
     console.print("\n[bold]API Usage[/bold]\n")
-    console.print(f"Remaining units: [green]{format_number(api_usage.remaining_units)}[/green]")
+    console.print(api_usage.get("message", "No usage information returned."))
 
 
 if __name__ == "__main__":

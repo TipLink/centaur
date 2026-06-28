@@ -31,9 +31,13 @@ module Api
         assert_response :ok
         data = json_body.fetch("data")
         assert_equal "https://oauth2.googleapis.com/token", data["token_endpoint"]
-        assert_equal "oauth_refresh_token", data["credential_kind"]
         assert_equal "gmail-client-id", data["client_id"]
+        assert_equal "refresh_token", data["grant"]
+        refute data.key?("credential_kind")
         refute data.key?("client_secret")
+        refute data.key?("username")
+        refute data.key?("password")
+        refute data.key?("api_key")
         refute data.key?("access_token")
         refute data.key?("refresh_token")
       end
@@ -72,7 +76,8 @@ module Api
         assert_response :created
         data = json_body.fetch("data")
         assert_equal "the-client-id", data["client_id"]
-        assert_equal "oauth_refresh_token", data["credential_kind"]
+        assert_equal "refresh_token", data["grant"]
+        refute data.key?("credential_kind")
         refute data.key?("client_secret")
         refute data.key?("refresh_token")
         assert_equal [ "X-Api-Key" ], data["token_endpoint_header_names"]
@@ -88,6 +93,33 @@ module Api
         body = {
           data: {
             namespace: "acme", foreign_id: "fineas-github-app",
+            grant: "github_app_installation",
+            token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+            client_id: "12345",
+            client_secret: "-----BEGIN RSA PRIVATE KEY-----\nprivate\n-----END RSA PRIVATE KEY-----"
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "github_app_installation", data["grant"]
+        assert_equal "12345", data["client_id"]
+        refute data.key?("credential_kind")
+        refute data.key?("client_secret")
+        refute data.key?("refresh_token")
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_nil created.refresh_token
+        assert_equal "-----BEGIN RSA PRIVATE KEY-----\nprivate\n-----END RSA PRIVATE KEY-----", created.client_secret
+      end
+
+      test "create maps legacy credential_kind to grant" do
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "fineas-github-app-legacy",
             credential_kind: "github_app_installation",
             token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
             client_id: "12345",
@@ -100,14 +132,72 @@ module Api
         end
         assert_response :created
         data = json_body.fetch("data")
-        assert_equal "github_app_installation", data["credential_kind"]
-        assert_equal "12345", data["client_id"]
-        refute data.key?("client_secret")
-        refute data.key?("refresh_token")
+        assert_equal "github_app_installation", data["grant"]
+        refute data.key?("credential_kind")
 
         created = BrokerCredential.find_by_oid(data["id"])
         assert_nil created.refresh_token
-        assert_equal "-----BEGIN RSA PRIVATE KEY-----\nprivate\n-----END RSA PRIVATE KEY-----", created.client_secret
+        assert_equal "github_app_installation", created.grant
+      end
+
+      test "create password grant stores initial values and redacts secrets" do
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "password-provider",
+            grant: "password",
+            token_endpoint: "https://auth.example.com/token",
+            client_id: "password-client",
+            client_secret: "password-secret",
+            username: "password-user",
+            password: "password-value",
+            token_endpoint_headers: { "x-api-key" => "password-key" }
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "password", data["grant"]
+        refute data.key?("client_secret")
+        refute data.key?("username")
+        refute data.key?("password")
+        assert_equal [ "x-api-key" ], data["token_endpoint_header_names"]
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_equal "password-user", created.username
+        assert_equal "password-value", created.password
+        assert_equal "password-secret", created.client_secret
+        assert_equal({ "x-api-key" => "password-key" }, created.token_endpoint_headers)
+        assert created.next_attempt_at.present?
+      end
+
+      test "create preqin grant stores username and API key and redacts secrets" do
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "preqin",
+            grant: "preqin",
+            username: "preqin-user",
+            api_key: "preqin-api-key"
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "preqin", data["grant"]
+        assert_equal BrokerCredential::PREQIN_TOKEN_ENDPOINT, data["token_endpoint"]
+        assert_nil data["client_id"]
+        refute data.key?("username")
+        refute data.key?("api_key")
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_equal "preqin-user", created.username
+        assert_equal "preqin-api-key", created.api_key
+        assert created.next_attempt_at.present?
       end
 
       test "create rejects a missing client_id" do
@@ -124,6 +214,38 @@ module Api
         assert_response :unprocessable_entity
       end
 
+      test "create password grant rejects missing password" do
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "password-incomplete",
+            grant: "password",
+            token_endpoint: "https://idp.example/token",
+            client_id: "cid",
+            username: "user"
+          }
+        }
+        assert_no_difference -> { BrokerCredential.count } do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :unprocessable_entity
+        assert json_body.dig("error", "details", "password").present?
+      end
+
+      test "create preqin grant rejects missing API key" do
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "preqin-incomplete",
+            grant: "preqin",
+            username: "preqin-user"
+          }
+        }
+        assert_no_difference -> { BrokerCredential.count } do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :unprocessable_entity
+        assert json_body.dig("error", "details", "api_key").present?
+      end
+
       test "re-auth via PUT clears dead state and reschedules" do
         bc = broker_credentials(:acme_managed_gmail)
         bc.update!(dead: true, dead_reason: "invalid_grant", failure_count: 3)
@@ -137,6 +259,80 @@ module Api
         assert_nil bc.dead_reason
         assert_equal 0, bc.failure_count
         assert_equal "fresh-seed", bc.refresh_token
+      end
+
+      test "blank write-only fields preserve existing password grant material" do
+        bc = BrokerCredential.create!(namespace: "acme", foreign_id: "password-preserve",
+                                      grant: "password", token_endpoint: "https://idp.example/token",
+                                      client_id: "cid", client_secret: "secret",
+                                      username: "user", password: "pass", created_by: users(:acme_admin))
+
+        body = { data: { client_secret: "", username: "", password: "" } }
+        patch api_v1_broker_credential_url(id: bc.oid), params: body.to_json, headers: auth_headers
+        assert_response :ok
+
+        bc.reload
+        assert_equal "secret", bc.client_secret
+        assert_equal "user", bc.username
+        assert_equal "pass", bc.password
+      end
+
+      test "password initial values update clears dead state and reschedules" do
+        bc = BrokerCredential.create!(namespace: "acme", foreign_id: "password-dead",
+                                      grant: "password", token_endpoint: "https://idp.example/token",
+                                      client_id: "cid", username: "old", password: "old",
+                                      dead: true, dead_reason: "invalid_grant", failure_count: 3,
+                                      created_by: users(:acme_admin))
+
+        body = { data: { username: "new-user", password: "new-pass" } }
+        patch api_v1_broker_credential_url(id: bc.oid), params: body.to_json, headers: auth_headers
+        assert_response :ok
+
+        bc.reload
+        assert_equal "new-user", bc.username
+        assert_equal "new-pass", bc.password
+        refute bc.dead?
+        assert_nil bc.dead_reason
+        assert_equal 0, bc.failure_count
+        assert bc.next_attempt_at.present?
+      end
+
+      test "preqin API key update clears dead state and reschedules" do
+        bc = BrokerCredential.create!(namespace: "acme", foreign_id: "preqin-dead",
+                                      grant: "preqin", username: "old", api_key: "old",
+                                      dead: true, dead_reason: "http_400", failure_count: 3,
+                                      created_by: users(:acme_admin))
+
+        body = { data: { api_key: "new-key" } }
+        patch api_v1_broker_credential_url(id: bc.oid), params: body.to_json, headers: auth_headers
+        assert_response :ok
+
+        bc.reload
+        assert_equal "new-key", bc.api_key
+        refute bc.dead?
+        assert_nil bc.dead_reason
+        assert_equal 0, bc.failure_count
+        assert bc.next_attempt_at.present?
+      end
+
+      test "github app private key update clears dead state and reschedules" do
+        bc = BrokerCredential.create!(namespace: "acme", foreign_id: "github-app-dead",
+                                      grant: "github_app_installation",
+                                      token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+                                      client_id: "12345", client_secret: "old-key",
+                                      dead: true, dead_reason: "invalid_private_key", failure_count: 3,
+                                      created_by: users(:acme_admin))
+
+        body = { data: { client_secret: "new-key" } }
+        patch api_v1_broker_credential_url(id: bc.oid), params: body.to_json, headers: auth_headers
+        assert_response :ok
+
+        bc.reload
+        assert_equal "new-key", bc.client_secret
+        refute bc.dead?
+        assert_nil bc.dead_reason
+        assert_equal 0, bc.failure_count
+        assert bc.next_attempt_at.present?
       end
 
       test "destroy removes the credential" do

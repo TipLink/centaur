@@ -14,6 +14,7 @@ import type { ServerNotification } from '@centaur/harness-events'
 import {
   createSlackbotV2,
   normalizeSlackText,
+  parseSlackAssistantThreadId,
   type SlackbotV2,
   type SlackbotV2AppendMessagesRequest,
   type SlackbotV2ApiMessage,
@@ -48,6 +49,21 @@ describe('normalizeSlackText', () => {
     expect(normalizeSlackText('<#C0AJ07U8Z1N|eng-centaur>')).toBe(
       '#eng-centaur (C0AJ07U8Z1N)'
     )
+  })
+})
+
+describe('parseSlackAssistantThreadId', () => {
+  it('extracts channel and thread from legacy and team-qualified Slack thread IDs', () => {
+    expect(parseSlackAssistantThreadId('slack:C1:1700000000.000100')).toEqual({
+      channel: 'C1',
+      threadTs: '1700000000.000100'
+    })
+    expect(parseSlackAssistantThreadId('slack:T1:C1:1700000000.000100')).toEqual({
+      channel: 'C1',
+      threadTs: '1700000000.000100'
+    })
+    expect(parseSlackAssistantThreadId('slack:T1:C1:')).toBeNull()
+    expect(parseSlackAssistantThreadId('discord:C1:1700000000.000100')).toBeNull()
   })
 })
 
@@ -2850,6 +2866,18 @@ describe('slackbotv2', () => {
       answers: ['Recovered request.'],
       parentTs: parent.ts
     })
+    expect(
+      slackApi.calls
+        .filter(call => call.method === 'assistant.threads.setStatus')
+        .map(call => ({
+          channel_id: stringField(call.body.channel_id),
+          status: stringField(call.body.status),
+          thread_ts: stringField(call.body.thread_ts)
+        }))
+    ).toEqual([
+      { channel_id: CHANNEL_ID, status: 'Thinking...', thread_ts: parent.ts },
+      { channel_id: CHANNEL_ID, status: '', thread_ts: parent.ts }
+    ])
     expect(await threadText(parent.ts)).toContain('Recovered request.')
     // Recovery clears the obligation after the Slack stream stops; wait for
     // the state write instead of racing it.
@@ -3716,13 +3744,21 @@ function threadKey(threadTs: string): string {
   return `slack:${CHANNEL_ID}:${threadTs}`
 }
 
+function threadTsFromThreadKey(threadId: string, fallback: string): string {
+  const parts = threadId.split(':')
+  if (parts[0] !== 'slack') return fallback
+  if (parts.length === 4) return parts[3] || fallback
+  if (parts.length === 3) return parts[2] || fallback
+  return fallback
+}
+
 function apiMessageFromSlackEvent(input: {
   isMention: boolean
   text: string
   threadId: string
   ts: string
 }): SlackbotV2ApiMessage {
-  const threadTs = input.threadId.split(':')[2] ?? input.ts
+  const threadTs = threadTsFromThreadKey(input.threadId, input.ts)
   return {
     attachments: [],
     author: {

@@ -371,7 +371,9 @@ function normalizeSlackMarkup(input: string): string {
 function slackTokenText(token: string): string | undefined {
   if (token.startsWith('#')) {
     const { label, value } = splitSlackToken(token.slice(1))
-    return label ? `#${decodeSlackEntities(label)} (${decodeSlackEntities(value)})` : `#${decodeSlackEntities(value)}`
+    return label
+      ? `#${decodeSlackEntities(label)} (${decodeSlackEntities(value)})`
+      : `#${decodeSlackEntities(value)}`
   }
   if (token.startsWith('@')) return `@${decodeSlackEntities(token.slice(1))}`
   if (token.startsWith('!subteam^')) {
@@ -402,7 +404,9 @@ function hasUrlScheme(token: string): boolean {
   if (schemeEnd <= 0) return false
   for (let index = 0; index < schemeEnd; index += 1) {
     const code = token.charCodeAt(index)
-    if (code < 97 || code > 122) return false
+    const isLowercaseLetter = code >= 97 && code <= 122
+    const isUppercaseLetter = code >= 65 && code <= 90
+    if (!isLowercaseLetter && !isUppercaseLetter) return false
   }
   return true
 }

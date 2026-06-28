@@ -1,6 +1,7 @@
 """CLI for Slack search and analysis."""
 
 import json
+import re
 
 import typer
 from dotenv import load_dotenv
@@ -10,8 +11,41 @@ from centaur_sdk import Table
 load_dotenv()
 
 app = typer.Typer(name="slack", help="Slack CLI for AI agents")
+
+
+@app.command("health")
+def health():
+    """Assert slack connectivity and auth with a safe read-only check."""
+    from .client import _client
+
+    client = _client()
+    try:
+        details = client.list_bot_channels(limit=1)
+        payload = {"ok": True, "tool": "slack", "error": None, "details": details}
+    except Exception as exc:
+        payload = {"ok": False, "tool": "slack", "error": str(exc), "details": {}}
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        raise typer.Exit(1) from exc
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+
+
 console = Console()
 stderr_console = Console(stderr=True)
+
+_SLACK_CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]{8,}$")
+
+
+def _channel_arg_is_id(channel: str) -> bool:
+    value = channel.strip()
+    if value.startswith("<#") and value.endswith(">"):
+        value = value[2:-1].split("|", 1)[0]
+    elif value.startswith("#"):
+        value = value[1:]
+    return bool(_SLACK_CHANNEL_ID_RE.fullmatch(value.upper()))
 
 
 @app.command()
@@ -132,7 +166,7 @@ def search(
 
 @app.command()
 def channel(
-    name: str = typer.Argument(..., help="Channel name (without #)"),
+    name: str = typer.Argument(..., help="Slack channel ID, e.g. C1234567890"),
     limit: int = typer.Option(50, "--limit", "-n", help="Max messages"),
     full: bool = typer.Option(False, "--full", "-f", help="Show full message text"),
     cursor: str = typer.Option(None, "--cursor", help="Slack pagination cursor for the next page"),
@@ -151,12 +185,24 @@ def channel(
         "--inclusive",
         help="Include messages exactly on the oldest/latest boundary",
     ),
+    allow_name_resolution: bool = typer.Option(
+        False,
+        "--allow-name-resolution",
+        help="Allow resolving a channel name instead of requiring an explicit Slack channel ID",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output full page metadata as JSON"),
 ):
     """Get recent messages from a channel or a bounded history window."""
     import sys
 
     from .client import get_channel_history_page
+
+    if not allow_name_resolution and not _channel_arg_is_id(name):
+        stderr_console.print(
+            "[red]Error: slack channel requires an explicit Slack channel ID like C1234567890. "
+            "Pass --allow-name-resolution to resolve a channel name intentionally.[/]"
+        )
+        raise typer.Exit(1)
 
     try:
         page = get_channel_history_page(
@@ -215,7 +261,9 @@ def thread(
         "--latest",
         help="Latest timestamp boundary: Slack ts, epoch, ISO datetime, or YYYY-MM-DD",
     ),
-    inclusive: bool = typer.Option(True, "--inclusive/--exclusive", help="Include the boundary timestamps"),
+    inclusive: bool = typer.Option(
+        True, "--inclusive/--exclusive", help="Include the boundary timestamps"
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Get all replies in a thread.
@@ -472,22 +520,31 @@ def users(
 
 @app.command()
 def upload(
-    channel: str = typer.Argument(..., help="Channel name (with or without #)"),
-    files: list[str] = typer.Argument(..., help="File path(s) to upload"),
+    channel: str = typer.Argument(
+        ..., help="Slack channel/conversation ID to upload into, e.g. C123 or D123"
+    ),
+    files: list[str] = typer.Argument(..., help="File path(s) to upload"),  # noqa: B008
     comment: str = typer.Option(None, "--comment", "-c", help="Comment to post with files"),
-    thread: str = typer.Option(None, "--thread", "-t", help="Thread timestamp to reply to"),
+    thread: str = typer.Option(..., "--thread", "-t", help="Slack thread timestamp to reply to"),
 ):
-    """Upload file(s) to a channel.
+    """Upload file(s) to Slack.
 
     Examples:
-        slack upload "#eng-ai" screenshot.png
-        slack upload eng-ai file1.png file2.jpg -c "Here are the screenshots"
-        slack upload eng-ai report.pdf --thread 1234567890.123456
+        slack upload C123 screenshot.png --thread 1234567890.123456
+        slack upload C123 file1.png file2.jpg --thread 1234567890.123456 -c "Here are the files"
     """
     import base64
     from pathlib import Path
 
     from .client import upload_file
+
+    if not _channel_arg_is_id(channel):
+        console.print(
+            "[red]Error: upload channel must be a Slack conversation ID like C123 or D123[/]"
+        )
+        raise typer.Exit(1)
+
+    first_upload_path = files[0] if files else None
 
     for file_path in files:
         path = Path(file_path)
@@ -503,12 +560,14 @@ def upload(
                 content_base64=base64.b64encode(path.read_bytes()).decode(),
                 filename=path.name,
                 title=path.name,
-                comment=comment if file_path == files[0] else None,  # Only comment on first file
+                comment=comment
+                if file_path == first_upload_path
+                else None,  # Only comment on first file
                 thread_ts=thread,
             )
             console.print(f"[green]✓ Uploaded {path.name}[/]")
             console.print(f"[dim]{result['permalink']}[/]")
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             console.print(f"[red]Error uploading {path.name}: {e}[/]")
             raise typer.Exit(1)
 
@@ -766,7 +825,9 @@ def dump(
 
 @app.command()
 def files(
-    permalink: str = typer.Argument(..., help="Slack permalink to message with attachments"),
+    permalink: str = typer.Argument(
+        ..., help="Slack message permalink, channel:timestamp, or url_private"
+    ),
     download: bool = typer.Option(
         False, "--download", "-d", help="Download files to current directory"
     ),
@@ -776,13 +837,33 @@ def files(
 
     Examples:
         slack files "https://slack.com/archives/C01234567/p1234567890123456"
+        slack files "https://files.slack.com/files-pri/T1-F1/report.pdf" --download
         slack files "https://..." --download
         slack files "https://..." -d -o /tmp/slack-files
     """
     import re
     from pathlib import Path
+    from urllib.parse import urlparse
 
     from .client import _fetch_slack_file, get_message_files
+
+    parsed = urlparse(permalink)
+    if parsed.scheme == "https" and (parsed.hostname or "").lower() == "files.slack.com":
+        if not download:
+            console.print("[red]Pass --download to download a direct Slack file URL[/]")
+            raise typer.Exit(1)
+        output_dir = Path(output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            filename, _mime_type, body = _fetch_slack_file(permalink)
+            out_path = output_dir / filename
+            out_path.write_bytes(body)
+            console.print(f"[green]✓ Downloaded {filename}[/] ({len(body)} bytes)")
+            console.print(f"[dim]{out_path.absolute()}[/]")
+        except Exception as e:
+            console.print(f"[red]Error downloading Slack file: {e}[/]")
+            raise typer.Exit(1)
+        return
 
     if permalink.startswith("https://"):
         match = re.search(r"/archives/([A-Z0-9]+)/p(\d+)", permalink)
@@ -859,12 +940,24 @@ def feedback(
     item_id: int = typer.Option(None, "--id", help="Feedback item ID (for show/update-status)"),
     new_status: str = typer.Option(None, "--new-status", help="New status for update-status"),
     output: str = typer.Option(None, "--output", "-o", help="Output file path"),
-    max_items: int = typer.Option(8, "--max-items", help="Max actionable feedback items per improvement run"),
-    persona: str = typer.Option("eng", "--persona", help="Persona to use for auto-improvement runs"),
-    harness: str = typer.Option("amp", "--harness", help="Harness to use for auto-improvement runs"),
-    interval_sec: int = typer.Option(900, "--interval-sec", help="Sleep interval between loop iterations"),
-    iterations: int = typer.Option(0, "--iterations", help="Number of loop iterations to run; 0 means forever"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Build the improvement prompt without dispatching an agent run"),
+    max_items: int = typer.Option(
+        8, "--max-items", help="Max actionable feedback items per improvement run"
+    ),
+    persona: str = typer.Option(
+        "eng", "--persona", help="Persona to use for auto-improvement runs"
+    ),
+    harness: str = typer.Option(
+        "amp", "--harness", help="Harness to use for auto-improvement runs"
+    ),
+    interval_sec: int = typer.Option(
+        900, "--interval-sec", help="Sleep interval between loop iterations"
+    ),
+    iterations: int = typer.Option(
+        0, "--iterations", help="Number of loop iterations to run; 0 means forever"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Build the improvement prompt without dispatching an agent run"
+    ),
 ):
     """Collect and analyze feedback from bot interactions.
 
@@ -923,9 +1016,7 @@ def feedback(
     elif action == "backfill":
         lookback_days = since_days or 30
         backfill_limit = None if limit == 200 else limit_per_channel
-        console.print(
-            f"[bold]Backfilling feedback from: {', '.join(channel_list)}[/]"
-        )
+        console.print(f"[bold]Backfilling feedback from: {', '.join(channel_list)}[/]")
         stats = backfill_feedback(
             channels=channel_list,
             since_days=lookback_days,
@@ -1017,7 +1108,9 @@ def feedback(
         )
 
         collect_stats = result["collect_stats"]
-        console.print(f"[dim]Collected: +{collect_stats['feedback_items_created']} new, {collect_stats['feedback_items_updated']} updated[/]")
+        console.print(
+            f"[dim]Collected: +{collect_stats['feedback_items_created']} new, {collect_stats['feedback_items_updated']} updated[/]"
+        )
 
         if result["actionable_items"] == 0:
             console.print("\n[green]✓ No actionable feedback found![/]")
@@ -1072,7 +1165,9 @@ def feedback(
 
     else:
         console.print(f"[red]Unknown action: {action}[/]")
-        console.print("Valid actions: collect, backfill, digest, show, update-status, improve, loop")
+        console.print(
+            "Valid actions: collect, backfill, digest, show, update-status, improve, loop"
+        )
         raise typer.Exit(1)
 
 
@@ -1138,7 +1233,9 @@ def user_info(
             if profile["phone"]:
                 console.print(f"[bold]Phone:[/] {profile['phone']}")
             if profile["status_text"]:
-                console.print(f"[bold]Status:[/] {profile['status_emoji']} {profile['status_text']}")
+                console.print(
+                    f"[bold]Status:[/] {profile['status_emoji']} {profile['status_text']}"
+                )
             if profile["timezone"]:
                 console.print(f"[bold]Timezone:[/] {profile['tz_label']} ({profile['timezone']})")
             if profile["skype"]:

@@ -2321,7 +2321,9 @@ function normalizeSlackMarkup(input: string): string {
 function slackTokenText(token: string): string | undefined {
   if (token.startsWith('#')) {
     const { label, value } = splitSlackToken(token.slice(1))
-    return label ? `#${decodeSlackEntities(label)} (${decodeSlackEntities(value)})` : `#${decodeSlackEntities(value)}`
+    return label
+      ? `#${decodeSlackEntities(label)} (${decodeSlackEntities(value)})`
+      : `#${decodeSlackEntities(value)}`
   }
   if (token.startsWith('@')) return `@${decodeSlackEntities(token.slice(1))}`
   if (token.startsWith('!subteam^')) {
@@ -2352,7 +2354,9 @@ function hasUrlScheme(token: string): boolean {
   if (schemeEnd <= 0) return false
   for (let index = 0; index < schemeEnd; index += 1) {
     const code = token.charCodeAt(index)
-    if (code < 97 || code > 122) return false
+    const isLowercaseLetter = code >= 97 && code <= 122
+    const isUppercaseLetter = code >= 65 && code <= 90
+    if (!isLowercaseLetter && !isUppercaseLetter) return false
   }
   return true
 }
@@ -2555,9 +2559,21 @@ async function ignoreAssistantError(fn: () => Promise<void>): Promise<boolean> {
 }
 
 function slackAssistantTarget(thread: Thread): { channel: string; threadTs: string } | null {
-  const parts = thread.id.split(':')
-  if (parts[0] !== 'slack' || !parts[1] || !parts[2]) return null
-  return { channel: parts[1], threadTs: parts[2] }
+  return parseSlackAssistantThreadId(thread.id)
+}
+
+export function parseSlackAssistantThreadId(
+  threadId: string
+): { channel: string; threadTs: string } | null {
+  const parts = threadId.split(':')
+  if (parts[0] !== 'slack') return null
+  if (parts.length === 4 && parts[2] && parts[3]) {
+    return { channel: parts[2], threadTs: parts[3] }
+  }
+  if (parts.length === 3 && parts[1] && parts[2]) {
+    return { channel: parts[1], threadTs: parts[2] }
+  }
+  return null
 }
 
 function titleFromMessage(text: string, userName = 'centaur'): string {

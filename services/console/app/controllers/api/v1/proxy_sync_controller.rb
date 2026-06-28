@@ -9,11 +9,11 @@ module Api
     #
     # `proxy` carries managed proxy runtime settings. `secrets` populates the
     # proxy's `secrets` transform. `transforms` carries whole transforms the proxy
-    # splices into its pipeline: a gcp_auth transform per granted GcpAuthSecret,
-    # an hmac_sign transform per granted HmacSecret, and one bundled oauth_token
-    # transform. `postgres` carries one upstream-DSN entry per granted PgDsnSecret,
-    # keyed by foreign_id; the proxy's locally-defined listeners bind to these by
-    # foreign_id.
+    # splices into its pipeline: one gcp_auth, gcp_id_token, hmac_sign, or
+    # aws_auth transform per granted secret, and one bundled oauth_token
+    # transform. `postgres` carries one upstream-DSN entry per granted
+    # PgDsnSecret, keyed by foreign_id; the proxy's locally-defined listeners
+    # bind to these by foreign_id.
     #
     # The top-level `rules`, `mcp`, and `ingest_token` fields the proxy also
     # understands are intentionally omitted: centaur-console has no models for them

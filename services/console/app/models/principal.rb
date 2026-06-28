@@ -14,6 +14,7 @@ class Principal < ApplicationRecord
   has_many :sync_config_snapshots, class_name: "PrincipalSyncConfigSnapshot", dependent: :destroy
   belongs_to :created_by, class_name: "User"
 
+  after_commit :auto_grant_matching_oauth_credentials, on: %i[create update]
   before_commit :bump_own_sync_config_cache_version, on: :update, if: :sync_config_fields_changed?
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
@@ -60,6 +61,11 @@ class Principal < ApplicationRecord
     granted_secrets_by_priority(GcpAuthSecret, :gcp_auth_secret_id, includes: %i[keyfile_source rules])
   end
 
+  # gcp_id_token credentials this principal resolves to, via its effective grants.
+  def granted_gcp_id_token_secrets
+    granted_secrets_by_priority(GcpIdTokenSecret, :gcp_id_token_secret_id, includes: %i[keyfile_source rules])
+  end
+
   # aws_auth credentials this principal resolves to, via its effective grants.
   def granted_aws_auth_secrets
     granted_secrets_by_priority(AwsAuthSecret, :aws_auth_secret_id, includes: %i[sources rules])
@@ -88,9 +94,8 @@ class Principal < ApplicationRecord
     proxy_secrets_for(served_credentials)
   end
 
-  # The `transforms` array delivered to iron-proxy: one gcp_auth transform per
-  # granted GcpAuthSecret, one aws_auth transform per granted AwsAuthSecret, one
-  # hmac_sign transform per granted HmacSecret, plus a single oauth_token
+  # The `transforms` array delivered to iron-proxy: one gcp_auth/gcp_id_token/
+  # aws_auth/hmac_sign transform per granted secret, plus a single oauth_token
   # transform bundling every granted OauthTokenSecret as one `tokens` entry.
   # Credentials that lost a cross-type conflict are omitted (see
   # #served_credentials).
@@ -98,14 +103,18 @@ class Principal < ApplicationRecord
     proxy_transforms_for(served_credentials)
   end
 
-  # The top-level `postgres` array delivered to iron-proxy: one DSN entry per
-  # granted PgDsnSecret, keyed by foreign_id. Entries without a DSN source are
-  # skipped because the proxy can't dial an upstream without one.
+  # The top-level `postgres` array delivered to iron-proxy: one effective DSN
+  # entry per database. Entries without a DSN source are skipped because the
+  # proxy can't dial an upstream without one. When several granted PG DSNs route
+  # the same database, existing grant priority ordering decides the winner:
+  # higher-priority grants appear later and overwrite lower-priority routes.
   def sync_postgres
-    granted_pg_dsn_secrets.filter_map do |pg|
+    winners = {}
+    granted_pg_dsn_secrets.each do |pg|
       next unless pg.dsn_source
-      pg.to_proxy_dsn(principal: self)
+      winners[pg.database] = pg
     end
+    winners.values.map { |pg| pg.to_proxy_dsn(principal: self) }
   end
 
   # The config this principal resolves to, in the same shape iron-proxy receives
@@ -161,6 +170,10 @@ class Principal < ApplicationRecord
 
   private
 
+  def auto_grant_matching_oauth_credentials
+    PrincipalCredentialReconciliation.new.apply_for_principal(self)
+  end
+
   # The credentials actually delivered to the proxy, grouped by type, after
   # cross-type conflict resolution. Static secrets without a deliverable source
   # are dropped first (the proxy can't resolve a value for them) so a
@@ -169,15 +182,17 @@ class Principal < ApplicationRecord
   def served_credentials
     static = granted_static_secrets.select { |ss| ss.source&.deliverable? }
     gcp_auth = granted_gcp_auth_secrets.to_a
+    gcp_id_token = granted_gcp_id_token_secrets.to_a
     aws_auth = granted_aws_auth_secrets.to_a
     hmac = granted_hmac_secrets.to_a
     oauth = granted_oauth_token_secrets.to_a
 
-    suppressed = suppressed_conflict_credentials(static + gcp_auth + aws_auth + hmac + oauth)
+    suppressed = suppressed_conflict_credentials(static + gcp_auth + gcp_id_token + aws_auth + hmac + oauth)
 
     {
       static: static - suppressed,
       gcp_auth: gcp_auth - suppressed,
+      gcp_id_token: gcp_id_token - suppressed,
       aws_auth: aws_auth - suppressed,
       hmac: hmac - suppressed,
       oauth: oauth - suppressed
@@ -190,6 +205,7 @@ class Principal < ApplicationRecord
 
   def proxy_transforms_for(served)
     transforms = served[:gcp_auth].map(&:to_proxy_transform)
+    transforms += served[:gcp_id_token].map(&:to_proxy_transform)
     transforms += served[:aws_auth].map(&:to_proxy_transform)
     transforms += served[:hmac].map(&:to_proxy_transform)
 
