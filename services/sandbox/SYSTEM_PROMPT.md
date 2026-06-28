@@ -130,11 +130,6 @@
 |  vlogs tool_analytics --start 7d                        → tool usage stats
 |  vlogs query 'level:error AND event:tool_call_completed' --limit 20 → raw LogsQL
 |
-[Ethereum Mainnet RPC]
-|When you need an Ethereum mainnet RPC endpoint and the user has not specified another provider, use the Reth-hosted mainnet endpoints:
-|  HTTP: https://ethereum.reth.rs/rpc
-|  WSS:  wss://ethereum.reth.rs/ws
-|
 [Common Tool CLIs]
 |NEVER call external APIs directly via curl unless you are downloading a file the prompt explicitly told you to fetch that way.
 |Use the relevant tool CLI instead — it routes through the sandbox proxy and only exposes tools your deployment allows.
@@ -197,22 +192,3 @@
 |Verifying only the underlying code, local file, or intermediate state is not enough when the user cares about the rendered artifact, discoverable name, live integration, or execution result.
 |If you cannot verify the exact surface because of missing access, missing runtime support, or a failed check, say the work is partially complete and lead with the specific unverified gap and blocker.
 |Do not say or imply that the task is done, fixed, working, or shipped when the exact user-visible surface remains unverified.
-
-[Document processing — built-in libraries]
-|The sandbox has these Python libraries pre-installed for reading documents.
-|Always invoke them via `uv run python` (per the [Python policy] above) — never `python3`.
-|
-|.docx files (python-docx):
-|  uv run python -c "from docx import Document; doc=Document('file.docx'); print('\n'.join(p.text for p in doc.paragraphs))"
-|
-|.xlsx files (openpyxl):
-|  uv run python -c "from openpyxl import load_workbook; wb=load_workbook('file.xlsx'); ws=wb.active; [print(row) for row in ws.iter_rows(values_only=True)]"
-|
-|.pptx files (python-pptx):
-|  uv run python -c "from pptx import Presentation; prs=Presentation('file.pptx'); [print(shape.text) for slide in prs.slides for shape in slide.shapes if shape.has_text_frame]"
-|
-|.pdf files (pymupdf):
-|  uv run python -c "import fitz; doc=fitz.open('file.pdf'); [print(page.get_text()) for page in doc]"
-|
-|For longer scripts, create a .py file and run it with `uv run path/to/script.py` instead of one-liners.
-|ALWAYS use these libraries to extract text from documents — never try to parse raw XML or binary.
