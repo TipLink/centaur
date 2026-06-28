@@ -1,10 +1,6 @@
 require "test_helper"
 
 class BrokerCredentialTest < ActiveSupport::TestCase
-  CLIENT_CREDENTIAL_ATTRIBUTE = [ :client, :secret ].join("_").to_sym
-  REFRESH_TOKEN_ATTRIBUTE = [ :refresh, :token ].join("_").to_sym
-  PASSWORD_ATTRIBUTE = :password
-
   # A stub refresh client returning a fixed Result or raising a fixed error.
   class StubClient
     def initialize(&block) = (@block = block)
@@ -24,8 +20,8 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     BrokerCredential.new({
       namespace: "default", foreign_id: "cred-#{SecureRandom.hex(4)}",
       token_endpoint: "https://idp.example/token", scopes: %w[a b],
-      client_id: "cid", CLIENT_CREDENTIAL_ATTRIBUTE => "sec",
-      created_by: users(:acme_admin), REFRESH_TOKEN_ATTRIBUTE => refresh_token
+      client_id: "cid", client_secret: "sec",
+      created_by: users(:acme_admin), refresh_token: refresh_token
     }.merge(overrides))
   end
 
@@ -68,32 +64,26 @@ class BrokerCredentialTest < ActiveSupport::TestCase
       grant: BrokerCredential::GITHUB_APP_INSTALLATION,
       token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
       client_id: "12345",
-      CLIENT_CREDENTIAL_ATTRIBUTE => "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----",
-      REFRESH_TOKEN_ATTRIBUTE => nil
+      client_secret: "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----",
+      refresh_token: nil
     )
     assert bc.valid?, bc.errors.full_messages.to_sentence
   end
 
   test "github app installation credentials require a private key" do
-    bc = BrokerCredential.new(
-      namespace: "default",
-      foreign_id: "cred-#{SecureRandom.hex(4)}",
+    bc = build_credential(
       grant: BrokerCredential::GITHUB_APP_INSTALLATION,
-      token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
-      client_id: "12345",
-      created_by: users(:acme_admin)
+      client_secret: nil,
+      refresh_token: nil
     )
     refute bc.valid?
-    assert bc.errors[CLIENT_CREDENTIAL_ATTRIBUTE].any?
+    assert bc.errors[:client_secret].any?
   end
 
   test "password grant is valid with username and password" do
-    bc = build_credential(
-      grant: "password",
-      username: "user",
-      PASSWORD_ATTRIBUTE => "pass",
-      REFRESH_TOKEN_ATTRIBUTE => nil
-    )
+    # Test credentials are assigned to encrypted BrokerCredential fields.
+    # codeql[rb/clear-text-storage-sensitive-data]
+    bc = build_credential(grant: "password", username: "user", password: "pass", refresh_token: nil)
     assert bc.valid?, bc.errors.full_messages.to_sentence
   end
 

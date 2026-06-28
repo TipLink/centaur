@@ -28,20 +28,16 @@ def health():
         payload = {"ok": True, "tool": "opentable", "error": None, "details": details}
     except Exception as exc:
         payload = {"ok": False, "tool": "opentable", "error": str(exc), "details": {}}
-        emit_json(payload)
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
         raise typer.Exit(1) from exc
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
-    emit_json(payload)
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
 
 
 console = Console()
-
-
-def emit_json(data: object) -> None:
-    console.print_json(json.dumps(data, indent=2, ensure_ascii=False, default=str))
 
 
 def print_markdown_table(headers: list[str], rows: list[list[str]]) -> None:
@@ -140,7 +136,7 @@ def search(
         return
 
     if json_output:
-        emit_json(results)
+        print(json.dumps(results, indent=2))
         return
 
     if markdown:
@@ -200,7 +196,7 @@ def list_metros_cmd(
     metros = ot.list_metros()
 
     if json_output:
-        emit_json(metros)
+        print(json.dumps(metros, indent=2))
         return
 
     console.print("\n[bold cyan]Available Metro Areas[/]\n")
@@ -223,7 +219,7 @@ def list_regions_cmd(
     regions = ot.list_regions(metro_id)
 
     if json_output:
-        emit_json(regions)
+        print(json.dumps(regions, indent=2))
         return
 
     console.print(f"\n[bold cyan]Regions in {metro.upper()}[/]\n")
@@ -261,13 +257,17 @@ def list_neighborhoods_cmd(
     )
 
     if json_output:
-        emit_json(neighborhoods)
+        # Neighborhood data is static location metadata.
+        # codeql[py/clear-text-logging-sensitive-data]
+        print(json.dumps(neighborhoods, indent=2))
         return
 
     if not neighborhoods:
         console.print("[yellow]No neighborhood mappings available for this region[/]")
         return
 
+    # Region label comes from static location metadata.
+    # codeql[py/clear-text-logging-sensitive-data]
     console.print(f"\n[bold cyan]Neighborhoods in {region_label}[/]\n")
     for n in neighborhoods:
         console.print(f"  [bold]{n['name']}[/] (id: {n['id']})")
@@ -290,7 +290,7 @@ def list_zipcodes_cmd(
     zipcodes = ot.list_zipcodes(metro_id)
 
     if json_output:
-        emit_json(zipcodes)
+        print(json.dumps(zipcodes, indent=2))
         return
 
     if not zipcodes:

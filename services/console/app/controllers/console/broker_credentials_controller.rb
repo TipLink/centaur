@@ -10,8 +10,6 @@ module Console
 
     layout "console"
 
-    CLIENT_SECRET_ATTRIBUTE = [ :client, :secret ].join("_").to_sym
-
     before_action :set_credential, only: %i[edit update destroy]
 
     def new
@@ -69,9 +67,11 @@ module Console
       credential.token_endpoint_headers = header_params
       credential.labels = label_params
 
-      credential_value = credential_params[CLIENT_SECRET_ATTRIBUTE]
-      if credential_value.present?
-        credential.write_attribute(CLIENT_SECRET_ATTRIBUTE, credential_value)
+      secret = credential_params[:client_secret]
+      if secret.present?
+        # BrokerCredential encrypts client_secret at rest.
+        # codeql[rb/clear-text-storage-sensitive-data]
+        credential.client_secret = secret
         reset_refresh_state(credential) if credential.grant == BrokerCredential::GITHUB_APP_INSTALLATION
       end
       apply_initial_values(credential)
