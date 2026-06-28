@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
-from collections.abc import Iterable
 from typing import Any
 
 import httpx
@@ -16,16 +14,6 @@ OPERATIONAL_BASE_URL = "https://api.preqin.com"
 IDENTITY_BASE_URL = "https://id.preqin.com"
 FEEDS_BASE_URL = "https://feeds.preqin.com"
 OPERATIONAL_TOKEN_PLACEHOLDER = "PREQIN_OPERATIONAL_TOKEN"
-_SENSITIVE_KEY_PARTS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "credential",
-    "password",
-    "secret",
-    "token",
-    "username",
-)
 
 
 def _clean_secret(value: str | None) -> str | None:
@@ -42,57 +30,12 @@ def _clean_secret(value: str | None) -> str | None:
     return None
 
 
-def _redact_for_output(value: Any, secret_values: Iterable[str] = ()) -> Any:
-    """Redact secret-bearing fields before diagnostic output."""
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, child in value.items():
-            key_text = str(key)
-            if any(part in key_text.casefold() for part in _SENSITIVE_KEY_PARTS):
-                redacted[key_text] = "<redacted>"
-            else:
-                redacted[key_text] = _redact_for_output(child, secret_values)
-        return redacted
-    if isinstance(value, list):
-        return [_redact_for_output(child, secret_values) for child in value]
-    if isinstance(value, str):
-        return _redact_text(value, secret_values)
-    return value
-
-
-def _redact_text(text: str, secret_values: Iterable[str] = ()) -> str:
-    redacted = text
-    redacted = re.sub(
-        r"(authorization[\"'\s:=]+bearer\s+)[^,\"'\s)>\]};]+",
-        r"\1<redacted>",
-        redacted,
-        flags=re.IGNORECASE,
-    )
-    redacted = re.sub(
-        r"(\bbearer\s+)[^,\"'\s)>\]};]+",
-        r"\1<redacted>",
-        redacted,
-        flags=re.IGNORECASE,
-    )
-    redacted = re.sub(
-        r"(authorization[\"'\s:=]+)(?!bearer\s+)[^,\"'\s)>\]};]+",
-        r"\1<redacted>",
-        redacted,
-        flags=re.IGNORECASE,
-    )
-    for part in _SENSITIVE_KEY_PARTS:
-        if part == "authorization":
-            continue
-        redacted = re.sub(
-            rf"({re.escape(part)}[\"'\s:=]+)[^,\"'\s)>\]}}]+",
-            r"\1<redacted>",
-            redacted,
-            flags=re.IGNORECASE,
-        )
-    for value in secret_values:
-        if value and len(value) > 2:
-            redacted = redacted.replace(value, "<redacted>")
-    return redacted
+def _redact_token_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Redact token-bearing fields for diagnostics."""
+    return {
+        key: "<redacted>" if "token" in key.casefold() or "secret" in key.casefold() else value
+        for key, value in payload.items()
+    }
 
 
 def _credential_present(name: str, value: str | None) -> bool:
@@ -139,35 +82,10 @@ class PreqinClient:
         return {
             name: {
                 "present": _credential_present(name, value),
+                "length": len(value or ""),
             }
             for name, value in fields.items()
         }
-
-    def _known_sensitive_values(self) -> list[str]:
-        return [
-            value
-            for value in (
-                self._username_value(),
-                self._api_key_value(),
-                self._operational_token,
-                self._operational_token_value(),
-            )
-            if value
-        ]
-
-    def _safe_response_detail(self, response: httpx.Response) -> str:
-        try:
-            payload = response.json()
-        except ValueError:
-            body = _redact_text(response.text.strip(), self._known_sensitive_values())
-        else:
-            body = str(_redact_for_output(payload, self._known_sensitive_values()))
-        if len(body) > 500:
-            body = f"{body[:500]}..."
-        return f" - {body}" if body else ""
-
-    def safe_exception_message(self, exc: Exception) -> str:
-        return _redact_text(str(exc), self._known_sensitive_values())
 
     def _operational_access_token(self, force_refresh: bool = False) -> str:
         """Acquire a bearer token from Preqin's Operational API token endpoint."""
@@ -190,10 +108,11 @@ class PreqinClient:
             headers={"Accept": "application/json"},
         )
         if response.status_code >= 400:
+            body = response.text.strip()
+            detail = f" - {body}" if body else ""
             raise RuntimeError(
                 "Preqin Operational API auth failed "
-                f"({response.status_code}) at /connect/token using username/api key"
-                f"{self._safe_response_detail(response)}"
+                f"({response.status_code}) at /connect/token using username/api key{detail}"
             )
 
         data = response.json()
@@ -201,7 +120,7 @@ class PreqinClient:
         if not token:
             raise RuntimeError(
                 "Preqin Operational API auth response did not include an access token: "
-                f"{_redact_for_output(data)}"
+                f"{_redact_token_payload(data)}"
             )
         self._operational_token = token
         return token
@@ -222,7 +141,7 @@ class PreqinClient:
                 "ok": False,
                 "url": url,
                 "method": "operational_get",
-                "error": self.safe_exception_message(exc),
+                "error": str(exc),
                 "credentials": self.credential_status(),
             }
 
@@ -243,10 +162,9 @@ class PreqinClient:
             headers=headers,
         )
         if response.status_code >= 400:
-            raise RuntimeError(
-                f"Preqin API error ({response.status_code}) for {endpoint}"
-                f"{self._safe_response_detail(response)}"
-            )
+            body = response.text.strip()
+            detail = f" - {body}" if body else ""
+            raise RuntimeError(f"Preqin API error ({response.status_code}) for {endpoint}{detail}")
         return response.json()
 
     def get_fund_managers(

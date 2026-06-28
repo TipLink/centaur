@@ -86,8 +86,6 @@ module Api
         secret = attrs[:client_secret]
         return if secret.blank?
 
-        # BrokerCredential encrypts client_secret at rest.
-        # codeql[rb/clear-text-storage-sensitive-data]
         ref.client_secret = secret
         reset_refresh_state(ref) if ref.grant == BrokerCredential::GITHUB_APP_INSTALLATION
       end

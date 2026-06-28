@@ -81,8 +81,6 @@ class BrokerCredentialTest < ActiveSupport::TestCase
   end
 
   test "password grant is valid with username and password" do
-    # Test credentials are assigned to encrypted BrokerCredential fields.
-    # codeql[rb/clear-text-storage-sensitive-data]
     bc = build_credential(grant: "password", username: "user", password: "pass", refresh_token: nil)
     assert bc.valid?, bc.errors.full_messages.to_sentence
   end

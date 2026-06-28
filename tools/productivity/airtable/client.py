@@ -173,7 +173,7 @@ class AirtableClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            detail = error_message or exc.response.reason_phrase or "request failed"
+            detail = error_message or exc.response.text
             raise RuntimeError(f"Airtable API error: {exc.response.status_code} - {detail}") from exc
 
     def _request(

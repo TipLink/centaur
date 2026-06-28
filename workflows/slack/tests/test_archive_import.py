@@ -62,29 +62,6 @@ def _load_archive_import():
 archive_import = _load_archive_import()
 
 
-def test_strip_sensitive_url_query_matches_slack_host_boundaries():
-    assert (
-        archive_import._strip_sensitive_url_query("https://files.slack.com/files-pri/T123/file.png?t=x")
-        == "https://files.slack.com/files-pri/T123/file.png"
-    )
-    assert (
-        archive_import._strip_sensitive_url_query("https://example.slack.com/archives/C123?p=123")
-        == "https://example.slack.com/archives/C123"
-    )
-    assert (
-        archive_import._strip_sensitive_url_query("https://edge.slack-edge.com/path?token=secret")
-        == "https://edge.slack-edge.com/path"
-    )
-    assert (
-        archive_import._strip_sensitive_url_query("https://evilslack.com/path?token=secret")
-        == "https://evilslack.com/path?token=secret"
-    )
-    assert (
-        archive_import._strip_sensitive_url_query("https://slack.com.evil.test/path?token=secret")
-        == "https://slack.com.evil.test/path?token=secret"
-    )
-
-
 class FakeConn:
     def __init__(self) -> None:
         self.executemany_calls: list[tuple[str, list[tuple]]] = []

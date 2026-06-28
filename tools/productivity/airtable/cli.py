@@ -1,7 +1,6 @@
 """CLI for Airtable."""
 
 import json
-import re
 
 import typer
 from dotenv import load_dotenv
@@ -14,44 +13,6 @@ load_dotenv()
 app = typer.Typer(name="airtable", help="Airtable API client")
 
 
-_SENSITIVE_KEY_PARTS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "credential",
-    "password",
-    "secret",
-    "token",
-)
-
-
-def _redact_for_output(value: object) -> object:
-    if isinstance(value, dict):
-        redacted: dict[str, object] = {}
-        for key, child in value.items():
-            key_text = str(key)
-            if any(part in key_text.casefold() for part in _SENSITIVE_KEY_PARTS):
-                redacted[key_text] = "<redacted>"
-            else:
-                redacted[key_text] = _redact_for_output(child)
-        return redacted
-    if isinstance(value, list):
-        return [_redact_for_output(child) for child in value]
-    return value
-
-
-def _safe_error(exc: BaseException) -> str:
-    text = str(exc)
-    for part in _SENSITIVE_KEY_PARTS:
-        text = re.sub(
-            rf"({re.escape(part)}[^:=]*[:=]\s*)[^,\s)\]}}]+",
-            r"\1<redacted>",
-            text,
-            flags=re.IGNORECASE,
-        )
-    return text
-
-
 @app.command("health")
 def health():
     """Assert airtable connectivity and auth with a safe read-only check."""
@@ -62,18 +23,14 @@ def health():
         details = client.preflight_access()
         payload = {"ok": True, "tool": "airtable", "error": None, "details": details}
     except Exception as exc:
-        payload = {"ok": False, "tool": "airtable", "error": _safe_error(exc), "details": {}}
-        # Health payload is recursively redacted.
-        # codeql[py/clear-text-logging-sensitive-data]
-        print(json.dumps(_redact_for_output(payload), indent=2, ensure_ascii=False, default=str))
+        payload = {"ok": False, "tool": "airtable", "error": str(exc), "details": {}}
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
         raise typer.Exit(1) from exc
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
-    # Health payload is recursively redacted.
-    # codeql[py/clear-text-logging-sensitive-data]
-    print(json.dumps(_redact_for_output(payload), indent=2, ensure_ascii=False, default=str))
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
 
 
 console = Console()

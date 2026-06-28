@@ -69,8 +69,6 @@ module Console
 
       secret = credential_params[:client_secret]
       if secret.present?
-        # BrokerCredential encrypts client_secret at rest.
-        # codeql[rb/clear-text-storage-sensitive-data]
         credential.client_secret = secret
         reset_refresh_state(credential) if credential.grant == BrokerCredential::GITHUB_APP_INSTALLATION
       end
