@@ -2855,6 +2855,15 @@ describe('slackbotv2', () => {
 
     await waitFor(() => codexApi.eventRequests.length === 1, 2000)
     await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), 2000)
+    await waitFor(
+      () =>
+        slackApi.calls.some(
+          call =>
+            call.method === 'assistant.threads.setStatus' &&
+            stringField(call.body.status) === ''
+        ),
+      2000
+    )
 
     expect(codexApi.creates).toHaveLength(0)
     expect(codexApi.appends).toHaveLength(0)
