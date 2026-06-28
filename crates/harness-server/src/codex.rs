@@ -144,7 +144,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 let traceparent = trace_context.effective_traceparent();
                 if codex.is_none() {
                     otel::configure_codex_otel_for_startup(&trace_context)?;
-                    let mut child = CodexJsonRpcChild::spawn()?;
+                    let mut child = CodexJsonRpcChild::spawn(&trace_context)?;
                     initialize_codex(
                         &mut child,
                         &mut stdout,
@@ -383,13 +383,18 @@ struct CodexJsonRpcChild {
 }
 
 impl CodexJsonRpcChild {
-    fn spawn() -> Result<Self> {
+    fn spawn(trace_context: &otel::TraceContext) -> Result<Self> {
         let bin = codex_bin();
-        let mut child = ProcessCommand::new(&bin)
+        let mut command = ProcessCommand::new(&bin);
+        command
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(thread_key) = centaur_thread_key_env_value(trace_context) {
+            command.env("CENTAUR_THREAD_KEY", thread_key);
+        }
+        let mut child = command
             .spawn()
             .map_err(|source| HarnessServerError::SpawnCodex {
                 bin: bin.clone(),
@@ -551,6 +556,14 @@ impl CodexJsonRpcChild {
             return Ok(serde_json::from_str(trimmed)?);
         }
     }
+}
+
+fn centaur_thread_key_env_value(trace_context: &otel::TraceContext) -> Option<&str> {
+    trace_context
+        .thread_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_key| !thread_key.is_empty())
 }
 
 impl Drop for CodexJsonRpcChild {
@@ -786,6 +799,28 @@ mod tests {
         assert_eq!(
             codex.model_provider_for(Some("   "), Some("vendor/model")),
             "openrouter"
+        );
+    }
+
+    #[test]
+    fn derives_child_thread_key_env_from_trace_context() {
+        let trace_context = otel::TraceContext {
+            thread_key: Some(" slack:C123:1780000000.000000 ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            centaur_thread_key_env_value(&trace_context),
+            Some("slack:C123:1780000000.000000")
+        );
+
+        let blank_trace_context = otel::TraceContext {
+            thread_key: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(centaur_thread_key_env_value(&blank_trace_context), None);
+        assert_eq!(
+            centaur_thread_key_env_value(&otel::TraceContext::default()),
+            None
         );
     }
 
