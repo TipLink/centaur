@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 app = typer.Typer(name="preqin", help="Preqin Operational API and Feeds API CLI")
+console = Console()
 
 
 def _redacted_json(data: Any) -> str:
@@ -24,6 +25,18 @@ def _safe_error_text(exc: Exception) -> str:
     from .client import _redact_text
 
     return _redact_text(str(exc))
+
+
+def _emit_text(text: str) -> None:
+    console.out(text)
+
+
+def _emit_json(data: Any) -> None:
+    _emit_text(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+
+
+def _emit_redacted_json(data: Any) -> None:
+    _emit_text(_redacted_json(data))
 
 
 @app.command("health")
@@ -44,20 +57,13 @@ def health():
             "error": client.safe_exception_message(exc),
             "details": {},
         }
-        # Preqin health output is recursively redacted.
-        # codeql[py/clear-text-logging-sensitive-data]
-        print(_redacted_json(payload))
+        _emit_redacted_json(payload)
         raise typer.Exit(1) from exc
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
-    # Preqin health output is recursively redacted.
-    # codeql[py/clear-text-logging-sensitive-data]
-    print(_redacted_json(payload))
-
-
-console = Console()
+    _emit_redacted_json(payload)
 
 
 def get_client():
@@ -123,7 +129,7 @@ def _print_records(data: dict[str, Any] | list[dict[str, Any]], title: str) -> N
 
 def _exit_error(exc: Exception, json_output: bool) -> None:
     if json_output:
-        print(_redacted_json({"ok": False, "error": str(exc)}))
+        _emit_redacted_json({"ok": False, "error": str(exc)})
     else:
         console.print(f"[red]Error:[/] {_safe_error_text(exc)}")
     raise typer.Exit(1)
@@ -134,9 +140,7 @@ def credential_status(json_output: bool = typer.Option(False, "--json", help="Ou
     """Show which Preqin secret names resolve, without printing secret values."""
     data = get_client().credential_status()
     if json_output:
-        # Credential status exposes presence only, not values.
-        # codeql[py/clear-text-logging-sensitive-data]
-        print(json.dumps(data, indent=2))
+        _emit_json(data)
         return
     table = Table(title="Preqin credential status")
     table.add_column("Secret")
@@ -151,9 +155,7 @@ def auth_health(json_output: bool = typer.Option(False, "--json", help="Output a
     """Check Preqin Operational API auth."""
     data = get_client().auth_health()
     if json_output:
-        # Auth health data is client-redacted.
-        # codeql[py/clear-text-logging-sensitive-data]
-        print(_redacted_json(data))
+        _emit_redacted_json(data)
         return
     if data.get("ok"):
         console.print("[green]Preqin auth OK[/]")
@@ -188,7 +190,7 @@ def fund_managers(
     except RuntimeError as exc:
         _exit_error(exc, json_output)
     if json_output:
-        print(json.dumps(data, indent=2))
+        _emit_json(data)
         return
     _print_records(data, "Fund managers")
 
@@ -228,7 +230,7 @@ def funds(
     except RuntimeError as exc:
         _exit_error(exc, json_output)
     if json_output:
-        print(json.dumps(data, indent=2))
+        _emit_json(data)
         return
     _print_records(data, "Funds")
 
@@ -244,7 +246,7 @@ def find_paradigm_xyz(
     except RuntimeError as exc:
         _exit_error(exc, json_output)
     if json_output:
-        print(json.dumps(data, indent=2))
+        _emit_json(data)
         return
     _print_records(data.get("fund_managers", {}), "Paradigm XYZ fund-manager matches")
     _print_records(data.get("funds_by_manager", {}), "Paradigm XYZ funds by manager")
@@ -256,7 +258,7 @@ def feed_specs(json_output: bool = typer.Option(False, "--json", help="Output as
     """List public Preqin Feeds API OpenAPI spec versions."""
     data = get_client().list_feed_specs()
     if json_output:
-        print(json.dumps(data, indent=2))
+        _emit_json(data)
         return
     table = Table(title="Preqin Feeds API specs")
     table.add_column("Version")

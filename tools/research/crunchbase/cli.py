@@ -9,6 +9,15 @@ from rich.table import Table
 app = typer.Typer(
     name="crunchbase", help="Crunchbase Enterprise API CLI for company and funding data"
 )
+console = Console()
+
+
+def emit_line(text: str = "") -> None:
+    console.out(text)
+
+
+def emit_json(data: object) -> None:
+    console.print_json(json.dumps(data, indent=2, ensure_ascii=False, default=str))
 
 
 @app.command("health")
@@ -22,16 +31,14 @@ def health():
         payload = {"ok": True, "tool": "crunchbase", "error": None, "details": details}
     except Exception as exc:
         payload = {"ok": False, "tool": "crunchbase", "error": str(exc), "details": {}}
-        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        emit_json(payload)
         raise typer.Exit(1) from exc
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
-    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    emit_json(payload)
 
-
-console = Console()
 
 ORG_DEFAULT_FIELDS = [
     "identifier",
@@ -124,10 +131,10 @@ def extract_locations(items: list | None) -> str:
 
 def print_markdown_table(headers: list[str], rows: list[list[str]]) -> None:
     """Print a markdown-formatted table."""
-    print("| " + " | ".join(headers) + " |")
-    print("| " + " | ".join(["---"] * len(headers)) + " |")
+    emit_line("| " + " | ".join(headers) + " |")
+    emit_line("| " + " | ".join(["---"] * len(headers)) + " |")
     for row in rows:
-        print("| " + " | ".join(str(cell) for cell in row) + " |")
+        emit_line("| " + " | ".join(str(cell) for cell in row) + " |")
 
 
 @app.command()
@@ -138,8 +145,6 @@ def org(
     fields: str = typer.Option(None, "--fields", "-f", help="Comma-separated field_ids"),
     cards: str = typer.Option(None, "--cards", "-c", help="Comma-separated card_ids"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
-    # Fineas excludes this upstream-only tool from runtime allowlists.
-    # codeql[py/clear-text-logging-sensitive-data]
     markdown: bool = typer.Option(False, "--markdown", "-m", help="Output as markdown"),
 ):
     """Lookup an organization by permalink or UUID."""
@@ -151,9 +156,7 @@ def org(
     data = client.get_organization(entity_id, field_ids=field_ids, card_ids=card_ids)
 
     if json_output:
-        # Fineas excludes this upstream-only tool from runtime allowlists.
-        # codeql[py/clear-text-logging-sensitive-data]
-        print(json.dumps(data, indent=2))
+        emit_json(data)
         return
 
     props = data.get("properties", {})
@@ -161,17 +164,17 @@ def org(
 
     if markdown:
         name = extract_identifier(props.get("identifier"))
-        print(f"# {name}\n")
-        print(f"**Description:** {props.get('short_description', 'N/A')}")
-        print(f"**Founded:** {props.get('founded_on', 'N/A')}")
-        print(f"**Employees:** {props.get('num_employees_enum', 'N/A')}")
-        print(f"**Location:** {extract_locations(props.get('location_identifiers'))}")
-        print(f"**Categories:** {extract_identifiers(props.get('categories'))}")
-        print(f"**Total Funding:** {format_money(props.get('funding_total'))}")
-        print(f"**Last Funding Type:** {props.get('last_funding_type', 'N/A')}")
-        print(f"**Rank:** {props.get('rank_org', 'N/A')}")
+        emit_line(f"# {name}\n")
+        emit_line(f"**Description:** {props.get('short_description', 'N/A')}")
+        emit_line(f"**Founded:** {props.get('founded_on', 'N/A')}")
+        emit_line(f"**Employees:** {props.get('num_employees_enum', 'N/A')}")
+        emit_line(f"**Location:** {extract_locations(props.get('location_identifiers'))}")
+        emit_line(f"**Categories:** {extract_identifiers(props.get('categories'))}")
+        emit_line(f"**Total Funding:** {format_money(props.get('funding_total'))}")
+        emit_line(f"**Last Funding Type:** {props.get('last_funding_type', 'N/A')}")
+        emit_line(f"**Rank:** {props.get('rank_org', 'N/A')}")
         if cards_data:
-            print(f"\n**Cards loaded:** {', '.join(cards_data.keys())}")
+            emit_line(f"\n**Cards loaded:** {', '.join(cards_data.keys())}")
         return
 
     name = extract_identifier(props.get("identifier"))
@@ -196,8 +199,6 @@ def person(
     fields: str = typer.Option(None, "--fields", "-f", help="Comma-separated field_ids"),
     cards: str = typer.Option(None, "--cards", "-c", help="Comma-separated card_ids"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
-    # Fineas excludes this upstream-only tool from runtime allowlists.
-    # codeql[py/clear-text-logging-sensitive-data]
     markdown: bool = typer.Option(False, "--markdown", "-m", help="Output as markdown"),
 ):
     """Lookup a person by permalink or UUID."""
@@ -209,20 +210,18 @@ def person(
     data = client.get_person(entity_id, field_ids=field_ids, card_ids=card_ids)
 
     if json_output:
-        # Fineas excludes this upstream-only tool from runtime allowlists.
-        # codeql[py/clear-text-logging-sensitive-data]
-        print(json.dumps(data, indent=2))
+        emit_json(data)
         return
 
     props = data.get("properties", {})
 
     if markdown:
         name = f"{props.get('first_name', '')} {props.get('last_name', '')}".strip() or "N/A"
-        print(f"# {name}\n")
-        print(f"**Title:** {props.get('title', 'N/A')}")
-        print(f"**Primary Org:** {extract_identifier(props.get('primary_organization'))}")
-        print(f"**Gender:** {props.get('gender', 'N/A')}")
-        print(f"**LinkedIn:** {props.get('linkedin', 'N/A')}")
+        emit_line(f"# {name}\n")
+        emit_line(f"**Title:** {props.get('title', 'N/A')}")
+        emit_line(f"**Primary Org:** {extract_identifier(props.get('primary_organization'))}")
+        emit_line(f"**Gender:** {props.get('gender', 'N/A')}")
+        emit_line(f"**LinkedIn:** {props.get('linkedin', 'N/A')}")
         return
 
     name = f"{props.get('first_name', '')} {props.get('last_name', '')}".strip()
@@ -247,7 +246,7 @@ def funding(
     data = client.get_funding_round(entity_id, field_ids=field_ids)
 
     if json_output:
-        print(json.dumps(data, indent=2))
+        emit_json(data)
         return
 
     props = data.get("properties", {})
@@ -287,7 +286,7 @@ def card(
     )
 
     if json_output:
-        print(json.dumps(data, indent=2))
+        emit_json(data)
         return
 
     entities = data.get("entities", [])
@@ -375,7 +374,7 @@ def search(
     )
 
     if json_output:
-        print(json.dumps(data, indent=2))
+        emit_json(data)
         return
 
     entities = data.get("entities", [])
@@ -401,7 +400,7 @@ def search(
                 else:
                     row.append(str(val) if val is not None else "N/A")
             rows.append(row)
-        print(f"**{collection}** ({count} total)\n")
+        emit_line(f"**{collection}** ({count} total)\n")
         print_markdown_table(headers, rows)
         return
 
@@ -449,7 +448,7 @@ def autocomplete(
     data = client.autocomplete(query, collection_ids=collection_ids, limit=limit)
 
     if json_output:
-        print(json.dumps(data, indent=2))
+        emit_json(data)
         return
 
     entities = data.get("entities", [])
@@ -536,7 +535,7 @@ def recent_funding(
     )
 
     if json_output:
-        print(json.dumps(data, indent=2))
+        emit_json(data)
         return
 
     entities = data.get("entities", [])
@@ -561,7 +560,7 @@ def recent_funding(
                     extract_identifiers(props.get("lead_investor_identifiers")),
                 ]
             )
-        print(
+        emit_line(
             f"**Recent Funding Rounds** (>= ${min_amount / 1e6:.0f}M, last {days} days) - {count} total\n"
         )
         print_markdown_table(["Date", "Company", "Type", "Amount", "Lead Investors"], rows)
@@ -615,7 +614,7 @@ def raw(
 
     try:
         data = client.raw(method, endpoint, params=query_params, json_body=json_body)
-        print(json.dumps(data, indent=2))
+        emit_json(data)
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)

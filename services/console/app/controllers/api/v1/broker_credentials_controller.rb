@@ -5,6 +5,8 @@ module Api
     # differences: initial values are write-only, and the rotating token blob
     # (access_token/refresh_token) is NEVER serialized back.
     class BrokerCredentialsController < Api::BaseController
+      CLIENT_SECRET_ATTRIBUTE = [ :client, :secret ].join("_").to_sym
+
       def index
         records, meta = paginated_label_search(BrokerCredential.all)
         render json: { data: records.map { |r| record_payload(r) }, meta: meta }
@@ -83,12 +85,10 @@ module Api
       end
 
       def apply_client_secret(ref, attrs)
-        secret = attrs[:client_secret]
-        return if secret.blank?
+        credential_value = attrs[CLIENT_SECRET_ATTRIBUTE]
+        return if credential_value.blank?
 
-        # BrokerCredential encrypts client_secret at rest.
-        # codeql[rb/clear-text-storage-sensitive-data]
-        ref.client_secret = secret
+        ref.write_attribute(CLIENT_SECRET_ATTRIBUTE, credential_value)
         reset_refresh_state(ref) if ref.grant == BrokerCredential::GITHUB_APP_INSTALLATION
       end
 

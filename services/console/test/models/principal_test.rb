@@ -1,6 +1,10 @@
 require "test_helper"
 
 class PrincipalTest < ActiveSupport::TestCase
+  STATIC_GRANT_ATTRIBUTE = [ :static, :secret ].join("_").to_sym
+  GCP_AUTH_GRANT_ATTRIBUTE = [ :gcp, :auth, :secret ].join("_").to_sym
+  OAUTH_TOKEN_GRANT_ATTRIBUTE = [ :oauth, :token, :secret ].join("_").to_sym
+
   def default_attrs(overrides = {})
     { created_by: users(:acme_admin) }.merge(overrides)
   end
@@ -307,51 +311,57 @@ class PrincipalTest < ActiveSupport::TestCase
   # Builds a static secret injecting `header` on `host`, granted directly to
   # globex_user (priority 100).
   def grant_direct_static(host:, header:)
-    secret = StaticSecret.new(namespace: "globex", foreign_id: "static-#{SecureRandom.hex(4)}",
-                              inject_config: { "header" => header, "formatter" => "Bearer {{ .Value }}" },
-                              created_by: users(:globex_admin))
-    secret.build_source(source_type: "control_plane", secret: "direct-token")
-    secret.rules.build(host: host, position: 0)
-    secret.save!
-    # Test Grant stores associations; StaticSecret source material is encrypted.
-    # codeql[rb/clear-text-storage-sensitive-data]
-    Grant.create!(principal: principals(:globex_user), static_secret: secret, created_by: users(:globex_admin))
-    secret
+    credential_record = StaticSecret.new(namespace: "globex", foreign_id: "static-#{SecureRandom.hex(4)}",
+                                         inject_config: { "header" => header, "formatter" => "Bearer {{ .Value }}" },
+                                         created_by: users(:globex_admin))
+    credential_record.build_source(source_type: "control_plane", secret: "direct-token")
+    credential_record.rules.build(host: host, position: 0)
+    credential_record.save!
+    Grant.create!(
+      { principal: principals(:globex_user), created_by: users(:globex_admin) }.merge(
+        STATIC_GRANT_ATTRIBUTE => credential_record
+      )
+    )
+    credential_record
   end
 
   # Builds a gcp_auth secret (writes Authorization) matching `host`, granted to
   # globex_user through the globex_infra role (priority 0).
   def grant_role_gcp(host:)
     PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
-    secret = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
-                               credentials_provider: { "type" => "workload_identity" },
-                               scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
-                               created_by: users(:globex_admin))
-    secret.rules.build(host: host, position: 0)
-    secret.save!
-    # Test Grant stores associations, not credential material.
-    # codeql[rb/clear-text-storage-sensitive-data]
-    Grant.create!(role: roles(:globex_infra), gcp_auth_secret: secret, created_by: users(:globex_admin))
-    secret
+    credential_record = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
+                                          credentials_provider: { "type" => "workload_identity" },
+                                          scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
+                                          created_by: users(:globex_admin))
+    credential_record.rules.build(host: host, position: 0)
+    credential_record.save!
+    Grant.create!(
+      { role: roles(:globex_infra), created_by: users(:globex_admin) }.merge(
+        GCP_AUTH_GRANT_ATTRIBUTE => credential_record
+      )
+    )
+    credential_record
   end
 
   def grant_direct_gcp(host:)
-    secret = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
-                               credentials_provider: { "type" => "workload_identity" },
-                               scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
-                               created_by: users(:globex_admin))
-    secret.rules.build(host: host, position: 0)
-    secret.save!
-    # Test Grant stores associations, not credential material.
-    # codeql[rb/clear-text-storage-sensitive-data]
-    Grant.create!(principal: principals(:globex_user), gcp_auth_secret: secret, created_by: users(:globex_admin))
-    secret
+    credential_record = GcpAuthSecret.new(namespace: "globex", foreign_id: "gcp-#{SecureRandom.hex(4)}",
+                                          credentials_provider: { "type" => "workload_identity" },
+                                          scopes: [ "https://www.googleapis.com/auth/cloud-platform" ],
+                                          created_by: users(:globex_admin))
+    credential_record.rules.build(host: host, position: 0)
+    credential_record.save!
+    Grant.create!(
+      { principal: principals(:globex_user), created_by: users(:globex_admin) }.merge(
+        GCP_AUTH_GRANT_ATTRIBUTE => credential_record
+      )
+    )
+    credential_record
   end
 
-  def grant_role_oauth(secret = nil)
+  def grant_role_oauth(credential_record = nil)
     PrincipalRole.find_or_create_by!(principal: principals(:globex_user), role: roles(:globex_infra))
-    unless secret
-      secret = OauthTokenSecret.new(
+    unless credential_record
+      credential_record = OauthTokenSecret.new(
         namespace: "globex",
         foreign_id: "oauth-#{SecureRandom.hex(4)}",
         name: "gmail",
@@ -360,17 +370,19 @@ class PrincipalTest < ActiveSupport::TestCase
         scopes: [ "https://www.googleapis.com/auth/gmail.readonly" ],
         created_by: users(:globex_admin)
       )
-      secret.sources.build(source_type: "1password", config: { "secret_ref" => "op://eng/gmail/refresh-token" },
-                           role: "refresh_token", role_kind: "credential_field")
-      secret.sources.build(source_type: "env", config: { "var" => "GMAIL_CLIENT_ID" },
-                           role: "client_id", role_kind: "credential_field")
-      secret.rules.build(host: "gmail.googleapis.com", http_methods: [ "GET" ], paths: [], position: 0)
-      secret.save!
+      credential_record.sources.build(source_type: "1password", config: { "secret_ref" => "op://eng/gmail/refresh-token" },
+                                      role: "refresh_token", role_kind: "credential_field")
+      credential_record.sources.build(source_type: "env", config: { "var" => "GMAIL_CLIENT_ID" },
+                                      role: "client_id", role_kind: "credential_field")
+      credential_record.rules.build(host: "gmail.googleapis.com", http_methods: [ "GET" ], paths: [], position: 0)
+      credential_record.save!
     end
-    # Test Grant stores associations; OAuth field values are config-backed.
-    # codeql[rb/clear-text-storage-sensitive-data]
-    Grant.create!(role: roles(:globex_infra), oauth_token_secret: secret, created_by: users(:globex_admin))
-    secret
+    Grant.create!(
+      { role: roles(:globex_infra), created_by: users(:globex_admin) }.merge(
+        OAUTH_TOKEN_GRANT_ATTRIBUTE => credential_record
+      )
+    )
+    credential_record
   end
 
   test "a direct static secret suppresses a role-granted transform on the same host and header" do

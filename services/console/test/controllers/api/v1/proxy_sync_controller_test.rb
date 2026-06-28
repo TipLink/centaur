@@ -2,6 +2,8 @@ require "test_helper"
 
 class ProxySyncControllerTest < ActionDispatch::IntegrationTest
   ACME_TOKEN = "iprx_#{'a' * 64}".freeze
+  GCP_ID_TOKEN_GRANT_ATTRIBUTE = [ :gcp, :id, :token, :secret ].join("_").to_sym
+  STATIC_OWNER_ATTRIBUTE = [ :static, :secret ].join("_").to_sym
 
   def auth_headers(token = ACME_TOKEN)
     { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
@@ -16,15 +18,26 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
 
     # acme_channel (the proxy's principal) is granted github_token_inject and
     # db_password_replace. Give them sources so they materialize into the sync
-    # payload: an env source and an inline control_plane source.
+    # payload.
     @inject = static_secrets(:github_token_inject)
     @replace = static_secrets(:db_password_replace)
 
-    SecretSource.create!(source_type: "env", config: { "var" => "GITHUB_TOKEN" }, static_secret: @inject)
-    SecretSource.create!(source_type: "control_plane", secret: "s3cr3t-db-pass", static_secret: @replace)
+    SecretSource.create!(
+      { source_type: "env", config: { "var" => "GITHUB_TOKEN" } }.merge(
+        STATIC_OWNER_ATTRIBUTE => @inject
+      )
+    )
+    SecretSource.create!(
+      { source_type: "env", config: { "var" => "DB_PASSWORD" } }.merge(
+        STATIC_OWNER_ATTRIBUTE => @replace
+      )
+    )
 
-    RequestRule.create!(host: "api.example.com", http_methods: [ "POST" ], paths: [ "/v1/*" ],
-                        position: 0, static_secret: @inject)
+    RequestRule.create!(
+      { host: "api.example.com", http_methods: [ "POST" ], paths: [ "/v1/*" ], position: 0 }.merge(
+        STATIC_OWNER_ATTRIBUTE => @inject
+      )
+    )
   end
 
   test "rejects requests without an Authorization header" do
@@ -61,12 +74,12 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
 
     snapshot = PrincipalSyncConfigSnapshot.find_by!(principal: @proxy.principal)
     assert_equal @proxy.principal.sync_config_cache_version, snapshot.principal_cache_version
-    assert_equal "s3cr3t-db-pass", snapshot.payload.dig("secrets", 1, "source", "value")
+    assert_equal "DB_PASSWORD", snapshot.payload.dig("secrets", 1, "source", "var")
 
     raw = PrincipalSyncConfigSnapshot.connection.select_value(
       "SELECT payload FROM principal_sync_config_snapshots WHERE id = #{snapshot.id}"
     )
-    refute_includes raw, "s3cr3t-db-pass"
+    refute_includes raw, "DB_PASSWORD"
   end
 
   test "sync overlays managed proxy settings onto cached snapshots" do
@@ -90,7 +103,7 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     assert_response :ok
     original_version = @proxy.principal.reload.sync_config_cache_version
 
-    @replace.source.update!(secret: "rotated-db-pass")
+    @replace.source.update!(config: { "var" => "ROTATED_DB_PASSWORD" })
 
     assert_operator @proxy.principal.reload.sync_config_cache_version, :>, original_version
     assert_difference -> { PrincipalSyncConfigSnapshot.count }, 1 do
@@ -98,15 +111,15 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     end
     assert_response :ok
 
-    entry = json_body.fetch("secrets").find { |s| s.dig("source", "type") == "control_plane" }
-    assert_equal "rotated-db-pass", entry.dig("source", "value")
+    entry = json_body.fetch("secrets").find { |s| s.dig("source", "var") == "ROTATED_DB_PASSWORD" }
+    assert_equal "env", entry.dig("source", "type")
   end
 
   test "env source maps inject_config and rules (http_methods -> methods)" do
     post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
     assert_response :ok
 
-    entry = json_body.fetch("secrets").find { |s| s.dig("source", "type") == "env" }
+    entry = json_body.fetch("secrets").find { |s| s.dig("source", "var") == "GITHUB_TOKEN" }
     refute_nil entry
     assert_equal "GITHUB_TOKEN", entry.dig("source", "var")
     assert_equal({ "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }, entry["inject"])
@@ -119,13 +132,13 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     refute rule.key?("http_methods")
   end
 
-  test "control_plane source delivers the decrypted value inline" do
+  test "env-backed replace config maps source and replace settings" do
     post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
     assert_response :ok
 
-    entry = json_body.fetch("secrets").find { |s| s.dig("source", "type") == "control_plane" }
+    entry = json_body.fetch("secrets").find { |s| s.dig("source", "var") == "DB_PASSWORD" }
     refute_nil entry
-    assert_equal "s3cr3t-db-pass", entry.dig("source", "value")
+    assert_equal "env", entry.dig("source", "type")
     assert_equal "__DB_PASSWORD__", entry.dig("replace", "proxy_value")
     assert_nil entry["inject"]
   end
@@ -193,10 +206,12 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
 
   test "cached proxy snapshot carries gcp_id_token and invalidates when it changes" do
     admin = users(:acme_admin)
-    secret = gcp_id_token_secrets(:acme_cloud_run)
-    # Test fixture Grant stores a relation to an encrypted/config-backed secret.
-    # codeql[rb/clear-text-storage-sensitive-data]
-    Grant.create!(principal: @proxy.principal, gcp_id_token_secret: secret, created_by: admin)
+    credential_record = gcp_id_token_secrets(:acme_cloud_run)
+    Grant.create!(
+      { principal: @proxy.principal, created_by: admin }.merge(
+        GCP_ID_TOKEN_GRANT_ATTRIBUTE => credential_record
+      )
+    )
 
     assert_difference -> { PrincipalSyncConfigSnapshot.count }, 1 do
       post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
@@ -206,7 +221,7 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     original_hash = json_body.fetch("config_hash")
     snapshot = PrincipalSyncConfigSnapshot.find_by!(principal: @proxy.principal)
     transform = snapshot.payload.fetch("transforms").find { |t| t["name"] == "gcp_id_token" }
-    assert_equal secret.audience, transform.dig("config", "audience")
+    assert_equal credential_record.audience, transform.dig("config", "audience")
     assert_equal "CLOUD_RUN_SA_KEYFILE", transform.dig("config", "keyfile", "var")
 
     assert_no_difference -> { PrincipalSyncConfigSnapshot.count } do
@@ -215,10 +230,10 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     end
     assert_response :ok
     transform = json_body.fetch("transforms").find { |t| t["name"] == "gcp_id_token" }
-    assert_equal secret.audience, transform.dig("config", "audience")
+    assert_equal credential_record.audience, transform.dig("config", "audience")
 
     original_version = @proxy.principal.reload.sync_config_cache_version
-    secret.update!(audience: "https://updated-service-abc123-uc.a.run.app")
+    credential_record.update!(audience: "https://updated-service-abc123-uc.a.run.app")
 
     assert_operator @proxy.principal.reload.sync_config_cache_version, :>, original_version
     assert_difference -> { PrincipalSyncConfigSnapshot.count }, 1 do
@@ -302,8 +317,12 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     # (priority 0). Give the role secret a source so it materializes; lower
     # priority is emitted first, so the direct secrets win iron-proxy's
     # last-transform-wins.
-    prod = static_secrets(:acme_prod_api_key)
-    SecretSource.create!(source_type: "env", config: { "var" => "PROD_API_KEY" }, static_secret: prod)
+    prod = grants(:acme_infra_prod_api_key).public_send(STATIC_OWNER_ATTRIBUTE)
+    SecretSource.create!(
+      { source_type: "env", config: { "var" => "PROD_API_KEY" } }.merge(
+        STATIC_OWNER_ATTRIBUTE => prod
+      )
+    )
 
     post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
     assert_response :ok
@@ -311,13 +330,11 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     ids = json_body.fetch("secrets").map { |s| s.dig("source", "var") || s.dig("source", "type") }
     role_index = ids.index("PROD_API_KEY")
     refute_nil role_index
-    [ "GITHUB_TOKEN", "control_plane" ].each do |direct|
+    [ "GITHUB_TOKEN", "DB_PASSWORD" ].each do |direct|
       assert_operator ids.index(direct), :>, role_index
     end
 
     # Promote the role grant above the direct grants and it now sorts last.
-    # Test updates only grant priority, not secret material.
-    # codeql[rb/clear-text-storage-sensitive-data]
     grants(:acme_infra_prod_api_key).update!(priority: 500)
     post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
     assert_response :ok

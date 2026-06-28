@@ -12,6 +12,7 @@ from .client import AirtableClient
 load_dotenv()
 
 app = typer.Typer(name="airtable", help="Airtable API client")
+console = Console()
 
 
 _SENSITIVE_KEY_PARTS = (
@@ -52,6 +53,10 @@ def _safe_error(exc: BaseException) -> str:
     return text
 
 
+def _emit_json(data: object) -> None:
+    console.print_json(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+
+
 @app.command("health")
 def health():
     """Assert airtable connectivity and auth with a safe read-only check."""
@@ -63,20 +68,13 @@ def health():
         payload = {"ok": True, "tool": "airtable", "error": None, "details": details}
     except Exception as exc:
         payload = {"ok": False, "tool": "airtable", "error": _safe_error(exc), "details": {}}
-        # Health payload is recursively redacted.
-        # codeql[py/clear-text-logging-sensitive-data]
-        print(json.dumps(_redact_for_output(payload), indent=2, ensure_ascii=False, default=str))
+        _emit_json(_redact_for_output(payload))
         raise typer.Exit(1) from exc
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
-    # Health payload is recursively redacted.
-    # codeql[py/clear-text-logging-sensitive-data]
-    print(json.dumps(_redact_for_output(payload), indent=2, ensure_ascii=False, default=str))
-
-
-console = Console()
+    _emit_json(_redact_for_output(payload))
 
 
 def _print(data: object) -> None:

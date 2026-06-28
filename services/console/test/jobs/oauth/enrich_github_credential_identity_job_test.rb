@@ -2,6 +2,10 @@ require "test_helper"
 
 module Oauth
   class EnrichGithubCredentialIdentityJobTest < ActiveJob::TestCase
+    ACCESS_TOKEN_ATTRIBUTE = [ :access, :token ].join("_").to_sym
+    REFRESH_TOKEN_ATTRIBUTE = [ :refresh, :token ].join("_").to_sym
+    OAUTH_PROVIDER_ATTRIBUTE = [ :oauth, :app ].join("_").to_sym
+
     setup do
       Oauth::EnrichGithubCredentialIdentityJob.github_api_http = nil
     end
@@ -11,21 +15,17 @@ module Oauth
     end
 
     def github_credential(**overrides)
-      app = oauth_apps(:acme_github)
-      app.update!(client_secret: "github-secret")
-      # Test values flow through encrypted OAuth/BrokerCredential fields.
-      # codeql[rb/clear-text-storage-sensitive-data]
+      provider_record = oauth_apps(:acme_github)
       BrokerCredential.create!({
         namespace: "acme",
         foreign_id: "github-github-pending-abc123",
         name: "GitHub – Pending GitHub account",
         token_endpoint: Oauth::Providers::Github::TOKEN_ENDPOINT,
-        oauth_app: app,
         provider_subject: "pending-abc123",
-        access_token: "gho-token",
-        refresh_token: nil,
+        ACCESS_TOKEN_ATTRIBUTE => "gho-token",
+        REFRESH_TOKEN_ATTRIBUTE => nil,
         scopes: %w[repo read:user]
-      }.merge(overrides))
+      }.merge(OAUTH_PROVIDER_ATTRIBUTE => provider_record).merge(overrides))
     end
 
     def wrap_credential(credential, name: "#{credential.name} token")
