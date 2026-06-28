@@ -139,7 +139,7 @@
 |  twitter search ethereum --limit 20
 |  linear search "bug in auth"
 |  notion search "meeting notes"
-|  vlogs query 'level:error AND _stream:{service="api"}' --limit 20
+|  centaur-investigator self --json
 
 [Tool discovery — discover before you call]
 |IMPORTANT: Before using any unfamiliar tool CLI, run `<tool> --help` to see commands, parameters, and descriptions.
