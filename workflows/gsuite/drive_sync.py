@@ -5,10 +5,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from workflows.gsuite.drive import GOOGLE_DOC_MIME_TYPE
+from workflows.gsuite.drive import GOOGLE_DOC_MIME_TYPE, GOOGLE_FOLDER_MIME_TYPE
 from api.runtime_control import canonical_json
 from api.vm_metrics import (
     record_etl_items_failed,
@@ -42,13 +43,22 @@ class Input:
     since: str | None = None
     limit: int = DEFAULT_PAGE_SIZE
     watermark_overlap_seconds: int = DEFAULT_WATERMARK_OVERLAP_SECONDS
+    folder_ids: list[str] | str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DriveScope:
+    scope_id: str
+    query: str
+    recursive: bool = False
+    checkpointed: bool = True
 
 
 class GoogleDriveSyncClient(Protocol):
     """Small adapter protocol used by the Drive ETL workflow."""
 
-    def list_docs(
+    def list_files(
         self,
         *,
         query: str,
@@ -83,6 +93,54 @@ def _rfc3339(value: dt.datetime) -> str:
 
 def _drive_literal(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _extract_folder_id(value: str) -> str | None:
+    raw = value.strip().strip("<>").strip()
+    if not raw:
+        return None
+    match = re.search(r"/folders/([A-Za-z0-9_-]+)", raw)
+    if match:
+        return match.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,}", raw):
+        return raw
+    return None
+
+
+def _folder_ids_from(value: Any) -> list[str]:
+    if value is None:
+        return []
+    raw_values: list[str]
+    if isinstance(value, str):
+        raw_values = re.split(r"[\s,]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = [str(item) for item in value]
+    else:
+        raw_values = [str(value)]
+
+    folder_ids: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        folder_id = _extract_folder_id(raw)
+        if not folder_id or folder_id in seen:
+            continue
+        folder_ids.append(folder_id)
+        seen.add(folder_id)
+    return folder_ids
+
+
+def _configured_folder_ids(input_folder_ids: Any) -> list[str]:
+    folder_ids: list[str] = []
+    seen: set[str] = set()
+    for folder_id in [
+        *_folder_ids_from(os.getenv("GOOGLE_DRIVE_ETL_FOLDER_IDS")),
+        *_folder_ids_from(input_folder_ids),
+    ]:
+        if folder_id in seen:
+            continue
+        folder_ids.append(folder_id)
+        seen.add(folder_id)
+    return folder_ids
 
 
 def _content_hash(*parts: Any) -> str:
@@ -121,6 +179,79 @@ def _build_query(
     if modified_after:
         parts.append(f"modifiedTime > {_drive_literal(_rfc3339(modified_after))}")
     return " and ".join(parts)
+
+
+def _build_folder_query(folder_id: str) -> str:
+    return f"{_drive_literal(folder_id)} in parents and trashed = false"
+
+
+def _build_scopes(
+    *,
+    modified_after: dt.datetime | None,
+    folder_ids: list[str],
+) -> list[DriveScope]:
+    scopes = [
+        DriveScope(
+            scope_id="all_visible",
+            query=_build_query(modified_after=modified_after),
+            recursive=False,
+            checkpointed=True,
+        )
+    ]
+    for folder_id in folder_ids:
+        scopes.append(
+            DriveScope(
+                scope_id=f"folder:{folder_id}",
+                query=_build_folder_query(folder_id),
+                recursive=True,
+                checkpointed=False,
+            )
+        )
+    return scopes
+
+
+def _iter_scope_files(
+    client: GoogleDriveSyncClient,
+    *,
+    scope: DriveScope,
+    page_size: int,
+) -> list[dict[str, Any]]:
+    """Return Google Docs visible through a Drive scope.
+
+    Explicit folder scopes are full-scanned every run because Drive permission
+    and folder membership changes are not reliably represented by child
+    document modifiedTime.
+    """
+    files: list[dict[str, Any]] = []
+    pending_queries = [scope.query]
+    visited_folders: set[str] = set()
+
+    while pending_queries:
+        query = pending_queries.pop(0)
+        page_token: str | None = None
+        while True:
+            page = client.list_files(
+                query=query,
+                page_size=page_size,
+                page_token=page_token,
+            )
+            for file in page.get("files", []):
+                file_id = str(file.get("id") or "")
+                mime_type = str(file.get("mimeType") or "")
+                if not file_id:
+                    continue
+                if scope.recursive and mime_type == GOOGLE_FOLDER_MIME_TYPE:
+                    if file_id not in visited_folders:
+                        visited_folders.add(file_id)
+                        pending_queries.append(_build_folder_query(file_id))
+                    continue
+                if mime_type == GOOGLE_DOC_MIME_TYPE:
+                    files.append(file)
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                break
+
+    return files
 
 
 async def _load_checkpoint(pool, scope_id: str) -> dict[str, Any] | None:
@@ -348,16 +479,18 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         watermark = checkpoint["watermark_time"].astimezone(dt.timezone.utc)
     if watermark is not None:
         watermark = watermark - dt.timedelta(seconds=overlap_seconds)
-    query = _build_query(modified_after=watermark)
+    folder_ids = _configured_folder_ids(inp.folder_ids)
+    scopes = _build_scopes(modified_after=watermark, folder_ids=folder_ids)
 
     await _record_run_start(
         ctx._pool,
         run_id=run_id,
         workflow_run_id=ctx.run_id,
-        scopes_requested=[_scope_ref(scope_id)],
+        scopes_requested=[_scope_ref(scope.scope_id) for scope in scopes],
         metadata={
             **inp.metadata,
             "page_size": limit,
+            "folder_ids": folder_ids,
         },
     )
 
@@ -370,77 +503,71 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         "docs_fetched": 0,
         "docs_upserted": 0,
     }
+    seen_file_ids: set[str] = set()
 
-    for scope_id, query in [(scope_id, query)]:
+    for scope in scopes:
         successful_watermark: dt.datetime | None = None
         try:
-            page_token: str | None = None
-            while True:
-                page = client.list_docs(
-                    query=query, page_size=limit, page_token=page_token
-                )
-                files = [
-                    file
-                    for file in page.get("files", [])
-                    if str(file.get("id") or "")
-                    and str(file.get("mimeType") or "") == GOOGLE_DOC_MIME_TYPE
-                ]
-                counts["files_seen"] += len(files)
-                record_etl_items_seen("google_drive", "doc", "file", len(files))
-                for file in files:
-                    file_id = str(file.get("id") or "")
-                    modified_at = _file_modified_time(file)
-                    try:
-                        text = client.docs_get_text(file_id)
-                        counts["docs_fetched"] += 1
-                        await _upsert_file(
-                            ctx._pool, file=file, text=text, run_id=run_id
-                        )
-                        counts["files_upserted"] += 1
-                        counts["docs_upserted"] += 1
-                        record_etl_items_upserted("google_drive", "doc", "file", 1)
-                        if modified_at and (
+            files = _iter_scope_files(client, scope=scope, page_size=limit)
+            counts["files_seen"] += len(files)
+            record_etl_items_seen("google_drive", "doc", "file", len(files))
+            for file in files:
+                file_id = str(file.get("id") or "")
+                if file_id in seen_file_ids:
+                    continue
+                seen_file_ids.add(file_id)
+                modified_at = _file_modified_time(file)
+                try:
+                    text = client.docs_get_text(file_id)
+                    counts["docs_fetched"] += 1
+                    await _upsert_file(ctx._pool, file=file, text=text, run_id=run_id)
+                    counts["files_upserted"] += 1
+                    counts["docs_upserted"] += 1
+                    record_etl_items_upserted("google_drive", "doc", "file", 1)
+                    if (
+                        scope.checkpointed
+                        and modified_at
+                        and (
                             successful_watermark is None
                             or modified_at > successful_watermark
-                        ):
-                            successful_watermark = modified_at
-                    except Exception as exc:
-                        error = str(exc)
-                        failed.append(_scope_ref(scope_id, f"file:{file_id}:{error}"))
-                        record_etl_items_failed(
-                            "google_drive",
-                            "doc",
-                            "file",
-                            "permission_error"
-                            if "permission" in error.lower() or "403" in error
-                            else "api_error",
                         )
-                        await _record_file_error(
-                            ctx._pool,
-                            file_id=file_id,
-                            error=error,
-                            run_id=run_id,
-                        )
-                        ctx.log(
-                            "google_drive_sync_file_failed",
-                            scope_id=scope_id,
-                            file_id=file_id,
-                            file_name=str(file.get("name") or ""),
-                            error=error,
-                        )
-                page_token = page.get("nextPageToken")
-                if not page_token:
-                    break
-            await _update_checkpoint_success(
-                ctx._pool,
-                scope_id=scope_id,
-                watermark_time=successful_watermark,
-                run_id=run_id,
-            )
-            synced.append(_scope_ref(scope_id))
+                    ):
+                        successful_watermark = modified_at
+                except Exception as exc:
+                    error = str(exc)
+                    failed.append(_scope_ref(scope.scope_id, f"file:{file_id}:{error}"))
+                    record_etl_items_failed(
+                        "google_drive",
+                        "doc",
+                        "file",
+                        "permission_error"
+                        if "permission" in error.lower() or "403" in error
+                        else "api_error",
+                    )
+                    await _record_file_error(
+                        ctx._pool,
+                        file_id=file_id,
+                        error=error,
+                        run_id=run_id,
+                    )
+                    ctx.log(
+                        "google_drive_sync_file_failed",
+                        scope_id=scope.scope_id,
+                        file_id=file_id,
+                        file_name=str(file.get("name") or ""),
+                        error=error,
+                    )
+            if scope.checkpointed:
+                await _update_checkpoint_success(
+                    ctx._pool,
+                    scope_id=scope.scope_id,
+                    watermark_time=successful_watermark,
+                    run_id=run_id,
+                )
+            synced.append(_scope_ref(scope.scope_id))
             ctx.log(
                 "google_drive_sync_scope_completed",
-                scope_id=scope_id,
+                scope_id=scope.scope_id,
                 files_seen=counts["files_seen"],
                 files_upserted=counts["files_upserted"],
                 docs_fetched=counts["docs_fetched"],
@@ -451,17 +578,18 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
             )
         except Exception as exc:
             error = str(exc)
-            failed.append(_scope_ref(scope_id, error))
+            failed.append(_scope_ref(scope.scope_id, error))
             record_etl_items_failed("google_drive", "doc", "scope", "api_error")
-            await _update_checkpoint_failure(
-                ctx._pool,
-                scope_id=scope_id,
-                run_id=run_id,
-                error=error,
-            )
+            if scope.checkpointed:
+                await _update_checkpoint_failure(
+                    ctx._pool,
+                    scope_id=scope.scope_id,
+                    run_id=run_id,
+                    error=error,
+                )
             ctx.log(
                 "google_drive_sync_scope_failed",
-                scope_id=scope_id,
+                scope_id=scope.scope_id,
                 error=error,
             )
 
