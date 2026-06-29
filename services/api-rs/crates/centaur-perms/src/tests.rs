@@ -1003,6 +1003,62 @@ fn real_slack_tool_parses_and_translates() {
         ),
         "expected the SLACK_BOT_TOKEN static secret"
     );
+
+    let etl_inputs = out
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            SecretInput::Static(secret) if secret.name == "SLACK_ETL_TOKEN" => Some(secret),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(etl_inputs.len(), 2);
+
+    let slack_api = etl_inputs
+        .iter()
+        .find(|secret| {
+            secret
+                .rules
+                .iter()
+                .any(|rule| rule.host.as_deref() == Some("slack.com"))
+        })
+        .expect("expected Slack Web API ETL token rules");
+    let mut slack_hosts = slack_api
+        .rules
+        .iter()
+        .map(|rule| rule.host.as_deref().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    slack_hosts.sort();
+    assert_eq!(
+        slack_hosts,
+        vec!["slack.com".to_owned(), "www.slack.com".to_owned()]
+    );
+    for rule in &slack_api.rules {
+        assert_eq!(rule.http_methods, vec!["GET".to_owned(), "POST".to_owned()]);
+        assert_eq!(
+            rule.paths,
+            vec![
+                "/api/conversations.list".to_owned(),
+                "/api/conversations.history".to_owned(),
+                "/api/conversations.replies".to_owned(),
+                "/api/users.list".to_owned(),
+            ]
+        );
+    }
+
+    let files = etl_inputs
+        .iter()
+        .find(|secret| {
+            secret
+                .rules
+                .iter()
+                .any(|rule| rule.host.as_deref() == Some("files.slack.com"))
+        })
+        .expect("expected Slack file download ETL token rule");
+    assert_eq!(files.rules.len(), 1);
+    assert_eq!(files.rules[0].host.as_deref(), Some("files.slack.com"));
+    assert_eq!(files.rules[0].http_methods, vec!["GET".to_owned()]);
+    assert!(files.rules[0].paths.is_empty());
 }
 
 #[test]
