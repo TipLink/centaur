@@ -222,6 +222,7 @@ Google Workspace ETL workflows:
 | Env var | Set from | Controls |
 | --- | --- | --- |
 | `GOOGLE_DRIVE_ETL_ENABLED` | `api.googleDriveEtlEnabled`. | Enables Google Drive Docs sync. |
+| `GOOGLE_DRIVE_ETL_FOLDER_IDS` | `api.extraEnv`. | Comma- or whitespace-separated Drive folder IDs/URLs to recursively full-scan for Google Docs. |
 | `GOOGLE_DRIVE_SYNC_INTERVAL_SECONDS` | `api.googleDriveSyncIntervalSeconds`. | Google Drive Docs sync schedule interval. |
 | `GOOGLE_CALENDAR_ETL_ENABLED` | `api.googleCalendarEtlEnabled`. | Enables Google Calendar sync. |
 | `GOOGLE_CALENDAR_SYNC_INTERVAL_SECONDS` | `api.googleCalendarSyncIntervalSeconds`. | Google Calendar sync schedule interval. |
