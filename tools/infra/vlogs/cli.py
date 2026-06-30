@@ -1,6 +1,7 @@
 """CLI for VictoriaLogs queries."""
 
 import json
+import os
 
 import typer
 from dotenv import load_dotenv
@@ -12,6 +13,24 @@ load_dotenv()
 
 app = typer.Typer(name="vlogs", help="VictoriaLogs CLI for LogsQL queries and log exploration")
 console = Console()
+OPERATOR_ENVS = ("CENTAUR_OBSERVABILITY_OPERATOR_MODE", "CENTAUR_INVESTIGATOR_OPERATOR_MODE")
+
+
+def _operator_mode_enabled() -> bool:
+    return any(
+        os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+        for name in OPERATOR_ENVS
+    )
+
+
+def _require_operator(command: str) -> None:
+    if _operator_mode_enabled():
+        return
+    console.print(
+        f"[red]vlogs {command} is operator-only. Use `centaur-investigator self` "
+        "for current-sandbox debugging.[/red]"
+    )
+    raise typer.Exit(1)
 
 
 def get_client():
@@ -29,6 +48,7 @@ def query_logs(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Run a LogsQL query against VictoriaLogs."""
+    _require_operator("query")
     client = get_client()
     result = client.query(query=query, limit=limit, start=start, end=end)
 
@@ -55,6 +75,7 @@ def list_fields(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """List all known field names."""
+    _require_operator("fields")
     client = get_client()
     result = client.field_names(query=query, start=start, end=end)
 
@@ -76,6 +97,7 @@ def field_values(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Get all values for a field."""
+    _require_operator("field-values")
     client = get_client()
     result = client.field_values(field, query=query, limit=limit, start=start, end=end)
 
@@ -95,6 +117,7 @@ def list_streams(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Find log streams matching a query."""
+    _require_operator("streams")
     client = get_client()
     result = client.streams(query=query, start=start, end=end)
 

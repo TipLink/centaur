@@ -17,18 +17,26 @@ load_dotenv()
 
 app = typer.Typer(
     name="centaur-investigator",
-    help="Investigate Centaur threads and sessions from readonly Postgres.",
+    help="Investigate the current Centaur sandbox/thread by default.",
 )
 
 
 @app.command("health")
 def health():
-    """Assert centaur-investigator connectivity and auth with a safe read-only check."""
+    """Assert centaur-investigator connectivity without scanning other threads."""
     from .client import _client
 
     client = _client()
     try:
-        details = client.search_sessions(limit=1)
+        details = client.self_state(limit=1, include_observability=False)
+        if details.get("status") == "error" and "requires CENTAUR_THREAD_KEY" in str(
+            details.get("error")
+        ):
+            details = {
+                "status": "ok",
+                "scope": "unclaimed",
+                "note": "health ran outside a claimed session; self-debug activates with CENTAUR_THREAD_KEY",
+            }
         if isinstance(details, dict) and details.get("status") == "error":
             raise RuntimeError(
                 str(details.get("error") or "centaur-investigator health check failed")
@@ -89,6 +97,32 @@ def _print_investigation(result: dict[str, Any]) -> None:
                 str(row.get("completed_at") or ""),
             )
         console.print(table)
+
+
+@app.command("self")
+def self_debug(
+    limit: int = typer.Option(25, "--limit", "-n", help="Max rows per source."),
+    observability: bool = typer.Option(
+        True,
+        "--observability/--no-observability",
+        help="Query self-scoped aggregate vlogs/vmetrics metadata.",
+    ),
+    window_hours: int = typer.Option(24, "--window-hours", help="Observability lookback."),
+    logs_limit: int = typer.Option(100, "--logs-limit", help="Max log metadata rows."),
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Inspect only this sandbox's current thread/session state."""
+    result = CentaurInvestigatorClient().self_state(
+        limit=limit,
+        include_observability=observability,
+        window_hours=window_hours,
+        logs_limit=logs_limit,
+    )
+    _require_ok(result)
+    if json_output:
+        _print_json(result)
+        return
+    _print_investigation(result)
 
 
 @app.command("investigate")

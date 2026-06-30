@@ -235,6 +235,7 @@ def test_investigation_queries_readonly_tables_without_message_context(monkeypat
         return fake
 
     monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setenv("CENTAUR_INVESTIGATOR_OPERATOR_MODE", "1")
 
     result = CentaurInvestigatorClient("postgresql://example").investigate_slack_thread(
         "https://example.slack.com/archives/C123/p1777910337403889",
@@ -309,6 +310,7 @@ def test_observability_never_requests_raw_log_context(monkeypatch) -> None:
 
     monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
     monkeypatch.setattr(centaur_client, "_safe_load_module", fake_load_module)
+    monkeypatch.setenv("CENTAUR_INVESTIGATOR_OPERATOR_MODE", "1")
 
     result = CentaurInvestigatorClient("postgresql://example").investigate_slack_thread(
         "https://example.slack.com/archives/C123/p1777910337403889",
@@ -320,3 +322,80 @@ def test_observability_never_requests_raw_log_context(monkeypatch) -> None:
     assert "thread_trace" not in str(result["observability"])
     assert "execution_logs" not in str(result["observability"])
     assert "raw_payload" not in str(result)
+
+
+def test_self_state_uses_current_thread_and_disables_broad_like_queries(monkeypatch) -> None:
+    fake = _FakeConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:C123:1777910337.403889")
+    monkeypatch.delenv("CENTAUR_INVESTIGATOR_OPERATOR_MODE", raising=False)
+
+    result = CentaurInvestigatorClient("postgresql://example").self_state(
+        include_observability=False,
+    )
+
+    assert result["status"] == "ok"
+    assert result["scope"] == "self"
+    assert result["parsed"]["thread_key"] == "slack:C123:1777910337.403889"
+    assert result["postgres"]["nearby_sessions"]["rows"] == []
+
+    fetch_args = [args for _query, args in fake.fetch_calls if args]
+    assert fetch_args
+    assert all("%:C123:1777910337.403889" not in args for args in fetch_args)
+    assert all("%:C123:%" not in args for args in fetch_args)
+
+
+def test_cross_thread_investigation_is_denied_without_operator_mode(monkeypatch) -> None:
+    async def fake_connect(*args, **kwargs):
+        raise AssertionError("cross-thread denial should happen before Postgres connects")
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:C123:1777910337.403889")
+    monkeypatch.delenv("CENTAUR_INVESTIGATOR_OPERATOR_MODE", raising=False)
+
+    result = CentaurInvestigatorClient("postgresql://example").investigate_slack_thread(
+        "https://example.slack.com/archives/C999/p1777910337403889",
+        include_observability=False,
+    )
+
+    assert result["status"] == "error"
+    assert "self-scoped by default" in result["error"]
+
+
+def test_self_state_falls_back_to_local_context_when_postgres_unavailable(monkeypatch) -> None:
+    async def fake_connect(*args, **kwargs):
+        raise RuntimeError("permission denied for table sessions")
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(centaur_client, "_safe_load_module", lambda *args, **kwargs: None)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:C123:1777910337.403889")
+    monkeypatch.delenv("CENTAUR_INVESTIGATOR_OPERATOR_MODE", raising=False)
+
+    result = CentaurInvestigatorClient("postgresql://example").self_state(
+        include_observability=True,
+    )
+
+    assert result["status"] == "ok"
+    assert result["scope"] == "self"
+    assert result["analysis"]["primary_source"] == "local_sandbox_context"
+    assert result["postgres"]["status"] == "unavailable"
+    assert "permission denied" in result["postgres"]["error"]
+    assert result["observability"]["vlogs"]["status"] == "skipped"
+
+
+def test_search_sessions_requires_operator_mode(monkeypatch) -> None:
+    async def fake_connect(*args, **kwargs):
+        raise AssertionError("search-sessions denial should happen before Postgres connects")
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:C123:1777910337.403889")
+    monkeypatch.delenv("CENTAUR_INVESTIGATOR_OPERATOR_MODE", raising=False)
+
+    result = CentaurInvestigatorClient("postgresql://example").search_sessions()
+
+    assert result["status"] == "error"
+    assert "operator-only" in result["error"]
