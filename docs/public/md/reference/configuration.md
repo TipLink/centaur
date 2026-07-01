@@ -110,6 +110,7 @@ Execution tuning:
 | `SLACK_API_URL` | `slackbot.extraEnv`. | Optional Slack Web API base URL override. |
 | `CENTAUR_API_URL` | Chart-rendered API service URL. | API base URL used by Slackbot. |
 | `CENTAUR_SLACK_EVENTS_PATH` | `slackbot.extraEnv`. | Slack Events API route; defaults to `/api/webhooks/slack`. |
+| `SLACKBOT_AMBIENT_CHANNEL_IDS` | `slackbotv2.extraEnv`. | Comma/space-separated Slack channel ids where root messages start sessions without a bot mention. |
 | `RUNTIME_ERROR_ALERT_CHANNEL` | `slackbot.runtimeErrorAlertChannel`. | Slack channel for runtime error alerts. |
 | `SLACK_EVENT_DEDUP_TTL_MS` | `slackbot.extraEnv`. | Slack event dedupe window. |
 | `SLACK_SIGNATURE_MAX_AGE_SECONDS` | `slackbot.extraEnv`. | Maximum accepted Slack signature age. |
