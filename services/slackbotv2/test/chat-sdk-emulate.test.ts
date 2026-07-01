@@ -1478,6 +1478,85 @@ describe('slackbotv2', () => {
     expect(texts.some(text => text.includes('Draft answer from the live deltas'))).toBe(false)
   })
 
+  it('swaps duplicated live answer deltas for the durable terminal answer', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before duplicated answer deltas.')
+    const mentionText = `<@${BOT_USER_ID}> answer once even if the stream repeats`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-duplicate-delta-terminal-swap',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: mentionText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const finalAnswer = 'DURABLE_TERMINAL_ANSWER_VISIBLE'
+    const duplicatedLiveAnswer = `${finalAnswer}${finalAnswer}`
+    const outputLines: string[] = []
+    for (const notification of sampleCodexNotifications(finalAnswer)) {
+      const line = JSON.stringify(notification)
+      outputLines.push(line)
+      const params = notification.params as { itemId?: string }
+      if (notification.method === 'item/agentMessage/delta' && params.itemId === 'answer-1') {
+        outputLines.push(line)
+      }
+    }
+    codexApi.emitOutputLines(key, outputLines)
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          completedAtMs: 4,
+          item: {
+            type: 'agentMessage',
+            id: 'answer-1',
+            text: duplicatedLiveAnswer,
+            phase: 'final_answer',
+            memoryCitation: null
+          }
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-duplicate-delta-terminal-swap',
+      status: 'completed',
+      result_text: finalAnswer
+    })
+
+    await Promise.all(waits)
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.renderObligation === null
+    }, 3000)
+
+    const texts = await threadTexts(parent.ts)
+    expect(texts.filter(text => text.includes(finalAnswer))).toHaveLength(1)
+    expect(texts.some(text => text.includes(duplicatedLiveAnswer))).toBe(false)
+  })
+
   it('reposts the durable final answer when the Slack stream expires mid-render', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()

@@ -1764,13 +1764,16 @@ async function renderExecutionStream(
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
+  const fallback = new SlackRenderFallback()
   try {
     const visibleStream = await streamAfterFirstChunk(
-      conflateChatSdkStream(
-        slackSafeChatSdkStream(
-          codexAppServerToChatSdkStream(
-            stream,
-            rendererOptions(thread, options, capture)
+      fallback.collectChatSdk(
+        conflateChatSdkStream(
+          slackSafeChatSdkStream(
+            codexAppServerToChatSdkStream(
+              fallback.collectSource(stream),
+              rendererOptions(thread, options, capture)
+            )
           )
         )
       )
@@ -1786,7 +1789,10 @@ async function renderExecutionStream(
       recipientUserId: message.author.userId,
       taskDisplayMode: options.streamTaskDisplayMode ?? 'plan'
     })
-    return { diverged: capture.diverged, messageId: sent?.id }
+    return {
+      diverged: capture.diverged || fallback.terminalResultMismatch(),
+      messageId: sent?.id
+    }
   } finally {
     await setAssistantStatus(thread, '', options, trace)
   }
@@ -1811,13 +1817,16 @@ async function renderRecoveredExecutionStream(
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
+  const fallback = new SlackRenderFallback()
   try {
     const visibleStream = await streamAfterFirstChunk(
-      conflateChatSdkStream(
-        slackSafeChatSdkStream(
-          codexAppServerToChatSdkStream(
-            stream,
-            rendererOptions(thread, options, capture)
+      fallback.collectChatSdk(
+        conflateChatSdkStream(
+          slackSafeChatSdkStream(
+            codexAppServerToChatSdkStream(
+              fallback.collectSource(stream),
+              rendererOptions(thread, options, capture)
+            )
           )
         )
       )
@@ -1832,7 +1841,10 @@ async function renderRecoveredExecutionStream(
         taskDisplayMode: options.streamTaskDisplayMode ?? 'plan'
       }
     )
-    return { diverged: capture.diverged, messageId: sent?.id }
+    return {
+      diverged: capture.diverged || fallback.terminalResultMismatch(),
+      messageId: sent?.id
+    }
   } finally {
     await setAssistantStatus(thread, '', options, trace)
   }
@@ -1906,6 +1918,12 @@ class SlackRenderFallback {
 
   text(): string {
     return (this.terminalText || this.markdownText).trim()
+  }
+
+  terminalResultMismatch(): boolean {
+    const terminalText = this.terminalText.trim()
+    if (!terminalText) return false
+    return terminalText !== this.markdownText.trim()
   }
 
   private captureTerminalText(event: SlackbotV2RendererSource): void {
