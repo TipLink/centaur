@@ -39,8 +39,9 @@ posting to Slack.
 
 Create a Slack user token for ETL reads and store it as `SLACK_ETL_TOKEN` in
 the same secret source used by tools. The Slack tool declares it as an optional
-HTTP secret for `slack.com` and `files.slack.com`; iron-proxy injects the real
-value when the tool calls Slack.
+HTTP secret scoped to the Slack Web API endpoints below and `GET` file downloads
+from `files.slack.com`; iron-proxy injects the real value when the workflow
+calls Slack.
 
 The token must be able to call:
 
