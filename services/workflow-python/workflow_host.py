@@ -24,6 +24,10 @@ from typing import Any
 from api import metrics
 from api.workflow_engine import WorkflowContext
 
+DATABASE_CONNECT_ATTEMPTS = 5
+DATABASE_CONNECT_BACKOFF_SECONDS = 0.25
+DATABASE_CONNECT_BACKOFF_MAX_SECONDS = 2.0
+
 
 class ProtocolError(RuntimeError):
     pass
@@ -231,7 +235,29 @@ async def create_pool() -> Any:
         import asyncpg  # type: ignore
     except ImportError:
         return None
-    return await asyncpg.create_pool(database_url)
+
+    last_error: Exception | None = None
+    for attempt in range(1, DATABASE_CONNECT_ATTEMPTS + 1):
+        try:
+            return await asyncpg.create_pool(database_url)
+        except Exception as exc:
+            last_error = exc
+            if attempt == DATABASE_CONNECT_ATTEMPTS:
+                break
+            delay = min(
+                DATABASE_CONNECT_BACKOFF_MAX_SECONDS,
+                DATABASE_CONNECT_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+            )
+            print(
+                "workflow_database_connect_retry "
+                f"attempt={attempt} attempts={DATABASE_CONNECT_ATTEMPTS} "
+                f"delay_seconds={delay} "
+                f"error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(delay)
+    assert last_error is not None
+    raise last_error
 
 
 def jsonable(value: Any) -> Any:

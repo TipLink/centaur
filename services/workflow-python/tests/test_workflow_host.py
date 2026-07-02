@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -159,6 +161,34 @@ class WorkflowHostTests(unittest.TestCase):
         result = asyncio.run(ctx.run_agent("draft_summary", text="summarize this"))
 
         self.assertEqual(result, {"name": "draft_summary", "text": "summarize this"})
+
+    def test_create_pool_retries_transient_connection_failure(self) -> None:
+        host = load_workflow_host()
+        calls = []
+        sleeps = []
+        pool = FakePool()
+
+        async def create_pool(database_url):
+            calls.append(database_url)
+            if len(calls) < 3:
+                raise ConnectionRefusedError("postgres is still starting")
+            return pool
+
+        async def sleep(delay):
+            sleeps.append(delay)
+
+        fake_asyncpg = types.SimpleNamespace(create_pool=create_pool)
+
+        with (
+            patch.dict(os.environ, {"DATABASE_URL": "postgresql://example/db"}, clear=False),
+            patch.dict(sys.modules, {"asyncpg": fake_asyncpg}),
+            patch.object(host.asyncio, "sleep", sleep),
+        ):
+            result = asyncio.run(host.create_pool())
+
+        self.assertIs(result, pool)
+        self.assertEqual(calls, ["postgresql://example/db"] * 3)
+        self.assertEqual(sleeps, [0.25, 0.5])
 
     def test_workflow_result_includes_grouping_identifiers(self) -> None:
         host = load_workflow_host()
