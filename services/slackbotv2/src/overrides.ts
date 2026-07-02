@@ -10,7 +10,7 @@
  * applies at session creation — an explicit harness flag on a thread pinned to
  * another harness restarts the thread on the requested one. The model and
  * reasoning effort apply per turn via the blocks-protocol `model` / `reasoning`
- * fields; `--model` accepts either a full model id (claude-sonnet-4-6, gpt-5.2,
+ * fields; `--model` accepts either a full model id (claude-sonnet-5, gpt-5.2,
  * ...), an amp mode (deep/fast), or a Claude alias (fable/opus/sonnet/haiku)
  * which expands to the full id. Reasoning effort only affects the codex harness
  * (it maps to codex's `turn/start` `effort`); other harnesses ignore it. The
@@ -50,7 +50,7 @@ const CLAUDE_MODEL_ALIASES: Record<string, string> = {
   fable: 'claude-fable-5',
   haiku: 'claude-haiku-4-5',
   opus: 'claude-opus-4-8',
-  sonnet: 'claude-sonnet-4-6'
+  sonnet: 'claude-sonnet-5'
 }
 
 const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =

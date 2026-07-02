@@ -8,7 +8,7 @@
  * Flags are stripped from the text before it reaches the agent. The harness
  * applies at session creation (the API pins a thread to one harness); the model
  * applies per turn via the blocks-protocol `model` field. `--model` accepts a
- * full model id (claude-sonnet-4-6, gpt-5.2, …) or a Claude alias
+ * full model id (claude-sonnet-5, gpt-5.2, …) or a Claude alias
  * (fable/opus/sonnet/haiku) which expands to the full id.
  */
 
@@ -33,7 +33,7 @@ const CLAUDE_MODEL_ALIASES: Record<string, string> = {
   fable: "claude-fable-5",
   haiku: "claude-haiku-4-5",
   opus: "claude-opus-4-8",
-  sonnet: "claude-sonnet-4-6",
+  sonnet: "claude-sonnet-5",
 };
 
 const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =

@@ -100,12 +100,12 @@ function isCreateRequest(request: RecordedRequest): boolean {
 }
 
 describe("forwardToSessionApi overrides", () => {
-  test("creates session with default codex harness", async () => {
+  test("creates session with default claude-code harness", async () => {
     const { fetchFn, requests } = fakeApi();
     await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage("hi")));
     const create = requests.find(isCreateRequest);
     expect((create?.body as { harness_type?: string }).harness_type).toBe(
-      "codex",
+      "claudecode",
     );
     expect(
       (create?.body as { metadata: { platform: string } }).metadata.platform,
@@ -194,7 +194,7 @@ describe("forwardToSessionApi overrides", () => {
       createSession: [
         {
           body: {
-            error: `session ${THREAD_ID} already exists with harness_type amp, requested codex`,
+            error: `session ${THREAD_ID} already exists with harness_type amp, requested claudecode`,
             ok: false,
           },
           status: 409,
@@ -208,7 +208,7 @@ describe("forwardToSessionApi overrides", () => {
       creates.map(
         (request) => (request.body as { harness_type: string }).harness_type,
       ),
-    ).toEqual(["codex", "amp"]);
+    ).toEqual(["claudecode", "amp"]);
   });
 
   test("surfaces non-conflict create failures with a sanitized message", async () => {

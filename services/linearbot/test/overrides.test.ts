@@ -66,7 +66,7 @@ describe("extractMessageOverrides", () => {
       model: "claude-opus-4-8",
     });
     expect(extractMessageOverrides("--sonnet fix it").model).toBe(
-      "claude-sonnet-4-6",
+      "claude-sonnet-5",
     );
     expect(extractMessageOverrides("--haiku fix it").model).toBe(
       "claude-haiku-4-5",
@@ -83,7 +83,7 @@ describe("extractMessageOverrides", () => {
       model: "claude-opus-4-8",
     });
     expect(extractMessageOverrides("--model Sonnet go").model).toBe(
-      "claude-sonnet-4-6",
+      "claude-sonnet-5",
     );
     expect(extractMessageOverrides("--model fable go").model).toBe(
       "claude-fable-5",

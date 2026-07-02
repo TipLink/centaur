@@ -59,7 +59,7 @@ describe('extractMessageOverrides', () => {
       model: 'claude-opus-4-8',
       reasoning: undefined
     })
-    expect(extractMessageOverrides('--sonnet fix it').model).toBe('claude-sonnet-4-6')
+    expect(extractMessageOverrides('--sonnet fix it').model).toBe('claude-sonnet-5')
     expect(extractMessageOverrides('--haiku fix it').model).toBe('claude-haiku-4-5')
     expect(extractMessageOverrides('--fable fix it').model).toBe('claude-fable-5')
   })
@@ -70,7 +70,7 @@ describe('extractMessageOverrides', () => {
       harnessType: 'claudecode',
       model: 'claude-opus-4-8'
     })
-    expect(extractMessageOverrides('--model Sonnet go').model).toBe('claude-sonnet-4-6')
+    expect(extractMessageOverrides('--model Sonnet go').model).toBe('claude-sonnet-5')
     expect(extractMessageOverrides('--model fable go').model).toBe('claude-fable-5')
   })
 
