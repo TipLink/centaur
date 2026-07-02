@@ -370,7 +370,7 @@ async function bytesToBase64(data: Buffer | Blob): Promise<string> {
   return Buffer.from(bytes).toString("base64");
 }
 
-const DEFAULT_HARNESS_TYPE = "codex";
+const DEFAULT_HARNESS_TYPE = "claudecode";
 
 type CreateSessionOutcome = {
   /** The API restarted the thread onto the requested harness. */

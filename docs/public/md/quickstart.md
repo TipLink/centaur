@@ -78,9 +78,11 @@ Application-level model and tool secrets, such as `OPENAI_API_KEY`,
 placeholder values and [iron-proxy](https://docs.iron.sh) injects the real credentials only on approved
 outbound requests.
 
-The default harness is `codex`, so `OPENAI_API_KEY` must exist in the configured
-secret source before Slack agent turns can complete. Use explicit harness
-selectors only when you want a non-default harness such as Amp or Claude Code.
+The default harness is `claudecode`, so an Anthropic credential
+(`ANTHROPIC_API_KEY`, or the brokered subscription token in `access_token`
+mode) must exist in the configured secret source before Slack agent turns can
+complete. Use explicit harness selectors only when you want a non-default
+harness such as Codex or Amp.
 
 ## 3. Boot the stack
 

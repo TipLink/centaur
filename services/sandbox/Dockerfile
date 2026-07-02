@@ -244,4 +244,4 @@ COPY --link --chown=1001:1001 services/sandbox/SYSTEM_PROMPT.md /home/agent/AGEN
 
 ENTRYPOINT ["/entrypoint.sh"]
 # Default CMD uses Rust blocks mode; pass --mode=jsonrpc for raw App Server JSON-RPC.
-CMD ["harness-server", "codex"]
+CMD ["harness-server", "claude-code"]

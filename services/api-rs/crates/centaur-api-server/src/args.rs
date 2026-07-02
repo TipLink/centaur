@@ -474,12 +474,12 @@ struct SandboxArgs {
     workload: SandboxWorkloadKind,
     /// The default harness for warm sandboxes. Per-session sandboxes always
     /// run their session's harness (pinned via container args); this only
-    /// decides what the warm pool boots ahead of time. Defaults to codex
+    /// decides what the warm pool boots ahead of time. Defaults to claudecode
     /// to match the sandbox image's CMD.
     #[arg(
         long = "session-sandbox-harness",
         env = "SESSION_SANDBOX_HARNESS",
-        default_value = "codex"
+        default_value = "claudecode"
     )]
     default_harness: HarnessType,
     #[arg(long = "centaur-default-persona", env = "CENTAUR_DEFAULT_PERSONA")]
@@ -1766,7 +1766,7 @@ struct IronProxyHarnessArgs {
     #[arg(
         long = "kubernetes-iron-proxy-harness-engine",
         env = "KUBERNETES_IRON_PROXY_HARNESS_ENGINE",
-        default_value = "codex"
+        default_value = "claudecode"
     )]
     engine: HarnessType,
     #[arg(
@@ -2729,7 +2729,7 @@ mod tests {
             panic!("expected codex app server workload");
         };
 
-        assert_eq!(harness, HarnessType::Codex);
+        assert_eq!(harness, HarnessType::ClaudeCode);
         assert!(mounts.iter().any(|mount| {
             mount.target_path == SANDBOX_REPOS_MOUNT_PATH
                 && mount.read_only

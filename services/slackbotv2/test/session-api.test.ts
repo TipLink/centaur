@@ -371,11 +371,11 @@ describe('Slack display text fallback', () => {
 })
 
 describe('forwardToSessionApi overrides', () => {
-  test('creates session with default codex harness', async () => {
+  test('creates session with default claude-code harness', async () => {
     const { fetchFn, requests } = fakeApi()
     await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hi')))
     const create = requests.find(request => request.url.endsWith('.000100'))
-    expect((create?.body as { harness_type?: string }).harness_type).toBe('codex')
+    expect((create?.body as { harness_type?: string }).harness_type).toBe('claudecode')
   })
 
   test('creates session with parsed harness override', async () => {
@@ -467,7 +467,7 @@ describe('forwardToSessionApi overrides', () => {
         {
           body: {
             error:
-              'session slack:C1:1700000000.000100 already exists with harness_type amp, requested codex',
+              'session slack:C1:1700000000.000100 already exists with harness_type amp, requested claudecode',
             ok: false
           },
           status: 409
@@ -478,7 +478,7 @@ describe('forwardToSessionApi overrides', () => {
     await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hi')))
     const creates = requests.filter(request => request.url.endsWith('.000100'))
     expect(creates.map(request => (request.body as { harness_type: string }).harness_type)).toEqual(
-      ['codex', 'amp']
+      ['claudecode', 'amp']
     )
   })
 

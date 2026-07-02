@@ -47,7 +47,7 @@ fn main() {
 fn run() -> Result<()> {
     match Cli::parse()
         .command
-        .unwrap_or(CliCommand::Codex(HarnessCommand {
+        .unwrap_or(CliCommand::ClaudeCode(HarnessCommand {
             mode: ServerMode::Blocks,
         })) {
         CliCommand::Codex(command) => run_mode(HarnessKind::Codex, command.mode),
