@@ -206,6 +206,61 @@ describe('slackbotv2', () => {
     expect(codexApi.executes[0]?.threadKey).toBe(threadKey(mention.ts))
   })
 
+  it('executes root messages in ambient Slack channels without a mention', async () => {
+    bot = createTestBot({ ambientSlackChannelIds: [CHANNEL_ID] })
+    const message = await postUserMessage('Run this without a bot mention.')
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-ambient-channel-message',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: message.ts,
+          text: 'Run this without a bot mention.'
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]?.threadKey).toBe(threadKey(message.ts))
+  })
+
+  it('does not start ambient sessions from unmentioned replies', async () => {
+    bot = createTestBot({ ambientSlackChannelIds: [CHANNEL_ID] })
+    const parent = await postUserMessage('Existing unrelated discussion.')
+    const reply = await postUserMessage('Do not start from this reply.', parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-ambient-channel-reply',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: reply.ts,
+          thread_ts: parent.ts,
+          text: 'Do not start from this reply.'
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(0)
+  })
+
   it('syncs thread context, forwards subscribed messages, and renders execute streams', async () => {
     const parent = await postUserMessage('The deploy context is above.')
     const firstMention = await postUserMessage(

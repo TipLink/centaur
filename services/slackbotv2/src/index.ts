@@ -159,6 +159,22 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     })
   })
 
+  const ambientSlackChannelIds = ambientSlackChannelIdSet(options)
+  if (ambientSlackChannelIds.size > 0) {
+    chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
+      if (!isAmbientSlackChannelMessage(message, ambientSlackChannelIds)) return
+      if (!isAllowedSlackMessage(message, options, logger)) return
+      await handleSlackMessageHandoff(thread, message, {
+        assistantStatusRequested: true,
+        mode: 'execute',
+        options,
+        state,
+        subscribe: true,
+        trigger: 'ambient_channel_message'
+      })
+    })
+  }
+
   const app = new Hono()
   app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
   app.get('/metrics', c =>
@@ -258,6 +274,44 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   }
 
   return { app, chat }
+}
+
+function isAmbientSlackChannelMessage(
+  message: ChatMessage,
+  allowedChannels: ReadonlySet<string>
+): boolean {
+  if (message.isMention === true) return false
+
+  const raw = isJsonObject(message.raw) ? message.raw : undefined
+  if (raw && stringValue(raw.type) !== 'message') return false
+
+  const channelId = stringValue(raw?.channel) ?? slackChannelFromThreadId(message.threadId)
+  if (!channelId || !allowedChannels.has(channelId)) return false
+
+  const messageTs = stringValue(raw?.ts) ?? message.id
+  const threadTs = stringValue(raw?.thread_ts)
+  return !threadTs || threadTs === messageTs
+}
+
+function ambientSlackChannelIdSet(options: SlackbotV2Options): ReadonlySet<string> {
+  return new Set(
+    options.ambientSlackChannelIds ?? splitEnvList(process.env.SLACKBOT_AMBIENT_CHANNEL_IDS)
+  )
+}
+
+function slackChannelFromThreadId(threadId: string): string | undefined {
+  const parts = threadId.split(':')
+  if (parts[0] !== 'slack') return undefined
+  if (parts.length === 4) return parts[2] || undefined
+  if (parts.length === 3) return parts[1] || undefined
+  return undefined
+}
+
+function splitEnvList(value: string | undefined): string[] {
+  return (value ?? '')
+    .split(/[\s,]+/)
+    .map(part => part.trim())
+    .filter(Boolean)
 }
 
 async function handleSlackMessageHandoff(
