@@ -95,7 +95,7 @@ export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => 
 
 export type SlackbotV2Options = {
   allowedExternalTeamIds?: readonly string[]
-  /** Slack channel ids where root messages should start sessions without an @mention. */
+  /** Slack channel ids where messages should start sessions without an @mention. */
   ambientSlackChannelIds?: readonly string[]
   apiKey?: string
   apiUrl: string

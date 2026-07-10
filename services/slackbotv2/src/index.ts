@@ -148,18 +148,21 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     })
   })
 
+  const ambientSlackChannelIds = ambientSlackChannelIdSet(options)
+
   chat.onSubscribedMessage(async (thread, message) => {
     if (!isAllowedSlackMessage(message, options, logger)) return
+    const isAmbientMessage = isAmbientSlackChannelMessage(message, ambientSlackChannelIds)
+    const shouldExecute = message.isMention === true || isAmbientMessage
     await handleSlackMessageHandoff(thread, message, {
-      assistantStatusRequested: message.isMention === true,
-      mode: message.isMention === true ? 'execute' : 'append',
+      assistantStatusRequested: shouldExecute,
+      mode: shouldExecute ? 'execute' : 'append',
       options,
       state,
-      trigger: 'subscribed_message'
+      trigger: isAmbientMessage ? 'ambient_channel_message' : 'subscribed_message'
     })
   })
 
-  const ambientSlackChannelIds = ambientSlackChannelIdSet(options)
   if (ambientSlackChannelIds.size > 0) {
     chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
       if (!isAmbientSlackChannelMessage(message, ambientSlackChannelIds)) return
@@ -287,10 +290,7 @@ function isAmbientSlackChannelMessage(
 
   const channelId = stringValue(raw?.channel) ?? slackChannelFromThreadId(message.threadId)
   if (!channelId || !allowedChannels.has(channelId)) return false
-
-  const messageTs = stringValue(raw?.ts) ?? message.id
-  const threadTs = stringValue(raw?.thread_ts)
-  return !threadTs || threadTs === messageTs
+  return true
 }
 
 function ambientSlackChannelIdSet(options: SlackbotV2Options): ReadonlySet<string> {
