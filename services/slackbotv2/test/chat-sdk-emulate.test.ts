@@ -233,10 +233,10 @@ describe('slackbotv2', () => {
     expect(codexApi.executes[0]?.threadKey).toBe(threadKey(message.ts))
   })
 
-  it('does not start ambient sessions from unmentioned replies', async () => {
+  it('executes unmentioned replies in ambient Slack channels', async () => {
     bot = createTestBot({ ambientSlackChannelIds: [CHANNEL_ID] })
-    const parent = await postUserMessage('Existing unrelated discussion.')
-    const reply = await postUserMessage('Do not start from this reply.', parent.ts)
+    const parent = await postUserMessage('Existing discussion context.')
+    const reply = await postUserMessage('Use this thread context.', parent.ts)
     const waits: Promise<unknown>[] = []
     const response = await bot.app.request(
       '/api/webhooks/slack',
@@ -249,7 +249,34 @@ describe('slackbotv2', () => {
           team: TEAM_ID,
           ts: reply.ts,
           thread_ts: parent.ts,
-          text: 'Do not start from this reply.'
+          text: 'Use this thread context.'
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]?.threadKey).toBe(threadKey(parent.ts))
+  })
+
+  it('does not execute unmentioned messages outside ambient Slack channels', async () => {
+    bot = createTestBot({ ambientSlackChannelIds: ['COTHERCHANNEL'] })
+    const message = await postUserMessage('Ignore this without a bot mention.')
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-non-ambient-channel-message',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: message.ts,
+          text: 'Ignore this without a bot mention.'
         }
       }),
       {},
