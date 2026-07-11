@@ -13,6 +13,7 @@ venv/
 
 # uv
 uv.lock
+!services/workflow-python/uv.lock
 
 # Testing
 .pytest_cache/
