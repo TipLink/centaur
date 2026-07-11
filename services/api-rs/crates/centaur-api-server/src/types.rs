@@ -37,6 +37,8 @@ pub struct CreateSessionResponse {
 pub struct SessionContextResponse {
     pub thread_key: ThreadKey,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub slack: Option<SlackThreadContext>,
 }
 
@@ -75,9 +77,12 @@ pub struct ExecuteSessionResponse {
     pub status: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ReleaseThreadRequest {
     pub release_id: Option<String>,
+    /// Optional caller-side compare-and-swap fence. When present, release is
+    /// rejected unless the thread is still assigned to this exact sandbox.
+    pub expected_sandbox_id: Option<String>,
     #[serde(default)]
     pub cancel_inflight: bool,
 }
@@ -88,11 +93,40 @@ pub struct ReleaseThreadResponse {
     #[serde(flatten)]
     pub session: Session,
     pub release_id: Option<String>,
+    pub expected_sandbox_id: Option<String>,
     pub cancel_inflight: bool,
     pub sandbox_released: bool,
     pub sandbox_release_error: Option<String>,
     pub execution_id: Option<String>,
     pub execution_cancelled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InterruptSessionExecutionRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InterruptSessionExecutionResponse {
+    pub ok: bool,
+    pub interrupted: bool,
+    pub execution_id: Option<String>,
+    pub thread_key: ThreadKey,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RecordSessionDeliveryRequest {
+    pub message_id: Option<String>,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordSessionDeliveryResponse {
+    pub ok: bool,
+    pub created: bool,
+    pub event_id: i64,
+    pub execution_id: String,
+    pub thread_key: ThreadKey,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -106,8 +140,6 @@ pub struct ListWorkflowRunsQuery {
     pub limit: Option<i64>,
     pub workflow_name: Option<String>,
     pub thread_key: Option<String>,
-    pub status: Option<String>,
-    pub parent_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
