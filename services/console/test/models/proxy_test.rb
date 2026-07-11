@@ -40,10 +40,9 @@ class ProxyTest < ActiveSupport::TestCase
     assert_equal "unassigned", proxy.status
   end
 
-  test "an unassigned proxy delivers managed proxy settings without authority" do
+  test "an unassigned proxy delivers an empty config" do
     proxy = Proxy.create!(name: "idle", principal: nil)
     config = proxy.sync_config
-    assert_equal "120s", config.dig("proxy", "upstream_response_header_timeout")
     assert_empty config["secrets"]
     assert_empty config["transforms"]
     assert_empty config["postgres"]

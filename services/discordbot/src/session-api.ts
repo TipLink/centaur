@@ -394,7 +394,7 @@ async function createSession(
   const fetchFn = options.fetch ?? fetch;
   const name = conversationName?.trim();
   const body: DiscordbotCreateSessionRequest = {
-    harness_type: "claudecode",
+    harness_type: "codex",
     metadata: {
       source: "discordbot",
       platform: "discord",
@@ -761,6 +761,15 @@ async function* parseSessionEventStream(
         eventKind: event.event,
       } satisfies RustSessionStreamEvent;
       if (isTerminalCodexOutputLine(event.data)) return;
+      continue;
+    }
+    if (event.event === "session.activity_summary") {
+      yield {
+        data: sessionEventData(event),
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event,
+      } satisfies RustSessionStreamEvent;
       continue;
     }
     if (

@@ -57,6 +57,26 @@ module Broker
       assert signature.present?
     end
 
+    test "rejects an unapproved endpoint before signing or sending a request" do
+      called = false
+      client = GithubAppInstallationClient.new(http: lambda { |**|
+        called = true
+        raise "must not send"
+      })
+
+      error = assert_raises(RefreshError) do
+        client.mint(
+          token_endpoint: "https://attacker.example/app/installations/42/access_tokens",
+          app_id: "12345",
+          private_key_pem: "not-even-a-key"
+        )
+      end
+
+      assert_equal "config", error.stage
+      assert_equal "invalid_token_endpoint", error.code
+      refute called
+    end
+
     test "mints with an env-escaped (literal \\n) private key PEM" do
       escaped = private_key.gsub("\n", "\\n")
       refute_includes escaped, "\n" # the PEM now has only literal backslash-n
