@@ -17,6 +17,26 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:18080";
 const SOURCE_PATH: &str = "services/api-rs/crates/centaur-api-integration-test/src/main.rs";
 const TEST_MODEL: &str = "gpt-api-integration-test";
 
+fn workflow_api_key() -> Result<String> {
+    env::var("WORKFLOW_API_KEY")
+        .context("WORKFLOW_API_KEY is required for workflow API integration tests")
+}
+
+fn session_api_key() -> Result<String> {
+    env::var("SLACKBOT_API_KEY")
+        .context("SLACKBOT_API_KEY is required for session API integration tests")
+}
+
+fn control_api_key() -> Result<String> {
+    env::var("CENTAUR_CONTROL_API_KEY")
+        .context("CENTAUR_CONTROL_API_KEY is required for control API integration tests")
+}
+
+fn feedback_api_key() -> Result<String> {
+    env::var("SLACK_FEEDBACK_API_KEY")
+        .context("SLACK_FEEDBACK_API_KEY is required for feedback API integration tests")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let base_url = env::var("CENTAUR_API_URL")
@@ -249,6 +269,7 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
                     "harness_wire_value": wire_value,
                 },
             }),
+            Some(&session_api_key()?),
         )
         .await
         .with_context(|| format!("create {wire_value} session"))?;
@@ -273,6 +294,7 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
     let invalid_thread_key = test_thread_key("invalid-harness")?;
     let invalid_response = http
         .post(session_url(base_url, &invalid_thread_key))
+        .bearer_auth(session_api_key()?)
         .json(&json!({
             "harness_type": "claude-code",
             "metadata": {"source": "centaur-api-integration-test"},
@@ -290,6 +312,58 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
 }
 
 async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
+    let feedback_thread = format!(
+        "feedback-improvement:api-integration:{}",
+        Uuid::new_v4().simple()
+    );
+    let anonymous_feedback = http
+        .post(session_url(base_url, &feedback_thread))
+        .header("X-Centaur-Feedback-Key", feedback_api_key()?)
+        .json(&json!({"harness_type": "codex"}))
+        .send()
+        .await
+        .context("request feedback session without principal JWT")?;
+    if anonymous_feedback.status() != StatusCode::UNAUTHORIZED {
+        let status = anonymous_feedback.status();
+        let body = anonymous_feedback.text().await.unwrap_or_default();
+        bail!("feedback session without principal JWT returned {status}, expected 401: {body}");
+    }
+
+    let anonymous_drain = http
+        .post(format!("{base_url}/api/sandboxes/drain"))
+        .send()
+        .await
+        .context("request sandbox drain without authorization")?;
+    if anonymous_drain.status() != StatusCode::UNAUTHORIZED {
+        let status = anonymous_drain.status();
+        let body = anonymous_drain.text().await.unwrap_or_default();
+        bail!("anonymous sandbox drain returned {status}, expected 401: {body}");
+    }
+
+    let bot_drain = http
+        .post(format!("{base_url}/api/sandboxes/drain"))
+        .bearer_auth(session_api_key()?)
+        .send()
+        .await
+        .context("request sandbox drain with bot authorization")?;
+    if bot_drain.status() != StatusCode::UNAUTHORIZED {
+        let status = bot_drain.status();
+        let body = bot_drain.text().await.unwrap_or_default();
+        bail!("bot-authorized sandbox drain returned {status}, expected 401: {body}");
+    }
+
+    let control_drain = http
+        .post(format!("{base_url}/api/sandboxes/drain"))
+        .bearer_auth(control_api_key()?)
+        .send()
+        .await
+        .context("request sandbox drain with control authorization")?;
+    if control_drain.status() != StatusCode::OK {
+        let status = control_drain.status();
+        let body = control_drain.text().await.unwrap_or_default();
+        bail!("control-authorized sandbox drain returned {status}: {body}");
+    }
+
     let thread_key = test_thread_key("turn")?;
     let harness_wire_value = serde_json::to_value(HarnessType::Codex)
         .context("serialize executable harness type")?
@@ -307,9 +381,22 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
             },
             "on_harness_conflict": "restart",
         }),
+        Some(&session_api_key()?),
     )
     .await
     .context("create executable session")?;
+
+    let anonymous_release = http
+        .post(format!("{}/release", session_url(base_url, &thread_key)))
+        .json(&json!({"release_id": "anonymous", "cancel_inflight": false}))
+        .send()
+        .await
+        .context("request session release without authorization")?;
+    if anonymous_release.status() != StatusCode::UNAUTHORIZED {
+        let status = anonymous_release.status();
+        let body = anonymous_release.text().await.unwrap_or_default();
+        bail!("anonymous session release returned {status}, expected 401: {body}");
+    }
 
     let append = post_json_ok(
         http,
@@ -330,6 +417,7 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
                 },
             ],
         }),
+        Some(&session_api_key()?),
     )
     .await
     .context("append user message")?;
@@ -372,6 +460,7 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
             "idle_timeout_ms": 5_000,
             "max_duration_ms": 15_000,
         }),
+        Some(&session_api_key()?),
     )
     .await
     .context("execute session")?;
@@ -397,6 +486,7 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
             "idle_timeout_ms": 5_000,
             "max_duration_ms": 15_000,
         }),
+        Some(&session_api_key()?),
     )
     .await
     .context("replay idempotent execute")?;
@@ -416,6 +506,7 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
             "{}/events?after_event_id=0",
             session_url(base_url, &thread_key)
         ))
+        .bearer_auth(session_api_key()?)
         .send()
         .await
         .context("open session event stream")?;
@@ -492,6 +583,46 @@ async fn test_metrics(http: &HttpClient, base_url: &str) -> Result<()> {
 }
 
 async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
+    let anonymous_malformed_workflow = http
+        .post(format!("{base_url}/api/workflows/runs"))
+        .header("content-type", "application/json")
+        .body("{not-json")
+        .send()
+        .await
+        .context("request malformed workflow without authorization")?;
+    if anonymous_malformed_workflow.status() != StatusCode::UNAUTHORIZED {
+        let status = anonymous_malformed_workflow.status();
+        let body = anonymous_malformed_workflow
+            .text()
+            .await
+            .unwrap_or_default();
+        bail!("anonymous malformed workflow returned {status}, expected 401: {body}");
+    }
+
+    let anonymous_admin_batch = http
+        .post(format!("{base_url}/api/admin/slack/dm-sync/batch"))
+        .header("content-type", "application/json")
+        .body(format!("{{{}", "x".repeat(1024 * 1024)))
+        .send()
+        .await
+        .context("request oversized malformed admin batch without authorization")?;
+    if anonymous_admin_batch.status() != StatusCode::UNAUTHORIZED {
+        let status = anonymous_admin_batch.status();
+        let body = anonymous_admin_batch.text().await.unwrap_or_default();
+        bail!("anonymous malformed admin batch returned {status}, expected 401: {body}");
+    }
+
+    let anonymous = http
+        .get(format!("{base_url}/api/workflows/schedules"))
+        .send()
+        .await
+        .context("request workflow schedules without authorization")?;
+    if anonymous.status() != StatusCode::UNAUTHORIZED {
+        let status = anonymous.status();
+        let body = anonymous.text().await.unwrap_or_default();
+        bail!("anonymous workflow schedules request returned {status}, expected 401: {body}");
+    }
+
     let workflow_dir = integration_workflow_dir()?;
     fs::create_dir_all(&workflow_dir)
         .with_context(|| format!("create workflow dir {}", workflow_dir.display()))?;
@@ -515,6 +646,7 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         json!({
             "case": "added-workflow-run",
             "sleep_ms": 0,
+            "thread_key": "api-integration-test:workflow-filter",
         }),
     )
     .await
@@ -531,6 +663,33 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
     }
     if output.pointer("/received/case").and_then(Value::as_str) != Some("added-workflow-run") {
         bail!("completed workflow output did not echo input: {completed_run}");
+    }
+
+    let filtered = http
+        .get(format!(
+            "{base_url}/api/workflows/runs?workflow_name={workflow_name}&thread_key=api-integration-test%3Aworkflow-filter"
+        ))
+        .bearer_auth(workflow_api_key()?)
+        .send()
+        .await
+        .context("list workflow runs with resource filters")?;
+    if !filtered.status().is_success() {
+        let status = filtered.status();
+        let body = filtered.text().await.unwrap_or_default();
+        bail!("filtered workflow run list returned {status}: {body}");
+    }
+    let filtered = filtered
+        .json::<Value>()
+        .await
+        .context("parse filtered workflow run list")?;
+    let filtered_runs = filtered
+        .get("runs")
+        .and_then(Value::as_array)
+        .context("filtered workflow run list missing runs")?;
+    if filtered_runs.len() != 1
+        || filtered_runs[0].get("run_id").and_then(Value::as_str) != Some(completed_run_id.as_str())
+    {
+        bail!("workflow run filters returned unexpected rows: {filtered}");
     }
 
     let removed_run_id = create_workflow_run(
@@ -631,6 +790,7 @@ async fn create_workflow_run(
             "harness_type": HarnessType::Codex,
             "max_attempts": 1,
         }),
+        Some(&workflow_api_key()?),
     )
     .await?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -656,7 +816,12 @@ async fn wait_for_workflow_run_status(
     let mut last_run = Value::Null;
 
     while Instant::now() < deadline {
-        let body = get_json_ok(http, format!("{base_url}/api/workflows/runs/{run_id}")).await?;
+        let body = get_json_ok(
+            http,
+            format!("{base_url}/api/workflows/runs/{run_id}"),
+            Some(&workflow_api_key()?),
+        )
+        .await?;
         let run = body
             .get("run")
             .cloned()
@@ -694,7 +859,12 @@ async fn wait_for_workflow_schedule(
     let mut last_body = Value::Null;
 
     while Instant::now() < deadline {
-        let body = get_json_ok(http, format!("{base_url}/api/workflows/schedules")).await?;
+        let body = get_json_ok(
+            http,
+            format!("{base_url}/api/workflows/schedules"),
+            Some(&workflow_api_key()?),
+        )
+        .await?;
         let present = body
             .get("schedules")
             .and_then(Value::as_array)
@@ -718,9 +888,16 @@ fn parse_json(data: &str) -> Result<Value> {
     serde_json::from_str(data).with_context(|| format!("parse event payload as JSON: {data}"))
 }
 
-async fn get_json_ok(http: &HttpClient, url: impl AsRef<str>) -> Result<Value> {
-    let response = http
-        .get(url.as_ref())
+async fn get_json_ok(
+    http: &HttpClient,
+    url: impl AsRef<str>,
+    bearer_token: Option<&str>,
+) -> Result<Value> {
+    let mut request = http.get(url.as_ref());
+    if let Some(token) = bearer_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .with_context(|| format!("GET {}", url.as_ref()))?;
@@ -735,10 +912,17 @@ async fn get_json_ok(http: &HttpClient, url: impl AsRef<str>) -> Result<Value> {
         .with_context(|| format!("parse GET {} response", url.as_ref()))
 }
 
-async fn post_json_ok(http: &HttpClient, url: impl AsRef<str>, body: Value) -> Result<Value> {
-    let response = http
-        .post(url.as_ref())
-        .json(&body)
+async fn post_json_ok(
+    http: &HttpClient,
+    url: impl AsRef<str>,
+    body: Value,
+    bearer_token: Option<&str>,
+) -> Result<Value> {
+    let mut request = http.post(url.as_ref()).json(&body);
+    if let Some(token) = bearer_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .with_context(|| format!("POST {}", url.as_ref()))?;
