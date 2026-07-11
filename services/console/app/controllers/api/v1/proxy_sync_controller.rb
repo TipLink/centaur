@@ -7,13 +7,12 @@ module Api
     # hash (no payload), so the proxy skips re-applying. Otherwise we return the
     # full `secrets` and `transforms` payload.
     #
-    # `proxy` carries managed proxy runtime settings. `secrets` populates the
-    # proxy's `secrets` transform. `transforms` carries whole transforms the proxy
-    # splices into its pipeline: one gcp_auth, gcp_id_token, hmac_sign, or
-    # aws_auth transform per granted secret, and one bundled oauth_token
-    # transform. `postgres` carries one upstream-DSN entry per granted
-    # PgDsnSecret, keyed by foreign_id; the proxy's locally-defined listeners
-    # bind to these by foreign_id.
+    # `secrets` populates the proxy's `secrets` transform. `transforms` carries
+    # whole transforms the proxy splices into its pipeline: one gcp_auth,
+    # gcp_id_token, hmac_sign, or aws_auth transform per granted secret, and one
+    # bundled oauth_token transform. `postgres` carries one upstream-DSN
+    # entry per granted PgDsnSecret, keyed by foreign_id; the proxy's
+    # locally-defined listeners bind to these by foreign_id.
     #
     # The top-level `rules`, `mcp`, and `ingest_token` fields the proxy also
     # understands are intentionally omitted: centaur-console has no models for them
@@ -34,7 +33,6 @@ module Api
             config_hash: current_hash,
             status: current_proxy.status,
             principal_id: current_proxy.principal&.oid,
-            proxy: config["proxy"],
             secrets: config["secrets"],
             transforms: config["transforms"],
             postgres: config["postgres"]

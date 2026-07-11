@@ -18,6 +18,8 @@ const DROP_SLACK_CONTEXT_ADMIN_CHANNELS_SQL: &str =
     include_str!("../migrations/0023_drop_slack_context_rls_admin_channels.sql");
 const CENTAUR_READONLY_RLS_POLICIES_SQL: &str =
     include_str!("../migrations/0024_centaur_readonly_rls_policies.sql");
+const SLACK_PRIVATE_CHANNELS_SQL: &str =
+    include_str!("../migrations/0039_slack_private_channels.sql");
 
 const RLS_TABLES: &[&str] = &[
     "slack_sync_channels",
@@ -84,11 +86,16 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
     execute_migration(conn, ETL_CONTEXT_RLS_SQL).await?;
     execute_migration(conn, DROP_SLACK_CONTEXT_ADMIN_CHANNELS_SQL).await?;
     execute_migration(conn, CENTAUR_READONLY_RLS_POLICIES_SQL).await?;
+    insert_privacy_backfill_rows(conn).await?;
+    execute_migration(conn, SLACK_PRIVATE_CHANNELS_SQL).await?;
+    assert_privacy_backfill(conn).await?;
+    clear_privacy_backfill_rows(conn).await?;
     grant_schema_usage(conn, schema).await?;
 
     assert_rls_enabled(conn).await?;
     assert_expected_policies(conn).await?;
     assert_legacy_admin_state_is_removed(conn).await?;
+    assert_public_context_helper_acl(conn).await?;
 
     insert_fixture_rows(conn).await?;
 
@@ -158,6 +165,16 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
     let unset_channel = visible_rows(conn, schema, "centaur_slack_reader", None).await?;
     assert_eq!(unset_channel, public_company_context_rows());
 
+    let dm_channel = visible_rows(conn, schema, "centaur_slack_reader", Some("D_DM")).await?;
+    assert_eq!(dm_channel, public_company_context_rows());
+
+    let other_channel = visible_rows(conn, schema, "centaur_slack_reader", Some("C_OTHER")).await?;
+    assert_eq!(other_channel, public_company_context_rows());
+
+    let private_channel =
+        visible_rows(conn, schema, "centaur_slack_reader", Some("C_PRIVATE")).await?;
+    assert_eq!(private_channel, private_current_channel_rows());
+
     let formerly_admin_channel =
         visible_rows(conn, schema, "centaur_slack_reader", Some("C_ADMIN")).await?;
     assert_eq!(
@@ -189,7 +206,11 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
     );
 
     let readonly_role = visible_rows(conn, schema, "centaur_readonly", None).await?;
-    assert_eq!(readonly_role, all_visible_rows());
+    assert_eq!(readonly_role, public_visible_rows());
+
+    let readonly_private_channel =
+        visible_rows(conn, schema, "centaur_readonly", Some("C_PRIVATE")).await?;
+    assert_eq!(readonly_private_channel, public_and_private_visible_rows());
 
     Ok(())
 }
@@ -256,13 +277,116 @@ async fn execute_migration(conn: &mut PgConnection, sql: &str) -> Result<(), sql
     Ok(())
 }
 
+async fn insert_privacy_backfill_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(
+        r#"
+        insert into slack_sync_channels (channel_id, channel_name, raw_payload) values
+            ('C_BACKFILL_PUBLIC', 'known public', '{"is_private": false}'),
+            ('C_BACKFILL_PRIVATE', 'known private', '{"is_private": true}'),
+            ('C_BACKFILL_UNKNOWN', 'unknown privacy', '{}'),
+            ('C_BACKFILL_MALFORMED', 'malformed privacy', '{"is_private": "false"}');
+        "#,
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn assert_privacy_backfill(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        r#"
+        select channel_id, is_private
+        from slack_sync_channels
+        where channel_id like 'C_BACKFILL_%'
+        order by channel_id
+        "#,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![
+            ("C_BACKFILL_MALFORMED".to_owned(), true),
+            ("C_BACKFILL_PRIVATE".to_owned(), true),
+            ("C_BACKFILL_PUBLIC".to_owned(), false),
+            ("C_BACKFILL_UNKNOWN".to_owned(), true),
+        ]
+    );
+
+    let default_is_private: bool = sqlx::query_scalar(
+        "insert into slack_sync_channels (channel_id, channel_name) values ('C_DEFAULT', 'default') returning is_private",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    assert!(
+        default_is_private,
+        "unknown privacy must default to private"
+    );
+    Ok(())
+}
+
+async fn clear_privacy_backfill_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("delete from slack_sync_channels where channel_id like 'C_BACKFILL_%' or channel_id = 'C_DEFAULT'")
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+async fn assert_public_context_helper_acl(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        select
+            p.prosecdef as security_definer,
+            coalesce(p.proconfig @> array['search_path=pg_catalog']::text[], false)
+                as locked_search_path,
+            has_function_privilege(
+                'centaur_slack_reader',
+                p.oid,
+                'EXECUTE'
+            ) as reader_can_execute,
+            exists (
+                select 1
+                from aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) acl
+                where acl.grantee = 0
+                  and acl.privilege_type = 'EXECUTE'
+            ) as public_can_execute
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = current_schema()
+          and p.proname = 'centaur_slack_channel_is_public_syncable'
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+
+    assert!(row.get::<bool, _>("security_definer"));
+    assert!(row.get::<bool, _>("locked_search_path"));
+    assert!(row.get::<bool, _>("reader_can_execute"));
+    assert!(!row.get::<bool, _>("public_can_execute"));
+
+    let legacy_helper_count: i64 = sqlx::query_scalar(
+        r#"
+        select count(*)
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = current_schema()
+          and p.proname = 'centaur_slack_channel_is_syncable'
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    assert_eq!(legacy_helper_count, 0);
+    Ok(())
+}
+
 async fn create_minimal_etl_tables(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(
         r#"
         create table slack_sync_channels (
             channel_id text primary key,
             channel_name text not null default '',
-            is_syncable boolean not null default false
+            is_syncable boolean not null default false,
+            raw_payload jsonb not null default '{}'::jsonb
         );
 
         create table slack_sync_users (
@@ -544,28 +668,36 @@ async fn assert_legacy_admin_state_is_removed(conn: &mut PgConnection) -> Result
 async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(
         r#"
-        insert into slack_sync_channels (channel_id, channel_name, is_syncable) values
-            ('C_ALPHA', 'alpha', false),
-            ('C_BETA', 'beta', true),
-            ('C_ADMIN', 'admin', false);
+        insert into slack_sync_channels
+            (channel_id, channel_name, is_syncable, is_private)
+        values
+            ('C_ALPHA', 'alpha', false, false),
+            ('C_BETA', 'beta', true, false),
+            ('C_ADMIN', 'admin', false, false),
+            ('C_PRIVATE', 'private', true, true);
 
         insert into slack_sync_users (user_id, user_name) values
             ('U_ALPHA', 'alpha user'),
-            ('U_BETA', 'beta user');
+            ('U_BETA', 'beta user'),
+            ('U_PRIVATE', 'private user');
 
         insert into slack_sync_messages (channel_id, message_ts, text) values
             ('C_ALPHA', '1000.000001', 'alpha channel message'),
-            ('C_BETA', '1000.000002', 'beta channel message');
+            ('C_BETA', '1000.000002', 'beta channel message'),
+            ('C_PRIVATE', '1000.000003', 'private channel message');
 
         insert into slack_sync_message_attachments
             (channel_id, message_ts, slack_file_id, name)
         values
             ('C_ALPHA', '1000.000001', 'F_ALPHA', 'alpha.pdf'),
-            ('C_BETA', '1000.000002', 'F_BETA', 'beta.pdf');
+            ('C_BETA', '1000.000002', 'F_BETA', 'beta.pdf'),
+            ('C_PRIVATE', '1000.000003', 'F_PRIVATE', 'private.pdf');
 
         insert into company_context_documents (document_id, source, source_type, metadata) values
             ('doc_slack_alpha', 'slack', 'slack_thread', '{"channel_id": "C_ALPHA"}'),
             ('doc_slack_beta', 'slack', 'slack_thread', '{"channel_id": "C_BETA"}'),
+            ('doc_slack_private', 'slack', 'slack_thread', '{"channel_id": "C_PRIVATE"}'),
+            ('doc_slack_unknown', 'slack', 'slack_thread', '{}'),
             ('doc_gdrive', 'google_drive', 'google_doc', '{}'),
             ('doc_gcal', 'google_calendar', 'calendar_event', '{}'),
             ('doc_linear', 'linear', 'linear_issue', '{}');
@@ -704,14 +836,34 @@ fn public_company_context_rows() -> VisibleRows {
     }
 }
 
-fn all_visible_rows() -> VisibleRows {
+fn private_current_channel_rows() -> VisibleRows {
+    VisibleRows {
+        slack_channels: vec!["C_PRIVATE".to_owned()],
+        slack_messages: vec!["C_PRIVATE:1000.000003".to_owned()],
+        slack_attachments: vec!["C_PRIVATE:1000.000003:F_PRIVATE".to_owned()],
+        context_docs: vec![
+            "doc_gcal".to_owned(),
+            "doc_gdrive".to_owned(),
+            "doc_linear".to_owned(),
+            "doc_slack_beta".to_owned(),
+            "doc_slack_private".to_owned(),
+        ],
+        ..empty_visible_rows()
+    }
+}
+
+fn public_visible_rows() -> VisibleRows {
     VisibleRows {
         slack_channels: vec![
             "C_ADMIN".to_owned(),
             "C_ALPHA".to_owned(),
             "C_BETA".to_owned(),
         ],
-        slack_users: vec!["U_ALPHA".to_owned(), "U_BETA".to_owned()],
+        slack_users: vec![
+            "U_ALPHA".to_owned(),
+            "U_BETA".to_owned(),
+            "U_PRIVATE".to_owned(),
+        ],
         slack_messages: vec![
             "C_ALPHA:1000.000001".to_owned(),
             "C_BETA:1000.000002".to_owned(),
@@ -740,4 +892,14 @@ fn all_visible_rows() -> VisibleRows {
         linear_comments: 1,
         linear_checkpoints: 1,
     }
+}
+
+fn public_and_private_visible_rows() -> VisibleRows {
+    let mut rows = public_visible_rows();
+    rows.slack_channels.push("C_PRIVATE".to_owned());
+    rows.slack_messages.push("C_PRIVATE:1000.000003".to_owned());
+    rows.slack_attachments
+        .push("C_PRIVATE:1000.000003:F_PRIVATE".to_owned());
+    rows.context_docs.push("doc_slack_private".to_owned());
+    rows
 }

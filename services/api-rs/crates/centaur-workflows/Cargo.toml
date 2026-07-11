@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 absurd-sdk.workspace = true
+base64.workspace = true
 centaur-session-core.workspace = true
 centaur-session-runtime.workspace = true
 centaur-session-sqlx.workspace = true
@@ -16,9 +17,11 @@ chrono.workspace = true
 chrono-tz.workspace = true
 cron.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true

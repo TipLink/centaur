@@ -37,26 +37,19 @@ module Oauth
         return
       end
 
-      BrokerCredential.transaction do
-        credential.lock!
-        existing = BrokerCredential
-          .where(oauth_app: credential.oauth_app, provider_subject: subject)
-          .where.not(id: credential.id)
-          .first
+      old_name = credential.name
+      credential.update!(
+        name: "GitHub – #{display_name}",
+        provider_subject: subject,
+        provider_email: profile[:email].presence || credential.provider_email,
+        foreign_id: "github-#{credential.oauth_app.slug}-#{subject.downcase}"
+      )
 
-        if existing
-          merge_pending_credential!(pending: credential, existing:, profile:, display_name:)
-        else
-          old_name = credential.name
-          credential.update!(
-            name: "GitHub – #{display_name}",
-            provider_subject: subject,
-            provider_email: profile[:email].presence || credential.provider_email,
-            foreign_id: "github-#{credential.oauth_app.slug}-#{subject.downcase}"
-          )
-          rename_default_wrapper_secret!(credential, old_name)
-        end
-      end
+      secret = credential.static_secret
+      return unless secret
+      return if old_name.present? && secret.name != "#{old_name} token"
+
+      secret.update!(name: "#{credential.name} token")
     rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotUnique => e
       Rails.logger.warn do
         "github oauth credential identity enrichment failed to persist: " \
@@ -65,59 +58,6 @@ module Oauth
     end
 
     private
-
-    def merge_pending_credential!(pending:, existing:, profile:, display_name:)
-      existing.lock!
-      old_name = existing.name
-      existing.update!(
-        name: "GitHub – #{display_name}",
-        provider_email: profile[:email].presence || existing.provider_email || pending.provider_email,
-        access_token: pending.access_token,
-        refresh_token: pending.refresh_token,
-        scopes: pending.scopes,
-        expires_at: pending.expires_at,
-        last_refresh: pending.last_refresh,
-        next_attempt_at: pending.next_attempt_at,
-        failure_count: pending.failure_count,
-        dead: false,
-        dead_reason: nil
-      )
-      rename_default_wrapper_secret!(existing, old_name)
-      repoint_pending_sources!(pending, existing)
-      remove_pending_wrapper!(pending)
-      pending.destroy!
-    end
-
-    def rename_default_wrapper_secret!(credential, old_name)
-      secret = credential.static_secret
-      return unless secret
-      return if old_name.present? && secret.name != "#{old_name} token"
-
-      secret.update!(name: "#{credential.name} token")
-    end
-
-    def repoint_pending_sources!(pending, existing)
-      SecretSource.referencing_broker_credential(pending).find_each do |source|
-        config = if source.config.is_a?(Hash)
-          source.config.merge("credential_id" => existing.oid)
-        else
-          { "credential_id" => existing.oid }
-        end
-        config.delete("credential_namespace")
-        source.update!(config: config)
-      end
-    end
-
-    def remove_pending_wrapper!(pending)
-      secret = pending.static_secret
-      return unless secret
-
-      if secret.grants.exists?
-        secret.update!(broker_credential: nil)
-      else
-        secret.destroy!
-      end
-    end
 
     def github_profile(access_token)
       response = github_api(access_token)
