@@ -100,12 +100,12 @@ function isCreateRequest(request: RecordedRequest): boolean {
 }
 
 describe("forwardToSessionApi overrides", () => {
-  test("creates session with default claude-code harness", async () => {
+  test("creates session with default codex harness", async () => {
     const { fetchFn, requests } = fakeApi();
     await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage("hi")));
     const create = requests.find(isCreateRequest);
     expect((create?.body as { harness_type?: string }).harness_type).toBe(
-      "claudecode",
+      "codex",
     );
     expect(
       (create?.body as { metadata: { platform: string } }).metadata.platform,
@@ -158,6 +158,37 @@ describe("forwardToSessionApi overrides", () => {
     expect("model" in line).toBe(false);
   });
 
+  test("includes provider override on the execute input line", async () => {
+    const { fetchFn, requests } = fakeApi();
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage("review this"), {
+        model: "custom-model",
+        provider: "responses",
+      }),
+    );
+    const execute = requests.find((request) =>
+      request.url.endsWith("/execute"),
+    );
+    const line = JSON.parse(
+      (execute?.body as { input_lines: string[] }).input_lines[0]!,
+    );
+    expect(line.model).toBe("custom-model");
+    expect(line.provider).toBe("responses");
+  });
+
+  test("omits provider field when no override is set", async () => {
+    const { fetchFn, requests } = fakeApi();
+    await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage("hi")));
+    const execute = requests.find((request) =>
+      request.url.endsWith("/execute"),
+    );
+    const line = JSON.parse(
+      (execute?.body as { input_lines: string[] }).input_lines[0]!,
+    );
+    expect("provider" in line).toBe(false);
+  });
+
   test("retries session creation with existing harness on 409 conflict", async () => {
     const { fetchFn, requests } = fakeApi({
       createSession: [
@@ -194,7 +225,7 @@ describe("forwardToSessionApi overrides", () => {
       createSession: [
         {
           body: {
-            error: `session ${THREAD_ID} already exists with harness_type amp, requested claudecode`,
+            error: `session ${THREAD_ID} already exists with harness_type amp, requested codex`,
             ok: false,
           },
           status: 409,
@@ -208,7 +239,7 @@ describe("forwardToSessionApi overrides", () => {
       creates.map(
         (request) => (request.body as { harness_type: string }).harness_type,
       ),
-    ).toEqual(["claudecode", "amp"]);
+    ).toEqual(["codex", "amp"]);
   });
 
   test("surfaces non-conflict create failures with a sanitized message", async () => {

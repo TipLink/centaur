@@ -4,15 +4,15 @@ import type {
   ForwardSessionInput,
   JsonObject,
   JsonValue,
-  LinearbotApiAttachment,
-  LinearbotApiMessage,
-  LinearbotAppendMessagesRequest,
-  LinearbotCreateSessionRequest,
-  LinearbotExecuteSessionRequest,
-  LinearbotExecuteSessionResponse,
-  LinearbotOptions,
-  LinearbotRendererSource,
-  LinearbotSessionMessage,
+  GithubbotApiAttachment,
+  GithubbotApiMessage,
+  GithubbotAppendMessagesRequest,
+  GithubbotCreateSessionRequest,
+  GithubbotExecuteSessionRequest,
+  GithubbotExecuteSessionResponse,
+  GithubbotOptions,
+  GithubbotRendererSource,
+  GithubbotSessionMessage,
 } from "./types";
 import {
   elapsedMs,
@@ -39,7 +39,7 @@ export class SessionApiError extends Error {
     statusText: string;
   }) {
     // api-rs error bodies can carry internals; keep them out of the message,
-    // which is surfaced verbatim into the user-facing Linear session.
+    // which is surfaced verbatim into the user-facing GitHub session.
     super(
       `Centaur session ${input.action} failed: ${input.status} ${input.statusText}`,
     );
@@ -60,7 +60,7 @@ export function isRetryableSessionApiError(error: unknown): boolean {
 
 type ForwardSessionApiCallbacks = {
   onExecutionStarted?(
-    execution: LinearbotExecuteSessionResponse,
+    execution: GithubbotExecuteSessionResponse,
   ): Promise<void>;
   onMessagesAppended?(): Promise<void>;
   /**
@@ -75,14 +75,14 @@ type ForwardSessionApiCallbacks = {
 export async function collectInitialContext(
   thread: { allMessages: AsyncIterable<Message> },
   currentMessage: Message,
-): Promise<LinearbotApiMessage[]> {
+): Promise<GithubbotApiMessage[]> {
   const messages: Message[] = [];
   try {
     for await (const message of thread.allMessages) {
       messages.push(message);
     }
   } catch (error) {
-    if (!isLinearThreadNotFoundError(error)) throw error;
+    if (!isGitHubThreadNotFoundError(error)) throw error;
     return [await serializeMessage(currentMessage)];
   }
 
@@ -95,31 +95,27 @@ export async function collectInitialContext(
     messages.push(currentMessage);
   }
 
-  const serialized: LinearbotApiMessage[] = [];
+  const serialized: GithubbotApiMessage[] = [];
   for (const message of messages) {
     serialized.push(await serializeMessage(message));
   }
   return serialized;
 }
 
-// Linear analog of slackbotv2's isSlackThreadNotFoundError: the Linear SDK
-// surfaces GraphQL failures for deleted/inaccessible entities as errors whose
-// message carries "Entity not found" (and the adapter wraps some in
-// AdapterError text mentioning the missing session/comment).
-function isLinearThreadNotFoundError(error: unknown): boolean {
+// The GitHub adapter surfaces a deleted/inaccessible PR or comment thread as an
+// Octokit error carrying HTTP 404 (message "Not Found"); treat that as an empty
+// thread instead of a hard failure.
+function isGitHubThreadNotFoundError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  return (
-    error.message.includes("Entity not found") ||
-    error.message.includes("entity not found") ||
-    error.message.includes("Could not find referenced") ||
-    error.message.includes("is missing a root comment")
-  );
+  const status = (error as { status?: unknown }).status;
+  if (status === 404) return true;
+  return error.message.includes("Not Found");
 }
 
 export async function serializeMessage(
   message: Message,
-): Promise<LinearbotApiMessage> {
-  const attachments: LinearbotApiAttachment[] = [];
+): Promise<GithubbotApiMessage> {
+  const attachments: GithubbotApiAttachment[] = [];
   for (const attachment of message.attachments) {
     attachments.push(await serializeAttachment(attachment));
   }
@@ -142,17 +138,17 @@ export async function serializeMessage(
   };
 }
 
-// Note: on Linear the execute/openStream tail below is dead code on the live
+// Note: on GitHub the execute/openStream tail below is dead code on the live
 // path — index.ts always calls with `executeMessage: undefined` and runs the
 // execute via `executeSessionTurn` inside the render stream (after the
 // working-thought ack lands; the execute call blocks on cold sandbox
 // spin-up). The tail is kept verbatim so 3-way syncs against slackbotv2 diff
 // cleanly.
 export async function forwardToSessionApi(
-  options: LinearbotOptions,
+  options: GithubbotOptions,
   input: ForwardSessionInput,
   callbacks: ForwardSessionApiCallbacks = {},
-): Promise<AsyncIterable<LinearbotRendererSource> | null> {
+): Promise<AsyncIterable<GithubbotRendererSource> | null> {
   const createStartedAtMs = nowMs();
   const created = await createSession(
     options,
@@ -160,7 +156,7 @@ export async function forwardToSessionApi(
     input.harnessType,
     input.conversationName,
   );
-  traceLog(options, "linearbot_session_create_complete", input.trace, {
+  traceLog(options, "githubbot_session_create_complete", input.trace, {
     harness_switched: created.harnessSwitched,
     phase_ms: elapsedMs(createStartedAtMs),
   });
@@ -170,13 +166,13 @@ export async function forwardToSessionApi(
   if (input.messages.length > 0) {
     const appendStartedAtMs = nowMs();
     await appendSessionMessages(options, input.threadId, input.messages);
-    traceLog(options, "linearbot_session_append_complete", input.trace, {
+    traceLog(options, "githubbot_session_append_complete", input.trace, {
       message_count: input.messages.length,
       phase_ms: elapsedMs(appendStartedAtMs),
     });
     await callbacks.onMessagesAppended?.();
   } else {
-    traceLog(options, "linearbot_session_append_skipped", input.trace, {
+    traceLog(options, "githubbot_session_append_skipped", input.trace, {
       message_count: 0,
     });
   }
@@ -188,10 +184,9 @@ export async function forwardToSessionApi(
     input.threadId,
     input.executeMessage,
     input.model,
-    input.provider,
     input.contextPreamble,
   );
-  traceLog(options, "linearbot_session_execute_complete", input.trace, {
+  traceLog(options, "githubbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
     phase_ms: elapsedMs(executeStartedAtMs),
   });
@@ -209,9 +204,9 @@ export async function forwardToSessionApi(
  * idempotency_key, so a render retry won't re-spawn.
  */
 export async function executeSessionTurn(
-  options: LinearbotOptions,
+  options: GithubbotOptions,
   input: ForwardSessionInput,
-): Promise<LinearbotExecuteSessionResponse | null> {
+): Promise<GithubbotExecuteSessionResponse | null> {
   if (!input.executeMessage) return null;
   const executeStartedAtMs = nowMs();
   const execution = await executeSession(
@@ -219,10 +214,9 @@ export async function executeSessionTurn(
     input.threadId,
     input.executeMessage,
     input.model,
-    input.provider,
     input.contextPreamble,
   );
-  traceLog(options, "linearbot_session_execute_complete", input.trace, {
+  traceLog(options, "githubbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
     phase_ms: elapsedMs(executeStartedAtMs),
   });
@@ -230,12 +224,12 @@ export async function executeSessionTurn(
 }
 
 export async function openSessionEventStream(
-  options: LinearbotOptions,
+  options: GithubbotOptions,
   input: Pick<
     ForwardSessionInput,
     "afterEventId" | "executionId" | "onEventId" | "threadId" | "trace"
   >,
-): Promise<AsyncIterable<LinearbotRendererSource>> {
+): Promise<AsyncIterable<GithubbotRendererSource>> {
   const streamStartedAtMs = nowMs();
   const stream = await streamSessionNotifications(
     options,
@@ -244,7 +238,7 @@ export async function openSessionEventStream(
     input.executionId,
     input.onEventId,
   );
-  traceLog(options, "linearbot_session_events_opened", input.trace, {
+  traceLog(options, "githubbot_session_events_opened", input.trace, {
     after_event_id: input.afterEventId,
     execution_id: input.executionId,
     phase_ms: elapsedMs(streamStartedAtMs),
@@ -260,10 +254,10 @@ export function startingStreamNotification(threadId: string): JsonObject {
     method: "item/started",
     params: {
       threadId,
-      turnId: "linearbot-starting-turn",
+      turnId: "githubbot-starting-turn",
       startedAtMs: Date.now(),
       item: {
-        id: "linearbot-starting",
+        id: "githubbot-starting",
         memoryCitation: null,
         phase: "commentary",
         text: "",
@@ -276,14 +270,14 @@ export function startingStreamNotification(threadId: string): JsonObject {
 const RESTART_CONTEXT_MAX_CHARS = 24_000;
 
 /**
- * Transcript of the Linear issue thread, fed to a freshly restarted harness as
+ * Transcript of the GitHub issue thread, fed to a freshly restarted harness as
  * a context preamble (the old harness's conversation state dies with its
  * sandbox). The current message is excluded — it rides in the same input line
  * as the actual user turn. The synthetic issue-context message (author
- * "Linear") is part of the history, so the new harness still sees the issue.
+ * "GitHub") is part of the history, so the new harness still sees the issue.
  */
 export function harnessRestartPreamble(
-  history: LinearbotApiMessage[],
+  history: GithubbotApiMessage[],
   currentMessageId: string,
 ): string | undefined {
   const lines: string[] = [];
@@ -302,7 +296,7 @@ export function harnessRestartPreamble(
     transcript = `…(earlier messages truncated)\n${transcript.slice(-RESTART_CONTEXT_MAX_CHARS)}`;
   }
   return (
-    "This Linear issue thread was just restarted on a different agent harness, " +
+    "This GitHub issue thread was just restarted on a different agent harness, " +
     "so the previous agent's working state is gone. Transcript of the thread so " +
     `far, for context:\n${transcript}`
   );
@@ -323,8 +317,8 @@ const STAGED_ATTACHMENT_CHUNK_CHARS = 700 * 1024;
 
 async function serializeAttachment(
   attachment: Attachment,
-): Promise<LinearbotApiAttachment> {
-  const serialized: LinearbotApiAttachment = {
+): Promise<GithubbotApiAttachment> {
+  const serialized: GithubbotApiAttachment = {
     fetchMetadata: attachment.fetchMetadata,
     height: attachment.height,
     mimeType: attachment.mimeType,
@@ -380,7 +374,7 @@ type CreateSessionOutcome = {
 };
 
 async function createSession(
-  options: LinearbotOptions,
+  options: GithubbotOptions,
   threadId: string,
   harnessType?: string,
   conversationName?: string,
@@ -434,7 +428,7 @@ async function createSession(
 }
 
 async function postCreateSession(
-  options: LinearbotOptions,
+  options: GithubbotOptions,
   threadId: string,
   harnessType: string,
   onHarnessConflict?: "reject" | "restart",
@@ -442,14 +436,14 @@ async function postCreateSession(
 ): Promise<Response> {
   const fetchFn = options.fetch ?? fetch;
   const name = conversationName?.trim();
-  const body: LinearbotCreateSessionRequest = {
+  const body: GithubbotCreateSessionRequest = {
     harness_type: harnessType,
     metadata: {
-      source: "linearbot",
-      platform: "linear",
+      source: "githubbot",
+      platform: "github",
       thread_id: threadId,
       // api-rs reads this as the session principal's display name.
-      ...(name ? { linear_conversation_name: name } : {}),
+      ...(name ? { github_conversation_name: name } : {}),
     },
     ...(onHarnessConflict ? { on_harness_conflict: onHarnessConflict } : {}),
   };
@@ -485,12 +479,12 @@ function existingHarnessFromConflict(body: string): string | undefined {
 }
 
 async function appendSessionMessages(
-  options: LinearbotOptions,
+  options: GithubbotOptions,
   threadId: string,
-  messages: LinearbotApiMessage[],
+  messages: GithubbotApiMessage[],
 ): Promise<void> {
   const fetchFn = options.fetch ?? fetch;
-  const body: LinearbotAppendMessagesRequest = {
+  const body: GithubbotAppendMessagesRequest = {
     messages: messages.map(toSessionMessage),
   };
   const response = await fetchFn(
@@ -505,18 +499,17 @@ async function appendSessionMessages(
 }
 
 async function executeSession(
-  options: LinearbotOptions,
+  options: GithubbotOptions,
   threadId: string,
-  message: LinearbotApiMessage,
+  message: GithubbotApiMessage,
   model?: string,
-  provider?: string,
   contextPreamble?: string,
-): Promise<LinearbotExecuteSessionResponse> {
+): Promise<GithubbotExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch;
-  const body: LinearbotExecuteSessionRequest = {
+  const body: GithubbotExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(message, { action: "execute" }),
-    input_lines: toCodexInputLines(message, threadId, model, provider, contextPreamble),
+    input_lines: toCodexInputLines(message, threadId, model, contextPreamble),
     ...(options.idleTimeoutMs === undefined
       ? {}
       : { idle_timeout_ms: options.idleTimeoutMs }),
@@ -533,13 +526,13 @@ async function executeSession(
     },
   );
   await ensureApiOk(response, "execute session", options);
-  return (await response.json()) as LinearbotExecuteSessionResponse;
+  return (await response.json()) as GithubbotExecuteSessionResponse;
 }
 
 async function ensureApiOk(
   response: Response,
   action: string,
-  options: LinearbotOptions,
+  options: GithubbotOptions,
 ): Promise<void> {
   if (response.ok) return;
   let body = "";
@@ -560,15 +553,15 @@ async function ensureApiOk(
 
 // api-rs error bodies can carry stack traces, internal hostnames, or echoed
 // payloads. Log the full body server-side; the thrown message stays generic —
-// it is surfaced verbatim into the user-facing Linear session.
+// it is surfaced verbatim into the user-facing GitHub session.
 function logApiErrorBody(
-  options: LinearbotOptions,
+  options: GithubbotOptions,
   action: string,
   response: Response,
   body: string,
 ): void {
   if (!body) return;
-  (options.logger ?? noopLogger).warn("linearbot_session_api_error", {
+  (options.logger ?? noopLogger).warn("githubbot_session_api_error", {
     action,
     status: response.status,
     status_text: response.statusText,
@@ -581,12 +574,12 @@ function isRetryableApiStatus(status: number): boolean {
 }
 
 async function streamSessionNotifications(
-  options: LinearbotOptions,
+  options: GithubbotOptions,
   threadId: string,
   afterEventId: number,
   executionId: string | undefined,
   onEventId: (eventId: number) => void,
-): Promise<AsyncIterable<LinearbotRendererSource>> {
+): Promise<AsyncIterable<GithubbotRendererSource>> {
   const fetchFn = options.fetch ?? fetch;
   const url = new URL(apiSessionUrl(options.apiUrl, threadId, "events"));
   url.searchParams.set("after_event_id", String(afterEventId));
@@ -613,10 +606,10 @@ function ensureTrailingSlash(value: string): string {
   return value.endsWith("/") ? value : `${value}/`;
 }
 
-function apiHeaders(options: LinearbotOptions, jsonBody = true): HeadersInit {
+function apiHeaders(options: GithubbotOptions, jsonBody = true): HeadersInit {
   const apiKey =
     options.apiKey ??
-    process.env.LINEARBOT_API_KEY ??
+    process.env.GITHUBBOT_API_KEY ??
     process.env.CENTAUR_API_KEY;
   return {
     ...(jsonBody ? { "content-type": "application/json" } : {}),
@@ -625,8 +618,8 @@ function apiHeaders(options: LinearbotOptions, jsonBody = true): HeadersInit {
 }
 
 function toSessionMessage(
-  message: LinearbotApiMessage,
-): LinearbotSessionMessage {
+  message: GithubbotApiMessage,
+): GithubbotSessionMessage {
   return {
     client_message_id: message.id,
     role: message.author.isMe ? "assistant" : "user",
@@ -635,7 +628,7 @@ function toSessionMessage(
   };
 }
 
-function sessionMessageParts(message: LinearbotApiMessage): JsonValue[] {
+function sessionMessageParts(message: GithubbotApiMessage): JsonValue[] {
   const parts: JsonValue[] = [];
   if (message.text.trim()) {
     parts.push({ type: "text", text: message.text });
@@ -646,7 +639,7 @@ function sessionMessageParts(message: LinearbotApiMessage): JsonValue[] {
   return parts.length > 0 ? parts : [{ type: "text", text: "" }];
 }
 
-function sessionAttachmentPart(attachment: LinearbotApiAttachment): JsonObject {
+function sessionAttachmentPart(attachment: GithubbotApiAttachment): JsonObject {
   const part: JsonObject = {
     ...attachment,
     attachment_type: attachment.type,
@@ -663,12 +656,12 @@ function sessionAttachmentPart(attachment: LinearbotApiAttachment): JsonObject {
 }
 
 function sessionMetadata(
-  message: LinearbotApiMessage,
+  message: GithubbotApiMessage,
   extra: JsonObject = {},
 ): JsonObject {
   return {
-    source: "linearbot",
-    platform: "linear",
+    source: "githubbot",
+    platform: "github",
     message_id: message.id,
     thread_id: message.threadId,
     is_mention: message.isMention,
@@ -680,53 +673,69 @@ function sessionMetadata(
 }
 
 function toCodexInputLines(
-  message: LinearbotApiMessage,
+  message: GithubbotApiMessage,
   threadId: string,
   model?: string,
-  provider?: string,
   contextPreamble?: string,
 ): string[] {
-  const staged = new Map<LinearbotApiAttachment, string>();
+  const staged = new Map<GithubbotApiAttachment, string>();
   const lines: string[] = [];
-  for (const attachment of message.attachments) {
-    if (!attachment.dataBase64) continue;
-    const inlineLine = toCodexInputLineWithStaged(
-      message,
-      threadId,
-      staged,
-      model,
-      provider,
-      contextPreamble,
-    );
-    if (
-      inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS &&
-      attachment.dataBase64.length <= MAX_CODEX_INPUT_LINE_CHARS
-    ) {
-      continue;
-    }
+  const stage = (attachment: GithubbotApiAttachment): void => {
     const stagedAttachmentId = `att-${message.id}-${staged.size + 1}`;
     staged.set(attachment, stagedAttachmentId);
     lines.push(...stagedAttachmentInputLines(attachment, stagedAttachmentId));
+  };
+
+  // An attachment whose own payload exceeds the line cap can never ride inline,
+  // so stage it up front — a cheap per-attachment length check with no
+  // whole-message serialization (the previous loop re-serialized every
+  // attachment's full base64 once per attachment: O(n²) over the bytes).
+  for (const attachment of message.attachments) {
+    if (
+      attachment.dataBase64 &&
+      attachment.dataBase64.length > MAX_CODEX_INPUT_LINE_CHARS
+    ) {
+      stage(attachment);
+    }
   }
-  lines.push(
-    toCodexInputLineWithStaged(
-      message,
-      threadId,
-      staged,
-      model,
-      provider,
-      contextPreamble,
-    ),
+
+  // Serialize the single inline line once. If the attachments still riding inline
+  // overflow it, stage them largest-first until it fits — recomputed only on that
+  // rare overflow path, never once per attachment. An attachment therefore stays
+  // inline iff its own data fits and the cumulative inline line fits, which is the
+  // invariant the old loop enforced.
+  let inlineLine = toCodexInputLineWithStaged(
+    message,
+    threadId,
+    staged,
+    model,
+    contextPreamble,
   );
+  if (inlineLine.length > MAX_CODEX_INPUT_LINE_CHARS) {
+    const remaining = message.attachments
+      .filter((a) => a.dataBase64 && !staged.has(a))
+      .sort((a, b) => (b.dataBase64?.length ?? 0) - (a.dataBase64?.length ?? 0));
+    for (const attachment of remaining) {
+      stage(attachment);
+      inlineLine = toCodexInputLineWithStaged(
+        message,
+        threadId,
+        staged,
+        model,
+        contextPreamble,
+      );
+      if (inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS) break;
+    }
+  }
+  lines.push(inlineLine);
   return lines;
 }
 
 function toCodexInputLineWithStaged(
-  message: LinearbotApiMessage,
+  message: GithubbotApiMessage,
   threadId: string,
-  staged: Map<LinearbotApiAttachment, string>,
+  staged: Map<GithubbotApiAttachment, string>,
   model?: string,
-  provider?: string,
   contextPreamble?: string,
 ): string {
   return JSON.stringify({
@@ -734,7 +743,6 @@ function toCodexInputLineWithStaged(
     thread_key: threadId,
     trace_metadata: sessionMetadata(message, { action: "execute" }),
     ...(model ? { model } : {}),
-    ...(provider ? { provider } : {}),
     message: {
       role: "user",
       content: codexInputContent(message, staged, contextPreamble),
@@ -743,7 +751,7 @@ function toCodexInputLineWithStaged(
 }
 
 function stagedAttachmentInputLines(
-  attachment: LinearbotApiAttachment,
+  attachment: GithubbotApiAttachment,
   stagedAttachmentId: string,
 ): string[] {
   const dataBase64 = attachment.dataBase64;
@@ -774,8 +782,8 @@ function stagedAttachmentInputLines(
 }
 
 function codexInputContent(
-  message: LinearbotApiMessage,
-  staged: Map<LinearbotApiAttachment, string> = new Map(),
+  message: GithubbotApiMessage,
+  staged: Map<GithubbotApiAttachment, string> = new Map(),
   contextPreamble?: string,
 ): JsonValue[] {
   const content: JsonValue[] = [];
@@ -796,7 +804,7 @@ function codexInputContent(
 }
 
 function codexAttachmentInput(
-  attachment: LinearbotApiAttachment,
+  attachment: GithubbotApiAttachment,
   stagedAttachmentId?: string,
 ): JsonValue {
   if (stagedAttachmentId) {
@@ -837,7 +845,7 @@ function codexAttachmentInput(
   };
 }
 
-function attachmentDescription(attachment: LinearbotApiAttachment): string {
+function attachmentDescription(attachment: GithubbotApiAttachment): string {
   const fields = [
     `name=${attachment.name ?? "attachment"}`,
     `type=${attachment.type}`,
@@ -848,7 +856,7 @@ function attachmentDescription(attachment: LinearbotApiAttachment): string {
       : undefined,
     attachment.fetchError ? `fetch_error=${attachment.fetchError}` : undefined,
   ].filter(Boolean);
-  return `[Linear attachment: ${fields.join(" ")}]`;
+  return `[GitHub attachment: ${fields.join(" ")}]`;
 }
 
 type ParsedSessionEvent = {
@@ -860,7 +868,7 @@ type ParsedSessionEvent = {
 async function* parseSessionEventStream(
   stream: ReadableStream<Uint8Array>,
   onEventId: (eventId: number) => void,
-): AsyncIterable<LinearbotRendererSource> {
+): AsyncIterable<GithubbotRendererSource> {
   for await (const event of parseSseEvents(stream)) {
     if (typeof event.id === "number") onEventId(event.id);
     if (event.event === "session.output.line") {
