@@ -62,6 +62,10 @@ struct Cli {
     #[arg(long, default_value = "10m")]
     op_ttl: String,
 
+    /// Prefix on env-backed Secret keys (for Helm secretManager.envPrefix).
+    #[arg(long, env = "FIREWALL_MANAGER_SECRET_ENV_PREFIX", default_value = "")]
+    env_prefix: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -966,7 +970,8 @@ fn build_source_policy(cli: &Cli) -> Result<SourcePolicy> {
                 SourcePolicy::onepassword_connect(vault, cli.op_ttl.clone())
             }
         }
-    })
+    }
+    .with_env_prefix(cli.env_prefix.clone()))
 }
 
 fn role_identity(role: &RoleSpec, namespace: &str) -> IdentityInput {

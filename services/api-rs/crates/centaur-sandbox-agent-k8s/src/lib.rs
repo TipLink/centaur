@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    MountKind, ObservedSandbox, RepoCacheAccess, SandboxBackend, SandboxError, SandboxHandle,
+    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 use kube::api::{
@@ -37,15 +37,15 @@ const BACKEND_NAME: &str = "agent-sandbox-k8s";
 const DEFAULT_CONTAINER_NAME: &str = "agent";
 const MANAGED_BY_LABEL: &str = "centaur.ai/managed-by";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
+const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
+const API_SERVER_ENABLED_LABEL: &str = "centaur.ai/api-server-enabled";
 const MANAGED_BY_VALUE: &str = "api-rs";
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
 // so resume (which has only the sandbox id) can rebind without the spec or any
 // in-memory state. Survives pause and api-rs restarts.
 const IRON_CONTROL_PRINCIPAL_ANNOTATION: &str = "centaur.ai/iron-control-principal";
-// RFC 3339 instant stamped when the sandbox is paused for idleness and
-// cleared on resume. The reaper uses it to stop sandboxes whose pause
-// outlived the idle TTL, surviving api-rs restarts (the pause timer is
-// otherwise in-memory only).
+// RFC 3339 instant stamped when the sandbox is paused for idleness and cleared
+// on resume. This keeps suspended status observable across api-rs restarts.
 const PAUSED_AT_ANNOTATION: &str = "centaur.ai/paused-at";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -66,14 +66,13 @@ pub struct AgentSandboxConfig {
     /// git-clones the tools repo into the agent's `/app/tools`, and `TOOL_DIRS`
     /// is set so the agent's shim installer finds them.
     pub tools: Option<ToolsConfig>,
-    /// Optional org/deployment overlay image copied into each sandbox before
-    /// the agent starts. The overlay can carry tools, workflows, prompts, and
-    /// harness config without rebuilding the base sandbox image.
+    /// Transitional org/deployment overlay image. Its contents are copied into
+    /// an emptyDir before the agent starts so staged rollouts can coexist with
+    /// the newer repo-cache overlay architecture and roll back safely.
     pub overlay_image: Option<OverlayImageConfig>,
-    /// In-cluster OTLP collector (e.g. Laminar) the sandbox exports harness
-    /// traces to directly. The per-sandbox egress NetworkPolicy denies all
-    /// destinations except the proxy/control plane, so without this rule the
-    /// harness's usage/cost spans never leave the pod.
+    /// In-cluster OTLP collector (e.g. Laminar) used for observability-capable
+    /// sandboxes. Sandbox pod egress is granted by chart-level label policy;
+    /// the per-sandbox proxy uses this target for its own explicit egress.
     pub otlp_egress: Option<OtlpEgressTarget>,
     pub ready_timeout: Duration,
 }
@@ -617,6 +616,16 @@ fn build_agent_sandbox(
     labels.extend(spec.labels.clone());
     labels.insert(MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned());
     labels.insert(SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned());
+    if spec.capabilities.observability_enabled {
+        labels.insert(OBSERVABILITY_ENABLED_LABEL.to_owned(), "true".to_owned());
+    }
+    // Always project the capability. The transitional NetworkPolicy can then
+    // distinguish genuinely legacy pods (label absent) from new restricted
+    // pods (label explicitly false).
+    labels.insert(
+        API_SERVER_ENABLED_LABEL.to_owned(),
+        spec.capabilities.api_server_enabled.to_string(),
+    );
 
     let mut pod_labels = labels.clone();
     pod_labels.insert(
@@ -650,13 +659,29 @@ fn build_agent_sandbox(
         .iter()
         .map(|env| (env.name.clone(), env.value.clone()))
         .collect();
-    let repo_cache_tools = config
+    let repo_cache_enabled = spec.capabilities.repo_cache.enabled();
+    let scoped_tools = config
         .tools
         .as_ref()
-        .filter(|_| spec.capabilities.repo_cache_enabled);
-    let baked_base_tools = config.tools.is_some() && !spec.capabilities.repo_cache_enabled;
+        .filter(|_| repo_cache_enabled)
+        .map(|tools| tools.scoped_for_repo_cache_access(&spec.capabilities.repo_cache));
+    let repo_cache_tools = scoped_tools.as_ref().filter(|tools| tools.has_sources());
+    let baked_base_tools = config.tools.is_some() && repo_cache_tools.is_none();
+    // The legacy image carries private org overlays and predates capability
+    // scoping. Expose it only to full repo-cache principals; None/Public must
+    // not regain private tools, prompts, skills, or workflows through this
+    // transitional fallback.
+    let overlay_image = config
+        .overlay_image
+        .as_ref()
+        .filter(|_| matches!(spec.capabilities.repo_cache, RepoCacheAccess::All));
 
     if repo_cache_tools.is_some() {
+        // Workflow-host specs can inherit the API deployment's transitional
+        // TOOLS_OVERLAY_PATH. Remove it, even when it arrived before this
+        // function, because entrypoint.sh appends it after TOOL_DIRS and would
+        // let stale image tools shadow the reviewed repo-cache bootstrap.
+        agent_env.retain(|(name, _)| name != "TOOLS_OVERLAY_PATH");
         for (name, value) in tools::agent_env(repo_cache_tools) {
             upsert_env(&mut agent_env, &name, value);
         }
@@ -665,17 +690,28 @@ fn build_agent_sandbox(
             upsert_env(&mut agent_env, &name, value);
         }
     }
-    if let Some(overlay_image) = &config.overlay_image {
-        upsert_env(
+    if let Some(overlay_image) = overlay_image {
+        insert_env_if_absent(
+            &mut agent_env,
+            "CENTAUR_IMAGE_OVERLAY_DIR",
+            overlay_image.mount_path.clone(),
+        );
+        insert_env_if_absent(
             &mut agent_env,
             "CENTAUR_OVERLAY_DIR",
             overlay_image.mount_path.clone(),
         );
-        upsert_env(
-            &mut agent_env,
-            "TOOLS_OVERLAY_PATH",
-            format!("{}/tools", overlay_image.mount_path.trim_end_matches('/')),
-        );
+        // Repo-cache tools are published into TOOL_DIRS and are the reviewed
+        // source of truth. Keep the image path only as a fallback when no repo
+        // tool source is available; otherwise entrypoint.sh would append the
+        // stale image tree after TOOL_DIRS and let it shadow repo-backed tools.
+        if repo_cache_tools.is_none() {
+            insert_env_if_absent(
+                &mut agent_env,
+                "TOOLS_OVERLAY_PATH",
+                format!("{}/tools", overlay_image.mount_path.trim_end_matches('/')),
+            );
+        }
     }
     insert_optional(
         &mut container,
@@ -709,7 +745,7 @@ fn build_agent_sandbox(
         volume_mounts.extend(tools::agent_volume_mounts_json(repo_cache_tools));
         volumes.extend(tools::volumes_json(repo_cache_tools));
     }
-    if let Some(overlay_image) = &config.overlay_image {
+    if let Some(overlay_image) = overlay_image {
         volume_mounts.push(json!({
             "name": "overlay-root",
             "mountPath": overlay_image.mount_path,
@@ -747,7 +783,7 @@ fn build_agent_sandbox(
             clone_proxy.as_ref(),
         ));
     }
-    if let Some(overlay_image) = &config.overlay_image {
+    if let Some(overlay_image) = overlay_image {
         init_containers.push(overlay_init_container_json(overlay_image));
     }
 
@@ -757,7 +793,7 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    if repo_cache_tools.is_some() || config.overlay_image.is_some() {
+    if repo_cache_tools.is_some() || overlay_image.is_some() {
         pod_spec["securityContext"] = tools::pod_security_context_json();
     }
     insert_optional(
@@ -851,6 +887,11 @@ fn mount_json(spec: &SandboxSpec) -> (Vec<Value>, Vec<Value>) {
             "mountPath": mount.target_path,
             "readOnly": mount.read_only,
         }));
+        if let Some(sub_path) = &mount.sub_path
+            && let Some(mount_obj) = mounts.last_mut().and_then(Value::as_object_mut)
+        {
+            mount_obj.insert("subPath".to_owned(), json!(sub_path));
+        }
         volumes.push(match &mount.kind {
             MountKind::EmptyDir => json!({
                 "name": name,
@@ -931,6 +972,15 @@ fn upsert_env(env: &mut Vec<(String, String)>, name: &str, value: String) {
     }
 }
 
+/// Append an env default without replacing an operator-supplied value in
+/// `spec.env`. Transitional image wiring is a fallback, while explicit
+/// repo-backed paths are authoritative.
+fn insert_env_if_absent(env: &mut Vec<(String, String)>, name: &str, value: String) {
+    if !env.iter().any(|(existing, _)| existing == name) {
+        env.push((name.to_owned(), value));
+    }
+}
+
 fn next_sandbox_name() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -954,7 +1004,7 @@ fn map_kube_error(operation: &str, err: Error) -> SandboxError {
 
 #[cfg(test)]
 mod tests {
-    use centaur_sandbox_core::{ResourceLimits, SandboxCapabilities, SandboxSpec};
+    use centaur_sandbox_core::{RepoCacheAccess, ResourceLimits, SandboxCapabilities, SandboxSpec};
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
 
     use super::*;
@@ -998,6 +1048,108 @@ mod tests {
         assert_eq!(container.stdin, Some(true));
         assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 2);
         assert!(container.resources.as_ref().unwrap().limits.is_some());
+    }
+
+    #[test]
+    fn labels_observability_enabled_sandboxes_for_chart_policy() {
+        let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
+            repo_cache: RepoCacheAccess::All,
+            observability_enabled: true,
+            api_server_enabled: true,
+        });
+        let config = AgentSandboxConfig::new("centaur");
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert_eq!(
+            sandbox
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(OBSERVABILITY_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            sandbox
+                .spec
+                .pod_template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.labels.as_ref())
+                .and_then(|labels| labels.get(OBSERVABILITY_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            sandbox
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            sandbox
+                .spec
+                .pod_template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.labels.as_ref())
+                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn labels_api_server_capability_false_for_restricted_sandboxes() {
+        let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
+            repo_cache: RepoCacheAccess::All,
+            observability_enabled: false,
+            api_server_enabled: false,
+        });
+        let config = AgentSandboxConfig::new("centaur");
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert!(
+            sandbox
+                .metadata
+                .labels
+                .as_ref()
+                .is_none_or(|labels| !labels.contains_key(OBSERVABILITY_ENABLED_LABEL))
+        );
+        assert!(
+            sandbox
+                .spec
+                .pod_template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.labels.as_ref())
+                .is_none_or(|labels| !labels.contains_key(OBSERVABILITY_ENABLED_LABEL))
+        );
+        assert_eq!(
+            sandbox
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            sandbox
+                .spec
+                .pod_template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.labels.as_ref())
+                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]
@@ -1085,6 +1237,10 @@ mod tests {
                 && env.value.as_deref() == Some("/home/agent/overlay/org")
         }));
         assert!(env.iter().any(|env| {
+            env.name == "CENTAUR_IMAGE_OVERLAY_DIR"
+                && env.value.as_deref() == Some("/home/agent/overlay/org")
+        }));
+        assert!(env.iter().any(|env| {
             env.name == "TOOLS_OVERLAY_PATH"
                 && env.value.as_deref() == Some("/home/agent/overlay/org/tools")
         }));
@@ -1109,10 +1265,50 @@ mod tests {
     }
 
     #[test]
+    fn repo_backed_overlay_env_wins_over_transitional_image_defaults() {
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .env(
+                "CENTAUR_OVERLAY_DIR",
+                "/home/agent/github/TipLink/fineas-centaur-overlay",
+            )
+            .env("TOOLS_OVERLAY_PATH", "/app/overlay/org/tools");
+        let config = AgentSandboxConfig::new("centaur")
+            .tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"))
+            .overlay_image(
+                OverlayImageConfig::new("ghcr.io/example/overlay:sha-test")
+                    .mount_path("/home/agent/overlay/org"),
+            );
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+        let env = pod_spec.containers[0].env.as_ref().unwrap();
+
+        assert_eq!(
+            env.iter()
+                .find(|entry| entry.name == "CENTAUR_OVERLAY_DIR")
+                .and_then(|entry| entry.value.as_deref()),
+            Some("/home/agent/github/TipLink/fineas-centaur-overlay")
+        );
+        assert_eq!(
+            env.iter()
+                .find(|entry| entry.name == "TOOL_DIRS")
+                .and_then(|entry| entry.value.as_deref()),
+            Some("/app/tools")
+        );
+        assert!(!env.iter().any(|entry| entry.name == "TOOLS_OVERLAY_PATH"));
+        assert!(pod_spec.init_containers.as_ref().is_some_and(|containers| {
+            containers
+                .iter()
+                .any(|container| container.name == "overlay-bootstrap")
+        }));
+    }
+
+    #[test]
     fn disabled_repo_cache_uses_baked_base_tools_without_bootstrap() {
         let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
-            repo_cache_enabled: false,
+            repo_cache: RepoCacheAccess::None,
             observability_enabled: true,
+            api_server_enabled: true,
         });
         let mut tools = ToolsConfig::new("paradigmxyz/centaur", "api:test");
         tools.repo_cache_path = Some("/var/lib/centaur/repos".to_owned());
@@ -1164,6 +1360,48 @@ mod tests {
             security_context.fs_group_change_policy.as_deref(),
             Some("OnRootMismatch")
         );
+    }
+
+    #[test]
+    fn restricted_repo_cache_access_cannot_fall_back_to_private_overlay_image() {
+        for repo_cache in [RepoCacheAccess::None, RepoCacheAccess::Public] {
+            let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
+                repo_cache,
+                observability_enabled: true,
+                api_server_enabled: true,
+            });
+            let config = AgentSandboxConfig::new("centaur")
+                .tools(ToolsConfig::new("private-org/centaur", "api:test"))
+                .overlay_image(
+                    OverlayImageConfig::new("ghcr.io/private-org/overlay:sha-test")
+                        .mount_path("/home/agent/overlay/org"),
+                );
+
+            let sandbox =
+                build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+            let pod_spec = &sandbox.spec.pod_template.spec;
+            let container = &pod_spec.containers[0];
+            let env = container.env.as_ref().unwrap();
+
+            assert!(!env.iter().any(|entry| {
+                entry.name == "CENTAUR_OVERLAY_DIR"
+                    || entry.name == "CENTAUR_IMAGE_OVERLAY_DIR"
+                    || entry.name == "TOOLS_OVERLAY_PATH"
+            }));
+            assert!(
+                container.volume_mounts.as_ref().is_none_or(|mounts| {
+                    !mounts.iter().any(|mount| mount.name == "overlay-root")
+                })
+            );
+            assert!(pod_spec.init_containers.as_ref().is_none_or(|containers| {
+                !containers
+                    .iter()
+                    .any(|container| container.name == "overlay-bootstrap")
+            }));
+            assert!(pod_spec.volumes.as_ref().is_none_or(|volumes| {
+                !volumes.iter().any(|volume| volume.name == "overlay-root")
+            }));
+        }
     }
 
     #[test]

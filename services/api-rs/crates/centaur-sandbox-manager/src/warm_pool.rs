@@ -1,19 +1,30 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use centaur_sandbox_core::{SandboxError, SandboxId, SandboxSpec, SandboxStatus};
 use centaur_session_sqlx::{PgSessionStore, SessionStoreError};
 use thiserror::Error;
-use tokio::time::{MissedTickBehavior, interval};
-use tracing::warn;
+use tokio::{
+    sync::Mutex,
+    time::{MissedTickBehavior, interval},
+};
+use tracing::{debug, warn};
 
 use crate::SandboxManager;
 
 pub type WarmSandboxSpecFactory = Arc<dyn Fn() -> SandboxSpec + Send + Sync>;
+const STALE_EVICTING_WARM_SANDBOX_AGE: Duration = Duration::from_secs(300);
 
 pub struct WarmPoolConfig {
     pub target_size: usize,
     pub replenish_interval: Duration,
     pub bootstrap_iron_control_principal: Option<String>,
+    pub max_running_sandboxes: Option<usize>,
 }
 
 pub struct WarmPoolManager {
@@ -22,6 +33,8 @@ pub struct WarmPoolManager {
     spec_factory: WarmSandboxSpecFactory,
     workload_key: String,
     config: WarmPoolConfig,
+    paused: AtomicBool,
+    reconcile_lock: Mutex<()>,
 }
 
 impl WarmPoolManager {
@@ -38,11 +51,22 @@ impl WarmPoolManager {
             spec_factory,
             workload_key: workload_key.into(),
             config,
+            paused: AtomicBool::new(false),
+            reconcile_lock: Mutex::new(()),
         }
     }
 
     pub fn workload_key(&self) -> &str {
         &self.workload_key
+    }
+
+    /// Permanently pause this process's replenisher and wait for any in-flight
+    /// reconciliation to finish. Deployment drains use this before enumerating
+    /// sandboxes so the background loop cannot recreate a warm sandbox between
+    /// the drain and process shutdown.
+    pub async fn pause_and_wait(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+        let _guard = self.reconcile_lock.lock().await;
     }
 
     pub fn spawn_replenisher(self: Arc<Self>) {
@@ -115,12 +139,21 @@ impl WarmPoolManager {
     }
 
     async fn replenish_once(&self) -> Result<(), WarmPoolError> {
+        let _guard = self.reconcile_lock.lock().await;
+        if self.paused.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.prune_outdated_workload_ready_sandboxes().await?;
+        self.prune_stale_ready_sandboxes().await?;
+        self.prune_stale_evicting_sandboxes().await?;
+
         let needed = self.config.target_size.saturating_sub(
             self.store
                 .count_ready_warm_sandboxes(self.workload_key.as_str())
                 .await?
                 .max(0) as usize,
         );
+        let needed = needed.min(self.available_running_slots().await?);
 
         for _ in 0..needed {
             let mut spec = (self.spec_factory)();
@@ -140,6 +173,128 @@ impl WarmPoolManager {
 
         Ok(())
     }
+
+    async fn prune_outdated_workload_ready_sandboxes(&self) -> Result<(), WarmPoolError> {
+        for sandbox_id in self
+            .store
+            .reserve_ready_warm_sandboxes_for_workload_mismatch(self.workload_key.as_str())
+            .await?
+        {
+            let id = SandboxId::new(sandbox_id.as_str());
+            let result = match self.manager.status(&id).await {
+                Ok(status) if status_consumes_running_slot(&status) => {
+                    match self.manager.stop(&id).await {
+                        Ok(()) | Err(SandboxError::NotFound(_)) => {
+                            "outdated ready warm sandbox stopped".to_owned()
+                        }
+                        Err(error) => {
+                            let error_message = error.to_string();
+                            warn!(%sandbox_id, error = %error_message);
+                            return Err(WarmPoolError::Sandbox(error));
+                        }
+                    }
+                }
+                Ok(status) => format!("outdated ready warm sandbox was not running: {status:?}"),
+                Err(SandboxError::NotFound(_)) => {
+                    "outdated ready warm sandbox was not found".to_owned()
+                }
+                Err(error) => {
+                    let error_message = error.to_string();
+                    warn!(%sandbox_id, error = %error_message);
+                    return Err(WarmPoolError::Sandbox(error));
+                }
+            };
+            warn!(%sandbox_id, reason = %result, "retiring outdated ready warm sandbox");
+            self.store
+                .mark_warm_sandbox_failed(&sandbox_id, &result)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn prune_stale_ready_sandboxes(&self) -> Result<(), WarmPoolError> {
+        for sandbox_id in self.store.list_ready_warm_sandbox_ids().await? {
+            let id = SandboxId::new(sandbox_id.as_str());
+            let failure = match self.manager.status(&id).await {
+                Ok(SandboxStatus::Running) => continue,
+                Ok(status) => format!("ready warm sandbox was not running: {status:?}"),
+                Err(SandboxError::NotFound(_)) => "ready warm sandbox was not found".to_owned(),
+                Err(error) => {
+                    let error_message = error.to_string();
+                    warn!(%sandbox_id, error = %error_message);
+                    return Err(WarmPoolError::Sandbox(error));
+                }
+            };
+            warn!(%sandbox_id, error = %failure, "marking stale ready warm sandbox failed");
+            if !self
+                .store
+                .mark_ready_warm_sandbox_failed_if_unclaimed(&sandbox_id, &failure)
+                .await?
+            {
+                debug!(%sandbox_id, "stale ready warm sandbox was claimed while its status was checked");
+            }
+        }
+        Ok(())
+    }
+
+    async fn prune_stale_evicting_sandboxes(&self) -> Result<(), WarmPoolError> {
+        for sandbox_id in self
+            .store
+            .list_stale_evicting_warm_sandbox_ids(STALE_EVICTING_WARM_SANDBOX_AGE)
+            .await?
+        {
+            let id = SandboxId::new(sandbox_id.as_str());
+            let failure = match self.manager.status(&id).await {
+                Ok(status) if status_consumes_running_slot(&status) => {
+                    match self.manager.stop(&id).await {
+                        Ok(()) | Err(SandboxError::NotFound(_)) => {
+                            "stale evicting warm sandbox stopped".to_owned()
+                        }
+                        Err(error) => {
+                            let error_message = error.to_string();
+                            warn!(%sandbox_id, error = %error_message);
+                            return Err(WarmPoolError::Sandbox(error));
+                        }
+                    }
+                }
+                Ok(status) => format!("stale evicting warm sandbox was not running: {status:?}"),
+                Err(SandboxError::NotFound(_)) => {
+                    "stale evicting warm sandbox was not found".to_owned()
+                }
+                Err(error) => {
+                    let error_message = error.to_string();
+                    warn!(%sandbox_id, error = %error_message);
+                    return Err(WarmPoolError::Sandbox(error));
+                }
+            };
+            warn!(%sandbox_id, reason = %failure, "marking stale evicting warm sandbox failed");
+            self.store
+                .mark_warm_sandbox_failed(&sandbox_id, &failure)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn available_running_slots(&self) -> Result<usize, WarmPoolError> {
+        let Some(max_running) = self.config.max_running_sandboxes else {
+            return Ok(usize::MAX);
+        };
+        let running = self
+            .manager
+            .list_observed()
+            .await?
+            .into_iter()
+            .filter(|observed| status_consumes_running_slot(&observed.status))
+            .count();
+        Ok(max_running.saturating_sub(running))
+    }
+}
+
+fn status_consumes_running_slot(status: &SandboxStatus) -> bool {
+    matches!(
+        status,
+        SandboxStatus::Created | SandboxStatus::Running | SandboxStatus::Unknown(_)
+    )
 }
 
 #[derive(Debug, Error)]
@@ -148,4 +303,452 @@ pub enum WarmPoolError {
     Store(#[from] SessionStoreError),
     #[error(transparent)]
     Sandbox(#[from] SandboxError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use async_trait::async_trait;
+    use centaur_sandbox_core::{
+        ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
+        SandboxResult, SandboxSpec, SandboxStatus,
+    };
+    use centaur_session_core::{HarnessType, ThreadKey};
+    use serde_json::json;
+    use tokio::sync::OnceCell;
+
+    use super::*;
+
+    // Replenishment scans every warm-pool row, so DB-backed tests must not run
+    // fake backends against each other's rows.
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn paused_pool_does_not_replenish_during_deployment_drain() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let backend = Arc::new(TestBackend::new(format!("paused-{}", unique_suffix())));
+        let pool = WarmPoolManager::new(
+            Arc::new(SandboxManager::new(backend.clone())),
+            store,
+            Arc::new(|| SandboxSpec::new("image")),
+            format!("paused-workload-{}", unique_suffix()),
+            WarmPoolConfig {
+                target_size: 1,
+                replenish_interval: Duration::from_secs(1),
+                bootstrap_iron_control_principal: None,
+                max_running_sandboxes: None,
+            },
+        );
+
+        pool.pause_and_wait().await;
+        pool.replenish_once().await.expect("paused replenish");
+
+        assert!(backend.created().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replenisher_prunes_missing_ready_rows_before_counting() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let suffix = unique_suffix();
+        let workload_key = format!("test-prune-{suffix}");
+        let old_workload_key = format!("test-prune-old-{suffix}");
+        let stale_sandbox = format!("stale-{suffix}");
+        let old_stale_sandbox = format!("old-stale-{suffix}");
+        let fresh_sandbox = format!("fresh-{suffix}");
+        let claimed_thread = ThreadKey::parse(format!("test:warm-prune-{suffix}"))
+            .expect("parse claimed thread key");
+
+        store
+            .insert_ready_warm_sandbox(&stale_sandbox, &workload_key)
+            .await
+            .expect("insert stale warm sandbox row");
+        store
+            .insert_ready_warm_sandbox(&old_stale_sandbox, &old_workload_key)
+            .await
+            .expect("insert stale warm sandbox row for old workload");
+        assert_eq!(
+            store
+                .count_ready_warm_sandboxes(&workload_key)
+                .await
+                .expect("count ready warm sandboxes"),
+            1
+        );
+        assert_eq!(
+            store
+                .count_ready_warm_sandboxes(&old_workload_key)
+                .await
+                .expect("count ready warm sandboxes for old workload"),
+            1
+        );
+
+        let backend = Arc::new(TestBackend::new(fresh_sandbox.clone()));
+        let pool = WarmPoolManager::new(
+            Arc::new(SandboxManager::new(backend.clone())),
+            store.clone(),
+            Arc::new(|| SandboxSpec::new("image")),
+            workload_key.clone(),
+            WarmPoolConfig {
+                target_size: 1,
+                replenish_interval: Duration::from_secs(60),
+                bootstrap_iron_control_principal: None,
+                max_running_sandboxes: None,
+            },
+        );
+
+        pool.replenish_once().await.expect("replenish warm pool");
+
+        assert_eq!(backend.created(), vec![fresh_sandbox.clone()]);
+        assert_eq!(
+            store
+                .count_ready_warm_sandboxes(&workload_key)
+                .await
+                .expect("count ready warm sandboxes"),
+            1
+        );
+        store
+            .create_or_get_session(&claimed_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create warm-pool claim session");
+        assert_eq!(
+            store
+                .claim_ready_warm_sandbox(&workload_key, claimed_thread.as_str())
+                .await
+                .expect("claim ready warm sandbox"),
+            Some(fresh_sandbox)
+        );
+        assert_eq!(
+            store
+                .count_ready_warm_sandboxes(&old_workload_key)
+                .await
+                .expect("count ready warm sandboxes for old workload"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn replenisher_prunes_stale_evicting_rows() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let suffix = unique_suffix();
+        let workload_key = format!("test-evicting-{suffix}");
+        let stale_sandbox = format!("stale-evicting-{suffix}");
+
+        store
+            .insert_ready_warm_sandbox(&stale_sandbox, &workload_key)
+            .await
+            .expect("insert stale evicting warm sandbox row");
+        sqlx::query(
+            r#"
+            update session_warm_sandboxes
+            set status = 'evicting', updated_at = now() - interval '10 minutes'
+            where sandbox_id = $1
+            "#,
+        )
+        .bind(&stale_sandbox)
+        .execute(store.pool())
+        .await
+        .expect("make warm sandbox eviction stale");
+
+        let backend = Arc::new(TestBackend::new(format!("fresh-{suffix}")));
+        backend.set_status(&stale_sandbox, SandboxStatus::Running);
+        let pool = WarmPoolManager::new(
+            Arc::new(SandboxManager::new(backend.clone())),
+            store.clone(),
+            Arc::new(|| SandboxSpec::new("image")),
+            workload_key.clone(),
+            WarmPoolConfig {
+                target_size: 0,
+                replenish_interval: Duration::from_secs(60),
+                bootstrap_iron_control_principal: None,
+                max_running_sandboxes: None,
+            },
+        );
+
+        pool.replenish_once().await.expect("replenish warm pool");
+
+        assert_eq!(
+            backend
+                .status(&SandboxId::new(&stale_sandbox))
+                .await
+                .unwrap(),
+            SandboxStatus::Stopped
+        );
+        assert!(
+            !store
+                .list_referenced_sandbox_ids()
+                .await
+                .expect("list referenced sandboxes")
+                .contains(&stale_sandbox)
+        );
+    }
+
+    #[tokio::test]
+    async fn replenisher_stops_only_unclaimed_ready_rows_for_old_workloads() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let suffix = unique_suffix();
+        let workload_key = format!("test-current-{suffix}");
+        let old_workload_key = format!("test-old-{suffix}");
+        let current_ready = format!("current-ready-{suffix}");
+        let old_ready = format!("old-ready-{suffix}");
+        let old_claimed = format!("old-claimed-{suffix}");
+        let old_bound = format!("old-bound-{suffix}");
+        let claimed_thread = ThreadKey::parse(format!("test:warm-claimed-{suffix}"))
+            .expect("parse claimed thread key");
+
+        for (sandbox_id, key) in [
+            (&current_ready, &workload_key),
+            (&old_claimed, &old_workload_key),
+        ] {
+            store
+                .insert_ready_warm_sandbox(sandbox_id, key)
+                .await
+                .expect("insert warm sandbox row");
+        }
+        store
+            .create_or_get_session(&claimed_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create claimed session");
+        assert_eq!(
+            store
+                .claim_ready_warm_sandbox(&old_workload_key, claimed_thread.as_str())
+                .await
+                .expect("claim old workload sandbox"),
+            Some(old_claimed.clone())
+        );
+        store
+            .insert_ready_warm_sandbox(&old_ready, &old_workload_key)
+            .await
+            .expect("insert old ready warm sandbox row");
+        store
+            .insert_ready_warm_sandbox(&old_bound, &old_workload_key)
+            .await
+            .expect("insert old bound warm sandbox row");
+        let bound_thread =
+            ThreadKey::parse(format!("test:warm-bound-{suffix}")).expect("parse bound thread key");
+        store
+            .create_or_get_session(&bound_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create bound session");
+        store
+            .update_sandbox_id(&bound_thread, Some(&old_bound))
+            .await
+            .expect("bind old sandbox to session");
+        let bound_execution = store
+            .create_execution(&bound_thread, None, json!({}))
+            .await
+            .expect("create bound execution")
+            .execution
+            .execution_id;
+        store
+            .mark_execution_running(&bound_execution)
+            .await
+            .expect("mark bound execution running");
+
+        let backend = Arc::new(TestBackend::new(format!("unused-{suffix}")));
+        for sandbox_id in [&current_ready, &old_ready, &old_claimed, &old_bound] {
+            backend.set_status(sandbox_id, SandboxStatus::Running);
+        }
+        let pool = WarmPoolManager::new(
+            Arc::new(SandboxManager::new(backend.clone())),
+            store.clone(),
+            Arc::new(|| SandboxSpec::new("image")),
+            workload_key.clone(),
+            WarmPoolConfig {
+                target_size: 0,
+                replenish_interval: Duration::from_secs(60),
+                bootstrap_iron_control_principal: None,
+                max_running_sandboxes: None,
+            },
+        );
+
+        pool.replenish_once().await.expect("reconcile warm pool");
+
+        assert_eq!(
+            backend.status(&SandboxId::new(&old_ready)).await.unwrap(),
+            SandboxStatus::Stopped
+        );
+        for sandbox_id in [&current_ready, &old_claimed, &old_bound] {
+            assert_eq!(
+                backend.status(&SandboxId::new(sandbox_id)).await.unwrap(),
+                SandboxStatus::Running,
+                "current or claimed sandbox must not be stopped"
+            );
+        }
+        assert_eq!(
+            store
+                .count_ready_warm_sandboxes(&workload_key)
+                .await
+                .expect("count current ready rows"),
+            1
+        );
+        let claimed_status = sqlx::query_scalar::<_, String>(
+            "select status from session_warm_sandboxes where sandbox_id = $1",
+        )
+        .bind(&old_claimed)
+        .fetch_one(store.pool())
+        .await
+        .expect("read claimed warm row");
+        assert_eq!(claimed_status, "claimed");
+        let bound_status = sqlx::query_scalar::<_, String>(
+            "select status from session_warm_sandboxes where sandbox_id = $1",
+        )
+        .bind(&old_bound)
+        .fetch_one(store.pool())
+        .await
+        .expect("read bound warm row");
+        assert_eq!(bound_status, "ready");
+        store
+            .fail_execution_if_active(&bound_execution, "test cleanup")
+            .await
+            .expect("terminalize bound execution");
+    }
+
+    async fn test_store() -> Option<PgSessionStore> {
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return None;
+        };
+        static MIGRATIONS: OnceCell<()> = OnceCell::const_new();
+        MIGRATIONS
+            .get_or_init(|| async {
+                let store = PgSessionStore::connect(&url)
+                    .await
+                    .expect("connect test db");
+                store.run_migrations().await.expect("run migrations");
+            })
+            .await;
+        Some(
+            PgSessionStore::connect(&url)
+                .await
+                .expect("connect test db after migrations"),
+        )
+    }
+
+    fn unique_suffix() -> String {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos()
+            .to_string()
+    }
+
+    struct TestBackend {
+        create_id: String,
+        statuses: Mutex<BTreeMap<String, SandboxStatus>>,
+        created: Mutex<Vec<String>>,
+    }
+
+    impl TestBackend {
+        fn new(create_id: String) -> Self {
+            Self {
+                create_id,
+                statuses: Mutex::new(BTreeMap::new()),
+                created: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn created(&self) -> Vec<String> {
+            self.created.lock().unwrap().clone()
+        }
+
+        fn set_status(&self, sandbox_id: &str, status: SandboxStatus) {
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(sandbox_id.to_owned(), status);
+        }
+    }
+
+    #[async_trait]
+    impl SandboxBackend for TestBackend {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        async fn create(&self, _spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(self.create_id.clone(), SandboxStatus::Running);
+            self.created.lock().unwrap().push(self.create_id.clone());
+            Ok(SandboxHandle::new(
+                SandboxId::new(self.create_id.clone()),
+                self.name(),
+            ))
+        }
+
+        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+            Err(SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "open_io",
+            })
+        }
+
+        async fn status(&self, id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            self.statuses
+                .lock()
+                .unwrap()
+                .get(id.as_str())
+                .cloned()
+                .ok_or_else(|| SandboxError::NotFound(id.as_str().to_owned()))
+        }
+
+        async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            Ok(ObservedSandbox::new(
+                id.clone(),
+                self.name(),
+                self.status(id).await?,
+            ))
+        }
+
+        async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
+            Ok(self
+                .statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, status)| ObservedSandbox::new(id.clone(), self.name(), status.clone()))
+                .collect())
+        }
+
+        async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(id.as_str().to_owned(), SandboxStatus::Stopped);
+            Ok(())
+        }
+
+        async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(id.as_str().to_owned(), SandboxStatus::Suspended);
+            Ok(())
+        }
+
+        async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(id.as_str().to_owned(), SandboxStatus::Running);
+            Ok(())
+        }
+    }
 }

@@ -4,9 +4,8 @@
 //! Today the proxy config is rendered from fragments and baked into a
 //! per-sandbox ConfigMap. Under iron-control the same fragments become durable
 //! control-plane state: each fragment's secrets are upserted as typed secret
-//! resources and granted to a role. api-rs currently folds infra, harness, and
-//! discovered tool fragments into the single shared infra role so each sandbox
-//! principal only needs one assignment.
+//! resources and granted to a role. api-rs registers infra and harness
+//! fragments against the shared infra role.
 //!
 //! [`secret_inputs_from_fragment`] is the pure translation (fragment → secret
 //! inputs) and is unit-tested without a server; [`register_role`] drives the
@@ -403,7 +402,7 @@ pub fn source_from_placeholder(
 ) -> SecretSource {
     match policy.kind {
         SourceKind::Env => {
-            let mut config = json!({ "var": placeholder });
+            let mut config = json!({ "var": format!("{}{}", policy.env_prefix, placeholder) });
             insert_json_key(&mut config, json_key);
             SecretSource {
                 source_type: "env".to_owned(),
@@ -1036,10 +1035,25 @@ pub fn unique_foreign_id(candidate: String, used: &mut BTreeSet<String>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use centaur_iron_proxy::load_fragment_str;
+    use centaur_iron_proxy::{infra_fragment, load_fragment_str};
 
     fn env_policy() -> SourcePolicy {
         SourcePolicy::env()
+    }
+
+    #[test]
+    fn env_policy_prefixes_the_resolved_environment_key() {
+        let source = source_from_placeholder(
+            &SourcePolicy::env().with_env_prefix("CENTAUR_"),
+            "SLACK_FEEDBACK_API_KEY",
+            None,
+        );
+
+        assert_eq!(source.source_type, "env");
+        assert_eq!(
+            source.config,
+            json!({ "var": "CENTAUR_SLACK_FEEDBACK_API_KEY" })
+        );
     }
 
     #[test]
@@ -1196,6 +1210,46 @@ transforms:
         assert_eq!(inject.header.as_deref(), Some("Authorization"));
         assert_eq!(inject.formatter.as_deref(), Some("Bearer {{.Value}}"));
         assert!(input.replace_config.is_none());
+    }
+
+    #[test]
+    fn built_in_github_broker_becomes_infra_replace_secret() {
+        let fragment = infra_fragment().expect("built-in infra fragment parses");
+        let inputs =
+            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        let input = inputs
+            .iter()
+            .find_map(|input| match input {
+                SecretInput::Static(input) if input.foreign_id == "infra-github-app" => Some(input),
+                _ => None,
+            })
+            .expect("built-in GitHub broker static secret");
+
+        assert_eq!(input.name, "github-app");
+        assert_eq!(input.source.source_type, "token_broker");
+        assert_eq!(
+            input.source.config,
+            json!({
+                "credential_id": "github-app",
+                "credential_namespace": "default",
+            })
+        );
+        assert!(input.inject_config.is_none());
+        let replace = input.replace_config.as_ref().expect("replace config");
+        assert_eq!(replace.proxy_value, "GITHUB_TOKEN");
+        assert_eq!(replace.match_headers, vec!["Authorization"]);
+        assert_eq!(
+            input
+                .rules
+                .iter()
+                .filter_map(|rule| rule.host.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["github.com", "api.github.com"]
+        );
+        assert_eq!(
+            input.labels.get("managed-by").map(String::as_str),
+            Some("centaur")
+        );
     }
 
     #[test]

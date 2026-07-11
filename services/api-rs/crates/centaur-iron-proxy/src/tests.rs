@@ -3,7 +3,11 @@ use super::*;
 #[test]
 fn harness_auth_fragments_are_baked_in() {
     let codex = harness_auth_fragment("codex", "api_key").unwrap().unwrap();
-    assert!(placeholder_env(&[codex]).is_empty());
+    let codex_placeholders = placeholder_env(&[codex]);
+    assert_eq!(
+        codex_placeholders.get("OPENAI_API_KEY").map(String::as_str),
+        Some("OPENAI_API_KEY")
+    );
 
     // access_token carries the token-broker credential, not a replace
     // placeholder, so it contributes no sandbox placeholder env.
@@ -15,7 +19,35 @@ fn harness_auth_fragments_are_baked_in() {
     let openrouter = harness_auth_fragment("openrouter", "api_key")
         .unwrap()
         .unwrap();
-    assert!(placeholder_env(&[openrouter]).is_empty());
+    let openrouter_placeholders = placeholder_env(&[openrouter]);
+    assert_eq!(
+        openrouter_placeholders
+            .get("OPENROUTER_API_KEY")
+            .map(String::as_str),
+        Some("OPENROUTER_API_KEY")
+    );
+
+    let meta_ai = harness_auth_fragment("meta-ai", "api_key")
+        .unwrap()
+        .unwrap();
+    let meta_ai_placeholders = placeholder_env(&[meta_ai]);
+    assert_eq!(
+        meta_ai_placeholders
+            .get("META_AI_API_KEY")
+            .map(String::as_str),
+        Some("META_AI_API_KEY")
+    );
+
+    let claude_code = harness_auth_fragment("claude-code", "api_key")
+        .unwrap()
+        .unwrap();
+    let claude_code_placeholders = placeholder_env(&[claude_code]);
+    assert_eq!(
+        claude_code_placeholders
+            .get("ANTHROPIC_API_KEY")
+            .map(String::as_str),
+        Some("ANTHROPIC_API_KEY")
+    );
 
     assert!(harness_auth_fragment("codex", "bogus").unwrap().is_none());
 
@@ -25,12 +57,15 @@ fn harness_auth_fragments_are_baked_in() {
         Some("120s")
     );
     let placeholders = placeholder_env(&[infra]);
-    for name in ["AMP_API_KEY", "GITHUB_TOKEN"] {
-        assert_eq!(placeholders.get(name).map(String::as_str), Some(name));
-    }
-    assert!(
-        !placeholders.contains_key("SLACK_BOT_TOKEN"),
-        "agent sessions must not receive the broad Slack bot-token placeholder"
+    assert_eq!(
+        placeholders.get("GITHUB_TOKEN").map(String::as_str),
+        Some("GITHUB_TOKEN")
+    );
+    // Slack's bot credential is control-plane-only and is not part of the
+    // shared infra fragment.
+    assert_eq!(
+        placeholders.get("SLACK_BOT_TOKEN").map(String::as_str),
+        None
     );
 }
 
@@ -91,5 +126,23 @@ fn shipped_proxy_allowlist_preserves_railway_project_tokens() {
         headers
             .iter()
             .any(|header| header.as_str() == Some("project-access-token"))
+    );
+}
+
+#[test]
+fn shipped_proxy_allowlist_preserves_workflow_task_capabilities() {
+    let config: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../../iron-proxy/iron-proxy.yaml")).unwrap();
+    let transforms = config["transforms"].as_sequence().unwrap();
+    let header_allowlist = transforms
+        .iter()
+        .find(|transform| transform["name"].as_str() == Some("header_allowlist"))
+        .unwrap();
+    let headers = header_allowlist["config"]["headers"].as_sequence().unwrap();
+
+    assert!(
+        headers
+            .iter()
+            .any(|header| { header.as_str() == Some("x-centaur-workflow-task-token") })
     );
 }
