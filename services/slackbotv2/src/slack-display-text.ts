@@ -11,6 +11,95 @@ const MAX_RAW_DISPLAY_TEXT_CHARS = 24_000
 
 type UnknownRecord = Record<string, unknown>
 
+/**
+ * Decode the small angle-bracket grammar Slack uses for links and mentions.
+ *
+ * Keep this as a single left-to-right parser. A chain of overlapping regular
+ * expressions used to rescan long, unterminated link-like strings and could
+ * block the Slack event loop for more than a second per message.
+ */
+export function normalizeSlackMarkupText(input: string): string {
+  const output: string[] = []
+  let cursor = 0
+
+  while (cursor < input.length) {
+    const open = input.indexOf('<', cursor)
+    if (open < 0) {
+      output.push(input.slice(cursor))
+      break
+    }
+    output.push(input.slice(cursor, open))
+
+    const close = input.indexOf('>', open + 1)
+    if (close < 0) {
+      output.push(input.slice(open))
+      break
+    }
+
+    const raw = input.slice(open + 1, close)
+    output.push(renderSlackReference(raw) ?? input.slice(open, close + 1))
+    cursor = close + 1
+  }
+
+  // Slack entity decoding is deliberately one pass. In particular,
+  // "&amp;lt;" must become "&lt;", not "<".
+  return output
+    .join('')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&amp;', '&')
+}
+
+function renderSlackReference(raw: string): string | undefined {
+  const separator = raw.indexOf('|')
+  const target = separator < 0 ? raw : raw.slice(0, separator)
+  const label = separator < 0 ? undefined : raw.slice(separator + 1)
+
+  if (isSlackUrl(target)) {
+    return label ? `${label} (${target})` : target
+  }
+
+  if (target.startsWith('#') && isUppercaseSlackId(target.slice(1))) {
+    const id = target.slice(1)
+    return label ? `#${label} (${id})` : `#${id}`
+  }
+
+  if (label === undefined && target.startsWith('@') && isUppercaseSlackId(target.slice(1))) {
+    return `@${target.slice(1)}`
+  }
+
+  if (label && target.startsWith('!subteam^') && isUppercaseSlackId(target.slice(9))) {
+    return `@${label}`
+  }
+
+  if (label === undefined && ['!channel', '!here', '!everyone'].includes(target)) {
+    return `@${target.slice(1)}`
+  }
+
+  return undefined
+}
+
+function isSlackUrl(value: string): boolean {
+  const separator = value.indexOf('://')
+  if (separator <= 0) return false
+  for (let index = 0; index < separator; index += 1) {
+    const code = value.charCodeAt(index) | 32
+    if (code < 97 || code > 122) return false
+  }
+  return separator + 3 < value.length
+}
+
+function isUppercaseSlackId(value: string): boolean {
+  if (!value) return false
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    const uppercase = code >= 65 && code <= 90
+    const digit = code >= 48 && code <= 57
+    if (!uppercase && !digit) return false
+  }
+  return true
+}
+
 export function renderSlackDisplayText(input: { raw: unknown; text: string }): SlackDisplayText {
   const records = slackMessageRecords(input.raw)
   const rawBlockCount = countArrayFields(records, 'blocks')
@@ -337,105 +426,13 @@ function finalizeDisplayLines(lines: string[]): string {
 }
 
 function normalizeSlackFallbackText(input: string): string {
-  return normalizeSlackMarkup(input)
+  return normalizeSlackMarkupText(input)
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .split('\n')
     .map(line => line.replace(/[ \t]+/g, ' ').trim())
     .filter(Boolean)
     .join('\n')
-}
-
-function normalizeSlackMarkup(input: string): string {
-  let output = ''
-  let index = 0
-  while (index < input.length) {
-    const open = input.indexOf('<', index)
-    if (open === -1) {
-      output += decodeSlackEntities(input.slice(index))
-      break
-    }
-    output += decodeSlackEntities(input.slice(index, open))
-    const close = input.indexOf('>', open + 1)
-    if (close === -1) {
-      output += decodeSlackEntities(input.slice(open))
-      break
-    }
-    const token = input.slice(open + 1, close)
-    output += slackTokenText(token) ?? decodeSlackEntities(input.slice(open, close + 1))
-    index = close + 1
-  }
-  return output
-}
-
-function slackTokenText(token: string): string | undefined {
-  if (token.startsWith('#')) {
-    const { label, value } = splitSlackToken(token.slice(1))
-    return label
-      ? `#${decodeSlackEntities(label)} (${decodeSlackEntities(value)})`
-      : `#${decodeSlackEntities(value)}`
-  }
-  if (token.startsWith('@')) return `@${decodeSlackEntities(token.slice(1))}`
-  if (token.startsWith('!subteam^')) {
-    const { label, value } = splitSlackToken(token.slice('!subteam^'.length))
-    return `@${decodeSlackEntities(label || value)}`
-  }
-  if (token === '!channel' || token === '!here' || token === '!everyone') {
-    return `@${token.slice(1)}`
-  }
-  if (!hasUrlScheme(token)) return undefined
-  const { label, value } = splitSlackToken(token)
-  return label
-    ? `${decodeSlackEntities(label)} (${decodeSlackEntities(value)})`
-    : decodeSlackEntities(value)
-}
-
-function splitSlackToken(token: string): { label: string; value: string } {
-  const separator = token.indexOf('|')
-  if (separator === -1) return { label: '', value: token }
-  return {
-    label: token.slice(separator + 1),
-    value: token.slice(0, separator)
-  }
-}
-
-function hasUrlScheme(token: string): boolean {
-  const schemeEnd = token.indexOf('://')
-  if (schemeEnd <= 0) return false
-  for (let index = 0; index < schemeEnd; index += 1) {
-    const code = token.charCodeAt(index)
-    const isLowercaseLetter = code >= 97 && code <= 122
-    const isUppercaseLetter = code >= 65 && code <= 90
-    if (!isLowercaseLetter && !isUppercaseLetter) return false
-  }
-  return true
-}
-
-function decodeSlackEntities(input: string): string {
-  let output = ''
-  let index = 0
-  while (index < input.length) {
-    const entity = input.indexOf('&', index)
-    if (entity === -1) {
-      output += input.slice(index)
-      break
-    }
-    output += input.slice(index, entity)
-    if (input.startsWith('&amp;', entity)) {
-      output += '&'
-      index = entity + 5
-    } else if (input.startsWith('&lt;', entity)) {
-      output += '<'
-      index = entity + 4
-    } else if (input.startsWith('&gt;', entity)) {
-      output += '>'
-      index = entity + 4
-    } else {
-      output += '&'
-      index = entity + 1
-    }
-  }
-  return output
 }
 
 function truncateRawDisplayText(text: string): string {
