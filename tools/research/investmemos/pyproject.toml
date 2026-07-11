@@ -25,6 +25,3 @@ packages = ["."]
 
 [tool.centaur]
 module = "client.py"
-secrets = [
-    {type = "pg_dsn", name = "CENTAUR_POSTGRES_DSN", secret_ref = "DATABASE_URL", database = "ai_v2", role = "centaur_readonly"},
-]

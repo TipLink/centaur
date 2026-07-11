@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from api.runtime_control import canonical_json
-from api.vm_metrics import (
+from workflows.slack.metrics import (
     observe_slack_archive_import_batch_duration,
     observe_slack_archive_import_duration,
     record_slack_archive_import_attachments,
@@ -113,7 +113,12 @@ def _strip_sensitive_url_query(value: str) -> str:
     parsed = urllib.parse.urlsplit(value)
     if parsed.scheme not in {"http", "https"}:
         return value
-    if parsed.netloc.endswith("slack.com") or parsed.netloc.endswith("slack-edge.com"):
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    is_slack_host = hostname == "slack.com" or hostname.endswith(".slack.com")
+    is_slack_edge_host = hostname == "slack-edge.com" or hostname.endswith(
+        ".slack-edge.com"
+    )
+    if is_slack_host or is_slack_edge_host:
         return urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc, parsed.path, "", "")
         )
@@ -328,6 +333,7 @@ async def _upsert_archive_channels(pool, channels: list[dict[str, Any]]) -> int:
                 channel_id,
                 _as_text(channel.get("name")),
                 bool(channel.get("is_archived")),
+                _archive_channel_is_private(channel),
                 _topic_value(channel.get("topic")),
                 _topic_value(channel.get("purpose")),
                 len(channel.get("members") or []),
@@ -341,12 +347,17 @@ async def _upsert_archive_channels(pool, channels: list[dict[str, Any]]) -> int:
     async with pool.acquire() as conn:
         await conn.executemany(
             "INSERT INTO slack_sync_channels ("
-            "channel_id, channel_name, is_archived, is_syncable, topic, purpose, "
+            "channel_id, channel_name, is_archived, is_private, is_syncable, topic, purpose, "
             "member_count, raw_payload, last_seen_at, updated_at"
-            ") VALUES ($1, $2, $3, FALSE, $4, $5, $6, $7::jsonb, NOW(), NOW()) "
+            ") VALUES ($1, $2, $3, $4, FALSE, $5, $6, $7, $8::jsonb, NOW(), NOW()) "
             "ON CONFLICT (channel_id) DO UPDATE SET "
             "channel_name = CASE WHEN slack_sync_channels.channel_name = '' "
             "THEN EXCLUDED.channel_name ELSE slack_sync_channels.channel_name END, "
+            # Privacy is monotonic across archive collisions. An explicit or
+            # fail-closed private archive can raise a stale public row to
+            # private, while an archive can never downgrade an existing private
+            # channel and expose its imported messages.
+            "is_private = slack_sync_channels.is_private OR EXCLUDED.is_private, "
             "topic = CASE WHEN slack_sync_channels.topic = '' "
             "THEN EXCLUDED.topic ELSE slack_sync_channels.topic END, "
             "purpose = CASE WHEN slack_sync_channels.purpose = '' "
@@ -359,6 +370,12 @@ async def _upsert_archive_channels(pool, channels: list[dict[str, Any]]) -> int:
             rows,
         )
     return len(rows)
+
+
+def _archive_channel_is_private(channel: dict[str, Any]) -> bool:
+    """Return explicit Slack privacy, treating missing/malformed data as private."""
+    is_private = channel.get("is_private")
+    return is_private if isinstance(is_private, bool) else True
 
 
 async def _upsert_archive_users(pool, users: list[dict[str, Any]]) -> int:
@@ -699,12 +716,20 @@ def _api_base_url() -> str:
 
 
 def _request_archive_download_url(import_id: str) -> str:
+    task_token = _as_text(os.environ.get("CENTAUR_WORKFLOW_TASK_TOKEN"))
+    if not task_token:
+        raise RuntimeError(
+            "CENTAUR_WORKFLOW_TASK_TOKEN is required to authorize archive download"
+        )
     quoted_import_id = urllib.parse.quote(import_id, safe="")
     request = urllib.request.Request(
         f"{_api_base_url()}/api/admin/slack/archive-imports/{quoted_import_id}/download-url",
         data=b"",
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-Centaur-Workflow-Task-Token": task_token,
+        },
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         payload = json.load(response)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+import io
+import urllib.request
 
 from slack import feedback
 
@@ -52,8 +55,12 @@ def test_run_improvement_cycle_dispatches_only_actionable_items(tmp_path, monkey
     monkeypatch.setattr(feedback, "FEEDBACK_DB_PATH", tmp_path / "feedback.db")
 
     conn = feedback.init_db()
-    actionable_id = feedback.save_feedback_item(conn, _sample_item(category="cli_bug", severity="high")).item_id
-    success_id = feedback.save_feedback_item(conn, _sample_item(category="success", severity="low")).item_id
+    actionable_id = feedback.save_feedback_item(
+        conn, _sample_item(category="cli_bug", severity="high")
+    ).item_id
+    success_id = feedback.save_feedback_item(
+        conn, _sample_item(category="success", severity="low")
+    ).item_id
     conn.close()
 
     monkeypatch.setattr(
@@ -71,10 +78,9 @@ def test_run_improvement_cycle_dispatches_only_actionable_items(tmp_path, monkey
 
     class FakeAgentClient:
         def start_improvement_run(self, prompt: str, **kwargs):
-            assert "git-branch paradigmxyz/centaur fix-slack-feedback" in prompt
+            assert "git-branch paradigmxyz/centaur" in prompt
             return {
                 "thread_key": "feedback-improvement:test",
-                "assignment_generation": 7,
                 "execution_id": "exec-test-123",
                 "status": "queued",
             }
@@ -103,6 +109,81 @@ def test_run_improvement_cycle_dispatches_only_actionable_items(tmp_path, monkey
     assert row_by_id[actionable_id]["agent_execution_id"] == "exec-test-123"
     assert row_by_id[success_id]["status"] == "new"
     assert row_by_id[success_id]["agent_execution_id"] is None
+
+
+def test_agent_client_uses_session_api_for_improvement_runs():
+    class RecordingAgentClient(feedback.CentaurAgentClient):
+        def __init__(self):
+            super().__init__(base_url="http://api.local", api_key="test-key")
+            self.calls = []
+
+        def _request_json(self, method: str, path: str, payload: dict | None = None):
+            self.calls.append((method, path, payload))
+            if path.endswith("/execute"):
+                return {"execution_id": "exec-test-123", "status": "queued"}
+            return {"ok": True}
+
+    client = RecordingAgentClient()
+
+    result = client.start_improvement_run(
+        "Improve the Slack tool",
+        harness="codex",
+        persona_id="eng",
+        thread_key="feedback-improvement:test:1",
+    )
+
+    assert result == {
+        "thread_key": "feedback-improvement:test:1",
+        "execution_id": "exec-test-123",
+        "status": "queued",
+    }
+    assert [path for _, path, _ in client.calls] == [
+        "/api/session/feedback-improvement%3Atest%3A1",
+        "/api/session/feedback-improvement%3Atest%3A1/messages",
+        "/api/session/feedback-improvement%3Atest%3A1/execute",
+    ]
+    assert client.calls[0][2] == {
+        "harness_type": "codex",
+        "persona_id": "eng",
+        "metadata": {"source": "slack-feedback-loop"},
+        "on_harness_conflict": "restart",
+    }
+    execute_payload = client.calls[2][2]
+    assert execute_payload["metadata"] == {
+        "source": "slack-feedback-loop",
+        "delivery": {"platform": "dev"},
+    }
+    assert json.loads(execute_payload["input_lines"][0]) == {
+        "type": "user",
+        "message": {"content": [{"type": "text", "text": "Improve the Slack tool"}]},
+    }
+
+
+def test_agent_client_uses_non_conflicting_scoped_feedback_header(monkeypatch):
+    requests = []
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return FakeResponse(b'{"ok":true}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    client = feedback.CentaurAgentClient(
+        base_url="http://test-centaur-api-rs:8080", api_key="feedback-key"
+    )
+
+    client._request_json("POST", "/api/session/feedback-improvement%3Atest", {})
+
+    request, timeout = requests[0]
+    assert timeout == 60
+    assert request.get_header("X-centaur-feedback-key") == "feedback-key"
+    assert request.get_header("Authorization") is None
 
 
 def test_analyze_thread_signals_does_not_treat_exceptional_as_error():
@@ -141,29 +222,3 @@ def test_classify_feedback_prefers_success_for_positive_follow_up_without_error(
     assert signals.has_bot_error is False
     assert category == "success"
     assert severity == "low"
-
-
-def test_load_centaur_api_key_prefers_existing_agent_override(monkeypatch, tmp_path):
-    monkeypatch.setenv("CENTAUR_AGENT_API_KEY", "agent-key")
-    monkeypatch.setenv("CENTAUR_API_KEY", "sandbox-key")
-    monkeypatch.setattr(feedback, "CENTAUR_API_KEY_FILE", tmp_path / ".api_key")
-
-    assert feedback._load_centaur_api_key() == "agent-key"
-
-
-def test_load_centaur_api_key_uses_sandbox_control_plane_key(monkeypatch, tmp_path):
-    monkeypatch.delenv("CENTAUR_AGENT_API_KEY", raising=False)
-    monkeypatch.setenv("CENTAUR_API_KEY", "sandbox-key")
-    monkeypatch.setattr(feedback, "CENTAUR_API_KEY_FILE", tmp_path / ".api_key")
-
-    assert feedback._load_centaur_api_key() == "sandbox-key"
-
-
-def test_load_centaur_api_key_uses_refreshed_key_file(monkeypatch, tmp_path):
-    key_file = tmp_path / ".api_key"
-    key_file.write_text("file-key\n")
-    monkeypatch.delenv("CENTAUR_AGENT_API_KEY", raising=False)
-    monkeypatch.delenv("CENTAUR_API_KEY", raising=False)
-    monkeypatch.setattr(feedback, "CENTAUR_API_KEY_FILE", key_file)
-
-    assert feedback._load_centaur_api_key() == "file-key"

@@ -11,12 +11,9 @@ from typing import Any
 
 import asyncpg
 
-from centaur_sdk import secret
-
 
 DEFAULT_MEMO_SOURCE = "invest_memo_corpus"
 DEFAULT_MEMO_KIND = "invest_memo_chunk"
-POSTGRES_DSN_ENV = "CENTAUR_POSTGRES_DSN"
 
 
 def _normalize_company_type(value: str | None) -> str | None:
@@ -79,23 +76,13 @@ class InvestmemosClient:
     """Search and read investment memos from Postgres-backed corpus chunks."""
 
     def __init__(self, database_url: str | None = None) -> None:
-        self._database_url = (database_url or self._resolve_database_url()).strip()
+        self._database_url = (database_url or os.getenv("DATABASE_URL") or "").strip()
         self._default_source = (os.getenv("INVEST_MEMO_SOURCE") or DEFAULT_MEMO_SOURCE).strip()
         self._default_kind = (os.getenv("INVEST_MEMO_KIND") or DEFAULT_MEMO_KIND).strip()
 
-    @staticmethod
-    def _resolve_database_url() -> str:
-        value = os.getenv(POSTGRES_DSN_ENV)  # noqa: TID251
-        if value is None:
-            value = secret(POSTGRES_DSN_ENV, default="")
-        value = value.strip()
-        if value == POSTGRES_DSN_ENV:
-            return ""
-        return value
-
     def _require_database_url(self) -> str:
         if not self._database_url:
-            raise RuntimeError(f"{POSTGRES_DSN_ENV} is required for investmemos retrieval")
+            raise RuntimeError("DATABASE_URL is required for investmemos retrieval")
         return self._database_url
 
     async def _connect(self) -> asyncpg.Connection:

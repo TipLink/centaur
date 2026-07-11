@@ -26,6 +26,3 @@ build-backend = "hatchling.build"
 [tool.centaur]
 module = "client.py"
 hosts = ["api.preqin.com", "id.preqin.com", "feeds.preqin.com"]
-secrets = [
-    {type = "http", name = "PREQIN_OPERATIONAL_TOKEN", mode = "replace", match_headers = ["Authorization"], hosts = ["api.preqin.com"]},
-]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import httpx
@@ -64,18 +63,14 @@ class PreqinClient:
         return self._client
 
     def _username_value(self) -> str | None:
-        return self._username or _clean_secret(os.getenv("PREQIN_USERNAME"))
+        return self._username or _clean_secret(secret("PREQIN_USERNAME", ""))
 
     def _api_key_value(self) -> str | None:
-        return self._api_key or _clean_secret(os.getenv("PREQIN_API_KEY"))
-
-    def _operational_token_value(self) -> str | None:
-        return self._operational_token or _clean_secret(secret(OPERATIONAL_TOKEN_PLACEHOLDER, ""))
+        return self._api_key or _clean_secret(secret("PREQIN_API_KEY", ""))
 
     def credential_status(self) -> dict[str, Any]:
         """Report whether required Preqin secret names resolve, without exposing values."""
         fields = {
-            OPERATIONAL_TOKEN_PLACEHOLDER: self._operational_token_value(),
             "PREQIN_USERNAME": self._username_value(),
             "PREQIN_API_KEY": self._api_key_value(),
         }
@@ -146,7 +141,7 @@ class PreqinClient:
             }
 
     def _operational_get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        token = self._operational_token_value()
+        token = self._operational_token or _clean_secret(secret(OPERATIONAL_TOKEN_PLACEHOLDER, ""))
         username = self._username_value()
         api_key = self._api_key_value()
         if not token and _credential_present("PREQIN_USERNAME", username) and _credential_present(
