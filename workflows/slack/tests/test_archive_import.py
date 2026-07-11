@@ -10,6 +10,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import pytest
+
 
 def _load_archive_import():
     repo_root = Path(__file__).resolve().parents[3]
@@ -28,7 +30,7 @@ def _load_archive_import():
     api_module.workflow_engine = workflow_engine
     sys.modules["api.workflow_engine"] = workflow_engine
 
-    vm_metrics = types.ModuleType("api.vm_metrics")
+    slack_metrics = types.ModuleType("workflows.slack.metrics")
     for name in (
         "observe_slack_archive_import_batch_duration",
         "observe_slack_archive_import_duration",
@@ -45,13 +47,18 @@ def _load_archive_import():
         "record_slack_archive_import_users",
         "record_slack_etl_rate_limit",
         "set_slack_archive_import_last_failure_timestamp",
+    ):
+        setattr(slack_metrics, name, lambda *_args, **_kwargs: None)
+    sys.modules["workflows.slack.metrics"] = slack_metrics
+
+    etl_metrics = types.ModuleType("workflows.etl_metrics")
+    for name in (
         "set_etl_active_scopes",
         "set_etl_failed_scopes",
         "set_etl_scope_sync_freshness_seconds",
     ):
-        setattr(vm_metrics, name, lambda *_args, **_kwargs: None)
-    api_module.vm_metrics = vm_metrics
-    sys.modules["api.vm_metrics"] = vm_metrics
+        setattr(etl_metrics, name, lambda *_args, **_kwargs: None)
+    sys.modules["workflows.etl_metrics"] = etl_metrics
 
     centaur_sdk = sys.modules.setdefault("centaur_sdk", types.ModuleType("centaur_sdk"))
     centaur_sdk.secret = lambda _name, default=None: default
@@ -60,6 +67,21 @@ def _load_archive_import():
 
 
 archive_import = _load_archive_import()
+
+
+def test_strip_sensitive_url_query_requires_a_slack_hostname_boundary():
+    slack_url = "https://files.slack.com/file?token=xoxe-secret"
+    attacker_url = "https://not-slack.com/file?token=keep"
+    suffix_attacker_url = "https://files.slack.com.attacker.example/file?token=keep"
+
+    assert archive_import._strip_sensitive_url_query(slack_url) == (
+        "https://files.slack.com/file"
+    )
+    assert archive_import._strip_sensitive_url_query(attacker_url) == attacker_url
+    assert (
+        archive_import._strip_sensitive_url_query(suffix_attacker_url)
+        == suffix_attacker_url
+    )
 
 
 class FakeConn:
@@ -105,6 +127,7 @@ def _write_dummy_archive(path: Path) -> None:
             "id": "CENG",
             "name": "eng-test",
             "is_archived": False,
+            "is_private": False,
             "topic": {"value": "Archive topic"},
             "purpose": {"value": "Archive purpose"},
             "members": ["U123", "U234"],
@@ -311,13 +334,20 @@ def test_import_archive_path_parses_public_export_shape_and_edges(
     assert run_finishes[0]["counts"]["messages_upserted"] == 6
 
     channel_args = _executemany_calls_for(pool, "slack_sync_channels")[0][1]
-    assert channel_args[0][0:6] == (
+    channel_sql = _executemany_calls_for(pool, "slack_sync_channels")[0][0]
+    assert channel_args[0][0:7] == (
         "CENG",
         "eng-test",
+        False,
         False,
         "Archive topic",
         "Archive purpose",
         2,
+    )
+    assert channel_args[1][3] is True
+    assert (
+        "is_private = slack_sync_channels.is_private OR EXCLUDED.is_private"
+        in channel_sql
     )
 
     user_args = _executemany_calls_for(pool, "slack_sync_users")[0][1]
@@ -367,6 +397,13 @@ def test_archive_upsert_sql_preserves_live_fields():
     assert "download_status = CASE WHEN" in attachment_update
 
 
+def test_archive_channel_privacy_fails_closed():
+    assert archive_import._archive_channel_is_private({"is_private": False}) is False
+    assert archive_import._archive_channel_is_private({"is_private": True}) is True
+    assert archive_import._archive_channel_is_private({}) is True
+    assert archive_import._archive_channel_is_private({"is_private": "false"}) is True
+
+
 def test_request_archive_download_url_uses_api_presign_endpoint(monkeypatch):
     opened_requests = []
 
@@ -391,6 +428,9 @@ def test_request_archive_download_url_uses_api_presign_endpoint(monkeypatch):
         )
 
     monkeypatch.setenv("CENTAUR_API_URL", "http://centaur-api-rs:8080/")
+    monkeypatch.setenv("WORKFLOW_RUN_ID", "wfr_test")
+    monkeypatch.setenv("WORKFLOW_TASK_ID", "wft_test")
+    monkeypatch.setenv("CENTAUR_WORKFLOW_TASK_TOKEN", "signed.task-token")
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     download_url = archive_import._request_archive_download_url("sai id/with/slash")
@@ -400,10 +440,24 @@ def test_request_archive_download_url_uses_api_presign_endpoint(monkeypatch):
     assert timeout == 30
     assert request.get_method() == "POST"
     assert (
+        request.get_header("X-centaur-workflow-task-token") == "signed.task-token"
+    )
+    assert request.get_header("Authorization") is None
+    assert (
         request.full_url
         == "http://centaur-api-rs:8080/api/admin/slack/archive-imports/"
         "sai%20id%2Fwith%2Fslash/download-url"
     )
+
+
+def test_archive_download_requires_workflow_capability(monkeypatch):
+    monkeypatch.setenv("CENTAUR_API_URL", "http://centaur-api-rs:8080/")
+    monkeypatch.delenv("WORKFLOW_RUN_ID", raising=False)
+    monkeypatch.delenv("WORKFLOW_TASK_ID", raising=False)
+    monkeypatch.delenv("CENTAUR_WORKFLOW_TASK_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="CENTAUR_WORKFLOW_TASK_TOKEN"):
+        archive_import._request_archive_download_url("sai_test")
 
 
 def test_download_archive_streams_api_presigned_url(tmp_path, monkeypatch):
