@@ -1,10 +1,11 @@
 export { ApiError } from "./types";
 export { CentaurClient } from "./client";
 export type {
-  ExecuteOptions,
-  MessageOptions,
-  InputContentBlock,
-  ThreadMessageRecord,
+  RecordSessionDeliveryOptions,
+  RecordSessionDeliveryResponse,
+  ReleaseThreadOptions,
+  ReleaseThreadResponse,
   WorkflowRunOptions,
-  WorkflowRunAccepted,
+  WorkflowRun,
+  WorkflowRunCreated,
 } from "./client";

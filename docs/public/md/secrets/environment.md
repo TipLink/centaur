@@ -31,8 +31,9 @@ kubectl create secret generic centaur-infra-env \
   --namespace centaur-system \
   --from-literal=DATABASE_URL='postgres://...' \
   --from-literal=SLACKBOT_API_KEY='...' \
+  --from-literal=CENTAUR_CONTROL_API_KEY="$(openssl rand -hex 32)" \
+  --from-literal=SLACK_FEEDBACK_API_KEY="$(openssl rand -hex 32)" \
   --from-literal=SLACK_BOT_TOKEN='xoxb-...' \
-  --from-literal=SLACK_UPLOAD_TOKEN='xoxp-...' \
   --from-literal=SLACK_SIGNING_SECRET='...' \
   --from-literal=SANDBOX_SIGNING_KEY="$(openssl rand -hex 32)" \
   --from-literal=IRON_MANAGEMENT_API_KEY="$(openssl rand -hex 32)" \
@@ -41,6 +42,17 @@ kubectl create secret generic centaur-infra-env \
   --from-literal=ANTHROPIC_API_KEY='...' \
   --from-literal=WAREHOUSE_API_KEY='...'
 ```
+
+`CENTAUR_CONTROL_API_KEY` is a required control-plane credential. Use it only
+from Console and operator tooling; do not place it in a sandbox. The optional
+`SLACK_FEEDBACK_API_KEY` has a separate, narrow feedback-session scope and must
+not reuse the control key.
+
+When upgrading an existing release, add the prefixed control key (for example,
+`PREFIX_CENTAUR_CONTROL_API_KEY` when `envPrefix: PREFIX_`) before Helm/Argo
+applies the new workloads. The API and Console references are non-optional, so
+pods will not start until that Secret key exists. `just bootstrap-secrets`
+tops up existing local-development Secrets without rotating an existing key.
 
 For local development, `just bootstrap-secrets` creates the local Kubernetes
 Secret from your shell environment.
@@ -91,7 +103,7 @@ endpoint, and inject a short-lived bearer token for matching API hosts.
 Check the API pod environment:
 
 ```bash
-kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- env | \
+kubectl exec -n centaur-system deploy/centaur-centaur-api -- env | \
   grep -E 'FIREWALL_MANAGER_SECRET_SOURCE|WAREHOUSE_API_KEY'
 ```
 

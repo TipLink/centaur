@@ -17,7 +17,7 @@ creates sandbox pods for agent work. [iron-proxy](https://docs.iron.sh) handles 
 need credentials:
 
 <figure className="architecture-figure">
-  <img src="/brand/workflow.svg" alt="Centaur production workflow — Centaur API plus Postgres hands a run to the Kubernetes backend, which attaches a sandbox pod whose outbound HTTP routes through iron-proxy" />
+  <img src="/brand/workflow.svg" alt="Centaur production workflow: Centaur API plus Postgres hands a run to the Kubernetes backend, which attaches a sandbox pod whose outbound HTTP routes through iron-proxy" />
   <figcaption>Slackbot and API ingress → Centaur API (Postgres-backed) → Kubernetes sandbox runtime → outbound traffic through iron-proxy.</figcaption>
 </figure>
 
@@ -62,17 +62,25 @@ Minimum keys:
 | `DATABASE_URL` | API | Postgres connection string. |
 | `IRON_MANAGEMENT_API_KEY` | [iron-proxy](https://docs.iron.sh) management API | Generate with `openssl rand -hex 32`. |
 | `SANDBOX_SIGNING_KEY` | Sandbox API tokens | Generate with `openssl rand -hex 32`; keeps sandbox tokens valid across API restarts. |
-| `SLACK_BOT_TOKEN` | Slackbot | Bot User OAuth Token from the Slack app. |
-| `SLACK_UPLOAD_TOKEN` | Slack file uploads | Dedicated Slack token for tool-driven file upload and verification. |
+| `SLACK_BOT_TOKEN` | Slackbot/API | Bot User OAuth Token from the Slack app. |
 | `SLACK_SIGNING_SECRET` | Slackbot/API | Used to verify Slack webhook signatures. |
 | `SLACKBOT_API_KEY` | Slackbot to API | Static service token; API bootstraps it into Postgres on startup with `agent` scope. |
+| `CENTAUR_CONTROL_API_KEY` | Console/operator to API | Dedicated high-entropy service token for administrative routes and global controls. Never reuse a bot key or expose this value to sandboxes. |
+| `SLACK_FEEDBACK_API_KEY` | Optional sandbox feedback tool to API | Separate narrow token that can create and operate only `feedback-improvement:*` sessions. |
 | `OP_CONNECT_TOKEN` | [iron-proxy](https://docs.iron.sh) 1Password Connect source (preferred) | Needed when `ironProxy.secretSource` is `onepassword-connect`. |
 | `OP_SERVICE_ACCOUNT_TOKEN` | [iron-proxy](https://docs.iron.sh) 1Password service-account source | Needed when `ironProxy.secretSource` is `onepassword`. |
 | `OP_VAULT` | [iron-proxy](https://docs.iron.sh) 1Password source | Vault name or id used for `op://` references (either mode). |
 
-`SLACKBOT_API_KEY` is not created with the admin API during initial boot, because
-the API process requires it before it can start. Generate a high-entropy value,
-store it in the infra Secret, and reuse the same value in Slackbot.
+`SLACKBOT_API_KEY` and `CENTAUR_CONTROL_API_KEY` are not created with the admin
+API during initial boot, because the API process requires them before it can
+start. Generate distinct high-entropy values, store them in the infra Secret,
+and reuse only the Slackbot value in Slackbot. Local bootstrap generates and
+preserves the control and feedback keys automatically.
+
+For upgrades using `secretManager.existingSecretName`, create the prefixed
+`CENTAUR_CONTROL_API_KEY` Secret entry before applying the new chart. The API
+and Console references are non-optional and otherwise produce a pod startup
+failure. This secret prerequisite is the first gate in the upgrade runbook.
 
 ## 3. Configure harness credentials
 
@@ -82,6 +90,7 @@ Store one secret per enabled harness credential:
 |---------|-----------|----------------|---------------------|----------|
 | Codex default | `codex` | none or `--codex` | `OPENAI_API_KEY` | `api.openai.com` |
 | Codex with OpenRouter provider | `codex` | none or `--codex` | `OPENROUTER_API_KEY` | `openrouter.ai` |
+| Codex with Meta AI direct | `codex` | `--meta` | `META_AI_API_KEY` | `api.ai.meta.com` |
 | Amp | `amp` | `--amp` | `AMP_API_KEY` | `ampcode.com` |
 | Claude Code | `claude-code` | `--claude` | `ANTHROPIC_API_KEY` | `api.anthropic.com` |
 | pi-mono | `pi-mono` | `--pi` | `ANTHROPIC_API_KEY` | `api.anthropic.com` |
@@ -99,6 +108,10 @@ model slug such as `openrouter/auto`, or set `CODEX_MODEL_PROVIDER=openrouter`
 alongside `CODEX_MODEL`. Per-turn Codex model overrides with provider-style
 slugs such as `--model anthropic/claude-fable-5` also select the OpenRouter
 provider even when `OPENROUTER_MODEL` is unset.
+
+To run Codex through Meta AI direct, store `META_AI_API_KEY` and select the
+provider with `--meta`. Pair it with `--model <model-id>` when choosing a
+provider-specific model for a turn.
 
 Whatever source you pick, the vault is shared across the whole deployment,
 so any thread can use any configured credential. Per-user and per-channel
@@ -204,10 +217,9 @@ Use the app page to install the bot, copy the Bot User OAuth Token for
 1. Add the bot scopes required by the Slackbot features you enable.
 2. Install the app to the workspace.
 3. Store the Bot User OAuth Token as `SLACK_BOT_TOKEN`.
-4. Store a dedicated upload-capable Slack token as `SLACK_UPLOAD_TOKEN` if Slack file uploads are enabled.
-5. Store the app Signing Secret as `SLACK_SIGNING_SECRET`.
-6. Enable Event Subscriptions.
-7. Set the Request URL to `https://<your-host>/api/webhooks/slack`.
+4. Store the app Signing Secret as `SLACK_SIGNING_SECRET`.
+5. Enable Event Subscriptions.
+6. Set the Request URL to `https://<your-host>/api/webhooks/slack`.
 7. Subscribe to `app_mention` and to the message events you want Centaur to see:
    `message.channels`, `message.groups`, and `message.im`.
 
@@ -240,6 +252,10 @@ ironProxy:
   secretSource: onepassword-connect
   secretTtl: 10m
 
+apiRs:
+  # Delete any sandbox older than this, running or suspended.
+  sandboxMaxLifetimeSecs: 259200
+
 onepasswordConnect:
   connect:
     create: true
@@ -256,6 +272,17 @@ sandbox:
 
 The Kubernetes sandbox backend is the active runtime backend; there is no chart
 switch named `api.sandboxBackend`.
+
+Sandbox lifecycle has two separate timers:
+
+- Slackbot v2 sends `idle_timeout_ms` on execute requests, defaulting to up to
+  3 hours, so api-rs can pause an idle sandbox after a turn finishes.
+- api-rs deletes old sandboxes through `apiRs.sandboxMaxLifetimeSecs`, default
+  72 hours, regardless of whether the sandbox is still running or already
+  suspended.
+
+There is no suspended-only delete setting. If you want sandboxes gone after N
+hours, set `apiRs.sandboxMaxLifetimeSecs` to N hours in seconds.
 
 Install or upgrade:
 
@@ -285,21 +312,28 @@ Run one agent turn from inside the api-rs deployment:
 THREAD_KEY=cli:production-smoke-codex
 THREAD_PATH=$(jq -rn --arg v "$THREAD_KEY" '$v|@uri')
 
-SESSION=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}" \
-  -H "Content-Type: application/json" \
-  -d '{"harness_type":"codex","on_harness_conflict":"restart"}')
+SESSION=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s -X POST "http://localhost:8080/api/session/$1" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
+    -H "Content-Type: application/json" \
+    -d '\''{"harness_type":"codex","on_harness_conflict":"restart"}'\''' sh "$THREAD_PATH")
 
-kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}/messages" \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","parts":[{"type":"text","text":"Reply with exactly PONG."}]}]}'
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s -X POST "http://localhost:8080/api/session/$1/messages" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
+    -H "Content-Type: application/json" \
+    -d '\''{"messages":[{"role":"user","parts":[{"type":"text","text":"Reply with exactly PONG."}]}]}'\''' sh "$THREAD_PATH"
 
-EXECUTE=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}/execute" \
-  -H "Content-Type: application/json" \
-  -d '{"input_lines":["{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reply with exactly PONG.\"}]}}"]}')
+EXECUTE=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s -X POST "http://localhost:8080/api/session/$1/execute" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
+    -H "Content-Type: application/json" \
+    -d '\''{"input_lines":["{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reply with exactly PONG.\"}]}}"]}'\''' sh "$THREAD_PATH")
 EXECUTION_ID=$(printf '%s' "$EXECUTE" | jq -r '.execution_id')
 
-kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -N \
-  "http://localhost:8080/api/session/${THREAD_PATH}/events?execution_id=${EXECUTION_ID}&after_event_id=0"
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s -N "http://localhost:8080/api/session/$1/events?execution_id=$2&after_event_id=0" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"' sh "$THREAD_PATH" "$EXECUTION_ID"
 ```
 
 Then run the same prompt through Slack:
@@ -322,8 +356,9 @@ If a run fails because the sandbox pod exits or is deleted, inspect the durable
 session and api-rs logs before retrying:
 
 ```bash
-kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s \
-  "http://localhost:8080/api/session/${THREAD_PATH}" | jq
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s "http://localhost:8080/api/session/$1" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"' sh "$THREAD_PATH" | jq
 
 kubectl logs -n centaur-system deploy/centaur-centaur-api-rs --tail=200
 kubectl get pods -n centaur-system -l centaur.ai/managed=true
