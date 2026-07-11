@@ -75,6 +75,11 @@ app.kubernetes.io/component: {{ .component }}
 {{- $storageType -}}
 {{- end -}}
 
+{{- define "centaur.repositoryVisibility" -}}
+{{- $visibility := lower (default "private" .) -}}
+{{- if eq $visibility "public" -}}public{{- else -}}private{{- end -}}
+{{- end -}}
+
 {{- define "centaur.overlaySources" -}}
 {{- $sources := list -}}
 {{- with .Values.overlays.sources -}}
@@ -82,6 +87,7 @@ app.kubernetes.io/component: {{ .component }}
 {{- if .repo -}}
 {{- $source := dict "repo" .repo -}}
 {{- with .ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
+{{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .visibility) -}}
 {{- /*
 Subdir defaults: an omitted key falls back to the conventional layout
 (tools, workflows, .agents/skills); a key explicitly set to "" disables
@@ -112,17 +118,40 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- if and .Values.toolServer.enabled .Values.toolServer.repo -}}
 {{- $source := dict "repo" .Values.toolServer.repo "toolsSubdir" (default "tools" .Values.toolServer.subdir) "workflowsSubdir" "workflows" "skillsSubdir" ".agents/skills" -}}
 {{- with .Values.toolServer.ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
+{{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .Values.toolServer.visibility) -}}
 {{- $sources = append $sources $source -}}
 {{- range .Values.toolServer.extraSources -}}
 {{- if .repo -}}
 {{- $source := dict "repo" .repo "toolsSubdir" (default "tools" .subdir) "workflowsSubdir" (default "workflows" .workflowsSubdir) "skillsSubdir" (default ".agents/skills" .skillsSubdir) -}}
 {{- with .ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
+{{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .visibility) -}}
 {{- $sources = append $sources $source -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- toJson $sources -}}
+{{- end -}}
+
+{{- /*
+Hash every configured input whose contents are copied into a sandbox at boot.
+The API folds this value into SandboxSpec, making warm-pool identity sensitive
+to skills/workflow/prompt-only sources as well as tools and transitional images.
+Refs and image tags must still be immutable in production; this is an identity
+bridge, not a resolver for mutable branches or tags.
+*/ -}}
+{{- define "centaur.sandboxContentRevision" -}}
+{{- $payload := dict
+      "schemaVersion" 1
+      "overlaySources" (include "centaur.overlaySources" . | fromJsonArray)
+      "repositoryRefs" (.Values.repoCache.repositoryRefs | default dict)
+      "sandboxImage" (.Values.sandbox.image | default dict)
+      "ironProxyImage" (.Values.ironProxy.image | default dict)
+      "overlayImage" (.Values.overlay.image | default dict)
+      "overlaySystemPrompt" (.Values.overlay.systemPrompt | default "")
+      "sandboxHarness" (.Values.sandbox.harnessEngine | default "")
+      "operatorRevision" (.Values.apiRs.sandboxContentRevision | default "") -}}
+{{- toJson $payload | sha256sum -}}
 {{- end -}}
 
 {{- define "centaur.httpRouteName" -}}

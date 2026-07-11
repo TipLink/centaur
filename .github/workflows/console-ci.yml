@@ -5,12 +5,12 @@ on:
   push:
     branches: [ main ]
 
-permissions:
-  contents: read
-
 defaults:
   run:
     working-directory: services/console
+
+permissions:
+  contents: read
 
 jobs:
   console_changes:
@@ -48,7 +48,7 @@ jobs:
           fi
 
   scan_ruby:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -69,7 +69,7 @@ jobs:
         run: bin/bundler-audit
 
   scan_js:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -87,7 +87,7 @@ jobs:
         run: bin/importmap audit
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
     env:
@@ -116,7 +116,7 @@ jobs:
         run: bin/rubocop -f github
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 

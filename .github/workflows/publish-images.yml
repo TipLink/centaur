@@ -8,9 +8,11 @@ on:
       - .github/workflows/publish-images.yml
       - services/**
       - crates/harness-server/**
+      - harness/**
       - centaur_sdk/**
       - packages/**
       - tools/**
+      - workflows/**
       - scripts/bootstrap-k8s-secrets.sh
       - package.json
       - pnpm-lock.yaml
@@ -32,24 +34,24 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: tiplink/centaur
   IMAGE_SOURCE: https://github.com/TipLink/centaur
-  # Main/tags keep optimized release images. PRs and manual non-release
-  # branch publishes use debug builds so staging/dev iteration does not spend
-  # minutes optimizing Rust binaries that are immediately replaced by the next
-  # test build.
-  RUST_BUILD_PROFILE: ${{ (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v'))) && 'debug' || 'release' }}
+  # PR validation uses debug images for iteration speed. Pushes, tags, and
+  # reviewed manual branch publishes produce deployable release images and the
+  # arm64 release descriptor consumed by staged infra.
+  RUST_BUILD_PROFILE: ${{ github.event_name == 'pull_request' && 'debug' || 'release' }}
 
 jobs:
   # Build each image natively per platform (amd64 on x64 runners, arm64 on
   # arm runners), push by digest, and hand the digests to the merge job below
-  # which assembles the multi-arch manifest. PR and manual non-release branch
-  # builds stay amd64-only to keep iteration fast.
+  # which assembles the multi-arch manifest. PR builds stay amd64-only to keep
+  # review iteration fast; manual branch builds include arm64 so they can emit
+  # a deployable, architecture-specific release descriptor for staged rollout.
   build:
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        service: [api-rs, slackbotv2, linearbot, discordbot, teamsbot, agent, iron-proxy, console]
-        platform: ${{ (github.event_name == 'push' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
+        service: [api-rs, slackbotv2, linearbot, discordbot, githubbot, teamsbot, agent, iron-proxy, console]
+        platform: ${{ (github.event_name != 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
         include:
           - service: api-rs
             image: centaur-api-rs
@@ -70,6 +72,11 @@ jobs:
             image: centaur-discordbot
             context: .
             dockerfile: services/discordbot/Dockerfile
+            target: ""
+          - service: githubbot
+            image: centaur-githubbot
+            context: .
+            dockerfile: services/githubbot/Dockerfile
             target: ""
           - service: teamsbot
             image: centaur-teamsbot
@@ -100,6 +107,7 @@ jobs:
 
       - name: Derive platform slug
         run: |
+          set -euo pipefail
           platform="${{ matrix.platform }}"
           echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
 
@@ -151,6 +159,7 @@ jobs:
       - name: Export digest
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
+          set -euo pipefail
           mkdir -p ${{ runner.temp }}/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
@@ -179,6 +188,7 @@ jobs:
           - image: centaur-iron-proxy
           - image: centaur-console
           - image: centaur-discordbot
+          - image: centaur-githubbot
           - image: centaur-teamsbot
 
     steps:
@@ -223,6 +233,7 @@ jobs:
       - name: Create multi-arch manifest for ${{ matrix.image }}
         working-directory: ${{ runner.temp }}/digests
         run: |
+          set -euo pipefail
           mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           tag_args=()
           for tag in "${tags[@]}"; do
@@ -238,7 +249,74 @@ jobs:
 
       - name: Inspect manifest
         run: |
+          set -euo pipefail
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+
+  release-descriptor:
+    name: Publish reviewed linux/arm64 release descriptor
+    runs-on: ubuntu-latest
+    needs: merge
+    if: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write release descriptor
+        env:
+          RELEASE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "invalid release revision: $RELEASE_REVISION" >&2
+            exit 1
+          fi
+          tag="sha-${RELEASE_REVISION::7}"
+          printf 'component\trepository\ttag\tdigest\trevision\n' > centaur-release.tsv
+          while IFS=$'\t' read -r component image; do
+            repository="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${image}"
+            index_json="$(docker buildx imagetools inspect "${repository}:${tag}" --raw)"
+            mapfile -t arm64_digests < <(jq -r '
+              [.manifests[]
+                | select(.platform.os == "linux" and .platform.architecture == "arm64")
+                | .digest] | .[]' <<<"$index_json")
+            if [[ "${#arm64_digests[@]}" -ne 1 ]]; then
+              echo "expected one runnable linux/arm64 manifest for $image; found ${#arm64_digests[@]}" >&2
+              exit 1
+            fi
+            digest="${arm64_digests[0]}"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid arm64 digest for $image: $digest" >&2
+              exit 1
+            fi
+            # Prove the platform child itself is pullable. The multi-arch tag
+            # points at an OCI index; Kubernetes imageID reports this child
+            # manifest, so the reviewed lock records the child, not the index.
+            docker buildx imagetools inspect "${repository}@${digest}" >/dev/null
+            printf '%s\tghcr.io/tiplink/centaur/%s\t%s\t%s\t%s\n' \
+              "$component" "$image" "$tag" "$digest" "$RELEASE_REVISION" \
+              >> centaur-release.tsv
+          done <<'COMPONENTS'
+          api-rs	centaur-api-rs
+          slackbotv2	centaur-slackbotv2
+          sandbox	centaur-agent
+          iron-proxy	centaur-iron-proxy
+          console	centaur-console
+          COMPONENTS
+
+      - name: Upload release descriptor
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: centaur-linux-arm64-release-${{ github.sha }}
+          path: centaur-release.tsv
+          if-no-files-found: error
+          retention-days: 90
 
   promote-fineas-infra:
     name: Open Fineas infra promotion PR
@@ -257,6 +335,12 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      - name: Checkout Centaur promotion helper
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: centaur-source
+          persist-credentials: false
+
       - name: Checkout Fineas infra
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -265,252 +349,30 @@ jobs:
           path: fineas-centaur-infra
           persist-credentials: false
 
-      - name: Update Fineas Centaur pins
-        working-directory: fineas-centaur-infra
-        run: |
-          set -euo pipefail
-          bash scripts/bump-centaur-pins.sh "${GITHUB_SHA}"
-          scripts/audit-supply-chain.sh
-
-      - name: Open or update Fineas infra PR
-        id: promote
+      - name: Stage the Fineas Console migration
         env:
           FINEAS_INFRA_TOKEN: ${{ steps.fineas_token.outputs.token }}
           CENTAUR_TOKEN: ${{ github.token }}
           CENTAUR_SHA: ${{ github.sha }}
           CENTAUR_REPO: ${{ github.repository }}
           CENTAUR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FINEAS_INFRA_ROOT: fineas-centaur-infra
         run: |
-          python3 <<'PY'
-          from __future__ import annotations
+          set -euo pipefail
+          bump_helper=fineas-centaur-infra/scripts/bump-centaur-pins.sh
+          if ! grep -q -- '--stage' "$bump_helper"; then
+            echo 'Fineas staged promotion helper is not merged yet; skipping automatic promotion because the reviewed manual staged PR is authoritative.'
+            echo '### Fineas promotion' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Skipped: infra does not yet support staged promotion; use the reviewed manual staged PR.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if grep -q -- '--image-lock' "$bump_helper"; then
+            echo 'Fineas promotion requires a reviewed mixed-stage image lock; the staged infra PR DAG is authoritative.'
+            echo '### Fineas promotion' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Skipped: digest-locked promotion is handled by the reviewed infra PR DAG.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
-          import base64
-          import json
-          import os
-          import re
-          import subprocess
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-          from pathlib import Path
-
-          owner = "TipLink"
-          repo = "fineas-centaur-infra"
-          base_branch = "main"
-          root = Path("fineas-centaur-infra")
-          centaur_sha = os.environ["CENTAUR_SHA"]
-          centaur_short = centaur_sha[:7]
-          centaur_tag = f"sha-{centaur_short}"
-          branch = f"automation/promote-centaur-{centaur_short}"
-          message = f"chore: promote centaur {centaur_short}"
-          title = f"Promote Centaur {centaur_short} to Fineas"
-
-          headers = {
-              "Authorization": f"Bearer {os.environ['FINEAS_INFRA_TOKEN']}",
-              "Accept": "application/vnd.github+json",
-              "X-GitHub-Api-Version": "2022-11-28",
-              "User-Agent": "centaur-promote-fineas",
-          }
-          api = f"https://api.github.com/repos/{owner}/{repo}"
-          centaur_headers = dict(headers)
-          centaur_headers["Authorization"] = f"Bearer {os.environ['CENTAUR_TOKEN']}"
-
-          def request(
-              method: str,
-              url: str,
-              payload: dict | None = None,
-              *,
-              ok: tuple[int, ...] = (200, 201, 204),
-              request_headers: dict[str, str] | None = None,
-          ):
-              data = None
-              req_headers = dict(request_headers or headers)
-              if payload is not None:
-                  data = json.dumps(payload).encode()
-                  req_headers["Content-Type"] = "application/json"
-              req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
-              try:
-                  with urllib.request.urlopen(req) as resp:
-                      body_text = resp.read().decode()
-                      if resp.status not in ok:
-                          raise RuntimeError(f"{method} {url} returned {resp.status}: {body_text}")
-                      return json.loads(body_text) if body_text else None
-              except urllib.error.HTTPError as exc:
-                  body_text = exc.read().decode()
-                  if exc.code in ok:
-                      if exc.code == 404:
-                          return None
-                      return json.loads(body_text) if body_text else None
-                  raise RuntimeError(f"{method} {url} returned {exc.code}: {body_text}") from None
-
-          def centaur_pr_url_for_commit() -> str:
-              repo_full = os.environ["CENTAUR_REPO"]
-              url = f"https://api.github.com/repos/{repo_full}/commits/{centaur_sha}/pulls"
-              try:
-                  pulls = request("GET", url, request_headers=centaur_headers)
-              except RuntimeError as exc:
-                  print(f"warning: could not look up Centaur PR for {centaur_sha}: {exc}")
-                  return ""
-
-              merged_pulls = [pull for pull in pulls if pull.get("merged_at")]
-              pull = (merged_pulls or pulls or [None])[0]
-              return pull["html_url"] if pull else ""
-
-          def git(*args: str) -> str:
-              return subprocess.check_output(["git", "-C", str(root), *args], text=True)
-
-          def set_application_annotation(key: str, value: str) -> bool:
-              application_path = root / "clusters/centaur-sandbox/argocd/applications/centaur-sandbox.yaml"
-              text = application_path.read_text(encoding="utf-8")
-              pattern = re.compile(rf"^    {re.escape(key)}: .*$", flags=re.MULTILINE)
-
-              if value:
-                  line = f"    {key}: {json.dumps(value)}"
-                  if pattern.search(text):
-                      new_text = pattern.sub(line, text, count=1)
-                  else:
-                      marker = "    argocd.argoproj.io/compare-options: ServerSideDiff=true\n"
-                      if marker not in text:
-                          raise RuntimeError(f"could not place Application annotation {key}")
-                      new_text = text.replace(marker, f"{marker}{line}\n", 1)
-              else:
-                  new_text = pattern.sub("", text)
-                  new_text = re.sub(r"\n{3,}", "\n\n", new_text)
-
-              if new_text == text:
-                  return False
-              application_path.write_text(new_text, encoding="utf-8")
-              return True
-
-          def put_file_to_branch(rel: str, encoded_branch: str) -> bool:
-              encoded_path = urllib.parse.quote(rel, safe="")
-              existing = request("GET", f"{api}/contents/{encoded_path}?ref={encoded_branch}", ok=(200, 404))
-              content_bytes = (root / rel).read_bytes()
-              if existing:
-                  current = base64.b64decode(existing["content"]).replace(b"\r\n", b"\n")
-                  if current == content_bytes:
-                      return False
-
-              payload = {
-                  "message": message,
-                  "content": base64.b64encode(content_bytes).decode(),
-                  "branch": branch,
-              }
-              if existing:
-                  payload["sha"] = existing["sha"]
-              request("PUT", f"{api}/contents/{encoded_path}", payload)
-              return True
-
-          centaur_pr_url = centaur_pr_url_for_commit()
-          source_lines = [
-              f"- Centaur commit: https://github.com/{os.environ['CENTAUR_REPO']}/commit/{centaur_sha}",
-              f"- Image publish run: {os.environ['CENTAUR_RUN_URL']}",
-          ]
-          if centaur_pr_url:
-              source_lines.append(f"- Centaur PR: {centaur_pr_url}")
-
-          body = f"""## Summary
-          - update Fineas Centaur base image pins to `{centaur_tag}`
-          - pin the Centaur chart source to `{centaur_sha}`
-
-          ## Source
-          {chr(10).join(source_lines)}
-
-          ## Tests
-          - `bash scripts/bump-centaur-pins.sh {centaur_sha}`
-          - `scripts/audit-supply-chain.sh`
-          """
-
-          status_lines = [line for line in git("status", "--porcelain").splitlines() if line]
-          changed_paths: list[tuple[str, str]] = []
-          for line in status_lines:
-              status = line[:2]
-              path = line[3:]
-              if " -> " in path:
-                  path = path.split(" -> ", 1)[1]
-              if status == "??":
-                  kind = "A"
-              elif "D" in status:
-                  kind = "D"
-              else:
-                  kind = "M"
-              changed_paths.append((kind, path))
-
-          output_path = os.environ["GITHUB_OUTPUT"]
-          if not changed_paths:
-              with open(output_path, "a", encoding="utf-8") as output:
-                  output.write("changed=false\n")
-                  output.write(f"branch={branch}\n")
-                  output.write("pr_url=\n")
-              raise SystemExit(0)
-
-          base_ref = request("GET", f"{api}/git/ref/heads/{base_branch}")
-          base_sha = base_ref["object"]["sha"]
-          encoded_branch = urllib.parse.quote(branch, safe="")
-          try:
-              request("POST", f"{api}/git/refs", {"ref": f"refs/heads/{branch}", "sha": base_sha})
-          except RuntimeError as exc:
-              if "Reference already exists" not in str(exc):
-                  raise
-
-          changed = False
-          for kind, rel in changed_paths:
-              encoded_path = urllib.parse.quote(rel, safe="")
-              existing = request("GET", f"{api}/contents/{encoded_path}?ref={encoded_branch}", ok=(200, 404))
-              if kind == "D":
-                  if existing:
-                      request(
-                          "DELETE",
-                          f"{api}/contents/{encoded_path}",
-                          {"message": message, "branch": branch, "sha": existing["sha"]},
-                      )
-                      changed = True
-                  continue
-
-              content_bytes = (root / rel).read_bytes()
-              if existing:
-                  current = base64.b64decode(existing["content"]).replace(b"\r\n", b"\n")
-                  if current == content_bytes:
-                      continue
-
-              payload = {
-                  "message": message,
-                  "content": base64.b64encode(content_bytes).decode(),
-                  "branch": branch,
-              }
-              if existing:
-                  payload["sha"] = existing["sha"]
-              request("PUT", f"{api}/contents/{encoded_path}", payload)
-              changed = True
-
-          pulls = request(
-              "GET",
-              f"{api}/pulls?state=open&head={urllib.parse.quote(f'{owner}:{branch}', safe='')}",
-          )
-          if pulls:
-              pr = request("PATCH", f"{api}/pulls/{pulls[0]['number']}", {"title": title, "body": body})
-          elif changed:
-              pr = request("POST", f"{api}/pulls", {"title": title, "head": branch, "base": base_branch, "body": body})
-          else:
-              pr = None
-
-          if pr:
-              annotations_changed = False
-              annotations_changed |= set_application_annotation("fineas.dev/deployment-pr-url", pr["html_url"])
-              annotations_changed |= set_application_annotation("fineas.dev/centaur-pr-url", centaur_pr_url)
-              if annotations_changed:
-                  put_file_to_branch(
-                      "clusters/centaur-sandbox/argocd/applications/centaur-sandbox.yaml",
-                      encoded_branch,
-                  )
-
-          with open(output_path, "a", encoding="utf-8") as output:
-              output.write(f"changed={'true' if changed else 'false'}\n")
-              output.write(f"branch={branch}\n")
-              output.write(f"centaur_short={centaur_short}\n")
-              if pr:
-                  output.write(f"pr_url={pr['html_url']}\n")
-                  output.write(f"pr_number={pr['number']}\n")
-              else:
-                  output.write("pr_url=\n")
-          PY
+          bash "$bump_helper" --stage console "${GITHUB_SHA}"
+          fineas-centaur-infra/scripts/audit-supply-chain.sh
+          python3 centaur-source/.github/scripts/promote_fineas_infra.py
