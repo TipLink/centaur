@@ -69,6 +69,47 @@ class CentaurApiClient
     post("/api/admin/google/docs-sync/batch", payload)
   end
 
+  def create_session(thread_key:, harness_type:, metadata: {}, persona_id: nil,
+                     on_harness_conflict: "reject")
+    payload = {
+      harness_type: harness_type,
+      metadata: metadata,
+      on_harness_conflict: on_harness_conflict
+    }
+    payload[:persona_id] = persona_id if persona_id.present?
+
+    post("/api/session/#{escape_path(thread_key)}", payload)
+  end
+
+  def append_session_messages(thread_key:, messages:)
+    post("/api/session/#{escape_path(thread_key)}/messages", { messages: messages })
+  end
+
+  def execute_session(thread_key:, input_lines:, idempotency_key: nil, metadata: {})
+    payload = {
+      input_lines: input_lines,
+      metadata: metadata
+    }
+    payload[:idempotency_key] = idempotency_key if idempotency_key.present?
+
+    post("/api/session/#{escape_path(thread_key)}/execute", payload)
+  end
+
+  def list_workflow_schedules
+    get("/api/workflows/schedules")
+  end
+
+  def get_workflow_run(run_id)
+    get("/api/workflows/runs/#{escape_path(run_id)}")
+  end
+
+  def create_workflow_run(workflow_name:, input: nil)
+    payload = { workflow_name: workflow_name }
+    payload[:input] = input unless input.nil?
+
+    post("/api/workflows/runs", payload)
+  end
+
   private
 
   def get(path, params = {})
