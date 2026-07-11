@@ -23,6 +23,14 @@ module Broker
       raise ArgumentError, "token endpoint is required" if token_endpoint.blank?
       raise ArgumentError, "app_id is required" if app_id.blank?
       raise ArgumentError, "private_key_pem is required" if private_key_pem.blank?
+      unless CredentialGrants.github_app_installation_token_endpoint?(token_endpoint)
+        raise RefreshError.new(
+          "GitHub App token endpoint is not approved",
+          stage: "config",
+          code: "invalid_token_endpoint",
+          retryable: false
+        )
+      end
 
       jwt = app_jwt(app_id: app_id, private_key_pem: private_key_pem, now: now)
       response = perform(token_endpoint, jwt, timeout)

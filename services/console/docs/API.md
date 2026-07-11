@@ -810,6 +810,8 @@ The token credentials it refreshes with are fields on the credential, resolved b
 
 GitHub traffic is wired to this broker by the built-in sandbox proxy fragment (`centaur-iron-proxy/src/infra.yaml`): `github.com` and `api.github.com` already carry a `token_broker` source referencing the `github-app` credential, so a deployment only needs to provision that credential — no per-deployment static secret. The Helm chart can provision it at api-rs startup when `tokenBroker.githubApp.enabled=true` and `tokenBroker.githubApp.existingSecretName` points at a Kubernetes Secret containing the App ID, installation ID, and private key. The fragment uses a `replace` (placeholder swap) rather than a header `inject`, which preserves the caller's auth scheme: `git` over HTTPS keeps its Basic `x-access-token:<token>` form (`github.com` rejects `Bearer` for git transport) while the REST API keeps `Bearer`. To provision it manually instead of via Helm, run:
 
+`tokenBroker.githubApp.credentialId` and `extraCredentialIds` are compatibility aliases provisioned alongside the canonical `github-app` credential. They are bootstrap-only unless a separate, explicitly scoped secret references them; the built-in GitHub rules intentionally have one source so equal-priority credentials cannot compete for the same Authorization header.
+
 ```
 centaur-perms broker create --namespace default --foreign-id github-app \
   --grant github_app_installation --client-id "$GITHUB_APP_ID" \
