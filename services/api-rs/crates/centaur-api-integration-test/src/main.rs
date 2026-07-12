@@ -95,6 +95,16 @@ async fn main() -> Result<()> {
         test_metrics(&http, &base_url).await,
     );
 
+    // The authorized drain is intentionally last: it irreversibly fences new
+    // executions for the lifetime of this control-plane process.
+    let line = line!() + 1;
+    record_result(
+        &mut results,
+        "Control authorization drains sandboxes after other API checks",
+        line,
+        test_control_drain(&http, &base_url).await,
+    );
+
     write_report(&results)?;
 
     if results.iter().all(|result| result.passed) {
@@ -352,18 +362,6 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
         bail!("bot-authorized sandbox drain returned {status}, expected 401: {body}");
     }
 
-    let control_drain = http
-        .post(format!("{base_url}/api/sandboxes/drain"))
-        .bearer_auth(control_api_key()?)
-        .send()
-        .await
-        .context("request sandbox drain with control authorization")?;
-    if control_drain.status() != StatusCode::OK {
-        let status = control_drain.status();
-        let body = control_drain.text().await.unwrap_or_default();
-        bail!("control-authorized sandbox drain returned {status}: {body}");
-    }
-
     let thread_key = test_thread_key("turn")?;
     let harness_wire_value = serde_json::to_value(HarnessType::Codex)
         .context("serialize executable harness type")?
@@ -557,6 +555,24 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
     .await
     .context("timed out waiting for session execution completion")??;
 
+    Ok(())
+}
+
+async fn test_control_drain(http: &HttpClient, base_url: &str) -> Result<()> {
+    let response = http
+        .post(format!("{base_url}/api/sandboxes/drain"))
+        .bearer_auth(control_api_key()?)
+        .send()
+        .await
+        .context("request sandbox drain with control authorization")?;
+    let status = response.status();
+    let body = response
+        .json::<Value>()
+        .await
+        .context("parse control-authorized sandbox drain response")?;
+    if status != StatusCode::OK || body.get("ok").and_then(Value::as_bool) != Some(true) {
+        bail!("control-authorized sandbox drain returned {status}: {body}");
+    }
     Ok(())
 }
 
