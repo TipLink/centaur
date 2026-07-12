@@ -6,6 +6,35 @@ as $$
     select nullif(current_setting('centaur.slack_channel_id', true), '')
 $$;
 
+drop function if exists centaur_slack_channel_is_syncable(text);
+create or replace function centaur_slack_channel_is_syncable(_schema name, _channel_id text)
+returns boolean
+language plpgsql
+stable
+security definer
+set search_path = pg_catalog
+as $$
+declare
+    syncable boolean;
+begin
+    execute format(
+        'select exists (
+            select 1
+            from %I.slack_sync_channels channels
+            where channels.channel_id = $1
+              and channels.is_syncable
+        )',
+        _schema
+    )
+    into syncable
+    using _channel_id;
+    return coalesce(syncable, false);
+end
+$$;
+
+grant execute on function centaur_slack_channel_is_syncable(name, text)
+    to centaur_slack_reader;
+
 drop policy if exists centaur_slack_channels_admin_select on slack_sync_channels;
 drop policy if exists centaur_slack_channels_reader_select on slack_sync_channels;
 create policy centaur_slack_channels_reader_select
@@ -47,8 +76,12 @@ create policy centaur_context_docs_reader_select
     for select
     to centaur_slack_reader
     using (
-        source = 'slack'
-        and metadata ->> 'channel_id' = centaur_current_slack_channel_id()
+        source <> 'slack'
+        or metadata ->> 'channel_id' = centaur_current_slack_channel_id()
+        or (
+            metadata ->> 'channel_id' like 'C%'
+            and centaur_slack_channel_is_syncable(current_schema(), metadata ->> 'channel_id')
+        )
     );
 
 drop policy if exists centaur_google_drive_runs_admin_select on google_drive_sync_runs;
