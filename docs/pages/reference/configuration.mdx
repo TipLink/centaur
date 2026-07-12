@@ -202,7 +202,7 @@ Sandbox entrypoint and wrappers:
 
 | Env var | Set from | Controls |
 | --- | --- | --- |
-| `CENTAUR_HARNESS_CONFIG_DIR`, `CENTAUR_HARNESS_ADAPTER` | Sandbox image or `sandbox.extraEnv`. | Harness config directory and optional adapter executable. |
+| `CENTAUR_HARNESS_CONFIG_DIR`, `CENTAUR_HARNESS_ADAPTER` | Sandbox image or `sandbox.extraEnv`. | Authoritative harness config directory and optional adapter executable. The entrypoint copies this directory's Codex and Claude files instead of merging them with the image-baked `~/harness` defaults, so an override must carry every required provider, feature, and trust setting. Leave it unset to use the reviewed config packaged in the sandbox image. |
 | `CENTAUR_SKILL_DIRS` | Chart-rendered from `overlays.sources[*].skillsSubdir` (default `.agents/skills`) through `SESSION_SANDBOX_EXTRA_ENV`. | Ordered skill directories copied into the agent workspace. |
 | `AGENT_REPO`, `AGENT_PERSONA` | Runtime assignment metadata. | Workspace repo clone and persona prompt. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Sandbox entrypoint or `sandbox.extraEnv`. | Google ADC path; entrypoint creates a local stub when unset. |

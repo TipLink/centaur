@@ -14,6 +14,7 @@ on:
       - tools/**
       - workflows/**
       - scripts/bootstrap-k8s-secrets.sh
+      - scripts/probe-agent-harness-image.sh
       - package.json
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
@@ -113,7 +114,15 @@ jobs:
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
           push: false
+          load: ${{ matrix.service == 'agent' }}
+          tags: ${{ matrix.service == 'agent' && format('{0}:validate-{1}', matrix.image, env.PLATFORM_SLUG) || '' }}
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
           cache-from: type=gha,scope=validate-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
           cache-to: type=gha,mode=max,scope=validate-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+
+      - name: Probe packaged agent harness
+        if: matrix.service == 'agent'
+        env:
+          AGENT_IMAGE: ${{ matrix.image }}:validate-${{ env.PLATFORM_SLUG }}
+        run: bash scripts/probe-agent-harness-image.sh "$AGENT_IMAGE"

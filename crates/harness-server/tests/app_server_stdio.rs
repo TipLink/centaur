@@ -362,6 +362,73 @@ fn fake_codex_blocks_mode_uses_openrouter_provider_for_explicit_model_slug() {
 }
 
 #[test]
+fn fake_codex_blocks_mode_uses_meta_responses_provider_when_selected() {
+    let fake_codex = temp_path("fake-meta-codex.sh");
+    let fake_codex_log = temp_path("fake-meta-codex-requests.jsonl");
+    let script = fake_codex_app_server_script(&fake_codex_log);
+    std::fs::write(&fake_codex, script).expect("write fake codex script");
+    let mut permissions = std::fs::metadata(&fake_codex)
+        .expect("fake codex metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+
+    let mut bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Codex,
+        None,
+        Some((
+            "CODEX_BIN",
+            fake_codex.to_str().expect("utf-8 fake codex path"),
+        )),
+    );
+    // `--meta` reaches the harness as an explicit `responses` provider. It must
+    // win even when the selected model contains `/`, which would otherwise
+    // trigger the OpenRouter model-slug heuristic.
+    let user_line = json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "provider": "responses",
+        "model": "meta-llama/llama-4-maverick",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "say meta blocks"}],
+        },
+    });
+    let turn = bridge.run_blocks_user_line(user_line, Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_codex_v2_turn(&turn);
+
+    let requests = std::fs::read_to_string(&fake_codex_log).expect("read fake codex request log");
+    let requests: Vec<Value> = requests
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("fake codex request JSON"))
+        .collect();
+    let thread_start = requests
+        .iter()
+        .find(|value| value.get("method").and_then(Value::as_str) == Some("thread/start"))
+        .unwrap_or_else(|| panic!("blocks mode did not send thread/start; requests={requests:?}"));
+    assert_eq!(
+        thread_start
+            .pointer("/params/modelProvider")
+            .and_then(Value::as_str),
+        Some("responses")
+    );
+    let turn_start = requests
+        .iter()
+        .find(|value| value.get("method").and_then(Value::as_str) == Some("turn/start"))
+        .unwrap_or_else(|| panic!("blocks mode did not send turn/start; requests={requests:?}"));
+    assert_eq!(
+        turn_start.pointer("/params/model").and_then(Value::as_str),
+        Some("meta-llama/llama-4-maverick")
+    );
+
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(fake_codex_log);
+}
+
+#[test]
 fn fake_codex_blocks_mode_uses_bedrock_provider_when_selected() {
     let fake_codex = temp_path("fake-bedrock-codex.sh");
     let fake_codex_log = temp_path("fake-bedrock-codex-requests.jsonl");

@@ -9,6 +9,10 @@ from pathlib import Path
 import configure_codex_config
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PACKAGED_CODEX_CONFIG = REPO_ROOT / "harness/codex/config.toml"
+
+
 def render(source: str, env: dict[str, str] | None = None) -> tuple[str, dict]:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "config.toml"
@@ -19,6 +23,62 @@ def render(source: str, env: dict[str, str] | None = None) -> tuple[str, dict]:
 
 
 class ConfigureCodexConfigTests(unittest.TestCase):
+    def test_packaged_config_preserves_upstream_providers_under_deployment_overlay(
+        self,
+    ) -> None:
+        _, parsed = render(
+            PACKAGED_CODEX_CONFIG.read_text(encoding="utf-8"),
+            {
+                "CODEX_MODEL_REASONING_EFFORT": "medium",
+                "CODEX_CONFIG_OVERLAY": """
+                    model = "gpt-5.6-sol"
+                    plan_mode_reasoning_effort = "xhigh"
+
+                    [features.multi_agent_v2]
+                    enabled = false
+                    max_concurrent_threads_per_session = 6
+                """,
+            },
+        )
+
+        self.assertEqual(parsed["model"], "gpt-5.6-sol")
+        self.assertEqual(parsed["model_reasoning_effort"], "medium")
+        self.assertEqual(parsed["plan_mode_reasoning_effort"], "xhigh")
+        self.assertEqual(parsed["service_tier"], "fast")
+
+        features = parsed["features"]
+        self.assertFalse(features["multi_agent"])
+        self.assertFalse(features["enable_fanout"])
+        self.assertEqual(
+            features["multi_agent_v2"],
+            {
+                "enabled": False,
+                "max_concurrent_threads_per_session": 6,
+            },
+        )
+
+        self.assertEqual(
+            parsed["model_providers"]["openrouter"],
+            {
+                "name": "OpenRouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "env_key": "OPENROUTER_API_KEY",
+                "wire_api": "responses",
+                "requires_openai_auth": False,
+            },
+        )
+        self.assertEqual(
+            parsed["model_providers"]["responses"],
+            {
+                "name": "azure",
+                "base_url": "https://api.ai.meta.com/v1",
+                "env_key": "META_AI_API_KEY",
+                "wire_api": "responses",
+                "requires_openai_auth": False,
+            },
+        )
+        self.assertEqual(parsed["projects"]["/"]["trust_level"], "trusted")
+
     def test_disables_fineas_multi_agent_v2_table_without_conflicting_scalar(
         self,
     ) -> None:
