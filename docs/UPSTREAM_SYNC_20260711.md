@@ -25,6 +25,7 @@ the tested tree exactly, and satisfy the fork's signature policy.
 | Durable terminal reconciliation | Slack compares streamed markdown with the durable terminal result and replaces divergent output. |
 | Durable Slack delivery proof | After Slack confirms a primary, reconciled, fallback, or visible-error message, Slackbot records one idempotent `session.delivery_completed` event through a Slackbot-key-only route bound to the exact thread and execution. |
 | Generic HTTP secret scopes | Method/path scopes are retained through discovery, permission translation, and iron-control registration. |
+| Least-privilege Slack ETL token | The reviewed TipLink #68 intent is ported to the current `match_headers` manifest schema: `SLACK_ETL_TOKEN` can replace `Authorization` only for the four ETL Slack Web API paths over `GET`/`POST` and for `GET` downloads from `files.slack.com`. A real-manifest translation test locks the resulting iron-control rules. |
 | GitHub App installation tokens | The grant is registered in upstream `Broker::CredentialGrants`; the model delegates validation and refresh to that registry. Helm bootstraps the canonical credential before api-rs starts, and the built-in infra role grants a scheme-preserving `GITHUB_TOKEN` replacement for `github.com` and `api.github.com` to sandbox principals. |
 | Fork image publication | TipLink GHCR namespace, GitHub-hosted native builders, safe multi-arch assembly, and upstream `githubbot`/harness image inputs are combined. Pull requests build without registry credentials. Publication is globally serialized and accepts only an exact GitHub-signed, ready-or-merged PR head whose aggregate CI, Console CI, and native image-validation runs are green. A newly created full-SHA publication tag or exact dispatch may write packages; `reviewed-<full-SHA>` registry tags are single-assignment. The descriptor binds each final arm64 child to the runnable child produced by that exact run. Fineas promotion is owned by the separately reviewed infra PR DAG. |
 | GitHub-hosted CI | TipLink's removal of Depot runners remains authoritative across core, Console, docs, audit, and chart workflows. Native arm64 publication continues on GitHub's arm runner. |
@@ -132,6 +133,15 @@ Known one-for-one upstream equivalents include `d6dcdb4d` / `0691b1aa`,
 `60f3272c` / `f51239ee`, `26527258` / `2a6b838d`, and `226b9dcd` /
 `a90453b8`. The exact managed-proxy replacement for `9895becb` is the
 agent-k8s injection of `IRON_PROXY_UPSTREAM_RESPONSE_HEADER_TIMEOUT=120s`.
+
+### Reviewed post-baseline carry
+
+The 101-commit inventory above covers the `ba2c01f5` baseline. This sync also
+semantically ports the approved least-privilege Slack ETL token work from
+TipLink PR #68 (`c9ebdc58`, `68468602`, `31e14d62`, and `2186f3e5`) onto the
+current HTTP-secret manifest and documentation. Those four commits are not
+counted in the baseline inventory and are not patch-equivalent because the
+upstream secret schema and Slack ETL documentation evolved in parallel.
 
 ## Migration boundary
 

@@ -39,8 +39,9 @@ posting to Slack.
 
 Create a Slack user token for ETL reads and store it as `SLACK_ETL_TOKEN` in
 the same secret source used by tools. The Slack tool declares it as an optional
-HTTP secret for `slack.com` and `files.slack.com`; iron-proxy injects the real
-value when the tool calls Slack.
+HTTP secret scoped to `GET` and `POST` calls to the Slack Web API endpoints
+below, plus `GET` downloads from `files.slack.com`; iron-proxy replaces the
+`Authorization` header only for those requests.
 
 The token must be able to call:
 
@@ -231,7 +232,7 @@ kubectl exec -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
 Check sync health:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
   psql "$DATABASE_URL" -c \
   "SELECT channel_id, watermark_ts, last_success_at, last_error
    FROM slack_sync_checkpoints
@@ -242,7 +243,7 @@ kubectl exec -n centaur deploy/centaur-centaur-api -- \
 Check backfill pressure:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
   psql "$DATABASE_URL" -c \
   "SELECT job_type, status, count(*), min(updated_at) AS oldest_updated_at
    FROM slack_sync_backfill_jobs
@@ -253,7 +254,7 @@ kubectl exec -n centaur deploy/centaur-centaur-api -- \
 Check document projection:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api -- \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
   psql "$DATABASE_URL" -c \
   "SELECT source_type, count(*), max(source_updated_at)
    FROM company_context_documents
