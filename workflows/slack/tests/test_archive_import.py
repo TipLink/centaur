@@ -391,6 +391,8 @@ def test_request_archive_download_url_uses_api_presign_endpoint(monkeypatch):
         )
 
     monkeypatch.setenv("CENTAUR_API_URL", "http://centaur-api-rs:8080/")
+    monkeypatch.setenv("WORKFLOW_RUN_ID", "run-123")
+    monkeypatch.setenv("WORKFLOW_TASK_ID", "task-456")
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     download_url = archive_import._request_archive_download_url("sai id/with/slash")
@@ -404,6 +406,9 @@ def test_request_archive_download_url_uses_api_presign_endpoint(monkeypatch):
         == "http://centaur-api-rs:8080/api/admin/slack/archive-imports/"
         "sai%20id%2Fwith%2Fslash/download-url"
     )
+    headers = {name.lower(): value for name, value in request.header_items()}
+    assert headers["x-centaur-workflow-run-id"] == "run-123"
+    assert headers["x-centaur-workflow-task-id"] == "task-456"
 
 
 def test_download_archive_streams_api_presigned_url(tmp_path, monkeypatch):
