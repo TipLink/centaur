@@ -45,7 +45,7 @@ Console to production, create a bounded local snapshot:
 
 ```bash
 export CENTAUR_PROD_DATABASE_URL=postgresql://readonly:...@.../ai_v2
-scripts/mirror-prod-threads-snapshot.sh all
+bash scripts/mirror-prod-threads-snapshot.sh all
 ```
 
 The script exports recent `sessions`, `session_messages`,
