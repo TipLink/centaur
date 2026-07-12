@@ -8,8 +8,8 @@ use std::{
 };
 
 use absurd::{
-    Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy, SpawnOptions, StepHandle,
-    TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
+    Client, ClientOptions, RetryKind, RetryStrategy, SpawnOptions, StepHandle, TaskContext,
+    TaskRegistrationOptions, Worker, WorkerOptions,
 };
 use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
@@ -39,6 +39,13 @@ pub const WORKFLOW_SLACK_LIVE_QUEUE: &str = "centaur_workflows_slack_live";
 pub const WORKFLOW_ETL_QUEUE: &str = "centaur_workflows_etl";
 pub const WORKFLOW_ETL_BACKFILL_QUEUE: &str = "centaur_workflows_etl_backfill";
 pub const WORKFLOW_SCHEDULE_QUEUE: &str = "centaur_workflow_schedules";
+const ROLLBACK_REQUIRED_WORKFLOW_QUEUES: [&str; 5] = [
+    WORKFLOW_QUEUE,
+    WORKFLOW_SLACK_LIVE_QUEUE,
+    WORKFLOW_ETL_QUEUE,
+    WORKFLOW_ETL_BACKFILL_QUEUE,
+    WORKFLOW_SCHEDULE_QUEUE,
+];
 pub const WORKFLOW_TASK: &str = "centaur.workflow";
 pub const WORKFLOW_SCHEDULE_TASK: &str = "centaur.workflow.schedule_tick";
 const PYTHON_HOST_ENV: &str = "PYTHON_WORKFLOW_HOST_PATH";
@@ -52,6 +59,11 @@ const WORKFLOW_RECONCILE_INTERVAL_SECS_ENV: &str = "WORKFLOW_RECONCILE_INTERVAL_
 const DEFAULT_WORKFLOW_RECONCILE_INTERVAL_SECS: u64 = 60;
 const WORKFLOW_ENABLE_MODE_ENV: &str = "WORKFLOW_ENABLE_MODE";
 const WORKFLOW_ALLOWED_NAMES_ENV: &str = "WORKFLOW_ALLOWED_NAMES";
+/// This branch is an emergency schema-forward rollback bridge. Startup must
+/// explicitly opt into preserving, rather than executing, workflow tasks
+/// created by the forward runtime because their handler source may not exist
+/// in the rollback overlay.
+const ROLLBACK_BRIDGE_PAUSE_WORKFLOWS_ENV: &str = "CENTAUR_ROLLBACK_BRIDGE_PAUSE_WORKFLOWS";
 /// How many consecutive reconcile passes a workflow must be missing from
 /// discovery before its active tasks are cancelled. 0 disables reaping.
 const WORKFLOW_REAP_REMOVED_AFTER_TICKS_ENV: &str = "WORKFLOW_REAP_REMOVED_AFTER_TICKS";
@@ -93,11 +105,12 @@ struct WorkflowRuntimeInner {
     slack_live_client: Client,
     etl_client: Client,
     etl_backfill_client: Client,
-    _worker: Worker,
-    _slack_live_worker: Worker,
-    _etl_worker: Worker,
-    _etl_backfill_worker: Worker,
-    _schedule_worker: Worker,
+    _worker: Option<Worker>,
+    _slack_live_worker: Option<Worker>,
+    _etl_worker: Option<Worker>,
+    _etl_backfill_worker: Option<Worker>,
+    _schedule_worker: Option<Worker>,
+    paused_for_rollback: bool,
     webhook_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
     schedule_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
 }
@@ -420,6 +433,11 @@ impl WorkflowRuntime {
         session_runtime: SessionRuntime,
         workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
     ) -> Result<Self, WorkflowRuntimeError> {
+        // Validate before touching absurd queues. This rollback-only branch is
+        // unsafe if a missing or mistyped deployment value can start workers.
+        require_rollback_bridge_workflow_pause()?;
+        let paused_for_rollback = true;
+
         let client = Client::from_pool_with_options(
             store.pool().clone(),
             ClientOptions {
@@ -427,9 +445,6 @@ impl WorkflowRuntime {
                 ..ClientOptions::default()
             },
         )?;
-        client
-            .create_queue(Some(WORKFLOW_QUEUE), CreateQueueOptions::default())
-            .await?;
         let slack_live_client = Client::from_pool_with_options(
             store.pool().clone(),
             ClientOptions {
@@ -437,12 +452,6 @@ impl WorkflowRuntime {
                 ..ClientOptions::default()
             },
         )?;
-        slack_live_client
-            .create_queue(
-                Some(WORKFLOW_SLACK_LIVE_QUEUE),
-                CreateQueueOptions::default(),
-            )
-            .await?;
         let etl_client = Client::from_pool_with_options(
             store.pool().clone(),
             ClientOptions {
@@ -450,9 +459,6 @@ impl WorkflowRuntime {
                 ..ClientOptions::default()
             },
         )?;
-        etl_client
-            .create_queue(Some(WORKFLOW_ETL_QUEUE), CreateQueueOptions::default())
-            .await?;
         let etl_backfill_client = Client::from_pool_with_options(
             store.pool().clone(),
             ClientOptions {
@@ -460,12 +466,6 @@ impl WorkflowRuntime {
                 ..ClientOptions::default()
             },
         )?;
-        etl_backfill_client
-            .create_queue(
-                Some(WORKFLOW_ETL_BACKFILL_QUEUE),
-                CreateQueueOptions::default(),
-            )
-            .await?;
         let schedule_client = Client::from_pool_with_options(
             store.pool().clone(),
             ClientOptions {
@@ -473,9 +473,7 @@ impl WorkflowRuntime {
                 ..ClientOptions::default()
             },
         )?;
-        schedule_client
-            .create_queue(Some(WORKFLOW_SCHEDULE_QUEUE), CreateQueueOptions::default())
-            .await?;
+        require_existing_rollback_workflow_queues(&client).await?;
 
         let discovery = discover_python_workflow_metadata()
             .await
@@ -546,91 +544,110 @@ impl WorkflowRuntime {
                 }
             },
         )?;
-        let startup_schedules = schedule_registry
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        reconcile_schedules(&schedule_client, &startup_schedules).await?;
+        if !paused_for_rollback {
+            let startup_schedules = schedule_registry
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            reconcile_schedules(&schedule_client, &startup_schedules).await?;
+        }
 
-        let worker = client.start_worker(WorkerOptions {
-            worker_id: Some("centaur-api-rs-workflow-worker".to_owned()),
-            concurrency: worker_concurrency(
-                WORKFLOW_WORKER_CONCURRENCY_ENV,
-                DEFAULT_WORKFLOW_WORKER_CONCURRENCY,
-            ),
-            on_error: Some(Arc::new(|error| {
-                warn!(%error, "absurd workflow worker error");
-            })),
-            ..WorkerOptions::default()
+        let worker = (!paused_for_rollback).then(|| {
+            client.start_worker(WorkerOptions {
+                worker_id: Some("centaur-api-rs-workflow-worker".to_owned()),
+                concurrency: worker_concurrency(
+                    WORKFLOW_WORKER_CONCURRENCY_ENV,
+                    DEFAULT_WORKFLOW_WORKER_CONCURRENCY,
+                ),
+                on_error: Some(Arc::new(|error| {
+                    warn!(%error, "absurd workflow worker error");
+                })),
+                ..WorkerOptions::default()
+            })
         });
-        let slack_live_worker = slack_live_client.start_worker(WorkerOptions {
-            worker_id: Some("centaur-api-rs-workflow-slack-live-worker".to_owned()),
-            concurrency: 1,
-            on_error: Some(Arc::new(|error| {
-                warn!(%error, "absurd workflow slack live worker error");
-            })),
-            ..WorkerOptions::default()
+        let slack_live_worker = (!paused_for_rollback).then(|| {
+            slack_live_client.start_worker(WorkerOptions {
+                worker_id: Some("centaur-api-rs-workflow-slack-live-worker".to_owned()),
+                concurrency: 1,
+                on_error: Some(Arc::new(|error| {
+                    warn!(%error, "absurd workflow slack live worker error");
+                })),
+                ..WorkerOptions::default()
+            })
         });
-        let etl_worker = etl_client.start_worker(WorkerOptions {
-            worker_id: Some("centaur-api-rs-workflow-etl-worker".to_owned()),
-            concurrency: worker_concurrency(
-                WORKFLOW_ETL_WORKER_CONCURRENCY_ENV,
-                DEFAULT_WORKFLOW_ETL_WORKER_CONCURRENCY,
-            ),
-            on_error: Some(Arc::new(|error| {
-                warn!(%error, "absurd workflow etl worker error");
-            })),
-            ..WorkerOptions::default()
+        let etl_worker = (!paused_for_rollback).then(|| {
+            etl_client.start_worker(WorkerOptions {
+                worker_id: Some("centaur-api-rs-workflow-etl-worker".to_owned()),
+                concurrency: worker_concurrency(
+                    WORKFLOW_ETL_WORKER_CONCURRENCY_ENV,
+                    DEFAULT_WORKFLOW_ETL_WORKER_CONCURRENCY,
+                ),
+                on_error: Some(Arc::new(|error| {
+                    warn!(%error, "absurd workflow etl worker error");
+                })),
+                ..WorkerOptions::default()
+            })
         });
-        let etl_backfill_worker = etl_backfill_client.start_worker(WorkerOptions {
-            worker_id: Some("centaur-api-rs-workflow-etl-backfill-worker".to_owned()),
-            concurrency: worker_concurrency(
-                WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY_ENV,
-                DEFAULT_WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY,
-            ),
-            on_error: Some(Arc::new(|error| {
-                warn!(%error, "absurd workflow etl backfill worker error");
-            })),
-            ..WorkerOptions::default()
+        let etl_backfill_worker = (!paused_for_rollback).then(|| {
+            etl_backfill_client.start_worker(WorkerOptions {
+                worker_id: Some("centaur-api-rs-workflow-etl-backfill-worker".to_owned()),
+                concurrency: worker_concurrency(
+                    WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY_ENV,
+                    DEFAULT_WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY,
+                ),
+                on_error: Some(Arc::new(|error| {
+                    warn!(%error, "absurd workflow etl backfill worker error");
+                })),
+                ..WorkerOptions::default()
+            })
         });
-        let schedule_worker = schedule_client.start_worker(WorkerOptions {
-            worker_id: Some("centaur-api-rs-workflow-schedule-worker".to_owned()),
-            concurrency: worker_concurrency(
-                WORKFLOW_SCHEDULE_WORKER_CONCURRENCY_ENV,
-                DEFAULT_WORKFLOW_SCHEDULE_WORKER_CONCURRENCY,
-            ),
-            on_error: Some(Arc::new(|error| {
-                warn!(%error, "absurd workflow schedule worker error");
-            })),
-            ..WorkerOptions::default()
+        let schedule_worker = (!paused_for_rollback).then(|| {
+            schedule_client.start_worker(WorkerOptions {
+                worker_id: Some("centaur-api-rs-workflow-schedule-worker".to_owned()),
+                concurrency: worker_concurrency(
+                    WORKFLOW_SCHEDULE_WORKER_CONCURRENCY_ENV,
+                    DEFAULT_WORKFLOW_SCHEDULE_WORKER_CONCURRENCY,
+                ),
+                on_error: Some(Arc::new(|error| {
+                    warn!(%error, "absurd workflow schedule worker error");
+                })),
+                ..WorkerOptions::default()
+            })
         });
-        info!(
-            queue = WORKFLOW_QUEUE,
-            task = WORKFLOW_TASK,
-            "started absurd workflow worker"
-        );
-        info!(
-            queue = WORKFLOW_SLACK_LIVE_QUEUE,
-            task = WORKFLOW_TASK,
-            "started absurd workflow slack live worker"
-        );
-        info!(
-            queue = WORKFLOW_ETL_QUEUE,
-            task = WORKFLOW_TASK,
-            "started absurd workflow etl worker"
-        );
-        info!(
-            queue = WORKFLOW_ETL_BACKFILL_QUEUE,
-            task = WORKFLOW_TASK,
-            "started absurd workflow etl backfill worker"
-        );
-        info!(
-            queue = WORKFLOW_SCHEDULE_QUEUE,
-            task = WORKFLOW_SCHEDULE_TASK,
-            "started absurd workflow schedule worker"
-        );
+        if paused_for_rollback {
+            warn!(
+                env = ROLLBACK_BRIDGE_PAUSE_WORKFLOWS_ENV,
+                "rollback bridge is preserving absurd workflow rows without starting workers, schedules, or removed-workflow reaping"
+            );
+        } else {
+            info!(
+                queue = WORKFLOW_QUEUE,
+                task = WORKFLOW_TASK,
+                "started absurd workflow worker"
+            );
+            info!(
+                queue = WORKFLOW_SLACK_LIVE_QUEUE,
+                task = WORKFLOW_TASK,
+                "started absurd workflow slack live worker"
+            );
+            info!(
+                queue = WORKFLOW_ETL_QUEUE,
+                task = WORKFLOW_TASK,
+                "started absurd workflow etl worker"
+            );
+            info!(
+                queue = WORKFLOW_ETL_BACKFILL_QUEUE,
+                task = WORKFLOW_TASK,
+                "started absurd workflow etl backfill worker"
+            );
+            info!(
+                queue = WORKFLOW_SCHEDULE_QUEUE,
+                task = WORKFLOW_SCHEDULE_TASK,
+                "started absurd workflow schedule worker"
+            );
+        }
 
-        if let Some(interval) = workflow_reconcile_interval() {
+        if !paused_for_rollback && let Some(interval) = workflow_reconcile_interval() {
             spawn_workflow_metadata_reconciler(
                 schedule_client.clone(),
                 WorkflowQueueClients {
@@ -656,16 +673,27 @@ impl WorkflowRuntime {
                 _etl_worker: etl_worker,
                 _etl_backfill_worker: etl_backfill_worker,
                 _schedule_worker: schedule_worker,
+                paused_for_rollback,
                 webhook_registry,
                 schedule_registry,
             }),
         })
     }
 
+    fn ensure_workflow_mutations_enabled(&self) -> Result<(), WorkflowRuntimeError> {
+        if self.inner.paused_for_rollback {
+            return Err(WorkflowRuntimeError::Disabled(format!(
+                "workflow mutation is paused by the rollback bridge ({ROLLBACK_BRIDGE_PAUSE_WORKFLOWS_ENV}=true)"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn create_run(
         &self,
         request: CreateWorkflowRunRequest,
     ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
+        self.ensure_workflow_mutations_enabled()?;
         let workflow_name = request.workflow_name.trim();
         if workflow_name.is_empty() {
             return Err(WorkflowRuntimeError::BadRequest(
@@ -904,6 +932,7 @@ impl WorkflowRuntime {
     }
 
     pub async fn cancel_run(&self, run_id: &str) -> Result<(), WorkflowRuntimeError> {
+        self.ensure_workflow_mutations_enabled()?;
         for (queue_name, client) in [
             (WORKFLOW_QUEUE, &self.inner.client),
             (WORKFLOW_SLACK_LIVE_QUEUE, &self.inner.slack_live_client),
@@ -967,6 +996,7 @@ impl WorkflowRuntime {
         event_name: &str,
         payload: Value,
     ) -> Result<(), WorkflowRuntimeError> {
+        self.ensure_workflow_mutations_enabled()?;
         self.inner
             .client
             .emit_event(event_name, payload.clone(), Some(WORKFLOW_QUEUE))
@@ -1023,6 +1053,29 @@ impl WorkflowRuntime {
             WorkflowQueueClass::EtlBackfill => &self.inner.etl_backfill_client,
         }
     }
+}
+
+async fn require_existing_rollback_workflow_queues(
+    client: &Client,
+) -> Result<(), WorkflowRuntimeError> {
+    let existing = client
+        .list_queues()
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let missing = ROLLBACK_REQUIRED_WORKFLOW_QUEUES
+        .iter()
+        .filter(|queue| !existing.contains(**queue))
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(WorkflowRuntimeError::Internal(format!(
+        "rollback bridge requires all forward absurd queues to exist before startup; missing: {}",
+        missing.join(", ")
+    )))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1800,6 +1853,26 @@ fn workflow_reconcile_interval() -> Option<Duration> {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_WORKFLOW_RECONCILE_INTERVAL_SECS);
     (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+/// Refuse to run this rollback-only binary unless the deployment explicitly
+/// acknowledges that durable workflow processing must remain paused.
+pub fn require_rollback_bridge_workflow_pause() -> Result<(), WorkflowRuntimeError> {
+    let raw = env::var(ROLLBACK_BRIDGE_PAUSE_WORKFLOWS_ENV).ok();
+    if parse_rollback_bridge_pause(raw.as_deref()) {
+        return Ok(());
+    }
+
+    Err(WorkflowRuntimeError::Internal(format!(
+        "rollback bridge refuses to start unless {ROLLBACK_BRIDGE_PAUSE_WORKFLOWS_ENV}=true is explicitly configured"
+    )))
+}
+
+fn parse_rollback_bridge_pause(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("true")
+    )
 }
 
 /// Resolve a worker concurrency from `env_name`, falling back to `default` when
@@ -2782,7 +2855,10 @@ async fn run_python_workflow_host_local(
         .arg(&host_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .env("WORKFLOW_RUN_ID", ctx.run_id())
+        .env("WORKFLOW_TASK_ID", ctx.task_id())
+        .env("WORKFLOW_NAME", input.workflow_name.clone());
     if env::var_os("WORKFLOW_DIRS").is_none() {
         command.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
@@ -3832,6 +3908,27 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn rollback_bridge_requires_workflow_pause_to_be_explicitly_enabled() {
+        for value in [Some("true"), Some(" TRUE ")] {
+            assert!(parse_rollback_bridge_pause(value), "value={value:?}");
+        }
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some(" no "),
+            Some("OFF"),
+            Some("1"),
+            Some("yes"),
+            Some("on"),
+            Some("tru"),
+        ] {
+            assert!(!parse_rollback_bridge_pause(value), "value={value:?}");
+        }
+    }
 
     #[test]
     fn parse_worker_concurrency_uses_override_or_default() {

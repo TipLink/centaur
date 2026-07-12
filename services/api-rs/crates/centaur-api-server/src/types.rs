@@ -75,9 +75,13 @@ pub struct ExecuteSessionResponse {
     pub status: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ReleaseThreadRequest {
     pub release_id: Option<String>,
+    /// Compare-and-swap fence supplied by the caller. It is required whenever
+    /// the thread currently has a sandbox, and release is rejected unless the
+    /// thread is still assigned to this exact sandbox.
+    pub expected_sandbox_id: Option<String>,
     #[serde(default)]
     pub cancel_inflight: bool,
 }
@@ -88,6 +92,7 @@ pub struct ReleaseThreadResponse {
     #[serde(flatten)]
     pub session: Session,
     pub release_id: Option<String>,
+    pub expected_sandbox_id: Option<String>,
     pub cancel_inflight: bool,
     pub sandbox_released: bool,
     pub sandbox_release_error: Option<String>,

@@ -178,43 +178,6 @@ mod tests {
                 .unwrap(),
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/sandboxes/drain")
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/workflows/schedules")
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/workflows/runs")
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/workflows/runs")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"workflow_name":"agent_turn","input":{}}"#))
-                .unwrap(),
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/workflows/runs/run-1")
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/workflows/runs/run-1/cancel")
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/workflows/events")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"event_name":"test.event","payload":{}}"#))
-                .unwrap(),
-            Request::builder()
-                .method(Method::POST)
                 .uri("/api/webhooks/test")
                 .body(Body::empty())
                 .unwrap(),
@@ -222,6 +185,67 @@ mod tests {
             let app = build_router_with_app_state(AppState::unready());
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    #[tokio::test]
+    async fn control_routes_reject_anonymous_and_bot_keys_before_runtime_access() {
+        unsafe {
+            std::env::set_var("CENTAUR_CONTROL_API_KEY", "control-test-key");
+            std::env::set_var("SLACKBOT_API_KEY", "bot-test-key");
+        }
+
+        for (uri, method) in [
+            ("/api/sandboxes/drain", Method::POST),
+            ("/api/workflows/runs", Method::GET),
+            ("/api/admin/slack/archive-imports", Method::GET),
+            (
+                "/api/admin/slack/archive-imports/import-1/download-url",
+                Method::POST,
+            ),
+        ] {
+            let anonymous = build_router_with_app_state(AppState::unready())
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{uri}");
+
+            let bot_key = build_router_with_app_state(AppState::unready())
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer bot-test-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(bot_key.status(), StatusCode::UNAUTHORIZED, "{uri}");
+
+            let control = build_router_with_app_state(AppState::unready())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer control-test-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(control.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+
+        unsafe {
+            std::env::remove_var("CENTAUR_CONTROL_API_KEY");
+            std::env::remove_var("SLACKBOT_API_KEY");
         }
     }
 

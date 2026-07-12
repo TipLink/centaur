@@ -1,29 +1,31 @@
-name: Publish Images
+name: Publish Reviewed Rollback Bridge Images
 
 on:
-  push:
-    branches: [main]
-    tags: [v*]
-    paths:
-      - .github/workflows/publish-images.yml
-      - services/**
-      - crates/harness-server/**
-      - centaur_sdk/**
-      - packages/**
-      - tools/**
-      - scripts/bootstrap-k8s-secrets.sh
-      - package.json
-      - pnpm-lock.yaml
-      - pnpm-workspace.yaml
-      - .agents/skills/**
-  pull_request:
   workflow_dispatch:
+    inputs:
+      live_updater_scope_verified:
+        description: Operator attests live child annotations exclude all four bridge repositories and every relevant rule excludes reviewed-40 tags
+        required: true
+        type: boolean
+        default: false
+      reviewed_forward_commit:
+        description: Exact frozen reviewed-forward commit recorded by this bridge
+        required: true
+        type: string
+  push:
+    tags:
+      - 'rollback-bridge-publish-live-scope-verified-*'
 
 concurrency:
-  group: publish-images-${{ github.ref }}
-  cancel-in-progress: true
+  # Tags are global registry state, so every dispatch must serialize across
+  # branches and refs before any digest or manifest is published.
+  group: publish-reviewed-rollback-bridge-images
+  # A second dispatch must wait and observe the first run's immutable tags.
+  cancel-in-progress: false
 
 permissions:
+  actions: read
+  checks: read
   contents: read
   packages: write
   pull-requests: read
@@ -32,24 +34,182 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: tiplink/centaur
   IMAGE_SOURCE: https://github.com/TipLink/centaur
-  # Main/tags keep optimized release images. PRs and manual non-release
-  # branch publishes use debug builds so staging/dev iteration does not spend
-  # minutes optimizing Rust binaries that are immediately replaced by the next
-  # test build.
-  RUST_BUILD_PROFILE: ${{ (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v'))) && 'debug' || 'release' }}
+  RUST_BUILD_PROFILE: release
 
 jobs:
+  release-gate:
+    name: Confirm rollback publication barriers
+    runs-on: ubuntu-latest
+    outputs:
+      forward_commit: ${{ steps.forward_pin.outputs.commit }}
+    env:
+      DISPATCH_FORWARD_COMMIT: ${{ inputs.reviewed_forward_commit }}
+      GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      LIVE_UPDATER_SCOPE_VERIFIED: ${{ inputs.live_updater_scope_verified }}
+      TRIGGER_API_URL: ${{ github.api_url }}
+      TRIGGER_EVENT_NAME: ${{ github.event_name }}
+      TRIGGER_REF: ${{ github.ref }}
+      TRIGGER_REF_CREATED: ${{ github.event.created }}
+      TRIGGER_REF_NAME: ${{ github.ref_name }}
+      TRIGGER_REF_TYPE: ${{ github.ref_type }}
+      TRIGGER_REPOSITORY: ${{ github.repository }}
+      TRIGGER_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Require an exact reviewed publication trigger
+        id: forward_pin
+        run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+          commit="$(tr -d '\r\n' < .github/rollback-bridge-reviewed-forward-commit)"
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo ".github/rollback-bridge-reviewed-forward-commit must contain the frozen lowercase 40-character commit SHA" >&2
+            exit 1
+          fi
+          bridge_commit="$(git rev-parse HEAD)"
+          if [[ ! "$bridge_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "checked-out rollback bridge revision is not a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          object_type="$(git cat-file -t "$TRIGGER_SHA" 2>/dev/null || true)"
+          if [[ "$object_type" != "commit" || "$bridge_commit" != "$TRIGGER_SHA" ]]; then
+            echo "publication trigger must resolve directly to the exact checked-out bridge commit" >&2
+            exit 1
+          fi
+
+          case "$TRIGGER_EVENT_NAME" in
+            workflow_dispatch)
+              if [[ "$LIVE_UPDATER_SCOPE_VERIFIED" != "true" ]]; then
+                echo "read the live child annotations and verify that none of the four exact bridge repositories is in image-list and every relevant allow-tags rule excludes reviewed-40 before publication" >&2
+                exit 1
+              fi
+              if [[ "$DISPATCH_FORWARD_COMMIT" != "$commit" ]]; then
+                echo "dispatch reviewed_forward_commit does not match the bridge's frozen forward commit" >&2
+                exit 1
+              fi
+              ;;
+            push)
+              if [[ "$TRIGGER_REF_TYPE" != "tag" || "$TRIGGER_REF_CREATED" != "true" ||
+                "$TRIGGER_REF" != "refs/tags/${TRIGGER_REF_NAME}" ]]; then
+                echo "publication tag trigger must be a newly created tag ref" >&2
+                exit 1
+              fi
+              tag_pattern='^rollback-bridge-publish-live-scope-verified-([0-9a-f]{40})-forward-([0-9a-f]{40})-at-([1-9][0-9]{9})$'
+              if [[ ! "$TRIGGER_REF_NAME" =~ $tag_pattern ]]; then
+                echo "publication tag does not match the exact live-scope attestation format" >&2
+                exit 1
+              fi
+              tag_bridge_commit="${BASH_REMATCH[1]}"
+              tag_forward_commit="${BASH_REMATCH[2]}"
+              attested_at="${BASH_REMATCH[3]}"
+              if [[ "$tag_bridge_commit" != "$bridge_commit" ||
+                "$tag_forward_commit" != "$commit" ]]; then
+                echo "publication tag bridge or forward commit does not match the reviewed checkout" >&2
+                exit 1
+              fi
+              encoded_ref="$(jq -nr --arg value "$TRIGGER_REF_NAME" '$value|@uri')"
+              ref_json="$(curl --fail --silent --show-error \
+                --header "Authorization: Bearer ${GITHUB_API_TOKEN}" \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                "${TRIGGER_API_URL}/repos/${TRIGGER_REPOSITORY}/git/ref/tags/${encoded_ref}")"
+              if [[ "$(jq -er '.ref' <<<"$ref_json")" != "$TRIGGER_REF" ||
+                "$(jq -er '.object.type' <<<"$ref_json")" != "commit" ||
+                "$(jq -er '.object.sha' <<<"$ref_json")" != "$TRIGGER_SHA" ]]; then
+                echo "publication ref must be a lightweight tag directly targeting the trigger commit" >&2
+                exit 1
+              fi
+              now="$(date +%s)"
+              if ((attested_at > now + 120)); then
+                echo "publication tag live-scope timestamp is more than 120 seconds in the future" >&2
+                exit 1
+              fi
+              if ((now - attested_at > 900)); then
+                echo "publication tag live-scope proof is older than 900 seconds; rerun the read-only helper and create a new tag" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "unsupported rollback bridge publication trigger: $TRIGGER_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Require signed ready PR and exact-head non-CodeQL checks
+        run: bash .github/scripts/verify-reviewed-rollback-release.sh
+
+  tag-absence-gate:
+    name: Prove reviewed tags do not already exist before publishing digests
+    runs-on: ubuntu-latest
+    needs: release-gate
+    env:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REVIEWED_TAG: reviewed-${{ github.sha }}
+    steps:
+      - name: Reject overwrite and fail closed on registry errors
+        run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+          for image in centaur-api-rs centaur-slackbotv2 centaur-agent centaur-iron-proxy; do
+            repository="${IMAGE_NAMESPACE}/${image}"
+            token_json="$(curl --fail --silent --show-error \
+              --user "${GITHUB_ACTOR}:${GHCR_TOKEN}" \
+              --get \
+              --data-urlencode "scope=repository:${repository}:pull" \
+              --data-urlencode "service=ghcr.io" \
+              https://ghcr.io/token)"
+            registry_token="$(jq -er '.token' <<<"$token_json")"
+            response_body="$(mktemp)"
+            if ! status="$(curl --silent --show-error \
+              --output "$response_body" \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer ${registry_token}" \
+              --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/${repository}/manifests/${REVIEWED_TAG}")"; then
+              echo "registry request failed while checking ${repository}:${REVIEWED_TAG}" >&2
+              exit 1
+            fi
+            case "$status" in
+              404)
+                if ! jq -e 'any(.errors[]?; .code == "MANIFEST_UNKNOWN")' "$response_body" >/dev/null; then
+                  echo "registry returned HTTP 404 without MANIFEST_UNKNOWN for ${repository}:${REVIEWED_TAG}" >&2
+                  cat "$response_body" >&2
+                  exit 1
+                fi
+                ;;
+              200)
+                echo "refusing to overwrite immutable reviewed tag: ${repository}:${REVIEWED_TAG}" >&2
+                exit 1
+                ;;
+              *)
+                echo "registry returned HTTP $status while checking ${repository}:${REVIEWED_TAG}" >&2
+                cat "$response_body" >&2
+                exit 1
+                ;;
+            esac
+            rm -f "$response_body"
+          done
+
   # Build each image natively per platform (amd64 on x64 runners, arm64 on
-  # arm runners), push by digest, and hand the digests to the merge job below
-  # which assembles the multi-arch manifest. PR and manual non-release branch
-  # builds stay amd64-only to keep iteration fast.
+  # arm runners), push by digest, and hand the attested index digests to the
+  # merge job below which assembles the multi-arch manifest. The build also
+  # records the exact runnable child selected from each index so the release
+  # descriptor can bind the final platform tag to this run. Package writes
+  # require either the confirmed manual path or the exact,
+  # short-lived contents-write tag attestation validated above.
   build:
+    needs: tag-absence-gate
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        service: [api-rs, slackbotv2, linearbot, discordbot, teamsbot, agent, iron-proxy, console]
-        platform: ${{ (github.event_name == 'push' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
+        service: [api-rs, slackbotv2, agent, iron-proxy]
+        platform: [linux/amd64, linux/arm64]
         include:
           - service: api-rs
             image: centaur-api-rs
@@ -61,21 +221,6 @@ jobs:
             context: .
             dockerfile: services/slackbotv2/Dockerfile
             target: ""
-          - service: linearbot
-            image: centaur-linearbot
-            context: .
-            dockerfile: services/linearbot/Dockerfile
-            target: ""
-          - service: discordbot
-            image: centaur-discordbot
-            context: .
-            dockerfile: services/discordbot/Dockerfile
-            target: ""
-          - service: teamsbot
-            image: centaur-teamsbot
-            context: .
-            dockerfile: services/teamsbot/Dockerfile
-            target: ""
           - service: agent
             image: centaur-agent
             context: .
@@ -86,11 +231,6 @@ jobs:
             context: .
             dockerfile: services/iron-proxy/Dockerfile
             target: ""
-          - service: console
-            image: centaur-console
-            context: services/console
-            dockerfile: services/console/Dockerfile
-            target: ""
 
     steps:
       - name: Checkout
@@ -100,6 +240,7 @@ jobs:
 
       - name: Derive platform slug
         run: |
+          set -euo pipefail
           platform="${{ matrix.platform }}"
           echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
 
@@ -121,8 +262,6 @@ jobs:
           labels: |
             org.opencontainers.image.title=${{ matrix.image }}
             org.opencontainers.image.source=${{ env.IMAGE_SOURCE }}
-        env:
-          DOCKER_METADATA_PR_HEAD_SHA: true
 
       - name: Build and push ${{ matrix.image }} (${{ matrix.platform }})
         id: build
@@ -134,59 +273,79 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           # Tags are applied by the merge job on the multi-arch manifest;
-          # per-arch builds are pushed by digest only. Fork PRs run with a
-          # read-only GITHUB_TOKEN, so they build without pushing.
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ !github.event.pull_request.head.repo.fork }}
+          # per-arch release builds are pushed by digest only.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
           cache-from: |
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.PLATFORM_SLUG }}
             type=gha,scope=${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
-          # Fork PRs run with a read-only GITHUB_TOKEN: exporting the registry
-          # cache would fail the build, so only export it when we can push.
           cache-to: |
-            ${{ !github.event.pull_request.head.repo.fork && format('type=registry,ref={0}/{1}/{2}:buildcache-{3},mode=max', env.REGISTRY, env.IMAGE_NAMESPACE, matrix.image, env.PLATFORM_SLUG) || '' }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.PLATFORM_SLUG }},mode=max
             type=gha,mode=max,scope=${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
 
-      - name: Export digest
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+      - name: Export attested index and runnable platform digests
+        env:
+          BUILD_INDEX_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_IMAGE: ${{ matrix.image }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
         run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          set -euo pipefail
+          IFS=$'\n\t'
+          if [[ ! "$BUILD_INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid attested build index digest for $BUILD_IMAGE: $BUILD_INDEX_DIGEST" >&2
+            exit 1
+          fi
+          mkdir -p "${{ runner.temp }}/merge-index-digests"
+          touch "${{ runner.temp }}/merge-index-digests/${BUILD_INDEX_DIGEST#sha256:}"
 
-      - name: Upload digest
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+          platform_os=${BUILD_PLATFORM%%/*}
+          platform_architecture=${BUILD_PLATFORM##*/}
+          runnable_digest="$(bash .github/scripts/resolve-runnable-image-digest.sh \
+            "${REGISTRY}/${IMAGE_NAMESPACE}/${BUILD_IMAGE}@${BUILD_INDEX_DIGEST}" \
+            "$platform_os" \
+            "$platform_architecture")"
+          if [[ ! "$runnable_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid runnable build digest for $BUILD_IMAGE ($BUILD_PLATFORM): $runnable_digest" >&2
+            exit 1
+          fi
+          mkdir -p "${{ runner.temp }}/runnable-digests"
+          touch "${{ runner.temp }}/runnable-digests/${runnable_digest#sha256:}"
+
+      - name: Upload attested index digest for manifest merge
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digests-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
-          path: ${{ runner.temp }}/digests/*
+          name: merge-index-digests-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+          path: ${{ runner.temp }}/merge-index-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload runnable platform child digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runnable-digests-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+          path: ${{ runner.temp }}/runnable-digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
     runs-on: ubuntu-latest
     needs: build
-    if: ${{ !github.event.pull_request.head.repo.fork }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - image: centaur-api-rs
           - image: centaur-slackbotv2
-          - image: centaur-linearbot
           - image: centaur-agent
           - image: centaur-iron-proxy
-          - image: centaur-console
-          - image: centaur-discordbot
-          - image: centaur-teamsbot
 
     steps:
-      - name: Download digests
+      - name: Download attested index digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: digests-${{ matrix.image }}-*
-          path: ${{ runner.temp }}/digests
+          pattern: merge-index-digests-${{ matrix.image }}-*
+          path: ${{ runner.temp }}/merge-index-digests
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -207,310 +366,168 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=main,enable={{is_default_branch}}
-            type=raw,value=edge,enable={{is_default_branch}}
-            type=sha,prefix=main-sha-,enable={{is_default_branch}}
-            type=semver,pattern={{raw}}
-            type=ref,event=pr
-            type=sha
+            type=raw,value=reviewed-${{ github.sha }}
           labels: |
             org.opencontainers.image.title=${{ matrix.image }}
             org.opencontainers.image.source=${{ env.IMAGE_SOURCE }}
-        env:
-          DOCKER_METADATA_PR_HEAD_SHA: true
 
       - name: Create multi-arch manifest for ${{ matrix.image }}
-        working-directory: ${{ runner.temp }}/digests
+        working-directory: ${{ runner.temp }}/merge-index-digests
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEWED_TAG: reviewed-${{ github.sha }}
         run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+          repository="${IMAGE_NAMESPACE}/${{ matrix.image }}"
+          token_json="$(curl --fail --silent --show-error \
+            --user "${GITHUB_ACTOR}:${GHCR_TOKEN}" \
+            --get \
+            --data-urlencode "scope=repository:${repository}:pull" \
+            --data-urlencode "service=ghcr.io" \
+            https://ghcr.io/token)"
+          registry_token="$(jq -er '.token' <<<"$token_json")"
+          response_body="$(mktemp)"
+          if ! status="$(curl --silent --show-error \
+            --output "$response_body" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${registry_token}" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/${repository}/manifests/${REVIEWED_TAG}")"; then
+            echo "registry request failed while rechecking ${repository}:${REVIEWED_TAG}" >&2
+            exit 1
+          fi
+          case "$status" in
+            404)
+              if ! jq -e 'any(.errors[]?; .code == "MANIFEST_UNKNOWN")' "$response_body" >/dev/null; then
+                echo "registry returned HTTP 404 without MANIFEST_UNKNOWN for ${repository}:${REVIEWED_TAG}" >&2
+                cat "$response_body" >&2
+                exit 1
+              fi
+              ;;
+            200)
+              echo "refusing to overwrite immutable reviewed tag during final recheck: ${repository}:${REVIEWED_TAG}" >&2
+              exit 1
+              ;;
+            *)
+              echo "registry returned HTTP $status while rechecking ${repository}:${REVIEWED_TAG}" >&2
+              cat "$response_body" >&2
+              exit 1
+              ;;
+          esac
+          rm -f "$response_body"
+
           mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           tag_args=()
           for tag in "${tags[@]}"; do
             tag_args+=("-t" "$tag")
           done
 
+          mapfile -t merge_index_digest_files < <(find . -maxdepth 1 -type f -print)
+          if [[ "${#merge_index_digest_files[@]}" -ne 2 ]]; then
+            echo "expected exactly two attested platform index digests for ${{ matrix.image }}; found ${#merge_index_digest_files[@]}" >&2
+            exit 1
+          fi
           image_refs=()
-          for digest in *; do
-            image_refs+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}@sha256:${digest}")
+          for digest_file in "${merge_index_digest_files[@]}"; do
+            digest="sha256:$(basename "$digest_file")"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid attested platform index digest for ${{ matrix.image }}: $digest" >&2
+              exit 1
+            fi
+            image_refs+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}@${digest}")
           done
 
           docker buildx imagetools create "${tag_args[@]}" "${image_refs[@]}"
 
       - name: Inspect manifest
         run: |
+          set -euo pipefail
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
 
-  promote-fineas-infra:
-    name: Open Fineas infra promotion PR
+  release-descriptor:
+    name: Publish reviewed linux/arm64 release descriptor
     runs-on: ubuntu-latest
     needs: merge
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     steps:
-      - name: Create Fineas infra GitHub App token
-        id: fineas_token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+      - name: Download this run's runnable linux/arm64 child digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          app-id: ${{ vars.FINEAS_GITHUB_APP_ID }}
-          private-key: ${{ secrets.FINEAS_GITHUB_APP_PRIVATE_KEY }}
-          owner: TipLink
-          repositories: fineas-centaur-infra
-          permission-contents: write
-          permission-pull-requests: write
+          pattern: runnable-digests-*-linux-arm64
+          path: ${{ runner.temp }}/arm64-runnable-digests
 
-      - name: Checkout Fineas infra
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
-          repository: TipLink/fineas-centaur-infra
-          token: ${{ steps.fineas_token.outputs.token }}
-          path: fineas-centaur-infra
-          persist-credentials: false
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update Fineas Centaur pins
-        working-directory: fineas-centaur-infra
+      - name: Write release descriptor
+        env:
+          RELEASE_REVISION: ${{ github.sha }}
+          ARM64_RUNNABLE_DIGEST_ROOT: ${{ runner.temp }}/arm64-runnable-digests
         run: |
           set -euo pipefail
-          bash scripts/bump-centaur-pins.sh "${GITHUB_SHA}"
-          scripts/audit-supply-chain.sh
+          IFS=$'\n\t'
+          if [[ ! "$RELEASE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "invalid release revision: $RELEASE_REVISION" >&2
+            exit 1
+          fi
+          tag="reviewed-${RELEASE_REVISION}"
+          printf 'component\trepository\ttag\tdigest\trevision\n' > centaur-release.tsv
+          while IFS=$'\t' read -r component image; do
+            repository="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${image}"
+            index_json="$(docker buildx imagetools inspect "${repository}:${tag}" --raw)"
+            mapfile -t arm64_digests < <(jq -r '
+              [.manifests[]
+                | select(.platform.os == "linux" and .platform.architecture == "arm64")
+                | .digest] | .[]' <<<"$index_json")
+            if [[ "${#arm64_digests[@]}" -ne 1 ]]; then
+              echo "expected one runnable linux/arm64 manifest for $image; found ${#arm64_digests[@]}" >&2
+              exit 1
+            fi
+            digest="${arm64_digests[0]}"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid arm64 digest for $image: $digest" >&2
+              exit 1
+            fi
+            artifact_dir="${ARM64_RUNNABLE_DIGEST_ROOT}/runnable-digests-${image}-linux-arm64"
+            mapfile -t run_child_digest_files < <(find "$artifact_dir" -maxdepth 1 -type f -print)
+            if [[ "${#run_child_digest_files[@]}" -ne 1 ]]; then
+              echo "expected one runnable linux/arm64 child digest artifact for $image; found ${#run_child_digest_files[@]}" >&2
+              exit 1
+            fi
+            run_child_digest="sha256:$(basename "${run_child_digest_files[0]}")"
+            if [[ ! "$run_child_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid runnable linux/arm64 child digest for $image: $run_child_digest" >&2
+              exit 1
+            fi
+            if [[ "$digest" != "$run_child_digest" ]]; then
+              echo "reviewed tag arm64 child for $image does not match this run: tag=$digest run_child=$run_child_digest" >&2
+              exit 1
+            fi
+            # Prove the platform child itself is pullable. The multi-arch tag
+            # points at an OCI index; Kubernetes imageID reports this child
+            # manifest, so the reviewed lock records the child, not the index.
+            docker buildx imagetools inspect "${repository}@${digest}" >/dev/null
+            printf '%s\tghcr.io/tiplink/centaur/%s\t%s\t%s\t%s\n' \
+              "$component" "$image" "$tag" "$digest" "$RELEASE_REVISION" \
+              >> centaur-release.tsv
+          done <<'COMPONENTS'
+          api-rs	centaur-api-rs
+          slackbotv2	centaur-slackbotv2
+          sandbox	centaur-agent
+          iron-proxy	centaur-iron-proxy
+          COMPONENTS
 
-      - name: Open or update Fineas infra PR
-        id: promote
-        env:
-          FINEAS_INFRA_TOKEN: ${{ steps.fineas_token.outputs.token }}
-          CENTAUR_TOKEN: ${{ github.token }}
-          CENTAUR_SHA: ${{ github.sha }}
-          CENTAUR_REPO: ${{ github.repository }}
-          CENTAUR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          python3 <<'PY'
-          from __future__ import annotations
-
-          import base64
-          import json
-          import os
-          import re
-          import subprocess
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-          from pathlib import Path
-
-          owner = "TipLink"
-          repo = "fineas-centaur-infra"
-          base_branch = "main"
-          root = Path("fineas-centaur-infra")
-          centaur_sha = os.environ["CENTAUR_SHA"]
-          centaur_short = centaur_sha[:7]
-          centaur_tag = f"sha-{centaur_short}"
-          branch = f"automation/promote-centaur-{centaur_short}"
-          message = f"chore: promote centaur {centaur_short}"
-          title = f"Promote Centaur {centaur_short} to Fineas"
-
-          headers = {
-              "Authorization": f"Bearer {os.environ['FINEAS_INFRA_TOKEN']}",
-              "Accept": "application/vnd.github+json",
-              "X-GitHub-Api-Version": "2022-11-28",
-              "User-Agent": "centaur-promote-fineas",
-          }
-          api = f"https://api.github.com/repos/{owner}/{repo}"
-          centaur_headers = dict(headers)
-          centaur_headers["Authorization"] = f"Bearer {os.environ['CENTAUR_TOKEN']}"
-
-          def request(
-              method: str,
-              url: str,
-              payload: dict | None = None,
-              *,
-              ok: tuple[int, ...] = (200, 201, 204),
-              request_headers: dict[str, str] | None = None,
-          ):
-              data = None
-              req_headers = dict(request_headers or headers)
-              if payload is not None:
-                  data = json.dumps(payload).encode()
-                  req_headers["Content-Type"] = "application/json"
-              req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
-              try:
-                  with urllib.request.urlopen(req) as resp:
-                      body_text = resp.read().decode()
-                      if resp.status not in ok:
-                          raise RuntimeError(f"{method} {url} returned {resp.status}: {body_text}")
-                      return json.loads(body_text) if body_text else None
-              except urllib.error.HTTPError as exc:
-                  body_text = exc.read().decode()
-                  if exc.code in ok:
-                      if exc.code == 404:
-                          return None
-                      return json.loads(body_text) if body_text else None
-                  raise RuntimeError(f"{method} {url} returned {exc.code}: {body_text}") from None
-
-          def centaur_pr_url_for_commit() -> str:
-              repo_full = os.environ["CENTAUR_REPO"]
-              url = f"https://api.github.com/repos/{repo_full}/commits/{centaur_sha}/pulls"
-              try:
-                  pulls = request("GET", url, request_headers=centaur_headers)
-              except RuntimeError as exc:
-                  print(f"warning: could not look up Centaur PR for {centaur_sha}: {exc}")
-                  return ""
-
-              merged_pulls = [pull for pull in pulls if pull.get("merged_at")]
-              pull = (merged_pulls or pulls or [None])[0]
-              return pull["html_url"] if pull else ""
-
-          def git(*args: str) -> str:
-              return subprocess.check_output(["git", "-C", str(root), *args], text=True)
-
-          def set_application_annotation(key: str, value: str) -> bool:
-              application_path = root / "clusters/centaur-sandbox/argocd/applications/centaur-sandbox.yaml"
-              text = application_path.read_text(encoding="utf-8")
-              pattern = re.compile(rf"^    {re.escape(key)}: .*$", flags=re.MULTILINE)
-
-              if value:
-                  line = f"    {key}: {json.dumps(value)}"
-                  if pattern.search(text):
-                      new_text = pattern.sub(line, text, count=1)
-                  else:
-                      marker = "    argocd.argoproj.io/compare-options: ServerSideDiff=true\n"
-                      if marker not in text:
-                          raise RuntimeError(f"could not place Application annotation {key}")
-                      new_text = text.replace(marker, f"{marker}{line}\n", 1)
-              else:
-                  new_text = pattern.sub("", text)
-                  new_text = re.sub(r"\n{3,}", "\n\n", new_text)
-
-              if new_text == text:
-                  return False
-              application_path.write_text(new_text, encoding="utf-8")
-              return True
-
-          def put_file_to_branch(rel: str, encoded_branch: str) -> bool:
-              encoded_path = urllib.parse.quote(rel, safe="")
-              existing = request("GET", f"{api}/contents/{encoded_path}?ref={encoded_branch}", ok=(200, 404))
-              content_bytes = (root / rel).read_bytes()
-              if existing:
-                  current = base64.b64decode(existing["content"]).replace(b"\r\n", b"\n")
-                  if current == content_bytes:
-                      return False
-
-              payload = {
-                  "message": message,
-                  "content": base64.b64encode(content_bytes).decode(),
-                  "branch": branch,
-              }
-              if existing:
-                  payload["sha"] = existing["sha"]
-              request("PUT", f"{api}/contents/{encoded_path}", payload)
-              return True
-
-          centaur_pr_url = centaur_pr_url_for_commit()
-          source_lines = [
-              f"- Centaur commit: https://github.com/{os.environ['CENTAUR_REPO']}/commit/{centaur_sha}",
-              f"- Image publish run: {os.environ['CENTAUR_RUN_URL']}",
-          ]
-          if centaur_pr_url:
-              source_lines.append(f"- Centaur PR: {centaur_pr_url}")
-
-          body = f"""## Summary
-          - update Fineas Centaur base image pins to `{centaur_tag}`
-          - pin the Centaur chart source to `{centaur_sha}`
-
-          ## Source
-          {chr(10).join(source_lines)}
-
-          ## Tests
-          - `bash scripts/bump-centaur-pins.sh {centaur_sha}`
-          - `scripts/audit-supply-chain.sh`
-          """
-
-          status_lines = [line for line in git("status", "--porcelain").splitlines() if line]
-          changed_paths: list[tuple[str, str]] = []
-          for line in status_lines:
-              status = line[:2]
-              path = line[3:]
-              if " -> " in path:
-                  path = path.split(" -> ", 1)[1]
-              if status == "??":
-                  kind = "A"
-              elif "D" in status:
-                  kind = "D"
-              else:
-                  kind = "M"
-              changed_paths.append((kind, path))
-
-          output_path = os.environ["GITHUB_OUTPUT"]
-          if not changed_paths:
-              with open(output_path, "a", encoding="utf-8") as output:
-                  output.write("changed=false\n")
-                  output.write(f"branch={branch}\n")
-                  output.write("pr_url=\n")
-              raise SystemExit(0)
-
-          base_ref = request("GET", f"{api}/git/ref/heads/{base_branch}")
-          base_sha = base_ref["object"]["sha"]
-          encoded_branch = urllib.parse.quote(branch, safe="")
-          try:
-              request("POST", f"{api}/git/refs", {"ref": f"refs/heads/{branch}", "sha": base_sha})
-          except RuntimeError as exc:
-              if "Reference already exists" not in str(exc):
-                  raise
-
-          changed = False
-          for kind, rel in changed_paths:
-              encoded_path = urllib.parse.quote(rel, safe="")
-              existing = request("GET", f"{api}/contents/{encoded_path}?ref={encoded_branch}", ok=(200, 404))
-              if kind == "D":
-                  if existing:
-                      request(
-                          "DELETE",
-                          f"{api}/contents/{encoded_path}",
-                          {"message": message, "branch": branch, "sha": existing["sha"]},
-                      )
-                      changed = True
-                  continue
-
-              content_bytes = (root / rel).read_bytes()
-              if existing:
-                  current = base64.b64decode(existing["content"]).replace(b"\r\n", b"\n")
-                  if current == content_bytes:
-                      continue
-
-              payload = {
-                  "message": message,
-                  "content": base64.b64encode(content_bytes).decode(),
-                  "branch": branch,
-              }
-              if existing:
-                  payload["sha"] = existing["sha"]
-              request("PUT", f"{api}/contents/{encoded_path}", payload)
-              changed = True
-
-          pulls = request(
-              "GET",
-              f"{api}/pulls?state=open&head={urllib.parse.quote(f'{owner}:{branch}', safe='')}",
-          )
-          if pulls:
-              pr = request("PATCH", f"{api}/pulls/{pulls[0]['number']}", {"title": title, "body": body})
-          elif changed:
-              pr = request("POST", f"{api}/pulls", {"title": title, "head": branch, "base": base_branch, "body": body})
-          else:
-              pr = None
-
-          if pr:
-              annotations_changed = False
-              annotations_changed |= set_application_annotation("fineas.dev/deployment-pr-url", pr["html_url"])
-              annotations_changed |= set_application_annotation("fineas.dev/centaur-pr-url", centaur_pr_url)
-              if annotations_changed:
-                  put_file_to_branch(
-                      "clusters/centaur-sandbox/argocd/applications/centaur-sandbox.yaml",
-                      encoded_branch,
-                  )
-
-          with open(output_path, "a", encoding="utf-8") as output:
-              output.write(f"changed={'true' if changed else 'false'}\n")
-              output.write(f"branch={branch}\n")
-              output.write(f"centaur_short={centaur_short}\n")
-              if pr:
-                  output.write(f"pr_url={pr['html_url']}\n")
-                  output.write(f"pr_number={pr['number']}\n")
-              else:
-                  output.write("pr_url=\n")
-          PY
+      - name: Upload release descriptor
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: centaur-linux-arm64-release-${{ github.sha }}
+          path: centaur-release.tsv
+          if-no-files-found: error
+          retention-days: 90

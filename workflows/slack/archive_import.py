@@ -700,11 +700,17 @@ def _api_base_url() -> str:
 
 def _request_archive_download_url(import_id: str) -> str:
     quoted_import_id = urllib.parse.quote(import_id, safe="")
+    headers = {"Content-Type": "application/json"}
+    workflow_run_id = _as_text(os.environ.get("WORKFLOW_RUN_ID")).strip()
+    workflow_task_id = _as_text(os.environ.get("WORKFLOW_TASK_ID")).strip()
+    if workflow_run_id and workflow_task_id:
+        headers["X-Centaur-Workflow-Run-Id"] = workflow_run_id
+        headers["X-Centaur-Workflow-Task-Id"] = workflow_task_id
     request = urllib.request.Request(
         f"{_api_base_url()}/api/admin/slack/archive-imports/{quoted_import_id}/download-url",
         data=b"",
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         payload = json.load(response)

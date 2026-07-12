@@ -81,6 +81,8 @@ Optional required-by-mode variables:
 | `CENTAUR_ENVIRONMENT`, `DEPLOY_ENV`, `ENVIRONMENT` | `apiRs.extraEnv` or deployment env. | Deployment environment resource attribute for telemetry. |
 | `OTEL_TRACES_EXPORTER` | `apiRs.extraEnv`. | Set to `otlp` to force OTLP trace export, or `none`/`off` to disable it. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `apiRs.extraEnv`. | Enables OTLP trace export to Tempo, Jaeger, or another OTLP collector. |
+| `CENTAUR_CONTROL_API_KEY` | Forward chart Secret mapping. | Dedicated bearer key for destructive, admin, and global workflow routes in the rollback bridge. Startup fails if it is missing or any configured control, bot, workflow, or feedback service credentials are reused across trust lanes. |
+| `CENTAUR_ROLLBACK_BRIDGE_PAUSE_WORKFLOWS` | Required as `apiRs.extraEnv.CENTAUR_ROLLBACK_BRIDGE_PAUSE_WORKFLOWS: "true"` in rollback infra. | Preserves non-terminal forward workflow rows by disabling workers, schedules, reconciliation, and workflow mutations. The rollback bridge refuses startup when missing, false, or malformed. |
 | `apiRs.metrics.scrapeAnnotations` | Helm value, default `true`. | Adds Prometheus scrape annotations to the API-RS Pod template and Service. |
 | `apiRs.metrics.path` | Helm value, default `/metrics`. | Metrics scrape path for annotation-based discovery. |
 | `apiRs.metrics.annotations` | Helm value. | Additional scrape annotations for Prometheus-compatible collectors. |

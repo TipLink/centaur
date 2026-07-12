@@ -1,9 +1,18 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use centaur_sandbox_core::{SandboxError, SandboxId, SandboxSpec, SandboxStatus};
 use centaur_session_sqlx::{PgSessionStore, SessionStoreError};
 use thiserror::Error;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::{
+    sync::Mutex,
+    time::{MissedTickBehavior, interval},
+};
 use tracing::warn;
 
 use crate::SandboxManager;
@@ -22,6 +31,8 @@ pub struct WarmPoolManager {
     spec_factory: WarmSandboxSpecFactory,
     workload_key: String,
     config: WarmPoolConfig,
+    paused: AtomicBool,
+    reconcile_lock: Mutex<()>,
 }
 
 impl WarmPoolManager {
@@ -38,11 +49,22 @@ impl WarmPoolManager {
             spec_factory,
             workload_key: workload_key.into(),
             config,
+            paused: AtomicBool::new(false),
+            reconcile_lock: Mutex::new(()),
         }
     }
 
     pub fn workload_key(&self) -> &str {
         &self.workload_key
+    }
+
+    /// Permanently pause this process's replenisher and wait for any in-flight
+    /// reconciliation to finish. Deployment drains call this before listing
+    /// sandboxes so the background loop cannot recreate a warm sandbox between
+    /// the drain and the zero-overlap rollback cutover.
+    pub async fn pause_and_wait(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+        let _guard = self.reconcile_lock.lock().await;
     }
 
     pub fn spawn_replenisher(self: Arc<Self>) {
@@ -115,6 +137,10 @@ impl WarmPoolManager {
     }
 
     async fn replenish_once(&self) -> Result<(), WarmPoolError> {
+        let _guard = self.reconcile_lock.lock().await;
+        if self.paused.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let needed = self.config.target_size.saturating_sub(
             self.store
                 .count_ready_warm_sandboxes(self.workload_key.as_str())

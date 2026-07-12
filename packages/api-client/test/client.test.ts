@@ -129,6 +129,7 @@ describe("CentaurClient", () => {
     });
     await client.releaseThread(threadKey, {
       releaseId: "release:1",
+      expectedSandboxId: "sbx:1",
       cancelInflight: true,
     });
 
@@ -182,6 +183,7 @@ describe("CentaurClient", () => {
       "/api/session/slack%3AT123%3AC123%3A1700000000.000100/release",
       {
         release_id: "release:1",
+        expected_sandbox_id: "sbx:1",
         cancel_inflight: true,
       },
     );
