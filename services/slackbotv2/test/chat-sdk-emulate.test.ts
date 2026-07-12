@@ -19,6 +19,7 @@ import {
   type SlackbotV2ApiMessage,
   type SlackbotV2CreateSessionRequest,
   type SlackbotV2ExecuteSessionRequest,
+  type SlackbotV2RecordDeliveryRequest,
   type SlackbotV2SessionMessage
 } from '../src/index'
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
@@ -51,6 +52,7 @@ describe('normalizeSlackText', () => {
       '#eng-centaur (C0AJ07U8Z1N)'
     )
   })
+
 })
 
 let emulator: Emulator
@@ -140,6 +142,220 @@ describe('slackbotv2', () => {
     await Promise.all(waits)
     expect(codexApi.executes).toHaveLength(1)
     expect(codexApi.executes[0]?.threadKey).toBe(threadKey(parent.ts))
+  })
+
+  it('executes root messages in ambient Slack channels without a mention', async () => {
+    bot = createTestBot({ ambientSlackChannelIds: [CHANNEL_ID] })
+    const message = await postUserMessage('Run this without a bot mention.')
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-ambient-channel-message',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: message.ts,
+          text: 'Run this without a bot mention.'
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]?.threadKey).toBe(threadKey(message.ts))
+  })
+
+  it('dedupes an ambient root retry after the first delivery subscribes the thread', async () => {
+    bot = createTestBot({ ambientSlackChannelIds: [CHANNEL_ID] })
+    const message = await postUserMessage('Execute this ambient message exactly once.')
+
+    for (const eventId of [
+      'Ev-slackbotv2-ambient-channel-first-delivery',
+      'Ev-slackbotv2-ambient-channel-retry'
+    ]) {
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: eventId,
+          event: {
+            type: 'message',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: message.ts,
+            text: 'Execute this ambient message exactly once.'
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+    }
+
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]?.threadKey).toBe(threadKey(message.ts))
+  })
+
+  it('executes unmentioned replies in ambient Slack channels', async () => {
+    bot = createTestBot({ ambientSlackChannelIds: [CHANNEL_ID] })
+    const parent = await postUserMessage('Existing discussion context.')
+    const reply = await postUserMessage('Use this thread context.', parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-ambient-channel-reply',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: reply.ts,
+          thread_ts: parent.ts,
+          text: 'Use this thread context.'
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]?.threadKey).toBe(threadKey(parent.ts))
+  })
+
+  it('does not execute unmentioned messages outside ambient Slack channels', async () => {
+    bot = createTestBot({ ambientSlackChannelIds: ['COTHERCHANNEL'] })
+    const message = await postUserMessage('Ignore this without a bot mention.')
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-non-ambient-channel-message',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: message.ts,
+          text: 'Ignore this without a bot mention.'
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.executes).toHaveLength(0)
+  })
+
+  it('does not let a non-actionable message event suppress a later app_mention', async () => {
+    const text = `<@${BOT_USER_ID}> process the app mention after duplicate delivery`
+    const mention = await postUserMessage(text)
+
+    const messageWaits: Promise<unknown>[] = []
+    const messageResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-nonactionable-message-first',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text: ''
+        }
+      }),
+      {},
+      waitUntilContext(messageWaits)
+    )
+
+    expect(messageResponse.status).toBe(200)
+    await Promise.all(messageWaits)
+    expect(codexApi.executes).toHaveLength(0)
+
+    const appMentionWaits: Promise<unknown>[] = []
+    const appMentionResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-app-mention-after-nonactionable-message',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text
+        }
+      }),
+      {},
+      waitUntilContext(appMentionWaits)
+    )
+
+    expect(appMentionResponse.status).toBe(200)
+    await Promise.all(appMentionWaits)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.executes[0]?.threadKey).toBe(threadKey(mention.ts))
+  })
+
+  it('dedupes app_mention after a message event that already triggered', async () => {
+    const text = `<@${BOT_USER_ID}> process only once`
+    const mention = await postUserMessage(text)
+
+    const messageWaits: Promise<unknown>[] = []
+    const messageResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-triggering-message-first',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text
+        }
+      }),
+      {},
+      waitUntilContext(messageWaits)
+    )
+
+    expect(messageResponse.status).toBe(200)
+    await Promise.all(messageWaits)
+    expect(codexApi.executes).toHaveLength(1)
+
+    const appMentionWaits: Promise<unknown>[] = []
+    const appMentionResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-app-mention-after-triggering-message',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          text
+        }
+      }),
+      {},
+      waitUntilContext(appMentionWaits)
+    )
+
+    expect(appMentionResponse.status).toBe(200)
+    await Promise.all(appMentionWaits)
+    expect(codexApi.executes).toHaveLength(1)
   })
 
   it('syncs thread context, forwards subscribed messages, and renders execute streams', async () => {
@@ -235,6 +451,16 @@ describe('slackbotv2', () => {
       threadKey(parent.ts)
     ])
     expect(codexApi.executes).toHaveLength(2)
+    expect(codexApi.deliveries).toHaveLength(2)
+    expect(codexApi.deliveries.map(delivery => delivery.body.outcome)).toEqual([
+      'primary',
+      'primary'
+    ])
+    expect(codexApi.deliveries.map(delivery => delivery.executionId)).toEqual([
+      'exe-1',
+      'exe-3'
+    ])
+    expect(codexApi.deliveries.every(delivery => Boolean(delivery.body.message_id))).toBe(true)
 
     const firstAppend = codexApi.appends[0]!
     expect(firstAppend.threadKey).toBe(threadKey(parent.ts))
@@ -1638,6 +1864,14 @@ describe('slackbotv2', () => {
     expect(renderedText).toContain(
       'Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway'
     )
+    expect(codexApi.deliveries).toHaveLength(1)
+    expect(codexApi.deliveries[0]).toEqual(
+      expect.objectContaining({
+        body: expect.objectContaining({ outcome: 'primary' }),
+        executionId: 'exe-1',
+        threadKey: threadKey(parent.ts)
+      })
+    )
   })
 
   it('renders successful completions with no final answer as visible Slack text', async () => {
@@ -1926,6 +2160,14 @@ describe('slackbotv2', () => {
     expect(texts.filter(text =>
       text.includes('TOO_LONG_FALLBACK_VISIBLE')
     )).toHaveLength(1)
+    expect(codexApi.deliveries).toHaveLength(1)
+    expect(codexApi.deliveries[0]).toEqual(
+      expect.objectContaining({
+        body: expect.objectContaining({ outcome: 'fallback' }),
+        executionId: 'exe-1',
+        threadKey: key
+      })
+    )
     const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
     expect(threadState).toEqual(
       expect.objectContaining({
@@ -2014,6 +2256,85 @@ describe('slackbotv2', () => {
     expect(texts.some(text => text.includes('Draft answer from the live deltas'))).toBe(false)
   })
 
+  it('swaps duplicated live answer deltas for the durable terminal answer', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before duplicated answer deltas.')
+    const mentionText = `<@${BOT_USER_ID}> answer once even if the stream repeats`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-duplicate-delta-terminal-swap',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: mentionText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const finalAnswer = 'DURABLE_TERMINAL_ANSWER_VISIBLE'
+    const duplicatedLiveAnswer = `${finalAnswer}${finalAnswer}`
+    const outputLines: string[] = []
+    for (const notification of sampleCodexNotifications(finalAnswer)) {
+      const line = JSON.stringify(notification)
+      outputLines.push(line)
+      const params = notification.params as { itemId?: string }
+      if (notification.method === 'item/agentMessage/delta' && params.itemId === 'answer-1') {
+        outputLines.push(line)
+      }
+    }
+    codexApi.emitOutputLines(key, outputLines)
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          completedAtMs: 4,
+          item: {
+            type: 'agentMessage',
+            id: 'answer-1',
+            text: duplicatedLiveAnswer,
+            phase: 'final_answer',
+            memoryCitation: null
+          }
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-duplicate-delta-terminal-swap',
+      status: 'completed',
+      result_text: finalAnswer
+    })
+
+    await Promise.all(waits)
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.renderObligation === null
+    }, 3000)
+
+    const texts = await threadTexts(parent.ts)
+    expect(texts.filter(text => text.includes(finalAnswer))).toHaveLength(1)
+    expect(texts.some(text => text.includes(duplicatedLiveAnswer))).toBe(false)
+  })
+
   it('reposts the durable final answer when the Slack stream expires mid-render', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -2023,6 +2344,7 @@ describe('slackbotv2', () => {
     // (production: ~300s after chat.startStream) and every further append
     // fails. The final answer has not reached Slack at that point.
     slackApi.failStreamAppendsAfter(1, 'message_not_in_streaming_state')
+    const durableFinalAnswer = `EXPIRED_STREAM_FALLBACK_VISIBLE ${'detail '.repeat(64)}`.trimEnd()
 
     const parent = await postUserMessage('Context before a stream expiry.')
     const mention = await postUserMessage(`<@${BOT_USER_ID}> run something long`, parent.ts)
@@ -2067,15 +2389,19 @@ describe('slackbotv2', () => {
     codexApi.emitSessionEvent(key, 'session.execution_completed', {
       execution_id: 'exe-stream-expired',
       status: 'completed',
-      result_text: 'EXPIRED_STREAM_FALLBACK_VISIBLE'
+      // Exceed the adapter's 256-character stream buffer so this answer uses
+      // chat.appendStream and exercises the configured expiry above.
+      result_text: durableFinalAnswer
     })
 
     await Promise.all(waits)
     const texts = await threadTexts(parent.ts)
     const visibleFinalReplies = texts.filter(text =>
-      text.includes('EXPIRED_STREAM_FALLBACK_VISIBLE')
+      text.includes(durableFinalAnswer)
     )
     expect(visibleFinalReplies).toHaveLength(1)
+    expect(codexApi.deliveries).toHaveLength(1)
+    expect(codexApi.deliveries[0]?.body.outcome).toBe('fallback')
     const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
     expect(threadState).toEqual(
       expect.objectContaining({
@@ -3568,6 +3894,61 @@ describe('slackbotv2', () => {
       })
     )
     expect(Number(recoveredThreadState?.lastEventId)).toBeGreaterThan(0)
+    expect(codexApi.deliveries).toHaveLength(1)
+    expect(codexApi.deliveries[0]).toEqual(
+      expect.objectContaining({
+        body: expect.objectContaining({ outcome: 'recovery_primary' }),
+        executionId: 'exe-recovery',
+        threadKey: key
+      })
+    )
+  })
+
+  it('records a receipt after a visible non-retryable recovery error', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+
+    const parent = await postUserMessage('Context before failed recovery.')
+    const mentionText = `<@${BOT_USER_ID}> recover a permanently failed stream`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const message = apiMessageFromSlackEvent({
+      isMention: true,
+      text: mentionText,
+      threadId: key,
+      ts: mention.ts
+    })
+    await sharedState.set(`thread-state:${key}`, {
+      activeExecution: true,
+      executedMessageIds: [mention.ts],
+      forwardedMessageIds: [mention.ts],
+      historyForwarded: true,
+      lastEventId: 0,
+      renderObligation: {
+        afterEventId: 0,
+        executionId: 'exe-recovery-error',
+        message
+      }
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+    codexApi.failNextEventsStatus = 400
+
+    bot = createTestBot({ state: sharedState })
+
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.renderObligation === null
+    }, 2000)
+
+    expect(await threadText(parent.ts)).toContain('Execution failed')
+    expect(codexApi.deliveries).toHaveLength(1)
+    expect(codexApi.deliveries[0]).toEqual(
+      expect.objectContaining({
+        body: expect.objectContaining({ outcome: 'recovery_stream_error' }),
+        executionId: 'exe-recovery-error',
+        threadKey: key
+      })
+    )
   })
 
   it('skips stale render obligations from Chat SDK state on startup', async () => {
@@ -4651,18 +5032,24 @@ type MockSessionEvent = {
   threadKey: string
 }
 
+type MockSessionDelivery = MockSessionRequest<SlackbotV2RecordDeliveryRequest> & {
+  executionId: string
+}
+
 type MockSessionApi = {
   appends: MockSessionRequest<SlackbotV2AppendMessagesRequest>[]
   autoRespond: boolean
   close(): Promise<void>
   closeStreams(): void
   creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[]
+  deliveries: MockSessionDelivery[]
   emitOutputLine(threadKey: string, line: string, executionId?: string): void
   emitOutputLines(threadKey: string, lines: string[], executionId?: string): void
   emitSessionEvent(threadKey: string, event: string, data: unknown, executionId?: string): void
   eventRequests: MockSessionEventRequest[]
   executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[]
   failNextEvents: boolean
+  failNextEventsStatus: number | null
   failNextExecute: boolean
   failNextExecuteAfterAccept: boolean
   holdNextExecute(): () => void
@@ -4674,6 +5061,7 @@ type MockSessionApi = {
 async function startMockCodexApi(): Promise<MockSessionApi> {
   const appends: MockSessionRequest<SlackbotV2AppendMessagesRequest>[] = []
   const creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[] = []
+  const deliveries: MockSessionDelivery[] = []
   const eventRequests: MockSessionEventRequest[] = []
   const events: MockSessionEvent[] = []
   const executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[] = []
@@ -4683,7 +5071,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   let executeHold: Promise<void> | null = null
   let executeHoldRelease: (() => void) | null = null
   let eventId = 0
-  let failNextEvents = false
+  let failNextEventsStatus: number | null = null
   let failNextExecute = false
   let failNextExecuteAfterAccept = false
   const port = await availablePort(4063)
@@ -4695,6 +5083,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     void handleMockCodexRequest(req, res, {
       appends,
       creates,
+      deliveries,
       events,
       eventRequests,
       executes,
@@ -4711,7 +5100,10 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
         return failNextExecuteAfterAccept
       },
       get failNextEvents() {
-        return failNextEvents
+        return failNextEventsStatus !== null
+      },
+      get failNextEventsStatus() {
+        return failNextEventsStatus
       },
       idempotentExecutions,
       nextEventId() {
@@ -4720,7 +5112,10 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       },
       port,
       setFailNextEvents(value) {
-        failNextEvents = value
+        failNextEventsStatus = value ? 503 : null
+      },
+      setFailNextEventsStatus(value) {
+        failNextEventsStatus = value
       },
       setFailNextExecute(value) {
         failNextExecute = value
@@ -4739,11 +5134,13 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   const api: MockSessionApi = {
     appends,
     creates,
+    deliveries,
     eventRequests,
     executes,
     reset() {
       appends.length = 0
       creates.length = 0
+      deliveries.length = 0
       eventRequests.length = 0
       events.length = 0
       executes.length = 0
@@ -4754,7 +5151,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       closeStreams()
       autoRespond = true
       eventId = 0
-      failNextEvents = false
+      failNextEventsStatus = null
       failNextExecute = false
       failNextExecuteAfterAccept = false
     },
@@ -4779,10 +5176,16 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       failNextExecuteAfterAccept = value
     },
     get failNextEvents() {
-      return failNextEvents
+      return failNextEventsStatus !== null
     },
     set failNextEvents(value: boolean) {
-      failNextEvents = value
+      failNextEventsStatus = value ? 503 : null
+    },
+    get failNextEventsStatus() {
+      return failNextEventsStatus
+    },
+    set failNextEventsStatus(value: number | null) {
+      failNextEventsStatus = value
     },
     holdNextExecute() {
       if (executeHoldRelease) throw new Error('execute is already held')
@@ -4839,23 +5242,47 @@ async function handleMockCodexRequest(
     appends: MockSessionRequest<SlackbotV2AppendMessagesRequest>[]
     autoRespond: boolean
     creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[]
+    deliveries: MockSessionDelivery[]
     events: MockSessionEvent[]
     eventRequests: MockSessionEventRequest[]
     executeHold: Promise<void> | null
     executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[]
     failNextExecuteAfterAccept: boolean
     failNextEvents: boolean
+    failNextEventsStatus: number | null
     failNextExecute: boolean
       idempotentExecutions: Map<string, string>
     nextEventId(): number
     port: number
     setFailNextEvents(value: boolean): void
+    setFailNextEventsStatus(value: number | null): void
     setFailNextExecute(value: boolean): void
     setFailNextExecuteAfterAccept(value: boolean): void
     streams: Set<ServerResponse>
   }
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${input.port}`)
+  const deliveryMatch = /^\/api\/session\/([^/]+)\/executions\/([^/]+)\/delivery$/.exec(
+    url.pathname
+  )
+  if (deliveryMatch?.[1] && deliveryMatch[2]) {
+    const threadKey = decodeURIComponent(deliveryMatch[1])
+    const executionId = decodeURIComponent(deliveryMatch[2])
+    const request = await nodeRequestToWebRequest(req, url)
+    const body = (await request.json()) as SlackbotV2RecordDeliveryRequest
+    input.deliveries.push({ body, executionId, threadKey })
+    await sendWebResponse(
+      res,
+      Response.json({
+        created: input.deliveries.filter(delivery => delivery.executionId === executionId).length === 1,
+        event_id: 10_000 + input.deliveries.length,
+        execution_id: executionId,
+        ok: true,
+        thread_key: threadKey
+      })
+    )
+    return
+  }
   const match = /^\/api\/session\/([^/]+)(?:\/(messages|execute|events))?$/.exec(url.pathname)
   if (!match?.[1]) {
     await sendWebResponse(res, new Response('not found', { status: 404 }))
@@ -4885,11 +5312,12 @@ async function handleMockCodexRequest(
     const afterEventId = Number.parseInt(url.searchParams.get('after_event_id') ?? '0', 10) || 0
     const executionId = url.searchParams.get('execution_id') || undefined
     input.eventRequests.push({ threadKey, afterEventId, executionId })
-    if (input.failNextEvents) {
-      input.setFailNextEvents(false)
+    if (input.failNextEventsStatus !== null) {
+      const status = input.failNextEventsStatus
+      input.setFailNextEventsStatus(null)
       await sendWebResponse(
         res,
-        new Response('unavailable', { status: 503, statusText: 'Service Unavailable' })
+        new Response('event stream failed', { status })
       )
       return
     }
@@ -5420,6 +5848,7 @@ async function appendStream(
       ts,
       text: BROKEN_STREAM_TEXT
     })
+    streams.delete(streamKey(channel, ts))
     return Response.json({ ok: false, error: appendFailure.error })
   }
   if (appendFailure.remaining > 0) appendFailure.remaining -= 1
@@ -5447,7 +5876,10 @@ async function stopStream(
   const ts = stringField(body.ts)
   calls.push({ method: 'chat.stopStream', body, streamTs: ts })
   const key = streamKey(channel, ts)
-  const record = streams.get(key) ?? { channel, payloadChars: 0, ts, text: '' }
+  const record = streams.get(key)
+  if (!record) {
+    return Response.json({ ok: false, error: 'message_not_in_streaming_state' })
+  }
   const text = [record.text, streamBodyText(body)].filter(part => part.trim()).join('\n')
   const payloadChars = record.payloadChars + streamBodyPayloadChars(body)
   if (maxStreamStopChars !== null && payloadChars > maxStreamStopChars) {

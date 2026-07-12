@@ -125,6 +125,8 @@ class CentaurAgentClient:
                 "capability, but it is disabled for this principal."
             )
         self.base_url = (base_url or os.getenv("CENTAUR_API_URL") or "http://api:8000").rstrip("/")
+        # The server requires this scoped key together with the proxy-injected
+        # caller JWT, then binds the child session to that same principal.
         self.api_key = api_key or _load_centaur_api_key()
         if not self.api_key:
             raise RuntimeError("SLACK_FEEDBACK_API_KEY not set")
@@ -133,7 +135,9 @@ class CentaurAgentClient:
         self, method: str, path: str, payload: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            # Keep this credential separate from Authorization: Console's
+            # proxy injects the caller JWT there for the same API host.
+            "X-Centaur-Feedback-Key": self.api_key,
             "Accept": "application/json",
         }
         data: bytes | None = None
@@ -259,7 +263,7 @@ def _severity_filter_clause(min_severity: str | None) -> tuple[str, list[str]]:
 
 
 def _load_centaur_api_key() -> str | None:
-    return os.getenv("SLACK_FEEDBACK_API_KEY")
+    return secret("SLACK_FEEDBACK_API_KEY", "").strip() or None
 
 
 def _bot_message_looks_like_error(text: str) -> bool:

@@ -33,4 +33,7 @@ secrets = [
 optional_secrets = [
     {type = "http", name = "SLACK_SEARCH_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com"]},
     {type = "http", name = "SLACK_ETL_TOKEN", match_headers = ["Authorization"], hosts = ["slack.com", "files.slack.com"]},
+    # Used only alongside the proxy-injected caller JWT. The server binds the
+    # feedback-improvement:* child to that principal's existing capabilities.
+    {type = "http", name = "SLACK_FEEDBACK_API_KEY", match_headers = ["X-Centaur-Feedback-Key"], hosts = ["api", "centaur-api-rs"]},
 ]

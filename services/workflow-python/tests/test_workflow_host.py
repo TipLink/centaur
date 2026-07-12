@@ -59,6 +59,8 @@ class RequestRpc(FakeRpc):
             }
         if message_type == "ctx.agent_turn":
             return payload["args"]
+        if message_type == "ctx.start_workflow":
+            return {"ok": True, "run_id": "child-run", "created": True}
         if message_type == "ctx.sleep":
             return {"slept": True}
         raise AssertionError(f"unexpected request {payload}")
@@ -161,6 +163,39 @@ class WorkflowHostTests(unittest.TestCase):
         result = asyncio.run(ctx.run_agent("draft_summary", text="summarize this"))
 
         self.assertEqual(result, {"name": "draft_summary", "text": "summarize this"})
+
+    def test_start_workflow_uses_private_context_rpc(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="parent",
+        )
+
+        result = asyncio.run(
+            ctx.start_workflow(
+                "child",
+                {"value": 1},
+                idempotency_key="parent:child:1",
+                max_attempts=2,
+            )
+        )
+
+        self.assertEqual(result["run_id"], "child-run")
+        self.assertEqual(
+            rpc.requests,
+            [
+                {
+                    "type": "ctx.start_workflow",
+                    "workflow_name": "child",
+                    "input": {"value": 1},
+                    "idempotency_key": "parent:child:1",
+                    "max_attempts": 2,
+                }
+            ],
+        )
 
     def test_create_pool_retries_transient_connection_failure(self) -> None:
         host = load_workflow_host()

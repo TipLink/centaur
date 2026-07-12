@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+import io
+import urllib.request
 
 from slack import feedback
 
@@ -155,6 +157,33 @@ def test_agent_client_uses_session_api_for_improvement_runs():
         "type": "user",
         "message": {"content": [{"type": "text", "text": "Improve the Slack tool"}]},
     }
+
+
+def test_agent_client_uses_non_conflicting_scoped_feedback_header(monkeypatch):
+    requests = []
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return FakeResponse(b'{"ok":true}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    client = feedback.CentaurAgentClient(
+        base_url="http://test-centaur-api-rs:8080", api_key="feedback-key"
+    )
+
+    client._request_json("POST", "/api/session/feedback-improvement%3Atest", {})
+
+    request, timeout = requests[0]
+    assert timeout == 60
+    assert request.get_header("X-centaur-feedback-key") == "feedback-key"
+    assert request.get_header("Authorization") is None
 
 
 def test_analyze_thread_signals_does_not_treat_exceptional_as_error():

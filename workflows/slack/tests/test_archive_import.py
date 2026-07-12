@@ -10,6 +10,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import pytest
+
 
 def _load_archive_import():
     repo_root = Path(__file__).resolve().parents[3]
@@ -110,6 +112,7 @@ def _write_dummy_archive(path: Path) -> None:
             "id": "CENG",
             "name": "eng-test",
             "is_archived": False,
+            "is_private": False,
             "topic": {"value": "Archive topic"},
             "purpose": {"value": "Archive purpose"},
             "members": ["U123", "U234"],
@@ -316,13 +319,20 @@ def test_import_archive_path_parses_public_export_shape_and_edges(
     assert run_finishes[0]["counts"]["messages_upserted"] == 6
 
     channel_args = _executemany_calls_for(pool, "slack_sync_channels")[0][1]
-    assert channel_args[0][0:6] == (
+    channel_sql = _executemany_calls_for(pool, "slack_sync_channels")[0][0]
+    assert channel_args[0][0:7] == (
         "CENG",
         "eng-test",
+        False,
         False,
         "Archive topic",
         "Archive purpose",
         2,
+    )
+    assert channel_args[1][3] is True
+    assert (
+        "is_private = slack_sync_channels.is_private OR EXCLUDED.is_private"
+        in channel_sql
     )
 
     user_args = _executemany_calls_for(pool, "slack_sync_users")[0][1]
@@ -372,6 +382,13 @@ def test_archive_upsert_sql_preserves_live_fields():
     assert "download_status = CASE WHEN" in attachment_update
 
 
+def test_archive_channel_privacy_fails_closed():
+    assert archive_import._archive_channel_is_private({"is_private": False}) is False
+    assert archive_import._archive_channel_is_private({"is_private": True}) is True
+    assert archive_import._archive_channel_is_private({}) is True
+    assert archive_import._archive_channel_is_private({"is_private": "false"}) is True
+
+
 def test_request_archive_download_url_uses_api_presign_endpoint(monkeypatch):
     opened_requests = []
 
@@ -396,6 +413,9 @@ def test_request_archive_download_url_uses_api_presign_endpoint(monkeypatch):
         )
 
     monkeypatch.setenv("CENTAUR_API_URL", "http://centaur-api-rs:8080/")
+    monkeypatch.setenv("WORKFLOW_RUN_ID", "wfr_test")
+    monkeypatch.setenv("WORKFLOW_TASK_ID", "wft_test")
+    monkeypatch.setenv("CENTAUR_WORKFLOW_TASK_TOKEN", "signed.task-token")
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     download_url = archive_import._request_archive_download_url("sai id/with/slash")
@@ -405,10 +425,24 @@ def test_request_archive_download_url_uses_api_presign_endpoint(monkeypatch):
     assert timeout == 30
     assert request.get_method() == "POST"
     assert (
+        request.get_header("X-centaur-workflow-task-token") == "signed.task-token"
+    )
+    assert request.get_header("Authorization") is None
+    assert (
         request.full_url
         == "http://centaur-api-rs:8080/api/admin/slack/archive-imports/"
         "sai%20id%2Fwith%2Fslash/download-url"
     )
+
+
+def test_archive_download_requires_workflow_capability(monkeypatch):
+    monkeypatch.setenv("CENTAUR_API_URL", "http://centaur-api-rs:8080/")
+    monkeypatch.delenv("WORKFLOW_RUN_ID", raising=False)
+    monkeypatch.delenv("WORKFLOW_TASK_ID", raising=False)
+    monkeypatch.delenv("CENTAUR_WORKFLOW_TASK_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="CENTAUR_WORKFLOW_TASK_TOKEN"):
+        archive_import._request_archive_download_url("sai_test")
 
 
 def test_download_archive_streams_api_presigned_url(tmp_path, monkeypatch):
