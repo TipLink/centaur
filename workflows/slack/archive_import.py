@@ -113,12 +113,7 @@ def _strip_sensitive_url_query(value: str) -> str:
     parsed = urllib.parse.urlsplit(value)
     if parsed.scheme not in {"http", "https"}:
         return value
-    hostname = (parsed.hostname or "").lower().rstrip(".")
-    is_slack_host = hostname == "slack.com" or hostname.endswith(".slack.com")
-    is_slack_edge_host = hostname == "slack-edge.com" or hostname.endswith(
-        ".slack-edge.com"
-    )
-    if is_slack_host or is_slack_edge_host:
+    if parsed.netloc.endswith("slack.com") or parsed.netloc.endswith("slack-edge.com"):
         return urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc, parsed.path, "", "")
         )

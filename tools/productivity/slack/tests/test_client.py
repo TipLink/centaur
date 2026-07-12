@@ -783,7 +783,6 @@ def test_get_channel_members_proxy_paginates_and_resolves_names() -> None:
 
     result = client.get_channel_members_proxy("<#C123456789|general>", limit=10)
 
-    # codeql[py/incomplete-url-substring-sanitization] These are relative API paths, not host validation.
     assert calls == [
         ("/api/slack/channels/C123456789/members", {"limit": 10, "cursor": None}),
         ("/api/slack/channels/C123456789/members", {"limit": 9, "cursor": "next"}),

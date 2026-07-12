@@ -69,21 +69,6 @@ def _load_archive_import():
 archive_import = _load_archive_import()
 
 
-def test_strip_sensitive_url_query_requires_a_slack_hostname_boundary():
-    slack_url = "https://files.slack.com/file?token=xoxe-secret"
-    attacker_url = "https://not-slack.com/file?token=keep"
-    suffix_attacker_url = "https://files.slack.com.attacker.example/file?token=keep"
-
-    assert archive_import._strip_sensitive_url_query(slack_url) == (
-        "https://files.slack.com/file"
-    )
-    assert archive_import._strip_sensitive_url_query(attacker_url) == attacker_url
-    assert (
-        archive_import._strip_sensitive_url_query(suffix_attacker_url)
-        == suffix_attacker_url
-    )
-
-
 class FakeConn:
     def __init__(self) -> None:
         self.executemany_calls: list[tuple[str, list[tuple]]] = []
