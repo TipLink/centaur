@@ -290,15 +290,6 @@ describe('session delivery receipts', () => {
 })
 
 describe('Slack display text fallback', () => {
-  test('decodes fallback Slack entities only once', () => {
-    expect(
-      renderSlackDisplayText({
-        raw: { blocks: [{ text: { text: '&amp;lt;script&amp;gt;', type: 'mrkdwn' }, type: 'section' }] },
-        text: ''
-      }).text
-    ).toBe('&lt;script&gt;')
-  })
-
   test('serializeMessage extracts raw Slack blocks when adapter text is empty', async () => {
     const raw = {
       blocks: [

@@ -25,11 +25,7 @@ import {
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
 import { observeSeconds, slackbotMetrics } from './metrics'
-import {
-  normalizeSlackMarkupText,
-  renderSlackDisplayText,
-  slackMessagePromptText
-} from './slack-display-text'
+import { renderSlackDisplayText, slackMessagePromptText } from './slack-display-text'
 import { slackUserIdForMessage } from './slack-user'
 import {
   collectInitialContext,
@@ -3058,7 +3054,18 @@ function slackTimestampToIso(ts: string): string {
 }
 
 export function normalizeSlackText(input: string): string {
-  return normalizeSlackMarkupText(input).trim()
+  return input
+    .replace(/<([a-z]+:\/\/[^>|]+)\|([^>]+)>/gi, '$2 ($1)')
+    .replace(/<([a-z]+:\/\/[^>]+)>/gi, '$1')
+    .replace(/<#([A-Z0-9]+)\|([^>]+)>/g, '#$2 ($1)')
+    .replace(/<#([A-Z0-9]+)>/g, '#$1')
+    .replace(/<@([A-Z0-9]+)>/g, '@$1')
+    .replace(/<!subteam\^([A-Z0-9]+)\|([^>]+)>/g, '@$2')
+    .replace(/<!(channel|here|everyone)>/g, '@$1')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .trim()
 }
 
 // Surfaces the renderer's structured diagnostics (otherwise a no-op: nothing

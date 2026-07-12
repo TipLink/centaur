@@ -424,7 +424,6 @@ class PrincipalTest < ActiveSupport::TestCase
     principal = principal_with_grants(secret)
 
     # Bootstrapping (no token yet) -> the secret is omitted from sync entirely.
-    # codeql[rb/clear-text-storage-sensitive-data] Test fixtures intentionally assert redaction.
     assert_empty principal.sync_secrets
 
     # Once control mints a token, it is delivered inline like a control_plane value.
@@ -438,7 +437,6 @@ class PrincipalTest < ActiveSupport::TestCase
   end
 
   test "sync_transforms emits a gcp_auth transform per granted GcpAuthSecret" do
-    # codeql[rb/clear-text-storage-sensitive-data] The fixture contains placeholders, not live secrets.
     transforms = principal_with_grants(gcp_auth_secrets(:acme_bigquery)).sync_transforms
     assert_equal 1, transforms.length
     assert_equal "gcp_auth", transforms.first["name"]
@@ -450,7 +448,6 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal 1, transforms.length
     transform = transforms.first
     assert_equal "gcp_id_token", transform["name"]
-    # codeql[rb/clear-text-storage-sensitive-data] This asserts a placeholder environment variable name.
     assert_equal({ "type" => "env", "var" => "CLOUD_RUN_SA_KEYFILE" }, transform.dig("config", "keyfile"))
     assert_equal "https://my-service-abc123-uc.a.run.app", transform.dig("config", "audience")
     assert_equal "x-serverless-authorization", transform.dig("config", "header")
@@ -476,7 +473,6 @@ class PrincipalTest < ActiveSupport::TestCase
   end
 
   test "sync_transforms is empty without transform grants" do
-    # codeql[rb/clear-text-storage-sensitive-data] The test verifies that no secret material is emitted.
     assert_empty principals(:globex_user).sync_transforms
   end
 

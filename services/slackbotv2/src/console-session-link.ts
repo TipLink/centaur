@@ -88,9 +88,7 @@ export function consoleSessionUrl(
 ): string | undefined {
   const base = consoleBaseUrl?.trim()
   if (!base) return undefined
-  let end = base.length
-  while (end > 0 && base.charCodeAt(end - 1) === 47) end -= 1
-  const normalized = base.slice(0, end)
+  const normalized = base.replace(/\/+$/, '')
   return `${normalized}/console/threads?thread=${encodeURIComponent(threadKey)}`
 }
 

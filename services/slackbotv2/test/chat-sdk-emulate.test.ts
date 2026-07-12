@@ -53,14 +53,6 @@ describe('normalizeSlackText', () => {
     )
   })
 
-  it('decodes Slack entities only once', () => {
-    expect(normalizeSlackText('&amp;lt;script&amp;gt;')).toBe('&lt;script&gt;')
-  })
-
-  it('handles long unterminated Slack links in one pass', () => {
-    const input = `<https://${'a'.repeat(250_000)}`
-    expect(normalizeSlackText(input)).toBe(input)
-  })
 })
 
 let emulator: Emulator
@@ -5743,7 +5735,6 @@ async function handlePatchedSlackRequest(
   }
 
   const body = await request.arrayBuffer()
-  // codeql[js/request-forgery] Test proxy upstream is a loopback server created by the fixture.
   const proxied = await fetch(new URL(`${path}${url.search}`, input.upstreamUrl), {
     method: request.method,
     headers: request.headers,

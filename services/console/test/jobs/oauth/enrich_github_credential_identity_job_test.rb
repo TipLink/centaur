@@ -13,7 +13,6 @@ module Oauth
     def github_credential(**overrides)
       app = oauth_apps(:acme_github)
       app.update!(client_secret: "github-secret")
-      # codeql[rb/clear-text-storage-sensitive-data] Test-only values exercise encrypted model fields.
       BrokerCredential.create!({
         namespace: "acme",
         foreign_id: "github-github-pending-abc123",

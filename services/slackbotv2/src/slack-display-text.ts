@@ -11,95 +11,6 @@ const MAX_RAW_DISPLAY_TEXT_CHARS = 24_000
 
 type UnknownRecord = Record<string, unknown>
 
-/**
- * Decode the small angle-bracket grammar Slack uses for links and mentions.
- *
- * Keep this as a single left-to-right parser. A chain of overlapping regular
- * expressions used to rescan long, unterminated link-like strings and could
- * block the Slack event loop for more than a second per message.
- */
-export function normalizeSlackMarkupText(input: string): string {
-  const output: string[] = []
-  let cursor = 0
-
-  while (cursor < input.length) {
-    const open = input.indexOf('<', cursor)
-    if (open < 0) {
-      output.push(input.slice(cursor))
-      break
-    }
-    output.push(input.slice(cursor, open))
-
-    const close = input.indexOf('>', open + 1)
-    if (close < 0) {
-      output.push(input.slice(open))
-      break
-    }
-
-    const raw = input.slice(open + 1, close)
-    output.push(renderSlackReference(raw) ?? input.slice(open, close + 1))
-    cursor = close + 1
-  }
-
-  // Slack entity decoding is deliberately one pass. In particular,
-  // "&amp;lt;" must become "&lt;", not "<".
-  return output
-    .join('')
-    .replaceAll('&lt;', '<')
-    .replaceAll('&gt;', '>')
-    .replaceAll('&amp;', '&')
-}
-
-function renderSlackReference(raw: string): string | undefined {
-  const separator = raw.indexOf('|')
-  const target = separator < 0 ? raw : raw.slice(0, separator)
-  const label = separator < 0 ? undefined : raw.slice(separator + 1)
-
-  if (isSlackUrl(target)) {
-    return label ? `${label} (${target})` : target
-  }
-
-  if (target.startsWith('#') && isUppercaseSlackId(target.slice(1))) {
-    const id = target.slice(1)
-    return label ? `#${label} (${id})` : `#${id}`
-  }
-
-  if (label === undefined && target.startsWith('@') && isUppercaseSlackId(target.slice(1))) {
-    return `@${target.slice(1)}`
-  }
-
-  if (label && target.startsWith('!subteam^') && isUppercaseSlackId(target.slice(9))) {
-    return `@${label}`
-  }
-
-  if (label === undefined && ['!channel', '!here', '!everyone'].includes(target)) {
-    return `@${target.slice(1)}`
-  }
-
-  return undefined
-}
-
-function isSlackUrl(value: string): boolean {
-  const separator = value.indexOf('://')
-  if (separator <= 0) return false
-  for (let index = 0; index < separator; index += 1) {
-    const code = value.charCodeAt(index) | 32
-    if (code < 97 || code > 122) return false
-  }
-  return separator + 3 < value.length
-}
-
-function isUppercaseSlackId(value: string): boolean {
-  if (!value) return false
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index)
-    const uppercase = code >= 65 && code <= 90
-    const digit = code >= 48 && code <= 57
-    if (!uppercase && !digit) return false
-  }
-  return true
-}
-
 export function renderSlackDisplayText(input: { raw: unknown; text: string }): SlackDisplayText {
   const records = slackMessageRecords(input.raw)
   const rawBlockCount = countArrayFields(records, 'blocks')
@@ -426,7 +337,17 @@ function finalizeDisplayLines(lines: string[]): string {
 }
 
 function normalizeSlackFallbackText(input: string): string {
-  return normalizeSlackMarkupText(input)
+  return input
+    .replace(/<([a-z]+:\/\/[^>|]+)\|([^>]+)>/gi, '$2 ($1)')
+    .replace(/<([a-z]+:\/\/[^>]+)>/gi, '$1')
+    .replace(/<#([A-Z0-9]+)\|([^>]+)>/g, '#$2 ($1)')
+    .replace(/<#([A-Z0-9]+)>/g, '#$1')
+    .replace(/<@([A-Z0-9]+)>/g, '@$1')
+    .replace(/<!subteam\^([A-Z0-9]+)\|([^>]+)>/g, '@$2')
+    .replace(/<!(channel|here|everyone)>/g, '@$1')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .split('\n')

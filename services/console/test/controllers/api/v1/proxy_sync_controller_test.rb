@@ -194,7 +194,6 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
       post api_v1_proxy_sync_url, params: { config_hash: "sha256:#{'0' * 64}" }.to_json,
                                  headers: auth_headers
     end
-    # codeql[rb/clear-text-storage-sensitive-data] Response is a test-only placeholder config.
     assert_response :ok
     transform = json_body.fetch("transforms").find { |t| t["name"] == "gcp_id_token" }
     assert_equal secret.audience, transform.dig("config", "audience")
@@ -341,7 +340,6 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     secret.rules.build(host: "github.com", position: 0)
     secret.rules.build(host: "api.github.com", position: 1)
     secret.save!
-    # codeql[rb/clear-text-storage-sensitive-data] Fake token data stays inside the encrypted test database.
     Grant.create!(role: roles(:acme_infra), static_secret: secret, created_by: admin)
 
     assert_equal secret, secret.source.static_secret
@@ -358,7 +356,6 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     assert_equal "ghs-live-installation-token", entry.dig("source", "value")
     assert_equal "control_plane", entry.dig("source", "type")
     assert_equal [ "Authorization" ], entry.dig("replace", "match_headers")
-    # codeql[rb/clear-text-storage-sensitive-data] This assertion verifies host rules, not secret persistence.
     assert_equal [ "github.com", "api.github.com" ], entry.fetch("rules").map { |rule| rule.fetch("host") }
   end
 

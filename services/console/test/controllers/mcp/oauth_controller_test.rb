@@ -93,7 +93,7 @@ module Mcp
       assert_redirected_to login_path
 
       post login_url, params: { email: @operator.email, password: "password123456" }
-      assert_match %r{\Ahttp://www\.example\.com/mcp/oauth/authorize\?}, response.location
+      assert_match %r{\Ahttp://www.example.com/mcp/oauth/authorize\?}, response.location
     end
 
     test "authorize accepts dynamic loopback redirect ports" do

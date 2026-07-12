@@ -13,7 +13,6 @@ module Oauth
     def attio_credential(**overrides)
       app = oauth_apps(:acme_attio)
       app.update!(client_secret: "attio-secret")
-      # codeql[rb/clear-text-storage-sensitive-data] Test-only values exercise encrypted model fields.
       BrokerCredential.create!({
         namespace: "acme",
         foreign_id: "attio-attio-pending-abc123",

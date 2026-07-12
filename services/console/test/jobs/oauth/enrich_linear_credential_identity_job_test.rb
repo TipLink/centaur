@@ -13,7 +13,6 @@ module Oauth
     def linear_credential(**overrides)
       app = oauth_apps(:acme_linear)
       app.update!(client_secret: "linear-secret")
-      # codeql[rb/clear-text-storage-sensitive-data] Test-only values exercise encrypted model fields.
       BrokerCredential.create!({
         namespace: "acme",
         foreign_id: "linear-linear-pending-abc123",
