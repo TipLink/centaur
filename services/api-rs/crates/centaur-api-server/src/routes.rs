@@ -29,8 +29,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use centaur_session_core::ThreadKey;
 use centaur_session_runtime::{
-    ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime, SessionRuntime,
-    thread_trace_id, thread_trace_parent_span_id,
+    DrainReport, ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, ReleaseThreadOutcome,
+    SandboxRuntime, SessionRuntime, thread_trace_id, thread_trace_parent_span_id,
 };
 use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{
@@ -184,24 +184,12 @@ pub fn build_router_with_session_and_workflow_runtime(
 }
 
 pub fn build_router_with_app_state(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
-        .route("/api/personas", get(list_personas))
-        .route(
-            "/api/session/{thread_key}",
-            post(create_or_get_session).get(get_session_context),
-        )
-        .route(
-            "/api/session/{thread_key}/messages",
-            post(append_messages).layer(DefaultBodyLimit::disable()),
-        )
-        .route(
-            "/api/session/{thread_key}/execute",
-            post(execute_session).layer(DefaultBodyLimit::disable()),
-        )
-        .route("/api/session/{thread_key}/events", get(stream_events))
+    // Keep destructive, administrative, and global workflow surfaces behind
+    // the dedicated operator key. Webhooks remain on their per-webhook auth;
+    // ordinary session routes retain their existing caller contract so this
+    // narrow rollback bridge does not pretend to implement the forward
+    // principal-JWT architecture.
+    let control_routes = Router::new()
         .route("/api/session/{thread_key}/release", post(release_thread))
         .route("/agent/threads/{thread_key}/release", post(release_thread))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
@@ -249,10 +237,6 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(refresh_slack_archive_import_upload_url),
         )
         .route(
-            "/api/admin/slack/archive-imports/{import_id}/download-url",
-            post(create_slack_archive_import_download_url),
-        )
-        .route(
             "/api/admin/slack/archive-imports/{import_id}/start",
             post(start_slack_archive_import),
         )
@@ -276,7 +260,32 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/api/admin/google/docs-sync/batch",
             post(ingest_google_docs_sync_batch).layer(DefaultBodyLimit::disable()),
         )
+        .route_layer(middleware::from_fn(require_control_authorization));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        .route("/api/personas", get(list_personas))
+        .route(
+            "/api/session/{thread_key}",
+            post(create_or_get_session).get(get_session_context),
+        )
+        .route(
+            "/api/session/{thread_key}/messages",
+            post(append_messages).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/session/{thread_key}/execute",
+            post(execute_session).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/session/{thread_key}/events", get(stream_events))
         .route("/api/webhooks/{slug}", any(invoke_workflow_webhook))
+        .route(
+            "/api/admin/slack/archive-imports/{import_id}/download-url",
+            post(create_slack_archive_import_download_url),
+        )
+        .merge(control_routes)
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<Body>| {
@@ -350,6 +359,78 @@ async fn metrics(State(state): State<AppState>) -> Response {
         Body::from(state.metrics.render()),
     )
         .into_response()
+}
+
+async fn require_control_authorization(request: Request, next: Next) -> Response {
+    let expected = env::var("CENTAUR_CONTROL_API_KEY").unwrap_or_default();
+    if !control_token_authorized(request.headers(), &expected) {
+        return ApiError::Unauthorized("invalid control service token".to_owned()).into_response();
+    }
+    next.run(request).await
+}
+
+fn control_token_authorized(headers: &HeaderMap, expected: &str) -> bool {
+    let expected = expected.trim();
+    !expected.is_empty()
+        && bearer_token(headers)
+            .is_some_and(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes()))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get("Authorization")?.to_str().ok()?.trim();
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug)]
+enum ArchiveDownloadAuthorization {
+    Control,
+    WorkflowTask { run_id: String, task_id: String },
+}
+
+fn authorize_archive_download(
+    headers: &HeaderMap,
+) -> Result<ArchiveDownloadAuthorization, ApiError> {
+    let control_key = env::var("CENTAUR_CONTROL_API_KEY").unwrap_or_default();
+    if control_token_authorized(headers, &control_key) {
+        return Ok(ArchiveDownloadAuthorization::Control);
+    }
+
+    let run_id = header_value(headers, "X-Centaur-Workflow-Run-Id")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let task_id = header_value(headers, "X-Centaur-Workflow-Task-Id")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    match (run_id, task_id) {
+        (Some(run_id), Some(task_id)) => {
+            Ok(ArchiveDownloadAuthorization::WorkflowTask { run_id, task_id })
+        }
+        _ => Err(ApiError::Unauthorized(
+            "archive download requires control or workflow-task authorization".to_owned(),
+        )),
+    }
+}
+
+fn ensure_archive_download_authorized(
+    authorization: &ArchiveDownloadAuthorization,
+    import: &SlackArchiveImportRow,
+) -> Result<(), ApiError> {
+    match authorization {
+        ArchiveDownloadAuthorization::Control => Ok(()),
+        ArchiveDownloadAuthorization::WorkflowTask { run_id, task_id }
+            if import.workflow_run_id.as_deref() == Some(run_id.as_str())
+                && import.workflow_task_id.as_deref() == Some(task_id.as_str()) =>
+        {
+            Ok(())
+        }
+        ArchiveDownloadAuthorization::WorkflowTask { .. } => Err(ApiError::Forbidden(
+            "workflow task is not authorized for this archive import".to_owned(),
+        )),
+    }
 }
 
 async fn http_metrics(req: Request, next: Next) -> Response {
@@ -506,41 +587,83 @@ async fn release_thread(
     State(state): State<AppState>,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<crate::types::ReleaseThreadRequest>,
-) -> Result<Json<crate::types::ReleaseThreadResponse>, ApiError> {
+) -> Result<(StatusCode, Json<crate::types::ReleaseThreadResponse>), ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let outcome = state
         .runtime()?
         .release_thread(
             &thread_key,
             request.release_id.as_deref(),
+            request.expected_sandbox_id.as_deref(),
             request.cancel_inflight,
         )
         .await?;
-    Ok(Json(crate::types::ReleaseThreadResponse {
-        ok: true,
-        session: outcome.session,
-        release_id: outcome.release_id,
-        cancel_inflight: outcome.cancel_inflight,
-        sandbox_released: outcome.sandbox_released,
-        sandbox_release_error: outcome.sandbox_release_error,
-        execution_id: outcome.execution_id,
-        execution_cancelled: outcome.execution_cancelled,
-    }))
+    Ok(release_thread_response(
+        outcome,
+        request.expected_sandbox_id,
+    ))
 }
 
-async fn drain_sandboxes(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+fn release_thread_response(
+    outcome: ReleaseThreadOutcome,
+    expected_sandbox_id: Option<String>,
+) -> (StatusCode, Json<crate::types::ReleaseThreadResponse>) {
+    let ReleaseThreadOutcome {
+        session,
+        release_id,
+        cancel_inflight,
+        sandbox_released,
+        sandbox_release_error,
+        execution_id,
+        execution_cancelled,
+    } = outcome;
+    let ok = sandbox_release_error.is_none();
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(crate::types::ReleaseThreadResponse {
+            ok,
+            session,
+            release_id,
+            expected_sandbox_id,
+            cancel_inflight,
+            sandbox_released,
+            sandbox_release_error,
+            execution_id,
+            execution_cancelled,
+        }),
+    )
+}
+
+async fn drain_sandboxes(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let report = state.runtime()?.drain().await?;
+    Ok(drain_report_response(report))
+}
+
+fn drain_report_response(report: DrainReport) -> (StatusCode, Json<Value>) {
+    let status = if report.failed.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     let failed = report
         .failed
         .iter()
         .map(|failure| json!({ "sandbox_id": failure.sandbox_id, "error": failure.error }))
         .collect::<Vec<_>>();
-    Ok(Json(json!({
+    let body = json!({
         "ok": report.failed.is_empty(),
         "stopped_count": report.stopped.len(),
         "stopped": report.stopped,
         "failed": failed,
-    })))
+    });
+    (status, Json(body))
 }
 
 async fn stream_events(
@@ -1223,10 +1346,13 @@ async fn refresh_slack_archive_import_upload_url(
 
 async fn create_slack_archive_import_download_url(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(import_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    let authorization = authorize_archive_download(&headers)?;
     let pool = db_pool(&state)?;
     let import = load_slack_archive_import(&pool, &import_id).await?;
+    ensure_archive_download_authorized(&authorization, &import)?;
     ensure_archive_import_status(
         &import.status,
         &["uploaded", "importing", "failed"],
@@ -3035,6 +3161,37 @@ mod slack_archive_import_tests {
     }
 
     #[test]
+    fn workflow_task_archive_capability_requires_exact_run_and_task_match() {
+        let mut import = archive_row("uploaded");
+        import.workflow_run_id = Some("run-123".to_owned());
+        import.workflow_task_id = Some("task-456".to_owned());
+
+        ensure_archive_download_authorized(
+            &ArchiveDownloadAuthorization::WorkflowTask {
+                run_id: "run-123".to_owned(),
+                task_id: "task-456".to_owned(),
+            },
+            &import,
+        )
+        .expect("matching task capability");
+        for (run_id, task_id) in [
+            ("run-other", "task-456"),
+            ("run-123", "task-other"),
+            ("run-other", "task-other"),
+        ] {
+            let error = ensure_archive_download_authorized(
+                &ArchiveDownloadAuthorization::WorkflowTask {
+                    run_id: run_id.to_owned(),
+                    task_id: task_id.to_owned(),
+                },
+                &import,
+            )
+            .expect_err("mismatched task capability must fail");
+            assert!(matches!(error, ApiError::Forbidden(_)));
+        }
+    }
+
+    #[test]
     fn archive_import_status_gate_allows_only_requested_statuses() {
         assert!(
             ensure_archive_import_status(
@@ -3163,6 +3320,19 @@ mod slack_archive_import_tests {
 #[cfg(test)]
 mod webhook_tests {
     use super::*;
+
+    #[test]
+    fn control_auth_accepts_only_the_dedicated_bearer_key() {
+        let mut headers = HeaderMap::new();
+        assert!(!control_token_authorized(&headers, "control-key"));
+
+        headers.insert("authorization", "Bearer bot-key".parse().unwrap());
+        assert!(!control_token_authorized(&headers, "control-key"));
+
+        headers.insert("authorization", "Bearer control-key".parse().unwrap());
+        assert!(control_token_authorized(&headers, "control-key"));
+        assert!(!control_token_authorized(&headers, ""));
+    }
 
     #[test]
     fn session_thread_key_from_path_decodes_session_routes() {
@@ -3419,5 +3589,69 @@ mod webhook_tests {
         )
         .unwrap_err();
         assert!(matches!(error, ApiError::Internal(_)));
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use centaur_session_core::{HarnessType, Session, SessionStatus};
+    use centaur_session_runtime::{DrainFailure, DrainReport, ReleaseThreadOutcome};
+
+    use super::*;
+
+    #[test]
+    fn partial_drain_failure_returns_non_success_status_with_report() {
+        let (status, Json(body)) = drain_report_response(DrainReport {
+            stopped: vec!["sbx-stopped".to_owned()],
+            failed: vec![DrainFailure {
+                sandbox_id: "sbx-live".to_owned(),
+                error: "stop failed".to_owned(),
+            }],
+        });
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["stopped"], json!(["sbx-stopped"]));
+        assert_eq!(body["failed"][0]["sandbox_id"], "sbx-live");
+    }
+
+    #[test]
+    fn sandbox_stop_failure_returns_service_unavailable_release_response() {
+        let (status, Json(body)) = release_thread_response(
+            ReleaseThreadOutcome {
+                session: Session {
+                    thread_key: ThreadKey::parse("test:release-stop-failure").unwrap(),
+                    sandbox_id: None,
+                    sandbox_capabilities: None,
+                    harness_type: HarnessType::Codex,
+                    harness_thread_id: None,
+                    persona_id: None,
+                    status: SessionStatus::Idle,
+                    iron_control_principal: None,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    updated_at: OffsetDateTime::UNIX_EPOCH,
+                },
+                release_id: Some("release-stop-failure".to_owned()),
+                cancel_inflight: false,
+                sandbox_released: false,
+                sandbox_release_error: Some("backend refused stop".to_owned()),
+                execution_id: None,
+                execution_cancelled: false,
+            },
+            Some("sbx-stop-failure".to_owned()),
+        );
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body.ok);
+        assert!(!body.sandbox_released);
+        assert_eq!(
+            body.sandbox_release_error.as_deref(),
+            Some("backend refused stop")
+        );
+        assert_eq!(
+            body.expected_sandbox_id.as_deref(),
+            Some("sbx-stop-failure")
+        );
+        assert!(body.session.sandbox_id.is_none());
     }
 }

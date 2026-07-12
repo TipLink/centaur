@@ -8,7 +8,10 @@ use anyhow::{Context, Result, bail};
 use centaur_session_core::HarnessType;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use reqwest::{Client as HttpClient, StatusCode};
+use reqwest::{
+    Client as HttpClient, StatusCode,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep, timeout};
 use uuid::Uuid;
@@ -23,7 +26,17 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_API_URL.to_owned())
         .trim_end_matches('/')
         .to_owned();
-    let http = HttpClient::new();
+    let control_key = env::var("CENTAUR_CONTROL_API_KEY")
+        .context("CENTAUR_CONTROL_API_KEY is required by protected API integration routes")?;
+    let mut headers = HeaderMap::new();
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {}", control_key.trim()))
+        .context("CENTAUR_CONTROL_API_KEY is not valid HTTP header material")?;
+    authorization.set_sensitive(true);
+    headers.insert(AUTHORIZATION, authorization);
+    let http = HttpClient::builder()
+        .default_headers(headers)
+        .build()
+        .context("build integration HTTP client")?;
 
     let mut results = Vec::new();
 
@@ -60,9 +73,14 @@ async fn main() -> Result<()> {
     );
 
     let line = line!() + 1;
+    let workflow_test_summary = if rollback_bridge_workflow_pause_enabled() {
+        "Rollback bridge rejects workflow mutations while preserving reads"
+    } else {
+        "Workflows API runs added workflows and cancels removed workflows"
+    };
     record_result(
         &mut results,
-        "Workflows API runs added workflows and cancels removed workflows",
+        workflow_test_summary,
         line,
         test_workflows_api(&http, &base_url).await,
     );
@@ -492,6 +510,10 @@ async fn test_metrics(http: &HttpClient, base_url: &str) -> Result<()> {
 }
 
 async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
+    if rollback_bridge_workflow_pause_enabled() {
+        return test_rollback_bridge_workflow_pause(http, base_url).await;
+    }
+
     let workflow_dir = integration_workflow_dir()?;
     fs::create_dir_all(&workflow_dir)
         .with_context(|| format!("create workflow dir {}", workflow_dir.display()))?;
@@ -557,6 +579,67 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
     wait_for_workflow_run_status(http, base_url, &removed_run_id, &["cancelled"])
         .await
         .context("wait for removed workflow run to be cancelled")?;
+
+    Ok(())
+}
+
+fn rollback_bridge_workflow_pause_enabled() -> bool {
+    matches!(
+        env::var("CENTAUR_ROLLBACK_BRIDGE_PAUSE_WORKFLOWS")
+            .ok()
+            .map(|raw| raw.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("true")
+    )
+}
+
+async fn test_rollback_bridge_workflow_pause(http: &HttpClient, base_url: &str) -> Result<()> {
+    // Read-only workflow inspection stays available for rollback validation.
+    get_json_ok(http, format!("{base_url}/api/workflows/schedules"))
+        .await
+        .context("list workflow schedules while rollback pause is active")?;
+
+    for (path, body) in [
+        (
+            "/api/workflows/runs".to_owned(),
+            json!({
+                "workflow_name": "must_not_start",
+                "input": {"source": "rollback-bridge-integration-test"},
+                "idempotency_key": format!("rollback-pause-{}", Uuid::new_v4().simple()),
+            }),
+        ),
+        (
+            format!("/api/workflows/runs/{}/cancel", Uuid::new_v4()),
+            json!({}),
+        ),
+        (
+            "/api/workflows/events".to_owned(),
+            json!({
+                "event_name": "rollback_bridge_must_not_emit",
+                "payload": {"source": "rollback-bridge-integration-test"},
+            }),
+        ),
+    ] {
+        let url = format!("{base_url}{path}");
+        let response = http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = response.status();
+        let response_body = response.text().await.unwrap_or_default();
+        if status != StatusCode::FORBIDDEN {
+            bail!(
+                "rollback workflow mutation POST {url} returned {status}, expected 403: {response_body}"
+            );
+        }
+        if !response_body.contains("rollback bridge") {
+            bail!(
+                "rollback workflow mutation POST {url} did not report the rollback fence: {response_body}"
+            );
+        }
+    }
 
     Ok(())
 }

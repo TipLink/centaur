@@ -1,0 +1,88 @@
+name: Publish Images
+
+on:
+  pull_request:
+
+concurrency:
+  group: validate-images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_BUILD_PROFILE: debug
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Preserve the historical per-service required-check matrix while this
+        # PR-only workflow builds without registry credentials or publication.
+        service: [api-rs, slackbotv2, linearbot, discordbot, teamsbot, agent, iron-proxy, console]
+        platform: [linux/amd64]
+        include:
+          - service: api-rs
+            image: centaur-api-rs
+            context: .
+            dockerfile: services/api-rs/Dockerfile
+            target: ""
+          - service: slackbotv2
+            image: centaur-slackbotv2
+            context: .
+            dockerfile: services/slackbotv2/Dockerfile
+            target: ""
+          - service: linearbot
+            image: centaur-linearbot
+            context: .
+            dockerfile: services/linearbot/Dockerfile
+            target: ""
+          - service: discordbot
+            image: centaur-discordbot
+            context: .
+            dockerfile: services/discordbot/Dockerfile
+            target: ""
+          - service: teamsbot
+            image: centaur-teamsbot
+            context: .
+            dockerfile: services/teamsbot/Dockerfile
+            target: ""
+          - service: agent
+            image: centaur-agent
+            context: .
+            dockerfile: services/sandbox/Dockerfile
+            target: sandbox
+          - service: iron-proxy
+            image: centaur-iron-proxy
+            context: .
+            dockerfile: services/iron-proxy/Dockerfile
+            target: ""
+          - service: console
+            image: centaur-console
+            context: services/console
+            dockerfile: services/console/Dockerfile
+            target: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build ${{ matrix.image }} without registry credentials
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          push: false
+          build-args: |
+            RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
+          cache-from: type=gha,scope=validate-${{ matrix.image }}-linux-amd64
+          cache-to: type=gha,mode=max,scope=validate-${{ matrix.image }}-linux-amd64

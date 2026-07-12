@@ -77,6 +77,10 @@ jobs:
             '^\.github/workflows/ci\.yml$'
           set_output rust_api \
             '^services/api-rs/' \
+            '^\.github/rollback-bridge-reviewed-forward-commit$' \
+            '^\.github/scripts/check-rollback-bridge-workflows\.sh$' \
+            '^\.github/workflows/publish-images\.yml$' \
+            '^\.github/workflows/validate-images\.yml$' \
             '^\.github/workflows/ci\.yml$'
           set_output sandbox_config_tests \
             '^services/sandbox/configure_codex_config\.py$' \
@@ -146,23 +150,22 @@ jobs:
     runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd="pg_isready -U postgres"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+
+      - name: Resolve the single reviewed forward commit pin
+        id: forward_pin
+        run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+          commit="$(tr -d '\r\n' < .github/rollback-bridge-reviewed-forward-commit)"
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo ".github/rollback-bridge-reviewed-forward-commit must contain the frozen lowercase 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -177,24 +180,82 @@ jobs:
         working-directory: services/api-rs
         run: cargo fmt --all --check
 
+      - name: Verify rollback bridge workflow safety
+        run: bash .github/scripts/check-rollback-bridge-workflows.sh
+
       - name: Clippy
         working-directory: services/api-rs
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Verify rollback bridge forward migration provenance
+        env:
+          REVIEWED_FORWARD_COMMIT: ${{ steps.forward_pin.outputs.commit }}
+        run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+
+          fixture_dir=services/api-rs/crates/centaur-api-server/tests/fixtures/forward_migrations
+          embedded_dir=services/api-rs/crates/centaur-session-sqlx/migrations
+          (
+            cd "$fixture_dir"
+            sha256sum --check SHA256SUMS
+          )
+          sha384sum --check "$embedded_dir/.checksums.sha384"
+          git fetch --no-tags --depth=1 origin "$REVIEWED_FORWARD_COMMIT"
+          while IFS=' ' read -r _ file; do
+            source_copy="$RUNNER_TEMP/$file"
+            git show "$REVIEWED_FORWARD_COMMIT:$embedded_dir/$file" > "$source_copy"
+            cmp "$source_copy" "$fixture_dir/$file"
+            cmp "$source_copy" "$embedded_dir/$file"
+          done < "$fixture_dir/SHA256SUMS"
+
+      - name: Start Rust test database
+        run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+
+          docker run --detach --name centaur-rust-test-postgres \
+            --publish 127.0.0.1:5432:5432 \
+            --env POSTGRES_USER=postgres \
+            --env POSTGRES_PASSWORD=postgres \
+            --env POSTGRES_DB=postgres \
+            paradedb/paradedb@sha256:e41e0c742ef91ece4fc7c08dda7f24e5a8f818563b164bbfea3a4364941d75f7 \
+            -c shared_preload_libraries=pg_search,pg_cron \
+            -c max_connections=500
+          for _ in {1..60}; do
+            if docker logs centaur-rust-test-postgres 2>&1 \
+              | grep -q 'PostgreSQL init process complete' \
+              && docker exec centaur-rust-test-postgres \
+              psql -U postgres -d postgres -tAc 'select 1' >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs centaur-rust-test-postgres
+          exit 1
+
       - name: Test
         working-directory: services/api-rs
         env:
+          SESSION_RUNTIME_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
           SESSION_SQLX_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: cargo test --workspace
 
+      - name: Cleanup Rust test database
+        if: ${{ always() }}
+        run: docker rm -f centaur-rust-test-postgres || true
+
       - name: Start API integration test dependencies
         run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+
           docker run --detach --name centaur-api-integration-test-postgres \
             --publish 127.0.0.1:15432:5432 \
             --env POSTGRES_USER=postgres \
             --env POSTGRES_PASSWORD=postgres \
             --env POSTGRES_DB=centaur \
-            paradedb/paradedb:0.23.0-pg16 \
+            paradedb/paradedb@sha256:e41e0c742ef91ece4fc7c08dda7f24e5a8f818563b164bbfea3a4364941d75f7 \
             -c shared_preload_libraries=pg_search,pg_cron \
             -c max_connections=500
           for _ in {1..60}; do
@@ -209,22 +270,96 @@ jobs:
           docker logs centaur-api-integration-test-postgres
           exit 1
 
+      - name: Checkout reviewed forward source for cross-version rehearsal
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: TipLink/centaur
+          ref: ${{ steps.forward_pin.outputs.commit }}
+          path: reviewed-forward
+          persist-credentials: false
+
+      - name: Build and verify reviewed forward runtime
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/reviewed-forward-target
+          SESSION_RUNTIME_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:15432/centaur?sslmode=disable
+        run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+
+          cargo build --locked \
+            --manifest-path reviewed-forward/services/api-rs/Cargo.toml \
+            -p centaur-api-server
+          cargo test --locked \
+            --manifest-path reviewed-forward/services/api-rs/Cargo.toml \
+            -p centaur-session-runtime \
+            rollback_era_clear_and_reassignment_cannot_spoof_forward_content_stamp \
+            -- --nocapture
+
+      - name: Apply API integration schema with reviewed forward runtime
+        working-directory: reviewed-forward/services/api-rs
+        env:
+          BIND_ADDR: 127.0.0.1:18081
+          CENTAUR_CONTROL_API_KEY: integration-control-key
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:15432/centaur?sslmode=disable
+          PYTHON_WORKFLOW_HOST_PATH: ${{ github.workspace }}/reviewed-forward/services/workflow-python/workflow_host.py
+          PYTHON_WORKFLOW_HOST_PYTHON: python3
+          RUN_MIGRATIONS: "true"
+          RUST_LOG: warn
+          SESSION_EXECUTION_ADOPTION_INTERVAL_SECS: "0"
+          WORKFLOW_DIRS: ${{ runner.temp }}/reviewed-forward-schema-workflows
+          WORKFLOW_HOST_SANDBOX: "false"
+          WORKFLOW_REAP_REMOVED_AFTER_TICKS: "0"
+          WORKFLOW_RECONCILE_INTERVAL_SECS: "0"
+        run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+
+          mkdir -p "$WORKFLOW_DIRS"
+          "${{ runner.temp }}/reviewed-forward-target/debug/centaur-api-server" \
+            > "$RUNNER_TEMP/reviewed-forward-schema.log" 2>&1 &
+          forward_pid="$!"
+          trap 'kill "$forward_pid" 2>/dev/null || true' EXIT
+          for _ in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:18081/readyz >/dev/null; then
+              kill "$forward_pid"
+              wait "$forward_pid" || true
+              trap - EXIT
+              exit 0
+            fi
+            if ! kill -0 "$forward_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/reviewed-forward-schema.log"
+          exit 1
+
       - name: Run API integration test
         working-directory: services/api-rs
         env:
           API_INTEGRATION_WORKFLOW_DIR: ${{ runner.temp }}/api-integration-workflows
           BIND_ADDR: 127.0.0.1:18080
           CENTAUR_API_URL: http://127.0.0.1:18080
+          CENTAUR_CONTROL_API_KEY: integration-control-key
+          CENTAUR_ROLLBACK_BRIDGE_PAUSE_WORKFLOWS: "true"
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:15432/centaur?sslmode=disable
-          RUN_MIGRATIONS: "true"
+          ROLLBACK_BRIDGE_FORWARD_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:15432/centaur?sslmode=disable
+          ROLLBACK_BRIDGE_REHEARSAL_FORWARD_BIN: ${{ runner.temp }}/reviewed-forward-target/debug/centaur-api-server
+          ROLLBACK_BRIDGE_REHEARSAL_FORWARD_WORKDIR: ${{ github.workspace }}/reviewed-forward/services/api-rs
+          ROLLBACK_BRIDGE_REHEARSAL_FORWARD_WORKFLOW_HOST: ${{ github.workspace }}/reviewed-forward/services/workflow-python/workflow_host.py
+          RUN_MIGRATIONS: "false"
           RUST_LOG: info
           WORKFLOW_DIRS: ${{ runner.temp }}/api-integration-workflows
           WORKFLOW_HOST_SANDBOX: "false"
           WORKFLOW_REAP_REMOVED_AFTER_TICKS: "1"
           WORKFLOW_RECONCILE_INTERVAL_SECS: "1"
         run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+
           mkdir -p "$API_INTEGRATION_WORKFLOW_DIR"
           cargo build --locked -p centaur-api-server -p centaur-api-integration-test
+          cargo test --locked -p centaur-api-server --test rollback_bridge_forward_schema -- --nocapture
 
           ./target/debug/centaur-api-server > "$RUNNER_TEMP/centaur-api-server.log" 2>&1 &
           api_pid="$!"

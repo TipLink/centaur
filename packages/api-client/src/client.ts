@@ -305,11 +305,15 @@ export class CentaurClient {
     }
   }
 
-  async releaseThread(threadKey: string, opts?: { releaseId?: string; cancelInflight?: boolean }) {
+  async releaseThread(
+    threadKey: string,
+    opts?: { releaseId?: string; expectedSandboxId?: string; cancelInflight?: boolean },
+  ) {
     const { data } = await this.http.post(
       `/api/session/${encodeURIComponent(threadKey)}/release`,
       {
         release_id: opts?.releaseId,
+        expected_sandbox_id: opts?.expectedSandboxId,
         cancel_inflight: opts?.cancelInflight ?? false,
       },
     );
