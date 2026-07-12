@@ -30,6 +30,14 @@ if grep -q 'docker/login-action' "$validator" || grep -q 'packages: write' "$val
 fi
 grep -Fq 'service: [api-rs, slackbotv2, linearbot, discordbot, teamsbot, agent, iron-proxy, console]' "$validator" ||
   fail "PR validator must preserve the historical eight-image required-check matrix"
+grep -q '^  agent-arm64:$' "$validator" ||
+  fail "PR validator must build the rollback agent natively on arm64"
+grep -Fq 'runs-on: ubuntu-24.04-arm' "$validator" ||
+  fail "arm64 rollback validation must use the native GitHub arm runner"
+grep -Fq 'centaur-agent:rollback-validate-linux-arm64' "$validator" ||
+  fail "arm64 rollback validation must load and probe the packaged image"
+grep -Fq '"$AGENT_BROWSER_EXECUTABLE_PATH" --version' "$validator" ||
+  fail "arm64 rollback validation must execute the selected native browser"
 
 grep -q '^  workflow_dispatch:$' "$publisher" ||
   fail "publisher must preserve the confirmed manual path"
