@@ -53,6 +53,7 @@ const SERVICE_API_KEY_ENVS: &[&str] = &[
     "TEAMSBOT_API_KEY",
     "WORKFLOW_API_KEY",
     "SLACK_FEEDBACK_API_KEY",
+    "CENTAUR_JWT_SIGNING_SECRET",
 ];
 const MIN_SERVICE_API_KEY_BYTES: usize = 32;
 
@@ -2242,6 +2243,10 @@ mod tests {
                 "SLACK_FEEDBACK_API_KEY",
                 "feedback-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
             ),
+            (
+                "CENTAUR_JWT_SIGNING_SECRET",
+                "jwt-signing-key-xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
         ]);
 
         let error = validate_service_api_key_separation()
@@ -2259,6 +2264,10 @@ mod tests {
                 "control-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
             ),
             ("WORKFLOW_API_KEY", "short"),
+            (
+                "CENTAUR_JWT_SIGNING_SECRET",
+                "jwt-signing-key-xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
         ]);
 
         let error = validate_service_api_key_separation().expect_err("short workflow key");
@@ -2266,6 +2275,57 @@ mod tests {
             error
                 .to_string()
                 .contains("WORKFLOW_API_KEY must contain at least 32 bytes")
+        );
+        assert!(!error.to_string().contains("short"));
+    }
+
+    #[test]
+    fn jwt_signing_key_must_be_distinct_from_service_credentials() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            (
+                "CENTAUR_CONTROL_API_KEY",
+                "shared-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "CENTAUR_JWT_SIGNING_SECRET",
+                "shared-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            ("SLACKBOT_API_KEY", ""),
+            ("GITHUBBOT_API_KEY", ""),
+            ("LINEARBOT_API_KEY", ""),
+            ("DISCORDBOT_API_KEY", ""),
+            ("TEAMSBOT_API_KEY", ""),
+            ("WORKFLOW_API_KEY", ""),
+            ("SLACK_FEEDBACK_API_KEY", ""),
+        ]);
+
+        let error = validate_service_api_key_separation()
+            .expect_err("equal signing and control keys must fail startup");
+        assert!(error.to_string().contains("must contain distinct"));
+        assert!(!error.to_string().contains("shared-key"));
+    }
+
+    #[test]
+    fn jwt_signing_key_must_be_at_least_32_bytes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_CONTROL_API_KEY", ""),
+            ("SLACKBOT_API_KEY", ""),
+            ("GITHUBBOT_API_KEY", ""),
+            ("LINEARBOT_API_KEY", ""),
+            ("DISCORDBOT_API_KEY", ""),
+            ("TEAMSBOT_API_KEY", ""),
+            ("WORKFLOW_API_KEY", ""),
+            ("SLACK_FEEDBACK_API_KEY", ""),
+            ("CENTAUR_JWT_SIGNING_SECRET", "short"),
+        ]);
+
+        let error = validate_service_api_key_separation().expect_err("short signing key");
+        assert!(
+            error
+                .to_string()
+                .contains("CENTAUR_JWT_SIGNING_SECRET must contain at least 32 bytes")
         );
         assert!(!error.to_string().contains("short"));
     }
@@ -2305,6 +2365,10 @@ mod tests {
             (
                 "SLACK_FEEDBACK_API_KEY",
                 "feedback-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "CENTAUR_JWT_SIGNING_SECRET",
+                "jwt-signing-key-xxxxxxxxxxxxxxxxxxxxxxxxxxx",
             ),
         ]);
 

@@ -1,9 +1,12 @@
 # TipLink Centaur upstream alignment (2026-07-11)
 
-This branch merges TipLink `ba2c01f5` with Paradigm `3c6e84d9` while preserving
-both histories. Conflict resolution used the upstream implementation as the
+This branch integrates the exact Paradigm tree at `3c6e84d9` with TipLink
+`ba2c01f5`. Conflict resolution used the upstream implementation as the
 baseline, then reapplied only TipLink behavior that remains deployment- or
-runtime-relevant.
+runtime-relevant. The reviewed aggregate tree is transported as GitHub-authored
+verified commits, then joined to a second GitHub-verified branch rooted at the
+upstream SHA. The final head must therefore contain both histories, reproduce
+the tested tree exactly, and satisfy the fork's signature policy.
 
 ## Retained on the current upstream architecture
 
@@ -19,7 +22,11 @@ runtime-relevant.
 | Durable Slack delivery proof | After Slack confirms a primary, reconciled, fallback, or visible-error message, Slackbot records one idempotent `session.delivery_completed` event through a Slackbot-key-only route bound to the exact thread and execution. |
 | Generic HTTP secret scopes | Method/path scopes are retained through discovery, permission translation, and iron-control registration. |
 | GitHub App installation tokens | The grant is registered in upstream `Broker::CredentialGrants`; the model delegates validation and refresh to that registry. Helm bootstraps the canonical credential before api-rs starts, and the built-in infra role grants a scheme-preserving `GITHUB_TOKEN` replacement for `github.com` and `api.github.com` to sandbox principals. |
-| Fork image publication | TipLink GHCR namespace, GitHub-hosted native builders, safe multi-arch assembly, GitHub App-authored Fineas infra promotion, and upstream `githubbot`/harness image inputs are combined. |
+| Fork image publication | TipLink GHCR namespace, GitHub-hosted native builders, safe multi-arch assembly, and upstream `githubbot`/harness image inputs are combined. Pull requests build without registry credentials; only a reviewed `v*` tag or explicit dispatch can write packages and emit a deployable descriptor. Fineas promotion is owned by the separately reviewed infra PR DAG. |
+| GitHub-hosted CI | TipLink's removal of Depot runners remains authoritative across core, Console, docs, audit, and chart workflows. Native arm64 publication continues on GitHub's arm runner. |
+| Human-reviewed upstream tracking | The weekly `upstream-sync.yml` workflow opens a draft cross-repository PR directly from `paradigmxyz:main`, after verifying every upstream-only commit. It never copies unreviewed code into a trusted TipLink branch, so PR workflows retain the external-head token/secret boundary. A separate synchronize-time check fails if the moving upstream/base refs no longer match the SHAs and verified count recorded in the PR body. The PR is only an audit signal; an integration branch must pin that recorded upstream SHA. |
+| Trusted publication split | PR docs, chart, and image validation have read-only/no-secret jobs. Cloudflare docs, chart, and runtime image publication live in non-PR workflows and require an explicit reviewed-main confirmation or release tag. |
+| Trust-lane key separation | API and Console startup reject configured control, bot, workflow, feedback, or JWT signing credentials shorter than 32 bytes or reused across trust lanes without printing secret values. |
 
 ## Transitional deployment compatibility
 
@@ -67,6 +74,10 @@ runtime-relevant.
   and stale generated docs/workflows were not carried into core. Those are
   either fixed upstream, obsolete under the new architecture, or belong in the
   overlay/tool repositories.
+- CodeQL findings in unchanged Paradigm code and inherited test fixtures are
+  treated as upstream baseline, not fork patches. This sync carries neither
+  analyzer-only rewrites nor `codeql[...]` suppression comments; review and
+  rollout gates cover integration-owned behavior instead.
 - Claude-as-default changes were not retained in base Centaur. Harness defaults
   remain upstream-owned; Fineas-specific defaults belong in the deployment
   overlay/configuration.
@@ -85,7 +96,8 @@ SQLx/Rails checksum manifests and CI guards are included in this branch.
 
 ## Rollout order
 
-1. Publish the merged fork images and chart.
+1. After review, explicitly publish the fork image descriptor and chart; a PR
+   run or merge alone does not enter the package/deployment lanes.
 2. Establish a zero-overlap delivery-writer boundary before the full runtime
    sync: disable cloudflared ingress, drain active work, and scale every old
    api-rs and Slackbot replica to zero. Do not allow old and receipt-writing

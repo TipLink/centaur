@@ -6,24 +6,6 @@ import {
 } from './codex-app-server'
 
 describe('CodexAppServerRendererEventMapper', () => {
-  it('unwraps only exact /bin/bash -lc command wrappers', () => {
-    const wrapped = new CodexAppServerRendererEventMapper().process({
-      type: 'item.started',
-      item: { id: 'wrapped', type: 'commandExecution', command: "/bin/bash -lc 'echo safe'" }
-    })
-    const malformed = new CodexAppServerRendererEventMapper().process({
-      type: 'item.started',
-      item: { id: 'malformed', type: 'commandExecution', command: "/bin/bash-lc 'echo unsafe'" }
-    })
-
-    expect(wrapped[0]).toMatchObject({
-      task: { details: [{ text: 'echo safe', type: 'code' }] }
-    })
-    expect(malformed[0]).toMatchObject({
-      task: { details: [{ text: "/bin/bash-lc 'echo unsafe'", type: 'code' }] }
-    })
-  })
-
   it('maps final answer deltas to generic renderer message deltas after activity exists', () => {
     const mapper = new CodexAppServerRendererEventMapper()
 

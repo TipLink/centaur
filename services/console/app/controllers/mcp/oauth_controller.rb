@@ -12,7 +12,6 @@ module Mcp
     # endpoints with no browser session authority. Authorization approval keeps
     # Rails CSRF protection; these two endpoints authenticate the protocol
     # request itself (PKCE for code exchange).
-    # codeql[rb/csrf-protection-disabled]
     skip_forgery_protection only: %i[register token]
 
     ACCESS_TOKEN_TTL_SECONDS = 1.hour.to_i

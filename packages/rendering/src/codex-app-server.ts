@@ -980,7 +980,7 @@ function parsePlanText(value: string): Array<{ step: string; status: RendererTas
     .split('\n')
     .map(line => {
       const trimmed = line.trim()
-      if (!/^(?:[-*]\s+|\d+[.)]\s+)/.test(trimmed)) return null
+      if (!/^[-*]\s+|\d+[.)]\s+/.test(trimmed)) return null
       return {
         step: trimmed,
         status: /\[[xX]\]/.test(trimmed) ? ('complete' as const) : ('pending' as const)
@@ -1433,18 +1433,10 @@ function unwrapShellCommand(command: string): string {
   const trimmed = command.trim()
   if (!trimmed) return trimmed
 
-  const prefix = '/bin/bash'
-  if (!trimmed.toLowerCase().startsWith(prefix)) return trimmed
-  let offset = prefix.length
-  if (offset >= trimmed.length || !/\s/.test(trimmed[offset] ?? '')) return trimmed
-  while (offset < trimmed.length && /\s/.test(trimmed[offset] ?? '')) offset += 1
-  if (trimmed.slice(offset, offset + 3).toLowerCase() !== '-lc') return trimmed
-  offset += 3
-  if (offset >= trimmed.length || !/\s/.test(trimmed[offset] ?? '')) return trimmed
-  while (offset < trimmed.length && /\s/.test(trimmed[offset] ?? '')) offset += 1
-  if (offset >= trimmed.length) return trimmed
+  const bashLc = /^\/bin\/bash\s+-lc\s+([\s\S]+)$/i.exec(trimmed)
+  if (!bashLc?.[1]) return trimmed
 
-  let inner = trimmed.slice(offset).trim()
+  let inner = bashLc[1].trim()
   if (
     (inner.startsWith("'") && inner.endsWith("'")) ||
     (inner.startsWith('"') && inner.endsWith('"'))

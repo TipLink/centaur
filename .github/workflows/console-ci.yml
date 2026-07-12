@@ -48,7 +48,7 @@ jobs:
           fi
 
   scan_ruby:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -69,7 +69,7 @@ jobs:
         run: bin/bundler-audit
 
   scan_js:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -87,7 +87,7 @@ jobs:
         run: bin/importmap audit
 
   lint:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
     env:
@@ -116,7 +116,7 @@ jobs:
         run: bin/rubocop -f github
 
   test:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -149,7 +149,6 @@ jobs:
           IRON_CONTROL_DB_PORT: 5432
           IRON_CONTROL_DB_USERNAME: postgres
           IRON_CONTROL_DB_PASSWORD: postgres
-          # RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
         run: bin/rails db:test:prepare test
 
   console-ci-success:

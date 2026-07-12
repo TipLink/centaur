@@ -1,0 +1,91 @@
+name: Verify Upstream Audit Head
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify:
+    name: Verify recorded upstream SHA and signatures
+    if: >-
+      github.event.pull_request.base.repo.full_name == 'TipLink/centaur' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == 'paradigmxyz/centaur' &&
+      github.event.pull_request.head.ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Match the moving head to the audited body
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import re
+
+          body = os.environ.get("PR_BODY", "")
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
+          sha_match = re.search(r"^- upstream HEAD: `([0-9a-f]{40})`$", body, re.MULTILINE)
+          base_match = re.search(
+              r"^- base HEAD at generation: `([0-9a-f]{40})`$", body, re.MULTILINE
+          )
+          count_match = re.search(
+              r"^- GitHub-verified upstream-only commits: ([0-9]+)$", body, re.MULTILINE
+          )
+          if sha_match is None or base_match is None or count_match is None:
+              raise SystemExit("audit PR body is missing a recorded SHA or verified count")
+          if base_match.group(1) != base:
+              raise SystemExit(
+                  f"moving base {base} does not match audited body SHA {base_match.group(1)}"
+              )
+          if sha_match.group(1) != head:
+              raise SystemExit(
+                  f"moving upstream head {head} does not match audited body SHA {sha_match.group(1)}"
+              )
+          print(f"EXPECTED_COUNT={count_match.group(1)}", file=open(os.environ["GITHUB_ENV"], "a"))
+          PY
+
+      - name: Re-verify every current upstream-only commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/upstream-head-verification"
+          git init --quiet "$repo"
+          git -C "$repo" remote add base "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$repo" remote add upstream "https://github.com/paradigmxyz/centaur.git"
+          git -C "$repo" fetch --quiet --filter=blob:none --no-tags base "$BASE_SHA"
+          git -C "$repo" fetch --quiet --filter=blob:none --no-tags upstream "$HEAD_SHA"
+          mapfile -t commits < <(git -C "$repo" rev-list --reverse "${BASE_SHA}..${HEAD_SHA}")
+          if [[ "${#commits[@]}" -ne "$EXPECTED_COUNT" ]]; then
+            echo "PR commit count ${#commits[@]} does not match audited count $EXPECTED_COUNT" >&2
+            exit 1
+          fi
+          if [[ "${#commits[@]}" -eq 0 || "${commits[-1]}" != "$HEAD_SHA" ]]; then
+            echo "PR commit list does not terminate at the current upstream head" >&2
+            exit 1
+          fi
+          failed=()
+          for commit in "${commits[@]}"; do
+            verification="$(gh api "repos/paradigmxyz/centaur/commits/${commit}" \
+              --jq '[.commit.verification.verified, .commit.verification.reason] | @tsv')"
+            verified="${verification%%$'\t'*}"
+            reason="${verification#*$'\t'}"
+            if [[ "$verified" != "true" ]]; then
+              failed+=("${commit}:${reason:-unknown}")
+            fi
+          done
+          if [[ "${#failed[@]}" -ne 0 ]]; then
+            printf 'unverified upstream commit(s):\n' >&2
+            printf '  %s\n' "${failed[@]}" >&2
+            exit 1
+          fi

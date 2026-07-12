@@ -51,7 +51,6 @@ module Console
 
       secret = app_params[:client_secret]
       # Active Record encryption protects this write-only attribute at rest.
-      # codeql[rb/clear-text-storage-sensitive-data]
       app.client_secret = secret if secret.present?
     end
 
