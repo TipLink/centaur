@@ -17,6 +17,7 @@ awk '
     capture = 1
     next
   }
+  capture && /^      - name:/ { exit }
   capture && /^  [^[:space:]]/ { exit }
   capture {
     sub(/^          /, "")

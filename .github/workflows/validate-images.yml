@@ -82,10 +82,16 @@ jobs:
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
           push: false
+          load: ${{ matrix.service == 'agent' }}
+          tags: ${{ matrix.service == 'agent' && 'centaur-agent:rollback-validate-linux-amd64' || '' }}
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
           cache-from: type=gha,scope=validate-${{ matrix.image }}-linux-amd64
           cache-to: type=gha,mode=max,scope=validate-${{ matrix.image }}-linux-amd64
+
+      - name: Probe deploy-composed rollback harness in packaged amd64 agent
+        if: matrix.service == 'agent'
+        run: bash scripts/probe-rollback-agent-image.sh centaur-agent:rollback-validate-linux-amd64 linux/amd64
 
   agent-arm64:
     name: build (agent, linux/arm64)
@@ -114,17 +120,25 @@ jobs:
           cache-from: type=gha,scope=validate-centaur-agent-linux-arm64
           cache-to: type=gha,mode=max,scope=validate-centaur-agent-linux-arm64
 
-      - name: Prove native browser contract in packaged arm64 image
+      - name: Probe deploy-composed rollback harness in packaged arm64 agent
+        run: bash scripts/probe-rollback-agent-image.sh centaur-agent:rollback-validate-linux-arm64 linux/arm64
+
+  image-validation-success:
+    name: Image validation success
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - build
+      - agent-arm64
+    steps:
+      - name: Require every rollback image validation build to succeed
+        env:
+          AMD64_BUILD_RESULT: ${{ needs.build.result }}
+          ARM64_AGENT_RESULT: ${{ needs.agent-arm64.result }}
         run: |
           set -euo pipefail
-          docker run --rm --entrypoint sh \
-            centaur-agent:rollback-validate-linux-arm64 -ceu '
-              test "$AGENT_BROWSER_EXECUTABLE_PATH" = \
-                /home/agent/.local/bin/centaur-agent-browser-chromium
-              test -x "$AGENT_BROWSER_EXECUTABLE_PATH"
-              command -v agent-browser >/dev/null
-              command -v playwright >/dev/null
-              agent-browser --version | grep -F "0.26.0"
-              playwright --version | grep -F "Version 1.58.0"
-              "$AGENT_BROWSER_EXECUTABLE_PATH" --version >/dev/null
-            '
+          if [[ "$AMD64_BUILD_RESULT" != "success" ||
+            "$ARM64_AGENT_RESULT" != "success" ]]; then
+            echo "rollback image validation failed: amd64=$AMD64_BUILD_RESULT arm64=$ARM64_AGENT_RESULT" >&2
+            exit 1
+          fi

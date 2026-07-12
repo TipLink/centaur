@@ -24,8 +24,11 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
+  checks: read
   contents: read
   packages: write
+  pull-requests: read
 
 env:
   REGISTRY: ghcr.io
@@ -136,6 +139,9 @@ jobs:
               ;;
           esac
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Require signed ready PR and exact-head non-CodeQL checks
+        run: bash .github/scripts/verify-reviewed-rollback-release.sh
 
   tag-absence-gate:
     name: Prove reviewed tags do not already exist before publishing digests

@@ -8,6 +8,7 @@ validator=.github/workflows/validate-images.yml
 ci=.github/workflows/ci.yml
 pin=.github/rollback-bridge-reviewed-forward-commit
 sandbox_dockerfile=services/sandbox/Dockerfile
+agent_probe=scripts/probe-rollback-agent-image.sh
 
 fail() {
   echo "rollback bridge workflow safety check failed: $*" >&2
@@ -34,10 +35,50 @@ grep -q '^  agent-arm64:$' "$validator" ||
   fail "PR validator must build the rollback agent natively on arm64"
 grep -Fq 'runs-on: ubuntu-24.04-arm' "$validator" ||
   fail "arm64 rollback validation must use the native GitHub arm runner"
+grep -Fq 'centaur-agent:rollback-validate-linux-amd64' "$validator" ||
+  fail "amd64 rollback validation must load the packaged agent image"
 grep -Fq 'centaur-agent:rollback-validate-linux-arm64' "$validator" ||
-  fail "arm64 rollback validation must load and probe the packaged image"
-grep -Fq '"$AGENT_BROWSER_EXECUTABLE_PATH" --version' "$validator" ||
-  fail "arm64 rollback validation must execute the selected native browser"
+  fail "arm64 rollback validation must load the packaged agent image"
+grep -Fq "load: \${{ matrix.service == 'agent' }}" "$validator" ||
+  fail "amd64 validation must load the final agent image"
+if [[ "$(grep -Fc 'bash scripts/probe-rollback-agent-image.sh' "$validator")" -ne 2 ]]; then
+  fail "PR validator must probe exactly the native amd64 and arm64 rollback agent images"
+fi
+grep -Fq 'centaur-agent:rollback-validate-linux-amd64 linux/amd64' "$validator" ||
+  fail "amd64 validation must run the deploy-composed rollback agent probe"
+grep -Fq 'centaur-agent:rollback-validate-linux-arm64 linux/arm64' "$validator" ||
+  fail "arm64 validation must run the deploy-composed rollback agent probe"
+grep -q '^  image-validation-success:$' "$validator" ||
+  fail "PR validator must expose an aggregate image validation check"
+grep -q '^    name: Image validation success$' "$validator" ||
+  fail "PR validator aggregate must preserve the exact publication check name"
+grep -Fq 'ARM64_AGENT_RESULT: ${{ needs.agent-arm64.result }}' "$validator" ||
+  fail "image validation aggregate must include the native arm64 agent result"
+grep -Fq 'AMD64_BUILD_RESULT: ${{ needs.build.result }}' "$validator" ||
+  fail "image validation aggregate must include the amd64 matrix and packaged agent result"
+
+for required_probe_contract in \
+  '--network none' \
+  'EXPECTED_CODEX_VERSION=codex-cli 0.144.1' \
+  'EXPECTED_CLAUDE_VERSION=2.1.198 (Claude Code)' \
+  'EXPECTED_PLAYWRIGHT_VERSION=Version 1.58.0' \
+  'EXPECTED_AGENT_BROWSER_VERSION=0.26.0' \
+  'EXPECTED_HARNESS_SERVER_VERSION=harness-server 0.1.0' \
+  '"$AGENT_BROWSER_EXECUTABLE_PATH" --version' \
+  'codex_config["model"] == "gpt-5.6-sol"' \
+  'codex_config["model_reasoning_effort"] == "medium"' \
+  'codex_config["plan_mode_reasoning_effort"] == "xhigh"' \
+  '"max_concurrent_threads_per_session": 6' \
+  'codex_config["model_providers"] == {' \
+  'codex_config["projects"] == {"/": {"trust_level": "trusted"}}' \
+  '["codex", "app-server", "--listen", "stdio://"]' \
+  '"method": "initialize"'; do
+  grep -Fq -- "$required_probe_contract" "$agent_probe" ||
+    fail "packaged rollback agent probe is missing contract: $required_probe_contract"
+done
+if grep -Fq '"method": "turn/start"' "$agent_probe"; then
+  fail "packaged rollback agent probe must initialize app-server without a model turn"
+fi
 
 grep -q '^  workflow_dispatch:$' "$publisher" ||
   fail "publisher must preserve the confirmed manual path"
@@ -52,6 +93,12 @@ actual_push_trigger="$(awk '
 if grep -Eq '^  (pull_request|create|schedule):' "$publisher"; then
   fail "publisher must not run for branches, pull requests, create events, or schedules"
 fi
+for permission in 'actions: read' 'checks: read' 'pull-requests: read'; do
+  grep -q "^  ${permission}$" "$publisher" ||
+    fail "publisher is missing required read permission: $permission"
+done
+grep -Fq 'bash .github/scripts/verify-reviewed-rollback-release.sh' "$publisher" ||
+  fail "publisher must enforce the signed exact-head non-CodeQL PR release gate"
 expected_tag_pattern='^rollback-bridge-publish-live-scope-verified-([0-9a-f]{40})-forward-([0-9a-f]{40})-at-([1-9][0-9]{9})$'
 actual_tag_pattern="$(awk -F "'" '/^[[:space:]]*tag_pattern=/{ print $2 }' "$publisher")"
 [[ "$actual_tag_pattern" == "$expected_tag_pattern" ]] ||
@@ -146,9 +193,10 @@ actual_descriptor_rows="$(awk '
 
 grep -Fq '.github/rollback-bridge-reviewed-forward-commit' "$ci" ||
   fail "CI does not read the central reviewed forward commit pin"
-mapfile -t integration_control_keys < <(
-  awk -F ': ' '/^[[:space:]]+CENTAUR_CONTROL_API_KEY: / { print $2 }' "$ci"
-)
+integration_control_keys=()
+while IFS= read -r integration_control_key; do
+  integration_control_keys+=("$integration_control_key")
+done < <(awk -F ': ' '/^[[:space:]]+CENTAUR_CONTROL_API_KEY: / { print $2 }' "$ci")
 [[ "${#integration_control_keys[@]}" -eq 2 ]] ||
   fail "CI must configure exactly two forward integration control keys"
 for integration_control_key in "${integration_control_keys[@]}"; do
@@ -173,11 +221,13 @@ grep -Fq '"$AGENT_BROWSER_EXECUTABLE_PATH" --version' "$sandbox_dockerfile" ||
 
 grep -Fq '.github/rollback-bridge-reviewed-forward-commit' "$publisher" ||
   fail "publisher does not read the central reviewed forward commit pin"
-for resolver_path in \
+for required_ci_path in \
   '^\.github/scripts/resolve-runnable-image-digest\.sh$' \
-  '^\.github/scripts/test-resolve-runnable-image-digest\.sh$'; do
-  grep -Fq "$resolver_path" "$ci" ||
-    fail "CI change detection does not cover $resolver_path"
+  '^\.github/scripts/test-resolve-runnable-image-digest\.sh$' \
+  '^\.github/scripts/test-probe-rollback-agent-image\.sh$' \
+  '^scripts/probe-rollback-agent-image\.sh$'; do
+  grep -Fq "$required_ci_path" "$ci" ||
+    fail "CI change detection does not cover $required_ci_path"
 done
 placeholder="__REVIEWED_FORWARD_""COMMIT_REQUIRED__"
 unexpected_placeholder_files="$(
@@ -189,6 +239,8 @@ if [[ -n "$unexpected_placeholder_files" ]]; then
 fi
 
 bash .github/scripts/test-rollback-bridge-publication-trigger.sh
+bash .github/scripts/test-probe-rollback-agent-image.sh
 bash .github/scripts/test-resolve-runnable-image-digest.sh
+bash .github/scripts/test-verify-reviewed-rollback-release.sh
 
 echo "rollback bridge workflow safety checks passed"

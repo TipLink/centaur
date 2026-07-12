@@ -82,8 +82,12 @@ jobs:
             '^\.github/scripts/resolve-runnable-image-digest\.sh$' \
             '^\.github/scripts/test-resolve-runnable-image-digest\.sh$' \
             '^\.github/scripts/test-rollback-bridge-publication-trigger\.sh$' \
+            '^\.github/scripts/test-probe-rollback-agent-image\.sh$' \
+            '^\.github/scripts/verify-reviewed-rollback-release\.sh$' \
+            '^\.github/scripts/test-verify-reviewed-rollback-release\.sh$' \
             '^\.github/workflows/publish-images\.yml$' \
             '^\.github/workflows/validate-images\.yml$' \
+            '^scripts/probe-rollback-agent-image\.sh$' \
             '^\.github/workflows/ci\.yml$'
           set_output sandbox_config_tests \
             '^services/sandbox/configure_codex_config\.py$' \

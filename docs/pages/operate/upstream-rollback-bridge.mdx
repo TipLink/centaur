@@ -32,7 +32,10 @@ Fineas upstream-sync runbook in
   `rollback-bridge-publish-live-scope-verified-<bridge40>-forward-<forward40>-at-<unix-seconds>`
   immediately after the same read-only live check. The release gate requires
   the tag object, checkout, event SHA, embedded bridge SHA, and frozen forward
-  SHA to agree. It allows 120 seconds of future clock skew and fails closed
+  SHA to agree. It also requires the exact GitHub-verified, same-repository,
+  non-draft bridge PR head and successful exact-head `CI success`, `Console CI
+  success`, and `Image validation success` runs; CodeQL is intentionally not a
+  publication gate. It allows 120 seconds of future clock skew and fails closed
   once the attestation is 900 seconds old. If Actions queueing exceeds that
   window, rerun the helper and create a new timestamped tag; never delete or
   recreate an attestation ref. The 900-second window bounds admission to the
@@ -50,7 +53,17 @@ Fineas upstream-sync runbook in
   consuming the descriptor in Git or changing any Argo pin. The separate
   pull-request workflow preserves the historical `Publish Images` check
   context but has read-only repository permissions, receives no registry
-  credentials, and builds with `push: false`.
+  credentials, and builds with `push: false`. Its agent jobs load the final
+  image natively on both amd64 and arm64, run the real entrypoint with the exact
+  Fineas rollback Codex and Claude overlays, and then prove Codex `0.144.1`,
+  Claude Code `2.1.198`, Playwright `1.58.0`, agent-browser `0.26.0`,
+  `harness-server`, and the native browser executable. It also proves
+  `gpt-5.6-sol` at medium effort, plan effort `xhigh`, multi-agent v2 disabled
+  with cap 6, Sonnet 5 at high effort, and preservation of the exact OpenRouter
+  provider and root trust contract. The probe has
+  no network and sends only a Codex app-server `initialize` request; it never
+  starts a model turn. The aggregate `Image validation success` check fails if
+  either native packaged-image probe fails.
 - Publication run `29175125487` at bridge head `a08bbe41` is superseded audit
   evidence. Its BuildKit outputs were attested OCI indexes, while the final
   tags resolved to runnable platform children; the old descriptor comparison
