@@ -185,16 +185,85 @@ class PrincipalTest < ActiveSupport::TestCase
     end
   end
 
-  test "effective_config does not fall back to slack channel label" do
+  test "api server JWT does not infer Slack access from a legacy channel label" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
       principal = principals(:acme_channel)
       principal.update!(labels: { Principal::SLACK_CHANNEL_ID_LABEL => "C0123456789" })
 
-      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_equal principal.oid, claims.fetch("sub")
+      assert_empty claims.dig("slack", "upload_channels")
+      assert_empty claims.dig("slack", "download_channels")
+      assert_empty claims.dig("slack", "history_channels")
     end
   end
 
-  test "clearing slack channel permissions revokes slack access" do
+  test "api-enabled non-Slack principal receives a subject-only API JWT" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      principal = Principal.create!(
+        default_attrs(namespace: "acme", foreign_id: "github-subject-only")
+      )
+
+      entry = principal.effective_config(redact_secrets: false).fetch("secrets").find do |secret|
+        secret.dig("inject", "header") == "Authorization" &&
+          secret.dig("source", "type") == "control_plane"
+      end
+
+      refute_nil entry
+      claims = jwt_payload(entry.dig("source", "value"))
+      assert_equal principal.oid, claims.fetch("sub")
+      assert_empty claims.dig("slack", "upload_channels")
+    end
+  end
+
+  test "feedback credential follows the release-qualified API host without overriding its JWT" do
+    with_env(
+      "CENTAUR_JWT_SIGNING_SECRET" => "test-secret",
+      "CENTAUR_API_URL" => "http://test-centaur-api-rs:8080",
+      "CENTAUR_API_SERVER_PROXY_HOSTS" => nil
+    ) do
+      principal = Principal.create!(
+        default_attrs(namespace: "acme", foreign_id: "feedback-host-test")
+      )
+      feedback_secret = StaticSecret.new(
+        namespace: "acme",
+        foreign_id: "tool-slack-slack-feedback-api-key",
+        name: Principal::FEEDBACK_API_SECRET_NAME,
+        replace_config: {
+          "proxy_value" => "SLACK_FEEDBACK_API_KEY",
+          "match_headers" => [ "X-Centaur-Feedback-Key" ]
+        },
+        created_by: users(:acme_admin)
+      )
+      feedback_secret.build_source(
+        source_type: "env",
+        config: { "var" => "SLACK_FEEDBACK_API_KEY" }
+      )
+      feedback_secret.rules.build(host: "centaur-api-rs", position: 0)
+      feedback_secret.save!
+      Grant.create!(
+        principal: principal,
+        static_secret: feedback_secret,
+        created_by: users(:acme_admin)
+      )
+
+      secrets = principal.effective_config(redact_secrets: false).fetch("secrets")
+      feedback_entry = secrets.find do |secret|
+        secret.dig("replace", "proxy_value") == "SLACK_FEEDBACK_API_KEY"
+      end
+      jwt_entry = secrets.find do |secret|
+        secret.dig("inject", "header") == "Authorization" &&
+          secret.dig("source", "type") == "control_plane"
+      end
+
+      assert_includes feedback_entry.fetch("rules"), { "host" => "test-centaur-api-rs" }
+      assert_equal [ "X-Centaur-Feedback-Key" ], feedback_entry.dig("replace", "match_headers")
+      refute_nil jwt_entry
+      assert_includes jwt_entry.fetch("rules"), { "host" => "test-centaur-api-rs" }
+    end
+  end
+
+  test "clearing slack channel permissions preserves subject-only session access" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
       principal = Principal.create!(
         default_attrs(
@@ -214,7 +283,11 @@ class PrincipalTest < ActiveSupport::TestCase
       SlackChannelPermission.replace_for_principal!(principal, [])
 
       assert_empty principal.slack_channel_permissions.reload
-      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_equal principal.oid, claims.fetch("sub")
+      assert_empty claims.dig("slack", "upload_channels")
+      assert_empty claims.dig("slack", "download_channels")
+      assert_empty claims.dig("slack", "history_channels")
     end
   end
 

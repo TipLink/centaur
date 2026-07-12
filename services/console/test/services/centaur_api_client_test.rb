@@ -50,6 +50,17 @@ class CentaurApiClientTest < ActiveSupport::TestCase
     assert_equal({ "source" => "test" }, body["metadata"])
   end
 
+  test "uses the canonical Console control-plane API key" do
+    http = StubHTTP.new(status: 200, body: { ok: true, schedules: [] }.to_json)
+
+    with_env("CENTAUR_CONSOLE_CENTAUR_API_KEY" => "control-key") do
+      CentaurApiClient.new(base_url: "http://api.internal:8080", http: http)
+                      .list_workflow_schedules
+    end
+
+    assert_equal "Bearer control-key", http.requests.first[:headers]["Authorization"]
+  end
+
   test "raises useful errors for non-2xx responses" do
     http = StubHTTP.new(status: 400, body: { error: "bad archive" }.to_json)
     client = CentaurApiClient.new(base_url: "http://api.internal:8080", http: http)
@@ -193,5 +204,19 @@ class CentaurApiClientTest < ActiveSupport::TestCase
 
     with_input = http.requests.second
     assert_equal({ "workflow_name" => "slack_sync", "input" => { "mode" => "full" } }, JSON.parse(with_input[:body]))
+  end
+
+  private
+
+  def with_env(values)
+    previous = values.keys.to_h { |key| [ key, ENV[key] ] }
+    values.each do |key, value|
+      value.nil? ? ENV.delete(key) : ENV[key] = value
+    end
+    yield
+  ensure
+    previous.each do |key, value|
+      value.nil? ? ENV.delete(key) : ENV[key] = value
+    end
   end
 end

@@ -82,6 +82,9 @@ transforms:
         - "addepar-firm"
         - "clientid"
         - "x-as-user-email"
+        # Workflow-scoped HMAC capability. Keep this separate from Authorization:
+        # principal credential injection may replace Authorization for API hosts.
+        - "x-centaur-workflow-task-token"
         # Datadog static-key auth for the agent-facing Datadog tool/CLI: it
         # authenticates to api.datadoghq.com with these two headers (Datadog does
         # not accept Authorization: Bearer for static API/app keys). Neither is

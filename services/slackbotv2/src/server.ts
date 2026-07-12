@@ -27,6 +27,7 @@ const consoleLogger = {
 const options: SlackbotV2Options = {
   apiUrl,
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
+  ambientSlackChannelIds: envList('SLACKBOT_AMBIENT_CHANNEL_IDS'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
   botToken,
@@ -79,6 +80,15 @@ console.log(
 function optionalEnv(name: string): string | undefined {
   const value = process.env[name]?.trim()
   return value ? value : undefined
+}
+
+function envList(name: string): string[] | undefined {
+  const value = optionalEnv(name)
+  if (!value) return undefined
+  return value
+    .split(/[\s,]+/)
+    .map(part => part.trim())
+    .filter(Boolean)
 }
 
 function requiredEnv(name: string): string {

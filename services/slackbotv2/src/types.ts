@@ -98,10 +98,25 @@ export type SlackbotV2InterruptSessionResponse = {
   thread_key: string
 }
 
+export type SlackbotV2RecordDeliveryRequest = {
+  message_id?: string
+  outcome: string
+}
+
+export type SlackbotV2RecordDeliveryResponse = {
+  ok: boolean
+  created: boolean
+  event_id: number
+  execution_id: string
+  thread_key: string
+}
+
 export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 export type SlackbotV2Options = {
   allowedExternalTeamIds?: readonly string[]
+  /** Slack channel ids where messages should start sessions without an @mention. */
+  ambientSlackChannelIds?: readonly string[]
   apiKey?: string
   apiUrl: string
   assistantStatus?: string

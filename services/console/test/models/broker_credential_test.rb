@@ -7,6 +7,11 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     def refresh(**kw) = @block.call(**kw)
   end
 
+  class StubGithubAppClient
+    def initialize(&block) = (@block = block)
+    def mint(**kw) = @block.call(**kw)
+  end
+
   def result(access_token: "AT", refresh_token: "RT", expires_in: 3600)
     Broker::RefreshClient::Result.new(access_token: access_token, refresh_token: refresh_token, expires_in: expires_in)
   end
@@ -52,6 +57,51 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     bc = build_credential(client_id: nil)
     refute bc.valid?
     assert bc.errors[:client_id].any?
+  end
+
+  test "github app installation credentials do not require a refresh token" do
+    bc = build_credential(
+      grant: BrokerCredential::GITHUB_APP_INSTALLATION,
+      token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+      client_id: "12345",
+      client_secret: "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----",
+      refresh_token: nil
+    )
+    assert bc.valid?, bc.errors.full_messages.to_sentence
+  end
+
+  test "github app installation credentials require a private key" do
+    bc = build_credential(
+      grant: BrokerCredential::GITHUB_APP_INSTALLATION,
+      client_secret: nil,
+      refresh_token: nil
+    )
+    refute bc.valid?
+    assert bc.errors[:client_secret].any?
+  end
+
+  test "github app installation credentials reject unapproved token endpoints" do
+    endpoints = [
+      "https://attacker.example/app/installations/42/access_tokens",
+      "https://api.github.com.attacker.example/app/installations/42/access_tokens",
+      "https://user@api.github.com/app/installations/42/access_tokens",
+      "https://api.github.com:444/app/installations/42/access_tokens",
+      "https://api.github.com/app/installations/42/access_tokens?redirect=attacker",
+      "https://api.github.com/app/installations/42/access_tokens#fragment",
+      "http://api.github.com/app/installations/42/access_tokens"
+    ]
+
+    endpoints.each do |token_endpoint|
+      credential = build_credential(
+        grant: BrokerCredential::GITHUB_APP_INSTALLATION,
+        token_endpoint: token_endpoint,
+        client_id: "12345",
+        client_secret: "private-key",
+        refresh_token: nil
+      )
+      refute credential.valid?, token_endpoint
+      assert credential.errors[:token_endpoint].any?, token_endpoint
+    end
   end
 
   test "password grant is valid with username and password" do
@@ -418,6 +468,33 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     assert_equal "preqin_missing_initial_values", bc.dead_reason
   end
 
+  test "github app refresh mints an installation token without a refresh token" do
+    now = Time.current
+    captured = {}
+    bc = create_credential(
+      grant: BrokerCredential::GITHUB_APP_INSTALLATION,
+      token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+      client_id: "12345",
+      client_secret: "private-key",
+      refresh_token: nil
+    )
+    bc.github_app_client = StubGithubAppClient.new do |**kw|
+      captured = kw
+      result(access_token: "ghs-fresh", refresh_token: nil, expires_in: 3600)
+    end
+
+    bc.refresh!(now: now)
+
+    bc.reload
+    assert_equal "live", bc.status
+    assert_equal "ghs-fresh", bc.access_token
+    assert_nil bc.refresh_token
+    assert_equal "12345", captured[:app_id]
+    assert_equal "private-key", captured[:private_key_pem]
+    assert_equal "https://api.github.com/app/installations/42/access_tokens", captured[:token_endpoint]
+    assert_in_delta (now + 3600).to_f, bc.expires_at.to_f, 1
+  end
+
   # --- scope ----------------------------------------------------------------
 
   test "refreshable includes never-attempted and due, excludes dead and future" do
@@ -446,6 +523,15 @@ class BrokerCredentialTest < ActiveSupport::TestCase
   test "refreshable includes preqin credentials without a refresh_token" do
     bc = create_credential(grant: "preqin", client_id: nil, username: "user",
                            api_key: "api-key", refresh_token: nil)
+    bc.update_columns(last_refresh: 1.hour.ago, next_attempt_at: 1.minute.ago)
+
+    assert_includes BrokerCredential.refreshable.pluck(:id), bc.id
+  end
+
+  test "refreshable includes github app installation credentials without a refresh_token" do
+    bc = create_credential(grant: BrokerCredential::GITHUB_APP_INSTALLATION,
+                           token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+                           client_id: "12345", client_secret: "private-key", refresh_token: nil)
     bc.update_columns(last_refresh: 1.hour.ago, next_attempt_at: 1.minute.ago)
 
     assert_includes BrokerCredential.refreshable.pluck(:id), bc.id

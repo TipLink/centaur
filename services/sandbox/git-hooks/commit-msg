@@ -16,7 +16,7 @@ EOF
   exit 1
 fi
 
-if rg -i -q \
+if grep -E -i -q \
   -e 'generated with (claude|codex|amp)' \
   -e 'co-authored-by:.*(claude|codex|anthropic|openai|amp)' \
   -e 'co-authored-by:.*(centaur[[:space:]]+ai|ai@centaur\.local)' \
@@ -27,4 +27,10 @@ Commit message contains generated-by or AI co-author attribution.
 Remove the generated attribution footer and commit again.
 EOF
   exit 1
+else
+  scan_status=$?
+  if (( scan_status != 1 )); then
+    echo "failed to scan commit message for generated attribution" >&2
+    exit "$scan_status"
+  fi
 fi

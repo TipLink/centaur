@@ -13,8 +13,65 @@ from unittest import mock
 import install_tool_shims
 
 
+class OverlaySkillSourcesTest(unittest.TestCase):
+    def test_repo_overlay_skills_win_with_mounted_image_as_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_overlay = root / "repo-overlay"
+            image_overlay = root / "image-overlay"
+            repo_skills = repo_overlay / ".agents" / "skills"
+            image_skills = image_overlay / ".agents" / "skills"
+            repo_skills.mkdir(parents=True)
+            image_skills.mkdir(parents=True)
+
+            with (
+                mock.patch.object(install_tool_shims, "_home_dir", return_value=root / "home"),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CENTAUR_OVERLAY_DIR": str(repo_overlay),
+                        "CENTAUR_IMAGE_OVERLAY_DIR": str(image_overlay),
+                    },
+                    clear=True,
+                ),
+            ):
+                sources = install_tool_shims._skill_sources()
+            self.assertIn(repo_skills, sources)
+            self.assertNotIn(image_skills, sources)
+
+            repo_skills.rmdir()
+            with (
+                mock.patch.object(install_tool_shims, "_home_dir", return_value=root / "home"),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CENTAUR_OVERLAY_DIR": str(repo_overlay),
+                        "CENTAUR_IMAGE_OVERLAY_DIR": str(image_overlay),
+                    },
+                    clear=True,
+                ),
+            ):
+                sources = install_tool_shims._skill_sources()
+            self.assertNotIn(image_skills, sources)
+
+            repo_overlay.rename(root / "repo-overlay-missing")
+            with (
+                mock.patch.object(install_tool_shims, "_home_dir", return_value=root / "home"),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CENTAUR_OVERLAY_DIR": str(repo_overlay),
+                        "CENTAUR_IMAGE_OVERLAY_DIR": str(image_overlay),
+                    },
+                    clear=True,
+                ),
+            ):
+                sources = install_tool_shims._skill_sources()
+            self.assertIn(image_skills, sources)
+
+
 class CopyPublishedToolsTest(unittest.TestCase):
-    def test_copies_tool_dirs_and_skips_duplicate_names(self) -> None:
+    def test_copies_tool_dirs_and_replaces_duplicate_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             published = root / "published"
@@ -40,14 +97,31 @@ class CopyPublishedToolsTest(unittest.TestCase):
                 (target / "research" / "sensortower" / "pyproject.toml").read_text(),
                 "base\n",
             )
-            self.assertIn("skipping duplicate tool websearch", stderr.getvalue())
+            self.assertIn("replacing duplicate tool websearch", stderr.getvalue())
             self.assertEqual(
                 (target / "research" / "websearch" / "pyproject.toml").read_text(),
-                "old project\n",
+                "new project\n",
             )
-            self.assertEqual((target / "research" / "websearch" / "old.py").read_text(), "old\n")
-            self.assertFalse((target / "research" / "websearch" / "new.py").exists())
+            self.assertFalse((target / "research" / "websearch" / "old.py").exists())
+            self.assertEqual((target / "research" / "websearch" / "new.py").read_text(), "new\n")
             self.assertEqual((target / "research" / "company" / "pyproject.toml").read_text(), "company\n")
+
+    def test_duplicate_name_replaces_package_even_if_category_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            published = root / "published"
+            target = root / "target"
+
+            (target / "productivity" / "slack").mkdir(parents=True)
+            (target / "productivity" / "slack" / "pyproject.toml").write_text("base\n")
+
+            (published / "slack").mkdir(parents=True)
+            (published / "slack" / "pyproject.toml").write_text("overlay\n")
+
+            install_tool_shims._copy_published_tools(target, published)
+
+            self.assertFalse((target / "productivity" / "slack").exists())
+            self.assertEqual((target / "slack" / "pyproject.toml").read_text(), "overlay\n")
 
     def test_tool_allowlist_restricts_installed_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,6 +138,30 @@ class CopyPublishedToolsTest(unittest.TestCase):
 
             # Allowlisted tool installed; unconfigured tool skipped.
             self.assertTrue((target / "research" / "websearch" / "pyproject.toml").exists())
+            self.assertFalse((target / "productivity" / "linear").exists())
+
+    def test_tool_allowlist_accepts_visible_script_name_when_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            published = root / "published"
+            target = root / "target"
+
+            investigator = published / "infra" / "centaur_investigator"
+            investigator.mkdir(parents=True)
+            (investigator / "pyproject.toml").write_text(
+                '[project]\nname = "centaur_investigator"\n\n'
+                '[project.scripts]\ncentaur-investigator = "client:main"\n'
+            )
+            linear = published / "productivity" / "linear"
+            linear.mkdir(parents=True)
+            (linear / "pyproject.toml").write_text(
+                '[project]\nname = "linear"\n\n[project.scripts]\nlinear = "client:main"\n'
+            )
+
+            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": "centaur-investigator"}):
+                install_tool_shims._copy_published_tools(target, published)
+
+            self.assertTrue((target / "infra" / "centaur_investigator").exists())
             self.assertFalse((target / "productivity" / "linear").exists())
 
     def test_unset_allowlist_installs_all_tools(self) -> None:
@@ -113,6 +211,17 @@ class CopyPublishedToolsTest(unittest.TestCase):
                 scripts = install_tool_shims._discover_scripts([root])
             self.assertIn("websearch", scripts)
             self.assertNotIn("linear", scripts)
+
+            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": "centaur-investigator"}):
+                d = root / "infra" / "centaur_investigator"
+                d.mkdir(parents=True)
+                (d / "pyproject.toml").write_text(
+                    '[project]\nname = "centaur_investigator"\n\n'
+                    '[project.scripts]\ncentaur-investigator = "client:main"\n'
+                )
+                script_named = install_tool_shims._discover_scripts([root])
+            self.assertIn("centaur-investigator", script_named)
+            self.assertNotIn("websearch", script_named)
 
             with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": ""}):
                 scripts_all = install_tool_shims._discover_scripts([root])

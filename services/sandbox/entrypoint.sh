@@ -415,19 +415,12 @@ elif [ -f "$HOME_DIR/AGENTS.md" ]; then
     cp "$HOME_DIR/AGENTS.md" "$TARGET_PROMPT"
 fi
 
-if [ -f "$HOME_DIR/AGENTS_OVERLAY.md" ] && [ -f "$TARGET_PROMPT" ]; then
+OVERLAY_PROMPT="$(HOME="$HOME_DIR" select-overlay-prompt)"
+if [ -n "$OVERLAY_PROMPT" ] && [ -f "$TARGET_PROMPT" ]; then
     printf '\n\n---\n\n' >> "$TARGET_PROMPT"
-    cat "$HOME_DIR/AGENTS_OVERLAY.md" >> "$TARGET_PROMPT"
-# Repo-cache-era org prompt: with overlay images gone, point CENTAUR_OVERLAY_DIR
-# at the org repo's clone under the repos mount (e.g. ~/github/<owner>/<repo>)
-# and its SYSTEM_PROMPT.md is appended here, same contract the overlay-bootstrap
-# init container used to fulfil by staging $HOME/AGENTS_OVERLAY.md.
-elif [ -n "${CENTAUR_OVERLAY_DIR:-}" ] \
-    && [ -f "${CENTAUR_OVERLAY_DIR}/services/sandbox/SYSTEM_PROMPT.md" ] \
-    && [ -f "$TARGET_PROMPT" ]; then
-    printf '\n\n---\n\n' >> "$TARGET_PROMPT"
-    cat "${CENTAUR_OVERLAY_DIR}/services/sandbox/SYSTEM_PROMPT.md" >> "$TARGET_PROMPT"
+    cat "$OVERLAY_PROMPT" >> "$TARGET_PROMPT"
 fi
+unset OVERLAY_PROMPT
 
 if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
     cat >> "$TARGET_PROMPT" <<'EOF'

@@ -164,7 +164,7 @@ class CommitMessageHookTest(unittest.TestCase):
             message.flush()
 
             result = subprocess.run(
-                [str(COMMIT_MSG_HOOK), message.name],
+                ["bash", str(COMMIT_MSG_HOOK), message.name],
                 check=False,
                 capture_output=True,
                 text=True,

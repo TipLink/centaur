@@ -27,12 +27,12 @@ def _split_paths(value: str) -> list[Path]:
 
 
 def _tool_allowlist() -> set[str] | None:
-    """Tool package names to install, from ``TOOL_ALLOWLIST``.
+    """Tool package/project/script names to install, from ``TOOL_ALLOWLIST``.
 
     Returns ``None`` when unset/empty -> install every mounted tool (backward
-    compatible). When set, only tools whose package name is listed are installed,
-    so the sandbox catalog is exactly the configured tools and the agent neither
-    sees nor wastes context on unconfigured ones (which also lack credentials).
+    compatible). When set, only matching tools are installed, so the sandbox
+    catalog is exactly the configured tools and the agent neither sees nor
+    wastes context on unconfigured ones (which also lack credentials).
     """
     raw = os.environ.get("TOOL_ALLOWLIST", "").strip()
     if not raw:
@@ -46,6 +46,32 @@ def _tool_blocklist() -> set[str]:
     if not raw:
         return set()
     return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def _tool_pyproject_data(package_dir: Path) -> dict:
+    pyproject = package_dir / "pyproject.toml"
+    if not pyproject.is_file():
+        return {}
+    try:
+        return tomllib.loads(pyproject.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        print(f"warning: failed to read {pyproject}: {exc}", file=sys.stderr)
+        return {}
+
+
+def _tool_identifiers(package_dir: Path, data: dict | None = None) -> set[str]:
+    identifiers = {package_dir.name}
+    data = data if data is not None else _tool_pyproject_data(package_dir)
+    project = data.get("project") if isinstance(data, dict) else None
+    if not isinstance(project, dict):
+        return identifiers
+    project_name = str(project.get("name") or "").strip()
+    if project_name:
+        identifiers.add(project_name)
+    project_scripts = project.get("scripts") or {}
+    if isinstance(project_scripts, dict):
+        identifiers.update(str(name) for name in project_scripts if str(name))
+    return identifiers
 
 
 def _home_dir() -> Path:
@@ -149,21 +175,28 @@ def _copy_published_tools(tool_dir: Path, published: Path) -> None:
     existing = {package_dir.name: package_dir for package_dir in _tool_package_dirs(tool_dir)}
     for package_dir in _tool_package_dirs(published):
         tool_name = package_dir.name
-        if allowlist is not None and tool_name not in allowlist:
+        identifiers = _tool_identifiers(package_dir)
+        if allowlist is not None and identifiers.isdisjoint(allowlist):
             # Not in TOOL_ALLOWLIST -> don't install; keeps the agent's catalog
             # to configured tools (no phantom, credential-less tools).
             continue
-        if tool_name in blocklist:
-            continue
-        if tool_name in existing:
-            print(
-                f"skipping duplicate tool {tool_name}: {package_dir} conflicts with {existing[tool_name]}",
-                file=sys.stderr,
-            )
+        if not identifiers.isdisjoint(blocklist):
             continue
         relative_package_dir = package_dir.relative_to(published)
         target = tool_dir / relative_package_dir
+        previous = existing.get(tool_name)
+        if previous is not None and previous != target and (previous.exists() or previous.is_symlink()):
+            print(
+                f"replacing duplicate tool {tool_name}: {package_dir} overrides {previous}",
+                file=sys.stderr,
+            )
+            _remove_path(previous)
         if target.exists() or target.is_symlink():
+            if previous is not None:
+                print(
+                    f"replacing duplicate tool {tool_name}: {package_dir} overrides {previous}",
+                    file=sys.stderr,
+                )
             _remove_path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(package_dir, target, symlinks=True)
@@ -356,8 +389,21 @@ def _skill_sources() -> list[Path]:
     sources.append(home_dir / "centaur-overlay-skills")
 
     overlay_dir = os.environ.get("CENTAUR_OVERLAY_DIR")
-    if overlay_dir:
-        overlay_tree_skills = Path(overlay_dir) / ".agents" / "skills"
+    image_overlay_dir = os.environ.get("CENTAUR_IMAGE_OVERLAY_DIR")
+    # The explicit repo root is authoritative as a whole. Once it is mounted,
+    # a missing skills subtree means "no overlay skills" rather than permission
+    # to resurrect stale image-baked skills. Use the image only when the repo
+    # root itself is unavailable during the transitional rollout.
+    selected_overlay_dir = next(
+        (
+            Path(candidate)
+            for candidate in (overlay_dir, image_overlay_dir)
+            if candidate and Path(candidate).is_dir()
+        ),
+        None,
+    )
+    if selected_overlay_dir:
+        overlay_tree_skills = selected_overlay_dir / ".agents" / "skills"
         if overlay_tree_skills.is_dir():
             sources.append(overlay_tree_skills)
 
@@ -398,23 +444,17 @@ def _discover_scripts(tool_dirs: list[Path]) -> dict[str, dict[str, str]]:
                 for part in pyproject.parts
             ):
                 continue
-            try:
-                data = tomllib.loads(pyproject.read_text())
-            except (OSError, tomllib.TOMLDecodeError) as exc:
-                print(f"warning: failed to read {pyproject}: {exc}", file=sys.stderr)
+            data = _tool_pyproject_data(pyproject.parent)
+            if not data:
                 continue
             project = data.get("project") or {}
-            # Only shim allowlisted tools (by package dir or project name) so the
-            # agent's catalog is exactly the configured tools. Unset -> shim all.
-            package_dir = pyproject.parent.name
-            project_name = str(project.get("name") or "")
-            if (
-                allowlist is not None
-                and package_dir not in allowlist
-                and project_name not in allowlist
-            ):
+            # Only shim allowlisted tools so the agent's catalog is exactly the
+            # configured tools. Match package dir, project name, or script name.
+            # Unset -> shim all.
+            identifiers = _tool_identifiers(pyproject.parent, data)
+            if allowlist is not None and identifiers.isdisjoint(allowlist):
                 continue
-            if package_dir in blocklist or project_name in blocklist:
+            if not identifiers.isdisjoint(blocklist):
                 continue
             project_scripts = project.get("scripts") or {}
             if not isinstance(project_scripts, dict):
