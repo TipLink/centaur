@@ -6,6 +6,12 @@ on:
     paths:
       - .github/workflows/validate-images.yml
       - .github/workflows/publish-images.yml
+      - .github/scripts/resolve-runnable-image-digest.sh
+      - .github/scripts/verify-registry-tag-absent.sh
+      - .github/scripts/verify-reviewed-image-release.sh
+      - .github/scripts/test-resolve-runnable-image-digest.sh
+      - .github/scripts/test-verify-registry-tag-absent.sh
+      - .github/scripts/test-verify-reviewed-image-release.sh
       - services/**
       - crates/harness-server/**
       - harness/**
@@ -126,3 +132,19 @@ jobs:
         env:
           AGENT_IMAGE: ${{ matrix.image }}:validate-${{ env.PLATFORM_SLUG }}
         run: bash scripts/probe-agent-harness-image.sh "$AGENT_IMAGE"
+
+  image-validation-success:
+    name: Image validation success
+    runs-on: ubuntu-latest
+    if: always()
+    needs: build
+    steps:
+      - name: Require every image validation build to succeed
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_RESULT" != "success" ]]; then
+            echo "image validation matrix result is $BUILD_RESULT; expected success" >&2
+            exit 1
+          fi

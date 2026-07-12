@@ -25,6 +25,14 @@ def reject(text: str, needle: str, source: str) -> None:
         raise SystemExit(f"{source}: forbidden in this trust lane: {needle}")
 
 
+def require_count(text: str, needle: str, minimum: int, source: str) -> None:
+    count = text.count(needle)
+    if count < minimum:
+        raise SystemExit(
+            f"{source}: expected at least {minimum} occurrences of {needle}, found {count}"
+        )
+
+
 def audit_pull_request_workflows() -> None:
     label_gated_secret_workflow = "pr-audit.yml"
     for path in sorted(WORKFLOWS.glob("*.yml")):
@@ -46,12 +54,58 @@ def audit_split_publication_lanes() -> None:
     image_validation = read("validate-images.yml")
     require(image_validation, "pull_request:", "validate-images.yml")
     require(image_validation, "push: false", "validate-images.yml")
+    require(image_validation, "name: Image validation success", "validate-images.yml")
+    for helper in (
+        ".github/scripts/resolve-runnable-image-digest.sh",
+        ".github/scripts/verify-registry-tag-absent.sh",
+        ".github/scripts/verify-reviewed-image-release.sh",
+    ):
+        require(image_validation, helper, "validate-images.yml")
     reject(image_validation, "docker/login-action", "validate-images.yml")
     reject(image_validation, "packages: write", "validate-images.yml")
 
     image_publish = read("publish-images.yml")
     reject(image_publish, "pull_request:", "publish-images.yml")
-    require(image_publish, "tags: [v*]", "publish-images.yml")
+    require(image_publish, "'reviewed-images-publish-*'", "publish-images.yml")
+    require(image_publish, "group: publish-reviewed-centaur-images", "publish-images.yml")
+    require(image_publish, "cancel-in-progress: false", "publish-images.yml")
+    require(image_publish, "checks: read", "publish-images.yml")
+    require(
+        image_publish,
+        "verify-reviewed-image-release.sh",
+        "publish-images.yml",
+    )
+    require(
+        image_publish,
+        "verify-registry-tag-absent.sh",
+        "publish-images.yml",
+    )
+    require_count(
+        image_publish,
+        "verify-registry-tag-absent.sh",
+        2,
+        "publish-images.yml",
+    )
+    require(image_publish, "REVIEWED_TAG: reviewed-${{ github.sha }}", "publish-images.yml")
+    require(image_publish, 'tag="reviewed-${RELEASE_REVISION}"', "publish-images.yml")
+    require(image_publish, 'needs: tag-absence-gate', "publish-images.yml")
+    require(
+        image_publish,
+        'if [[ "${#root_digest_files[@]}" -ne 2 ]]',
+        "publish-images.yml",
+    )
+    require(
+        image_publish,
+        "pattern: runnable-child-digests-*-linux-arm64",
+        "publish-images.yml",
+    )
+    require(
+        image_publish,
+        'if [[ "$digest" != "$run_child_digest" ]]',
+        "publish-images.yml",
+    )
+    reject(image_publish, 'tag="sha-${RELEASE_REVISION', "publish-images.yml")
+    reject(image_publish, "type=semver", "publish-images.yml")
     reject(image_publish, "promote-fineas-infra", "publish-images.yml")
 
     for name in ("docs-deploy.yml", "release-chart-publish.yml"):

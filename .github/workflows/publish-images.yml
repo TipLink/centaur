@@ -2,14 +2,24 @@ name: Publish Reviewed Images
 
 on:
   push:
-    tags: [v*]
+    tags:
+      - 'reviewed-images-publish-*'
   workflow_dispatch:
+    inputs:
+      reviewed_commit:
+        description: Exact signed, ready-for-review PR head to publish
+        required: true
+        type: string
 
 concurrency:
-  group: publish-images-${{ github.ref }}
-  cancel-in-progress: true
+  # Reviewed package tags are global state. Serialize every branch, tag, and
+  # dispatch so a later run cannot race or cancel a partially published run.
+  group: publish-reviewed-centaur-images
+  cancel-in-progress: false
 
 permissions:
+  actions: read
+  checks: read
   contents: read
   packages: write
   pull-requests: read
@@ -21,12 +31,67 @@ env:
   RUST_BUILD_PROFILE: release
 
 jobs:
+  release-gate:
+    name: Bind publication to the reviewed signed PR head
+    runs-on: ubuntu-latest
+    env:
+      DISPATCH_REVIEWED_COMMIT: ${{ inputs.reviewed_commit }}
+      GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TRIGGER_API_URL: ${{ github.api_url }}
+      TRIGGER_EVENT_NAME: ${{ github.event_name }}
+      TRIGGER_REF: ${{ github.ref }}
+      TRIGGER_REF_CREATED: ${{ github.event.created }}
+      TRIGGER_REF_NAME: ${{ github.ref_name }}
+      TRIGGER_REF_TYPE: ${{ github.ref_type }}
+      TRIGGER_REPOSITORY: ${{ github.repository }}
+      TRIGGER_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout the exact publication commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Require signed PR head and exact-head non-CodeQL checks
+        run: bash .github/scripts/verify-reviewed-image-release.sh
+
+  tag-absence-gate:
+    name: Prove every reviewed image tag is unassigned
+    runs-on: ubuntu-latest
+    needs: release-gate
+    env:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REVIEWED_TAG: reviewed-${{ github.sha }}
+    steps:
+      - name: Checkout immutable-tag verifier
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Reject existing or unprovably absent tags
+        run: |
+          set -euo pipefail
+          IFS=$'\n\t'
+          for image in \
+            centaur-api-rs \
+            centaur-slackbotv2 \
+            centaur-linearbot \
+            centaur-discordbot \
+            centaur-githubbot \
+            centaur-teamsbot \
+            centaur-agent \
+            centaur-iron-proxy \
+            centaur-console; do
+            bash .github/scripts/verify-registry-tag-absent.sh \
+              "${IMAGE_NAMESPACE}/${image}" "$REVIEWED_TAG"
+          done
+
   # Build each image natively per platform (amd64 on x64 runners, arm64 on
-  # arm runners), push by digest, and hand the digests to the merge job below
-  # which assembles the multi-arch manifest. Pull requests are validated by the
-  # separate read-only Validate Images workflow; only reviewed tags or an
-  # explicit dispatch reach this package-write publication lane.
+  # arm runners), push by digest, and retain two distinct identities: the
+  # attested per-platform root used for the final merge and its runnable child
+  # manifest. Pull requests are validated by the separate read-only workflow;
+  # only the signed, exact checked PR head reaches this package-write lane.
   build:
+    needs: tag-absence-gate
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
@@ -125,6 +190,8 @@ jobs:
           # Tags are applied by the merge job on the multi-arch manifest;
           # per-arch release builds are pushed by digest only.
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
           cache-from: |
@@ -134,18 +201,46 @@ jobs:
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.PLATFORM_SLUG }},mode=max
             type=gha,mode=max,scope=${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
 
-      - name: Export digest
+      - name: Export attested root and runnable platform child digests
+        env:
+          BUILD_ROOT_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_IMAGE: ${{ matrix.image }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          IFS=$'\n\t'
+          if [[ ! "$BUILD_ROOT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid attested build root digest for $BUILD_IMAGE: $BUILD_ROOT_DIGEST" >&2
+            exit 1
+          fi
+          mkdir -p "${{ runner.temp }}/merge-root-digests"
+          touch "${{ runner.temp }}/merge-root-digests/${BUILD_ROOT_DIGEST#sha256:}"
 
-      - name: Upload digest
+          platform_os=${BUILD_PLATFORM%%/*}
+          platform_architecture=${BUILD_PLATFORM##*/}
+          runnable_digest="$(bash .github/scripts/resolve-runnable-image-digest.sh \
+            "${REGISTRY}/${IMAGE_NAMESPACE}/${BUILD_IMAGE}@${BUILD_ROOT_DIGEST}" \
+            "$platform_os" "$platform_architecture")"
+          if [[ ! "$runnable_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid runnable child digest for $BUILD_IMAGE ($BUILD_PLATFORM): $runnable_digest" >&2
+            exit 1
+          fi
+          mkdir -p "${{ runner.temp }}/runnable-child-digests"
+          touch "${{ runner.temp }}/runnable-child-digests/${runnable_digest#sha256:}"
+
+      - name: Upload attested platform root digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digests-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
-          path: ${{ runner.temp }}/digests/*
+          name: merge-root-digests-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+          path: ${{ runner.temp }}/merge-root-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload runnable platform child digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runnable-child-digests-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+          path: ${{ runner.temp }}/runnable-child-digests/*
           if-no-files-found: error
           retention-days: 1
 
@@ -167,11 +262,16 @@ jobs:
           - image: centaur-teamsbot
 
     steps:
-      - name: Download digests
+      - name: Checkout immutable-tag verifier
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download attested platform root digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: digests-${{ matrix.image }}-*
-          path: ${{ runner.temp }}/digests
+          pattern: merge-root-digests-${{ matrix.image }}-*
+          path: ${{ runner.temp }}/merge-root-digests
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -184,54 +284,55 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata for ${{ matrix.image }}
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
-          flavor: |
-            latest=false
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=main,enable={{is_default_branch}}
-            type=raw,value=edge,enable={{is_default_branch}}
-            type=sha,prefix=main-sha-,enable={{is_default_branch}}
-            type=semver,pattern={{raw}}
-            type=ref,event=pr
-            type=sha
-          labels: |
-            org.opencontainers.image.title=${{ matrix.image }}
-            org.opencontainers.image.source=${{ env.IMAGE_SOURCE }}
+      - name: Recheck absence and create immutable reviewed manifest
+        working-directory: ${{ runner.temp }}/merge-root-digests
         env:
-          DOCKER_METADATA_PR_HEAD_SHA: true
-
-      - name: Create multi-arch manifest for ${{ matrix.image }}
-        working-directory: ${{ runner.temp }}/digests
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEWED_TAG: reviewed-${{ github.sha }}
         run: |
           set -euo pipefail
-          mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          tag_args=()
-          for tag in "${tags[@]}"; do
-            tag_args+=("-t" "$tag")
-          done
-
+          IFS=$'\n\t'
+          repository="${IMAGE_NAMESPACE}/${{ matrix.image }}"
+          mapfile -t root_digest_files < <(find . -maxdepth 1 -type f -print)
+          if [[ "${#root_digest_files[@]}" -ne 2 ]]; then
+            echo "expected exactly two attested platform roots for ${{ matrix.image }}; found ${#root_digest_files[@]}" >&2
+            exit 1
+          fi
           image_refs=()
-          for digest in *; do
-            image_refs+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}@sha256:${digest}")
+          for digest_file in "${root_digest_files[@]}"; do
+            digest="sha256:$(basename "$digest_file")"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid attested platform root for ${{ matrix.image }}: $digest" >&2
+              exit 1
+            fi
+            image_refs+=("${REGISTRY}/${repository}@${digest}")
           done
 
-          docker buildx imagetools create "${tag_args[@]}" "${image_refs[@]}"
+          # Keep this single-assignment proof immediately adjacent to the only
+          # command that can create the final reviewed tag.
+          bash "$GITHUB_WORKSPACE/.github/scripts/verify-registry-tag-absent.sh" \
+            "$repository" "$REVIEWED_TAG"
+          docker buildx imagetools create \
+            -t "${REGISTRY}/${repository}:${REVIEWED_TAG}" \
+            "${image_refs[@]}"
 
-      - name: Inspect manifest
+      - name: Inspect immutable reviewed manifest
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect \
+            "${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.image }}:reviewed-${GITHUB_SHA}"
 
   release-descriptor:
     name: Publish reviewed linux/arm64 release descriptor
     runs-on: ubuntu-latest
     needs: merge
     steps:
+      - name: Download this run's runnable linux/arm64 child digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: runnable-child-digests-*-linux-arm64
+          path: ${{ runner.temp }}/arm64-runnable-child-digests
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -245,13 +346,15 @@ jobs:
       - name: Write release descriptor
         env:
           RELEASE_REVISION: ${{ github.sha }}
+          ARM64_RUNNABLE_DIGEST_ROOT: ${{ runner.temp }}/arm64-runnable-child-digests
         run: |
           set -euo pipefail
+          IFS=$'\n\t'
           if [[ ! "$RELEASE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
             echo "invalid release revision: $RELEASE_REVISION" >&2
             exit 1
           fi
-          tag="sha-${RELEASE_REVISION::7}"
+          tag="reviewed-${RELEASE_REVISION}"
           printf 'component\trepository\ttag\tdigest\trevision\n' > centaur-release.tsv
           while IFS=$'\t' read -r component image; do
             repository="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${image}"
@@ -269,9 +372,24 @@ jobs:
               echo "invalid arm64 digest for $image: $digest" >&2
               exit 1
             fi
+            artifact_dir="${ARM64_RUNNABLE_DIGEST_ROOT}/runnable-child-digests-${image}-linux-arm64"
+            mapfile -t run_child_digest_files < <(find "$artifact_dir" -maxdepth 1 -type f -print)
+            if [[ "${#run_child_digest_files[@]}" -ne 1 ]]; then
+              echo "expected one runnable arm64 child artifact for $image; found ${#run_child_digest_files[@]}" >&2
+              exit 1
+            fi
+            run_child_digest="sha256:$(basename "${run_child_digest_files[0]}")"
+            if [[ ! "$run_child_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid runnable arm64 child artifact for $image: $run_child_digest" >&2
+              exit 1
+            fi
+            if [[ "$digest" != "$run_child_digest" ]]; then
+              echo "reviewed tag arm64 child for $image does not match this run: tag=$digest run_child=$run_child_digest" >&2
+              exit 1
+            fi
             # Prove the platform child itself is pullable. The multi-arch tag
-            # points at an OCI index; Kubernetes imageID reports this child
-            # manifest, so the reviewed lock records the child, not the index.
+            # points at an OCI index; Fineas deploys tag@child-digest and its
+            # live verifier compares that child imageID, never the tag index.
             docker buildx imagetools inspect "${repository}@${digest}" >/dev/null
             printf '%s\tghcr.io/tiplink/centaur/%s\t%s\t%s\t%s\n' \
               "$component" "$image" "$tag" "$digest" "$RELEASE_REVISION" \

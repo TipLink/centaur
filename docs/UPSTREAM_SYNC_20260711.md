@@ -26,10 +26,10 @@ the tested tree exactly, and satisfy the fork's signature policy.
 | Durable Slack delivery proof | After Slack confirms a primary, reconciled, fallback, or visible-error message, Slackbot records one idempotent `session.delivery_completed` event through a Slackbot-key-only route bound to the exact thread and execution. |
 | Generic HTTP secret scopes | Method/path scopes are retained through discovery, permission translation, and iron-control registration. |
 | GitHub App installation tokens | The grant is registered in upstream `Broker::CredentialGrants`; the model delegates validation and refresh to that registry. Helm bootstraps the canonical credential before api-rs starts, and the built-in infra role grants a scheme-preserving `GITHUB_TOKEN` replacement for `github.com` and `api.github.com` to sandbox principals. |
-| Fork image publication | TipLink GHCR namespace, GitHub-hosted native builders, safe multi-arch assembly, and upstream `githubbot`/harness image inputs are combined. Pull requests build without registry credentials; only a reviewed `v*` tag or explicit dispatch can write packages and emit a deployable descriptor. Fineas promotion is owned by the separately reviewed infra PR DAG. |
+| Fork image publication | TipLink GHCR namespace, GitHub-hosted native builders, safe multi-arch assembly, and upstream `githubbot`/harness image inputs are combined. Pull requests build without registry credentials. Publication is globally serialized and accepts only an exact GitHub-signed, ready-or-merged PR head whose aggregate CI, Console CI, and native image-validation runs are green. A newly created full-SHA publication tag or exact dispatch may write packages; `reviewed-<full-SHA>` registry tags are single-assignment. The descriptor binds each final arm64 child to the runnable child produced by that exact run. Fineas promotion is owned by the separately reviewed infra PR DAG. |
 | GitHub-hosted CI | TipLink's removal of Depot runners remains authoritative across core, Console, docs, audit, and chart workflows. Native arm64 publication continues on GitHub's arm runner. |
 | Human-reviewed upstream tracking | The weekly `upstream-sync.yml` workflow opens a draft cross-repository PR directly from `paradigmxyz:main`, after verifying every upstream-only commit. It never copies unreviewed code into a trusted TipLink branch, so PR workflows retain the external-head token/secret boundary. A separate synchronize-time check fails if the moving upstream/base refs no longer match the SHAs and verified count recorded in the PR body. The PR is only an audit signal; an integration branch must pin that recorded upstream SHA. |
-| Trusted publication split | PR docs, chart, and image validation have read-only/no-secret jobs. Cloudflare docs, chart, and runtime image publication live in non-PR workflows and require an explicit reviewed-main confirmation or release tag. |
+| Trusted publication split | PR docs, chart, and image validation have read-only/no-secret jobs. Cloudflare docs and chart publication retain their reviewed-main confirmation. Runtime image publication is a separate package-writing workflow bound to a signed, ready-or-merged PR head and its exact successful aggregate checks. |
 | Trust-lane key separation | API and Console startup reject configured control, bot, workflow, feedback, or JWT signing credentials shorter than 32 bytes or reused across trust lanes without printing secret values. |
 
 ## Transitional deployment compatibility
@@ -147,8 +147,15 @@ SQLx/Rails checksum manifests and CI guards are included in this branch.
 
 ## Rollout order
 
-1. After review, explicitly publish the fork image descriptor and chart; a PR
-   run or merge alone does not enter the package/deployment lanes.
+1. After review and all exact-head non-CodeQL checks are green, create a fresh
+   `reviewed-images-publish-<full-SHA>-at-<unix-seconds>` lightweight tag
+   directly at the signed PR head (or dispatch with that same full SHA). The
+   globally serialized publisher refuses any pre-existing component tag,
+   rechecks immediately before every final tag write, and emits the descriptor
+   only after every final arm64 child matches this run. A PR run or merge alone
+   does not enter the package/deployment lanes. If a run creates only a subset
+   of final tags, never delete or move them and never retry that head; supersede
+   it with a new signed PR commit and repeat the complete gate.
 2. Establish a zero-overlap delivery-writer boundary before the full runtime
    sync: disable cloudflared ingress, drain active work, and scale every old
    api-rs and Slackbot replica to zero. Do not allow old and receipt-writing

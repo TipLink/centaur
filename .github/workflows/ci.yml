@@ -33,7 +33,12 @@ jobs:
           persist-credentials: false
 
       - name: Audit workflow trust boundaries
-        run: python .github/scripts/audit_workflow_trust.py
+        run: |
+          set -euo pipefail
+          python .github/scripts/audit_workflow_trust.py
+          bash .github/scripts/test-resolve-runnable-image-digest.sh
+          bash .github/scripts/test-verify-registry-tag-absent.sh
+          bash .github/scripts/test-verify-reviewed-image-release.sh
 
       - id: filter
         name: Detect changed paths
