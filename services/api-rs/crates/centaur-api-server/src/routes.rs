@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     convert::TryFrom,
     env,
@@ -17,8 +17,8 @@ use aws_sdk_s3::{
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    extract::{DefaultBodyLimit, FromRequestParts, MatchedPath, Path, Query, Request, State},
+    http::{HeaderMap, Method, StatusCode, Uri, request::Parts},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
@@ -29,8 +29,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use centaur_session_core::ThreadKey;
 use centaur_session_runtime::{
-    ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime, SessionRuntime,
-    thread_trace_id, thread_trace_parent_span_id,
+    DrainReport, ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime,
+    SessionRuntime, thread_trace_id, thread_trace_parent_span_id,
 };
 use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{
@@ -38,8 +38,9 @@ use centaur_telemetry::{
     record_http_request_started, set_span_parent_trace,
 };
 use centaur_workflows::{
-    CreateWorkflowRunRequest, WebhookFilter, WorkflowRuntime, WorkflowWebhookAuth,
-    WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
+    CreateWorkflowRunRequest, WebhookFilter, WorkflowRun, WorkflowRuntime, WorkflowWebhookAuth,
+    WorkflowWebhookSpec, WorkflowWebhookTriggerKey, decode_workflow_task_token,
+    workflow_task_signing_key_from_env,
 };
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
@@ -54,15 +55,16 @@ use uuid::Uuid;
 
 use crate::{
     ApiError,
-    api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
+    api_jwt::{bearer_jwt_from_headers, bearer_token, decode_jwt_payload, verify_console_jwt},
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
     slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
         InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, ListWorkflowRunsQuery,
-        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        stream_error_sse,
+        OnHarnessConflict, RecordSessionDeliveryRequest, RecordSessionDeliveryResponse,
+        ReleaseThreadRequest, ReleaseThreadResponse, SessionContextResponse, SessionSseEvent,
+        SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -137,6 +139,13 @@ impl AppState {
         self.initialized().map(|initialized| initialized.runtime)
     }
 
+    /// The workflow runtime, if initialization completed. Shutdown and the
+    /// admin drain use this to stop queue claims before fencing sandboxes.
+    pub fn workflow_runtime(&self) -> Option<WorkflowRuntime> {
+        self.initialized()
+            .and_then(|initialized| initialized.workflows)
+    }
+
     pub(crate) fn runtime(&self) -> Result<SessionRuntime, ApiError> {
         self.initialized()
             .map(|initialized| initialized.runtime)
@@ -163,6 +172,16 @@ impl AppState {
 }
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 1024 * 1024;
+const SESSION_API_SERVICE_KEY_ENVS: &[&str] = &[
+    "CENTAUR_CONTROL_API_KEY",
+    "SLACKBOT_API_KEY",
+    "GITHUBBOT_API_KEY",
+    "LINEARBOT_API_KEY",
+    "DISCORDBOT_API_KEY",
+    "TEAMSBOT_API_KEY",
+];
+const WORKFLOW_API_SERVICE_KEY_ENVS: &[&str] = &["CENTAUR_CONTROL_API_KEY", "WORKFLOW_API_KEY"];
+const ADMIN_API_SERVICE_KEY_ENVS: &[&str] = &["CENTAUR_CONTROL_API_KEY"];
 const REDACTED_WEBHOOK_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
@@ -226,6 +245,11 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/api/session/{thread_key}/interrupt",
             post(interrupt_session_execution),
         )
+        .route(
+            "/api/session/{thread_key}/executions/{execution_id}/delivery",
+            post(record_session_delivery),
+        )
+        .route("/api/session/{thread_key}/release", post(release_thread))
         .route("/api/session/{thread_key}/events", get(stream_events))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .merge(slack_proxy_router())
@@ -424,24 +448,44 @@ fn session_thread_key_from_path(path: &str) -> Option<ThreadKey> {
 
 async fn create_or_get_session(
     State(state): State<AppState>,
+    SessionApiAuthorization(authorization): SessionApiAuthorization,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
+    let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    ensure_session_create_authorized(&authorization, &thread_key)?;
     let on_harness_conflict = match request.on_harness_conflict {
         Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
     };
-    let outcome = state
-        .runtime()?
-        .create_or_get_session(
-            &thread_key,
-            &request.harness_type,
-            request.persona_id.as_deref(),
-            request.metadata,
-            on_harness_conflict,
-        )
-        .await?;
+    let outcome = match &authorization {
+        WorkflowApiAuthorization::FeedbackImprovement(claims) => {
+            runtime
+                .create_or_get_session_for_principal(
+                    &thread_key,
+                    &request.harness_type,
+                    request.persona_id.as_deref(),
+                    request.metadata,
+                    on_harness_conflict,
+                    claims.principal_id().ok_or_else(|| {
+                        ApiError::Forbidden("feedback JWT has no principal subject".to_owned())
+                    })?,
+                )
+                .await?
+        }
+        WorkflowApiAuthorization::Service | WorkflowApiAuthorization::Principal(_) => {
+            runtime
+                .create_or_get_session(
+                    &thread_key,
+                    &request.harness_type,
+                    request.persona_id.as_deref(),
+                    request.metadata,
+                    on_harness_conflict,
+                )
+                .await?
+        }
+    };
     Ok(Json(CreateSessionResponse {
         session: outcome.session,
         harness_switched: outcome.harness_switched,
@@ -450,10 +494,12 @@ async fn create_or_get_session(
 
 async fn get_session_context(
     State(state): State<AppState>,
+    SessionApiAuthorization(authorization): SessionApiAuthorization,
     Path(raw_thread_key): Path<String>,
 ) -> Result<Json<SessionContextResponse>, ApiError> {
     let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    ensure_session_resource_authorized(&runtime, &thread_key, &authorization).await?;
     let title = match runtime.session_title(&thread_key).await {
         Ok(title) => title,
         Err(error) => {
@@ -503,12 +549,14 @@ fn is_slack_conversation_id(value: &str) -> bool {
 
 async fn append_messages(
     State(state): State<AppState>,
+    SessionApiAuthorization(authorization): SessionApiAuthorization,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<AppendMessagesRequest>,
 ) -> Result<Json<AppendMessagesResponse>, ApiError> {
+    let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let message_ids = state
-        .runtime()?
+    ensure_session_resource_authorized(&runtime, &thread_key, &authorization).await?;
+    let message_ids = runtime
         .append_messages(&thread_key, &request.messages)
         .await?;
     Ok(Json(AppendMessagesResponse {
@@ -519,12 +567,14 @@ async fn append_messages(
 
 async fn execute_session(
     State(state): State<AppState>,
+    SessionApiAuthorization(authorization): SessionApiAuthorization,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<ExecuteSessionRequest>,
 ) -> Result<Json<ExecuteSessionResponse>, ApiError> {
+    let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let execution = state
-        .runtime()?
+    ensure_session_resource_authorized(&runtime, &thread_key, &authorization).await?;
+    let execution = runtime
         .execute_session(
             &thread_key,
             ExecuteSessionInput {
@@ -546,18 +596,20 @@ async fn execute_session(
 
 async fn interrupt_session_execution(
     State(state): State<AppState>,
+    SessionApiAuthorization(authorization): SessionApiAuthorization,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<InterruptSessionExecutionRequest>,
 ) -> Result<Json<InterruptSessionExecutionResponse>, ApiError> {
+    let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    ensure_session_resource_authorized(&runtime, &thread_key, &authorization).await?;
     let reason = request
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("Interrupted from Slack");
-    let outcome = state
-        .runtime()?
+    let outcome = runtime
         .interrupt_active_execution(&thread_key, reason)
         .await?;
     Ok(Json(InterruptSessionExecutionResponse {
@@ -568,29 +620,105 @@ async fn interrupt_session_execution(
     }))
 }
 
-async fn drain_sandboxes(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let report = state.runtime()?.drain().await?;
+async fn record_session_delivery(
+    State(state): State<AppState>,
+    _authorization: SlackDeliveryAuthorization,
+    Path((raw_thread_key, execution_id)): Path<(String, String)>,
+    Json(request): Json<RecordSessionDeliveryRequest>,
+) -> Result<Json<RecordSessionDeliveryResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let outcome = state
+        .runtime()?
+        .record_slack_delivery(
+            &thread_key,
+            &execution_id,
+            request.message_id.as_deref(),
+            &request.outcome,
+        )
+        .await?;
+    Ok(Json(RecordSessionDeliveryResponse {
+        ok: true,
+        created: outcome.created,
+        event_id: outcome.event.event_id,
+        execution_id,
+        thread_key,
+    }))
+}
+
+async fn release_thread(
+    State(state): State<AppState>,
+    SessionApiAuthorization(authorization): SessionApiAuthorization,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<ReleaseThreadRequest>,
+) -> Result<Json<ReleaseThreadResponse>, ApiError> {
+    let runtime = state.runtime()?;
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    ensure_session_resource_authorized(&runtime, &thread_key, &authorization).await?;
+    let outcome = runtime
+        .release_thread(
+            &thread_key,
+            request.release_id.as_deref(),
+            request.expected_sandbox_id.as_deref(),
+            request.cancel_inflight,
+        )
+        .await?;
+    Ok(Json(ReleaseThreadResponse {
+        ok: true,
+        session: outcome.session,
+        release_id: outcome.release_id,
+        expected_sandbox_id: request.expected_sandbox_id,
+        cancel_inflight: outcome.cancel_inflight,
+        sandbox_released: outcome.sandbox_released,
+        sandbox_release_error: outcome.sandbox_release_error,
+        execution_id: outcome.execution_id,
+        execution_cancelled: outcome.execution_cancelled,
+    }))
+}
+
+async fn drain_sandboxes(
+    State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if let Some(workflows) = state.workflow_runtime() {
+        workflows.close_workers().await?;
+    }
+    let runtime = state.runtime()?;
+    let report = runtime.drain().await?;
+    Ok(drain_http_response(report))
+}
+
+fn drain_http_response(report: DrainReport) -> (StatusCode, Json<Value>) {
+    let status = if report.failed.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     let failed = report
         .failed
         .iter()
         .map(|failure| json!({ "sandbox_id": failure.sandbox_id, "error": failure.error }))
         .collect::<Vec<_>>();
-    Ok(Json(json!({
+    (
+        status,
+        Json(json!({
         "ok": report.failed.is_empty(),
         "stopped_count": report.stopped.len(),
         "stopped": report.stopped,
         "failed": failed,
-    })))
+        })),
+    )
 }
 
 async fn stream_events(
     State(state): State<AppState>,
+    SessionApiAuthorization(authorization): SessionApiAuthorization,
     Path(raw_thread_key): Path<String>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let events = state
-        .runtime()?
+    ensure_session_resource_authorized(&runtime, &thread_key, &authorization).await?;
+    let events = runtime
         .stream_events(
             &thread_key,
             query.after_event_id.unwrap_or(0),
@@ -1138,6 +1266,7 @@ struct SlackArchiveUploadConfig {
 
 async fn list_slack_archive_imports(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Query(query): Query<ListSlackArchiveImportsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = db_pool(&state)?;
@@ -1161,6 +1290,7 @@ async fn list_slack_archive_imports(
 
 async fn get_slack_archive_import(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Path(import_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = db_pool(&state)?;
@@ -1172,6 +1302,7 @@ async fn get_slack_archive_import(
 
 async fn presign_slack_archive_import(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Json(request): Json<PresignSlackArchiveImportRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let pool = db_pool(&state)?;
@@ -1232,6 +1363,7 @@ async fn presign_slack_archive_import(
 
 async fn refresh_slack_archive_import_upload_url(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Path(import_id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let pool = db_pool(&state)?;
@@ -1263,10 +1395,12 @@ async fn refresh_slack_archive_import_upload_url(
 
 async fn create_slack_archive_import_download_url(
     State(state): State<AppState>,
+    authorization: ArchiveDownloadAuthorization,
     Path(import_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = db_pool(&state)?;
     let import = load_slack_archive_import(&pool, &import_id).await?;
+    ensure_archive_download_authorized(&authorization, &import)?;
     ensure_archive_import_status(
         &import.status,
         &["uploaded", "importing", "failed"],
@@ -1285,6 +1419,7 @@ async fn create_slack_archive_import_download_url(
 
 async fn delete_slack_archive_import(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Path(import_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = db_pool(&state)?;
@@ -1319,6 +1454,7 @@ async fn delete_slack_archive_import(
 
 async fn start_slack_archive_import(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Path(import_id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let pool = db_pool(&state)?;
@@ -1363,6 +1499,7 @@ async fn start_slack_archive_import(
 
 async fn retry_slack_archive_import(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Path(import_id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let pool = db_pool(&state)?;
@@ -1411,6 +1548,7 @@ async fn retry_slack_archive_import(
 
 async fn list_slack_dm_sync_checkpoints(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Query(query): Query<ListSlackDmSyncCheckpointsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = db_pool(&state)?;
@@ -1437,6 +1575,7 @@ async fn list_slack_dm_sync_checkpoints(
 
 async fn ingest_slack_dm_sync_batch(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Json(request): Json<SlackDmSyncBatchRequest>,
 ) -> Result<Json<Value>, ApiError> {
     validate_slack_dm_sync_batch(&request)?;
@@ -1670,6 +1809,7 @@ async fn ingest_slack_dm_sync_batch(
 
 async fn get_google_docs_sync_checkpoint(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Query(query): Query<GoogleDocsSyncCheckpointQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = db_pool(&state)?;
@@ -1689,6 +1829,7 @@ async fn get_google_docs_sync_checkpoint(
 
 async fn ingest_google_docs_sync_batch(
     State(state): State<AppState>,
+    _authorization: AdminServiceAuthorization,
     Json(request): Json<GoogleDocsSyncBatchRequest>,
 ) -> Result<Json<Value>, ApiError> {
     validate_google_docs_sync_batch(&request)?;
@@ -1953,55 +2094,519 @@ async fn ingest_google_docs_sync_batch(
     })))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct WorkflowApiClaims {
+    #[serde(default)]
+    sub: String,
+    #[serde(default)]
+    slack: WorkflowApiSlackClaims,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WorkflowApiSlackClaims {
+    #[serde(default)]
+    upload_channels: Vec<String>,
+}
+
+#[derive(Debug)]
+struct AdminServiceAuthorization;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArchiveDownloadAuthorization {
+    Service,
+    WorkflowTask { run_id: String, task_id: String },
+}
+
+impl FromRequestParts<AppState> for AdminServiceAuthorization {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = bearer_token(&parts.headers)?;
+        if token_matches_configured_env(token, ADMIN_API_SERVICE_KEY_ENVS) {
+            return Ok(Self);
+        }
+        Err(ApiError::Unauthorized(
+            "invalid admin service token".to_owned(),
+        ))
+    }
+}
+
+impl FromRequestParts<AppState> for ArchiveDownloadAuthorization {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let service_authorized = bearer_token(&parts.headers)
+            .ok()
+            .is_some_and(|token| token_matches_configured_env(token, ADMIN_API_SERVICE_KEY_ENVS));
+        if service_authorized {
+            return authorize_archive_download_headers(
+                &parts.headers,
+                None,
+                OffsetDateTime::now_utc().unix_timestamp(),
+                true,
+            );
+        }
+        let signing_key = workflow_task_signing_key_from_env()
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        authorize_archive_download_headers(
+            &parts.headers,
+            Some(&signing_key),
+            OffsetDateTime::now_utc().unix_timestamp(),
+            false,
+        )
+    }
+}
+
+fn authorize_archive_download_headers(
+    headers: &HeaderMap,
+    signing_key: Option<&[u8]>,
+    now_unix: i64,
+    service_authorized: bool,
+) -> Result<ArchiveDownloadAuthorization, ApiError> {
+    if service_authorized {
+        return Ok(ArchiveDownloadAuthorization::Service);
+    }
+
+    let token = header_value(headers, "X-Centaur-Workflow-Task-Token")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::Unauthorized(
+                "archive download requires signed workflow-task authorization".to_owned(),
+            )
+        })?;
+    let signing_key = signing_key.ok_or_else(|| {
+        ApiError::Internal("workflow task signing key is not configured".to_owned())
+    })?;
+    let identity = decode_workflow_task_token(signing_key, &token, now_unix).ok_or_else(|| {
+        ApiError::Unauthorized("invalid or expired workflow-task authorization".to_owned())
+    })?;
+    Ok(ArchiveDownloadAuthorization::WorkflowTask {
+        run_id: identity.run_id,
+        task_id: identity.task_id,
+    })
+}
+
+fn ensure_archive_download_authorized(
+    authorization: &ArchiveDownloadAuthorization,
+    import: &SlackArchiveImportRow,
+) -> Result<(), ApiError> {
+    match authorization {
+        ArchiveDownloadAuthorization::Service => Ok(()),
+        ArchiveDownloadAuthorization::WorkflowTask { run_id, task_id }
+            if import.workflow_run_id.as_deref() == Some(run_id.as_str())
+                && import.workflow_task_id.as_deref() == Some(task_id.as_str()) =>
+        {
+            Ok(())
+        }
+        ArchiveDownloadAuthorization::WorkflowTask { .. } => Err(ApiError::Forbidden(
+            "workflow task is not authorized for this archive import".to_owned(),
+        )),
+    }
+}
+
+#[derive(Debug)]
+enum WorkflowApiAuthorization {
+    Service,
+    FeedbackImprovement(WorkflowApiClaims),
+    Principal(WorkflowApiClaims),
+}
+
+impl FromRequestParts<AppState> for WorkflowApiAuthorization {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        authorize_workflow_api(&parts.headers)
+    }
+}
+
+#[derive(Debug)]
+struct SessionApiAuthorization(WorkflowApiAuthorization);
+
+#[derive(Debug)]
+struct SlackDeliveryAuthorization;
+
+impl WorkflowApiClaims {
+    fn allows_channel(&self, channel_id: &str) -> bool {
+        self.slack
+            .upload_channels
+            .iter()
+            .any(|allowed| allowed == channel_id)
+    }
+
+    fn has_channels(&self) -> bool {
+        !self.slack.upload_channels.is_empty()
+    }
+
+    fn principal_id(&self) -> Option<&str> {
+        let sub = self.sub.trim();
+        (!sub.is_empty()).then_some(sub)
+    }
+}
+
+fn configured_workflow_api_names(env_name: &str) -> BTreeSet<String> {
+    env::var(env_name)
+        .unwrap_or_default()
+        .split(|character: char| character == ',' || character.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn ensure_workflow_api_name_allowed(
+    workflow_name: &str,
+    allowed_names: &BTreeSet<String>,
+) -> Result<(), ApiError> {
+    let workflow_name = workflow_name.trim();
+    if !workflow_name.is_empty()
+        && (allowed_names.contains("*") || allowed_names.contains(workflow_name))
+    {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(
+        "workflow is not allowed through the sandbox workflow API".to_owned(),
+    ))
+}
+
+fn authorize_workflow_api(headers: &HeaderMap) -> Result<WorkflowApiAuthorization, ApiError> {
+    let token = bearer_token(headers)?;
+    if token_matches_configured_env(token, WORKFLOW_API_SERVICE_KEY_ENVS) {
+        return Ok(WorkflowApiAuthorization::Service);
+    }
+    let claims: WorkflowApiClaims = verify_console_jwt(token)?;
+    if !claims.has_channels() {
+        return Err(ApiError::Forbidden(
+            "JWT has no Slack upload channel permissions".to_owned(),
+        ));
+    }
+    Ok(WorkflowApiAuthorization::Principal(claims))
+}
+
+fn authorize_session_api(headers: &HeaderMap) -> Result<WorkflowApiAuthorization, ApiError> {
+    if let Some(presented) = header_value(headers, "X-Centaur-Feedback-Key") {
+        if !token_matches_configured_env(presented.trim(), &["SLACK_FEEDBACK_API_KEY"]) {
+            return Err(ApiError::Unauthorized(
+                "invalid feedback service token".to_owned(),
+            ));
+        }
+        let claims: WorkflowApiClaims = verify_console_jwt(bearer_token(headers)?)?;
+        if claims.principal_id().is_none() {
+            return Err(ApiError::Forbidden(
+                "feedback JWT has no principal subject".to_owned(),
+            ));
+        }
+        return Ok(WorkflowApiAuthorization::FeedbackImprovement(claims));
+    }
+
+    let slackbot_key = env::var("SLACKBOT_API_KEY").unwrap_or_default();
+    let slackbot_key = slackbot_key.trim();
+    if !slackbot_key.is_empty()
+        && header_value(headers, "X-Api-Key").is_some_and(|presented| {
+            constant_time_eq(presented.trim().as_bytes(), slackbot_key.as_bytes())
+        })
+    {
+        return Ok(WorkflowApiAuthorization::Service);
+    }
+
+    let token = bearer_token(headers)?;
+    if token_matches_configured_env(token, SESSION_API_SERVICE_KEY_ENVS) {
+        return Ok(WorkflowApiAuthorization::Service);
+    }
+    let claims: WorkflowApiClaims = verify_console_jwt(token)?;
+    if claims.principal_id().is_none() {
+        return Err(ApiError::Forbidden(
+            "JWT has no principal subject".to_owned(),
+        ));
+    }
+    Ok(WorkflowApiAuthorization::Principal(claims))
+}
+
+fn token_matches_configured_env(token: &str, env_names: &[&str]) -> bool {
+    env_names.iter().any(|env_name| {
+        env::var(env_name).is_ok_and(|expected| {
+            let expected = expected.trim();
+            !expected.is_empty() && constant_time_eq(token.as_bytes(), expected.as_bytes())
+        })
+    })
+}
+
+impl FromRequestParts<AppState> for SessionApiAuthorization {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        authorize_session_api(&parts.headers).map(Self)
+    }
+}
+
+fn authorize_slack_delivery_headers(
+    headers: &HeaderMap,
+    configured_key: Option<&str>,
+) -> Result<(), ApiError> {
+    // Parse authentication first so an anonymous request is always rejected
+    // as unauthorized, even when the service itself is misconfigured.
+    let presented = bearer_token(headers)?;
+    let expected = configured_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::Internal("SLACKBOT_API_KEY is not configured".to_owned()))?;
+    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return Ok(());
+    }
+    Err(ApiError::Unauthorized(
+        "invalid Slack delivery service token".to_owned(),
+    ))
+}
+
+impl FromRequestParts<AppState> for SlackDeliveryAuthorization {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let key = env::var("SLACKBOT_API_KEY").ok();
+        authorize_slack_delivery_headers(&parts.headers, key.as_deref())?;
+        Ok(Self)
+    }
+}
+
+fn ensure_session_create_authorized(
+    authorization: &WorkflowApiAuthorization,
+    thread_key: &ThreadKey,
+) -> Result<(), ApiError> {
+    match authorization {
+        WorkflowApiAuthorization::Service => Ok(()),
+        WorkflowApiAuthorization::FeedbackImprovement(_)
+            if thread_key.as_str().starts_with("feedback-improvement:") =>
+        {
+            Ok(())
+        }
+        WorkflowApiAuthorization::FeedbackImprovement(_) => Err(ApiError::Forbidden(
+            "feedback key is restricted to feedback-improvement sessions".to_owned(),
+        )),
+        WorkflowApiAuthorization::Principal(_) => Err(ApiError::Forbidden(
+            "session creation requires trusted service authorization".to_owned(),
+        )),
+    }
+}
+
+async fn ensure_session_resource_authorized(
+    runtime: &SessionRuntime,
+    thread_key: &ThreadKey,
+    authorization: &WorkflowApiAuthorization,
+) -> Result<(), ApiError> {
+    let claims = match authorization {
+        WorkflowApiAuthorization::Service => return Ok(()),
+        WorkflowApiAuthorization::FeedbackImprovement(claims)
+            if thread_key.as_str().starts_with("feedback-improvement:") =>
+        {
+            let session = runtime.get_session(thread_key).await?;
+            if session.iron_control_principal.as_deref() == claims.principal_id() {
+                return Ok(());
+            }
+            return Err(ApiError::Forbidden(
+                "feedback JWT is not authorized for this improvement session".to_owned(),
+            ));
+        }
+        WorkflowApiAuthorization::FeedbackImprovement(_) => {
+            return Err(ApiError::Forbidden(
+                "feedback key is restricted to feedback-improvement sessions".to_owned(),
+            ));
+        }
+        WorkflowApiAuthorization::Principal(claims) => claims,
+    };
+    let session = runtime.get_session(thread_key).await?;
+    if claims_owns_session(claims, session.iron_control_principal.as_deref()) {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(
+        "JWT is not authorized for this session".to_owned(),
+    ))
+}
+
+fn claims_owns_session(claims: &WorkflowApiClaims, bound_principal: Option<&str>) -> bool {
+    claims.principal_id().is_some_and(|principal_id| {
+        bound_principal
+            .is_some_and(|bound| constant_time_eq(principal_id.as_bytes(), bound.as_bytes()))
+    })
+}
+
+fn workflow_input_thread_context(input: &Value) -> Result<SlackThreadContext, ApiError> {
+    let raw_thread_key = input
+        .get("thread_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("workflow input.thread_key is required".to_owned()))?;
+    let thread_key = ThreadKey::try_from(raw_thread_key.to_owned())?;
+    let context = slack_thread_context(&thread_key).ok_or_else(|| {
+        ApiError::BadRequest("workflow input.thread_key must identify a Slack thread".to_owned())
+    })?;
+    if let Some(input_channel) = input
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && input_channel != context.channel_id
+    {
+        return Err(ApiError::BadRequest(
+            "workflow input.channel must match input.thread_key".to_owned(),
+        ));
+    }
+    Ok(context)
+}
+
+fn ensure_workflow_input_authorized(
+    authorization: &WorkflowApiAuthorization,
+    input: &Value,
+) -> Result<Option<SlackThreadContext>, ApiError> {
+    let WorkflowApiAuthorization::Principal(claims) = authorization else {
+        return Ok(None);
+    };
+    let context = workflow_input_thread_context(input)?;
+    if !claims.allows_channel(&context.channel_id) {
+        return Err(ApiError::Forbidden(
+            "JWT is not authorized for the workflow Slack channel".to_owned(),
+        ));
+    }
+    Ok(Some(context))
+}
+
+fn ensure_workflow_run_authorized(
+    authorization: &WorkflowApiAuthorization,
+    run: &WorkflowRun,
+    allowed_names: &BTreeSet<String>,
+) -> Result<(), ApiError> {
+    if matches!(authorization, WorkflowApiAuthorization::Principal(_)) {
+        ensure_workflow_api_name_allowed(&run.workflow_name, allowed_names)?;
+    }
+    ensure_workflow_input_authorized(authorization, &run.input)?;
+    Ok(())
+}
+
+fn ensure_workflow_service_authorized(
+    authorization: &WorkflowApiAuthorization,
+    operation: &str,
+) -> Result<(), ApiError> {
+    if matches!(authorization, WorkflowApiAuthorization::Service) {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(format!(
+        "workflow {operation} requires trusted service authorization"
+    )))
+}
+
 async fn create_workflow_run(
     State(state): State<AppState>,
+    authorization: WorkflowApiAuthorization,
     Json(request): Json<CreateWorkflowRunRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
+    if matches!(authorization, WorkflowApiAuthorization::Principal(_)) {
+        ensure_workflow_api_name_allowed(
+            &request.workflow_name,
+            &configured_workflow_api_names("WORKFLOW_API_ALLOWED_NAMES"),
+        )?;
+    }
+    ensure_workflow_input_authorized(&authorization, &request.input)?;
     let run = workflows.create_run(request).await?;
     Ok(Json(serde_json::to_value(run)?))
 }
 
 async fn list_workflow_runs(
     State(state): State<AppState>,
+    authorization: WorkflowApiAuthorization,
     Query(query): Query<ListWorkflowRunsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
-    let runs = workflows.list_runs(query.limit.unwrap_or(50)).await?;
+    let workflow_name = query
+        .workflow_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let thread_key = query
+        .thread_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if matches!(authorization, WorkflowApiAuthorization::Principal(_)) {
+        let workflow_name = workflow_name
+            .ok_or_else(|| ApiError::BadRequest("workflow_name query is required".to_owned()))?;
+        let thread_key = thread_key
+            .ok_or_else(|| ApiError::BadRequest("thread_key query is required".to_owned()))?;
+        ensure_workflow_api_name_allowed(
+            workflow_name,
+            &configured_workflow_api_names("WORKFLOW_API_ALLOWED_NAMES"),
+        )?;
+        ensure_workflow_input_authorized(&authorization, &json!({ "thread_key": thread_key }))?;
+    }
+    let runs = workflows
+        .list_runs(query.limit.unwrap_or(50), workflow_name, thread_key)
+        .await?;
     Ok(Json(json!({ "ok": true, "runs": runs })))
 }
 
 async fn list_workflow_schedules(
     State(state): State<AppState>,
+    authorization: WorkflowApiAuthorization,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
+    ensure_workflow_service_authorized(&authorization, "schedules")?;
     let schedules = workflows.list_schedules();
     Ok(Json(json!({ "ok": true, "schedules": schedules })))
 }
 
 async fn get_workflow_run(
     State(state): State<AppState>,
+    authorization: WorkflowApiAuthorization,
     Path(run_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
     let run = workflows.get_run(&run_id).await?;
+    ensure_workflow_run_authorized(
+        &authorization,
+        &run,
+        &configured_workflow_api_names("WORKFLOW_API_ALLOWED_NAMES"),
+    )?;
     Ok(Json(json!({ "ok": true, "run": run })))
 }
 
 async fn cancel_workflow_run(
     State(state): State<AppState>,
+    authorization: WorkflowApiAuthorization,
     Path(run_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
+    let run = workflows.get_run(&run_id).await?;
+    ensure_workflow_run_authorized(
+        &authorization,
+        &run,
+        &configured_workflow_api_names("WORKFLOW_API_ALLOWED_NAMES"),
+    )?;
     workflows.cancel_run(&run_id).await?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({ "ok": true, "status": "cancelled" })))
 }
 
 async fn emit_workflow_event(
     State(state): State<AppState>,
+    authorization: WorkflowApiAuthorization,
     Json(request): Json<EmitWorkflowEventRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
+    ensure_workflow_service_authorized(&authorization, "events")?;
     workflows
         .emit_event(&request.event_name, request.payload)
         .await?;
@@ -3012,6 +3617,194 @@ fn webhook_filter_matches(filter: &WebhookFilter, headers: &HeaderMap, body: &Va
 }
 
 #[cfg(test)]
+mod drain_response_tests {
+    use centaur_session_runtime::DrainFailure;
+
+    use super::*;
+
+    #[test]
+    fn partial_drain_failure_is_a_non_success_http_response() {
+        let (status, Json(body)) = drain_http_response(DrainReport {
+            stopped: vec!["sbx-stopped".to_owned()],
+            failed: vec![DrainFailure {
+                sandbox_id: "sbx-live".to_owned(),
+                error: "stop failed".to_owned(),
+            }],
+        });
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["stopped_count"], 1);
+        assert_eq!(body["failed"][0]["sandbox_id"], "sbx-live");
+    }
+
+    #[test]
+    fn complete_drain_remains_successful() {
+        let (status, Json(body)) = drain_http_response(DrainReport {
+            stopped: vec!["sbx-stopped".to_owned()],
+            failed: Vec::new(),
+        });
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+    }
+}
+
+#[cfg(test)]
+mod workflow_api_tests {
+    use super::*;
+
+    fn principal(channel_id: &str) -> WorkflowApiAuthorization {
+        WorkflowApiAuthorization::Principal(WorkflowApiClaims {
+            sub: "prn_test".to_owned(),
+            slack: WorkflowApiSlackClaims {
+                upload_channels: vec![channel_id.to_owned()],
+            },
+        })
+    }
+
+    #[test]
+    fn workflow_api_requires_an_explicit_allowed_name() {
+        let allowed = BTreeSet::from(["reminder".to_owned()]);
+        ensure_workflow_api_name_allowed("reminder", &allowed).unwrap();
+        assert!(matches!(
+            ensure_workflow_api_name_allowed("compliance_cdd_research", &allowed),
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            ensure_workflow_api_name_allowed("reminder", &BTreeSet::new()),
+            Err(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn workflow_api_scopes_input_to_the_jwt_slack_channel() {
+        let input = json!({
+            "thread_key": "slack:T123:C123:1780000000.000100",
+            "channel": "C123"
+        });
+        let context = ensure_workflow_input_authorized(&principal("C123"), &input)
+            .unwrap()
+            .expect("principal context");
+        assert_eq!(context.channel_id, "C123");
+
+        assert!(matches!(
+            ensure_workflow_input_authorized(&principal("C999"), &input),
+            Err(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn workflow_api_rejects_missing_or_mismatched_thread_context() {
+        assert!(matches!(
+            ensure_workflow_input_authorized(&principal("C123"), &json!({})),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            ensure_workflow_input_authorized(
+                &principal("C123"),
+                &json!({
+                    "thread_key": "slack:C123:1780000000.000100",
+                    "channel": "C999"
+                }),
+            ),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn workflow_service_authorization_can_operate_non_slack_runs() {
+        assert!(
+            ensure_workflow_input_authorized(
+                &WorkflowApiAuthorization::Service,
+                &json!({"metadata": {"reason": "operator"}}),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(constant_time_eq(b"service-token", b"service-token"));
+        assert!(!constant_time_eq(b"service-token", b"other-token"));
+    }
+
+    #[test]
+    fn workflow_principals_cannot_list_schedules_or_emit_global_events() {
+        for operation in ["schedules", "events"] {
+            assert!(matches!(
+                ensure_workflow_service_authorized(&principal("C123"), operation),
+                Err(ApiError::Forbidden(_))
+            ));
+            ensure_workflow_service_authorized(&WorkflowApiAuthorization::Service, operation)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn feedback_key_can_create_only_namespaced_improvement_sessions() {
+        let allowed = ThreadKey::parse("feedback-improvement:20260711:abcdef12").unwrap();
+        let denied = ThreadKey::parse("slack:C123:1780000000.000100").unwrap();
+        let feedback = WorkflowApiAuthorization::FeedbackImprovement(WorkflowApiClaims {
+            sub: "prn_feedback".to_owned(),
+            slack: WorkflowApiSlackClaims::default(),
+        });
+        ensure_session_create_authorized(&feedback, &allowed).unwrap();
+        assert!(matches!(
+            ensure_session_create_authorized(&feedback, &denied),
+            Err(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn channel_grant_does_not_authorize_another_principals_session() {
+        let claims = match principal("C123") {
+            WorkflowApiAuthorization::Principal(claims) => claims,
+            _ => unreachable!(),
+        };
+        assert!(claims.allows_channel("C123"));
+        assert!(claims_owns_session(&claims, Some("prn_test")));
+        assert!(!claims_owns_session(&claims, Some("prn_other")));
+        assert!(!claims_owns_session(&claims, None));
+    }
+
+    #[test]
+    fn slack_delivery_receipts_accept_only_the_dedicated_slackbot_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer slackbot-secret".parse().unwrap());
+        authorize_slack_delivery_headers(&headers, Some("slackbot-secret")).unwrap();
+
+        for forged in [
+            "Bearer control-secret",
+            "Bearer workflow-secret",
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcm5fZm9yZ2VkIn0.signature",
+        ] {
+            headers.insert("authorization", forged.parse().unwrap());
+            assert!(matches!(
+                authorize_slack_delivery_headers(&headers, Some("slackbot-secret")),
+                Err(ApiError::Unauthorized(_))
+            ));
+        }
+
+        headers.remove("authorization");
+        headers.insert("x-api-key", "slackbot-secret".parse().unwrap());
+        assert!(matches!(
+            authorize_slack_delivery_headers(&headers, Some("slackbot-secret")),
+            Err(ApiError::Unauthorized(_))
+        ));
+
+        headers.remove("x-api-key");
+        assert!(matches!(
+            authorize_slack_delivery_headers(&headers, None),
+            Err(ApiError::Unauthorized(_))
+        ));
+
+        headers.insert("authorization", "Bearer slackbot-secret".parse().unwrap());
+        assert!(matches!(
+            authorize_slack_delivery_headers(&headers, None),
+            Err(ApiError::Internal(_))
+        ));
+    }
+}
+
+#[cfg(test)]
 mod slack_archive_import_tests {
     use super::*;
 
@@ -3104,6 +3897,85 @@ mod slack_archive_import_tests {
             .unwrap_err();
             assert!(matches!(error, ApiError::BadRequest(_)));
         }
+    }
+
+    #[test]
+    fn archive_download_uses_task_header_when_proxy_authorization_coexists() {
+        let signing_key = b"workflow-signing-key";
+        let now = 1_700_000_000;
+        let task_token = centaur_workflows::mint_workflow_task_token(
+            signing_key,
+            "wfr_expected",
+            "wft_expected",
+            now + 300,
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer proxy-injected-principal-jwt".parse().unwrap(),
+        );
+        headers.insert("x-centaur-workflow-task-token", task_token.parse().unwrap());
+
+        assert_eq!(
+            authorize_archive_download_headers(&headers, Some(signing_key), now, false).unwrap(),
+            ArchiveDownloadAuthorization::WorkflowTask {
+                run_id: "wfr_expected".to_owned(),
+                task_id: "wft_expected".to_owned(),
+            }
+        );
+
+        headers.remove("x-centaur-workflow-task-token");
+        assert!(matches!(
+            authorize_archive_download_headers(&headers, Some(signing_key), now, false),
+            Err(ApiError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn archive_download_service_authorization_precedes_task_capability() {
+        assert_eq!(
+            authorize_archive_download_headers(&HeaderMap::new(), None, 1_700_000_000, true)
+                .unwrap(),
+            ArchiveDownloadAuthorization::Service
+        );
+    }
+
+    #[test]
+    fn archive_download_capability_is_bound_to_the_exact_workflow_task() {
+        let mut row = archive_row("importing");
+        row.workflow_run_id = Some("wfr_expected".to_owned());
+        row.workflow_task_id = Some("wft_expected".to_owned());
+
+        ensure_archive_download_authorized(
+            &ArchiveDownloadAuthorization::WorkflowTask {
+                run_id: "wfr_expected".to_owned(),
+                task_id: "wft_expected".to_owned(),
+            },
+            &row,
+        )
+        .unwrap();
+        ensure_archive_download_authorized(&ArchiveDownloadAuthorization::Service, &row).unwrap();
+        assert!(matches!(
+            ensure_archive_download_authorized(
+                &ArchiveDownloadAuthorization::WorkflowTask {
+                    run_id: "wfr_expected".to_owned(),
+                    task_id: "wft_other".to_owned(),
+                },
+                &row,
+            ),
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            ensure_archive_download_authorized(
+                &ArchiveDownloadAuthorization::WorkflowTask {
+                    run_id: "wfr_other".to_owned(),
+                    task_id: "wft_expected".to_owned(),
+                },
+                &row,
+            ),
+            Err(ApiError::Forbidden(_))
+        ));
     }
 
     #[test]

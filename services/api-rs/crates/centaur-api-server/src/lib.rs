@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_routes_report_unavailable_until_runtime_is_ready() {
+    async fn protected_runtime_routes_require_auth_before_runtime_is_ready() {
         for request in [
             Request::builder()
                 .method(Method::GET)
@@ -238,6 +238,12 @@ mod tests {
                 .uri("/api/session/slack%3AC123%3A123.456/execute")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"input_lines":[]}"#))
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/session/slack%3AC123%3A123.456/executions/exe-1/delivery")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"outcome":"primary"}"#))
                 .unwrap(),
             Request::builder()
                 .method(Method::GET)
@@ -281,16 +287,28 @@ mod tests {
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"event_name":"test.event","payload":{}}"#))
                 .unwrap(),
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/webhooks/test")
-                .body(Body::empty())
-                .unwrap(),
         ] {
             let app = build_router_with_app_state(AppState::unready());
             let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_webhooks_report_unavailable_until_runtime_is_ready() {
+        let app = build_router_with_app_state(AppState::unready());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/webhooks/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -347,7 +365,7 @@ mod tests {
             .unwrap();
 
         assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -373,11 +391,11 @@ mod tests {
             .unwrap();
 
         assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn session_context_exposes_slack_channel_and_thread_ts() {
+    async fn session_context_rejects_anonymous_slack_access() {
         let pool =
             PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
         let app = build_router_with_runtime(
@@ -395,16 +413,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["thread_key"], "slack:C123:123.456");
-        assert_eq!(body["slack"]["channel_id"], "C123");
-        assert_eq!(body["slack"]["thread_ts"], "123.456");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn session_context_omits_slack_for_non_slack_thread_key() {
+    async fn session_context_rejects_anonymous_non_slack_access() {
         let pool =
             PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
         let app = build_router_with_runtime(
@@ -422,11 +435,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["thread_key"], "cli:test");
-        assert!(body.get("slack").is_none());
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[derive(Default)]

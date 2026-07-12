@@ -77,6 +77,30 @@ pub struct ExecuteSessionResponse {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReleaseThreadRequest {
+    pub release_id: Option<String>,
+    /// Optional caller-side compare-and-swap fence. When present, release is
+    /// rejected unless the thread is still assigned to this exact sandbox.
+    pub expected_sandbox_id: Option<String>,
+    #[serde(default)]
+    pub cancel_inflight: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReleaseThreadResponse {
+    pub ok: bool,
+    #[serde(flatten)]
+    pub session: Session,
+    pub release_id: Option<String>,
+    pub expected_sandbox_id: Option<String>,
+    pub cancel_inflight: bool,
+    pub sandbox_released: bool,
+    pub sandbox_release_error: Option<String>,
+    pub execution_id: Option<String>,
+    pub execution_cancelled: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InterruptSessionExecutionRequest {
     pub reason: Option<String>,
@@ -90,15 +114,32 @@ pub struct InterruptSessionExecutionResponse {
     pub thread_key: ThreadKey,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RecordSessionDeliveryRequest {
+    pub message_id: Option<String>,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordSessionDeliveryResponse {
+    pub ok: bool,
+    pub created: bool,
+    pub event_id: i64,
+    pub execution_id: String,
+    pub thread_key: ThreadKey,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct EventsQuery {
     pub after_event_id: Option<i64>,
     pub execution_id: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ListWorkflowRunsQuery {
     pub limit: Option<i64>,
+    pub workflow_name: Option<String>,
+    pub thread_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

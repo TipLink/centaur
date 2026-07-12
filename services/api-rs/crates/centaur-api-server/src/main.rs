@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use args::Args;
+use args::{Args, validate_service_api_key_separation};
 
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
@@ -19,6 +19,7 @@ async fn main() -> Result<(), ServerError> {
     let telemetry = init_telemetry(TelemetryConfig::from_env())?;
 
     let args = Args::parse();
+    validate_service_api_key_separation()?;
     let listener = TcpListener::bind(args.server.bind_addr).await?;
     info!(
         bind_addr = %args.server.bind_addr,
@@ -37,6 +38,11 @@ async fn main() -> Result<(), ServerError> {
                 // Hand off before axum starts draining connections: open SSE
                 // streams can keep the server future alive until SIGKILL, and
                 // the lease release must not be lost to that.
+                if let Some(workflows) = shutdown_state.workflow_runtime()
+                    && let Err(error) = workflows.close_workers().await
+                {
+                    tracing::warn!(%error, "failed to close workflow workers during shutdown");
+                }
                 if let Some(runtime) = shutdown_state.session_runtime() {
                     runtime.handoff_owned_executions(drain_timeout).await;
                 }
@@ -98,7 +104,8 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     runtime = runtime.with_sandbox_cleanup(args.sandbox_cleanup_config());
     let workflow_host_sandbox = args
         .workflow_host_sandbox_runtime(workflow_host_principal.as_deref())
-        .await?;
+        .await?
+        .map(|sandbox| sandbox.with_runtime(runtime.sandbox_runtime_handle()));
     let workflows = Some(
         WorkflowRuntime::new_with_workflow_host_sandbox(
             store,
@@ -115,7 +122,11 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     // orphaned after startup — e.g. a rolling deploy terminates the previous
     // pod mid-turn after this pod's startup scan already ran.
     match args.execution_adoption_interval() {
-        Some(interval) => runtime.spawn_orphan_adoption(interval),
+        Some(interval) => {
+            // Dropping a Tokio JoinHandle intentionally detaches this
+            // process-lifetime reconciliation loop.
+            drop(runtime.spawn_orphan_adoption(interval));
+        }
         None => {
             let adoption_runtime = runtime.clone();
             tokio::spawn(async move {

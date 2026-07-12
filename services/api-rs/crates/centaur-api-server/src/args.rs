@@ -24,7 +24,7 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, ToolSource, ToolsConfig,
+    OtlpEgressTarget, OverlayImageConfig, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -35,6 +35,8 @@ use centaur_session_runtime::{
 };
 use centaur_workflows::WorkflowHostSandboxRuntime;
 use clap::{Args as ClapArgs, Parser, ValueEnum};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::{ServerError, activity_summary::ActivitySummaryConfig};
@@ -42,6 +44,42 @@ use crate::{ServerError, activity_summary::ActivitySummaryConfig};
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 const SLACK_BOT_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
+const SERVICE_API_KEY_ENVS: &[&str] = &[
+    "CENTAUR_CONTROL_API_KEY",
+    "SLACKBOT_API_KEY",
+    "GITHUBBOT_API_KEY",
+    "LINEARBOT_API_KEY",
+    "DISCORDBOT_API_KEY",
+    "TEAMSBOT_API_KEY",
+    "WORKFLOW_API_KEY",
+    "SLACK_FEEDBACK_API_KEY",
+    "CENTAUR_JWT_SIGNING_SECRET",
+];
+const MIN_SERVICE_API_KEY_BYTES: usize = 32;
+
+pub(crate) fn validate_service_api_key_separation() -> Result<(), ServerError> {
+    let mut owners = BTreeMap::<String, &'static str>::new();
+    for env_name in SERVICE_API_KEY_ENVS {
+        let Ok(value) = env::var(env_name) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.len() < MIN_SERVICE_API_KEY_BYTES {
+            return Err(ServerError::UnsupportedConfig(format!(
+                "{env_name} must contain at least {MIN_SERVICE_API_KEY_BYTES} bytes"
+            )));
+        }
+        if let Some(existing) = owners.insert(value.to_owned(), env_name) {
+            return Err(ServerError::UnsupportedConfig(format!(
+                "{existing} and {env_name} must contain distinct service credentials"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// OTLP env always forwarded from the api-rs process into codex sandboxes,
 /// mirroring the Python control plane's `_SANDBOX_PASSTHROUGH_ENV_KEYS`. The
@@ -636,6 +674,41 @@ struct SandboxArgs {
     /// `OTEL_SERVICE_NAME`, NO_PROXY extras) into every codex sandbox.
     #[arg(long = "session-sandbox-extra-env", env = "SESSION_SANDBOX_EXTRA_ENV")]
     extra_env_json: Option<String>,
+    #[arg(long = "centaur-overlay-image", env = "CENTAUR_OVERLAY_IMAGE")]
+    overlay_image: Option<String>,
+    /// Release-scoped digest of every repo/image/config input copied into a
+    /// sandbox at boot. The chart computes this from the complete overlay
+    /// source manifest (including skills-only sources and repo-cache ref
+    /// overrides), so a content rollout changes the warm workload key even
+    /// when the tools-only compatibility view is unchanged.
+    #[arg(
+        long = "centaur-sandbox-content-revision",
+        env = "CENTAUR_SANDBOX_CONTENT_REVISION"
+    )]
+    sandbox_content_revision: Option<String>,
+    #[arg(
+        long = "centaur-overlay-image-pull-policy",
+        env = "CENTAUR_OVERLAY_IMAGE_PULL_POLICY"
+    )]
+    overlay_image_pull_policy: Option<String>,
+    #[arg(
+        long = "centaur-overlay-image-source-path",
+        env = "CENTAUR_OVERLAY_IMAGE_SOURCE_PATH",
+        default_value = "/overlay"
+    )]
+    overlay_image_source_path: String,
+    #[arg(
+        long = "centaur-overlay-dir",
+        env = "CENTAUR_OVERLAY_DIR",
+        default_value = "/app/overlay/org"
+    )]
+    _overlay_dir: String,
+    #[arg(
+        long = "centaur-sandbox-overlay-dir",
+        env = "CENTAUR_SANDBOX_OVERLAY_DIR",
+        default_value = "/home/agent/overlay/org"
+    )]
+    sandbox_overlay_dir: String,
     #[command(flatten)]
     tools: ToolDiscoveryArgs,
     #[command(flatten)]
@@ -914,11 +987,34 @@ impl SandboxArgs {
         match self.workload {
             SandboxWorkloadKind::Mock => Ok(SandboxWorkloadMode::mock_app_server(image)),
             SandboxWorkloadKind::CodexAppServer => {
-                let mut workload = SandboxWorkloadMode::codex_app_server(
-                    image,
-                    self.codex_app_server_env_template()?,
-                    self.default_harness.clone(),
-                );
+                let mut env = self.codex_app_server_env_template()?;
+                env.push((
+                    "CENTAUR_SANDBOX_BOOTSTRAP_FINGERPRINT".to_owned(),
+                    sandbox_bootstrap_fingerprint(
+                        self.tools_source.to_config().as_ref(),
+                        clean_optional_value(self.overlay_image.as_deref())
+                            .map(|image| OverlayImageConfig {
+                                image,
+                                image_pull_policy: clean_optional_value(
+                                    self.overlay_image_pull_policy.as_deref(),
+                                ),
+                                source_path: clean_optional_value(Some(
+                                    self.overlay_image_source_path.as_str(),
+                                ))
+                                .unwrap_or_else(|| "/overlay".to_owned()),
+                                mount_path: clean_optional_value(Some(
+                                    self.sandbox_overlay_dir.as_str(),
+                                ))
+                                .unwrap_or_else(|| "/home/agent/overlay/org".to_owned()),
+                            })
+                            .as_ref(),
+                        self.agent_image_pull_policy.as_deref(),
+                        &self.image_pull_secrets,
+                        clean_optional_value(self.sandbox_content_revision.as_deref()).as_deref(),
+                    )?,
+                ));
+                let mut workload =
+                    SandboxWorkloadMode::codex_app_server(image, env, self.default_harness.clone());
                 if let Some(repos_path) = clean_optional_value(self.repos_path.as_deref()) {
                     workload = workload.mount(
                         Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH)
@@ -1258,6 +1354,61 @@ impl SandboxArgs {
     }
 }
 
+fn sandbox_bootstrap_fingerprint(
+    tools: Option<&ToolsConfig>,
+    overlay: Option<&OverlayImageConfig>,
+    agent_image_pull_policy: Option<&str>,
+    image_pull_secrets: &[String],
+    content_revision: Option<&str>,
+) -> Result<String, ServerError> {
+    let tools = tools.map(|tools| {
+        json!({
+            "repo": tools.repo,
+            "git_ref": tools.git_ref,
+            "source_subdir": tools.source_subdir,
+            "visibility": tools.visibility,
+            "image": tools.image,
+            "image_pull_policy": tools.image_pull_policy,
+            "github_token": tools.github_token.as_ref().map(|token| json!({
+                "secret_name": token.secret_name,
+                "secret_key": token.secret_key,
+            })),
+            "repo_cache_path": tools.repo_cache_path,
+            "repo_cache_pvc": tools.repo_cache_pvc,
+            "repo_cache_sub_path": tools.repo_cache_sub_path,
+            "auto_reload": tools.auto_reload,
+            "extra_sources": tools.extra_sources.iter().map(|source| json!({
+                "repo": source.repo,
+                "git_ref": source.git_ref,
+                "source_subdir": source.source_subdir,
+                "visibility": source.visibility,
+            })).collect::<Vec<_>>(),
+        })
+    });
+    let overlay = overlay.map(|overlay| {
+        json!({
+            "image": overlay.image,
+            "image_pull_policy": overlay.image_pull_policy,
+            "source_path": overlay.source_path,
+            "mount_path": overlay.mount_path,
+        })
+    });
+    let material = serde_json::to_vec(&json!({
+        "version": 2,
+        "tools": tools,
+        "overlay_image": overlay,
+        "agent_image_pull_policy": agent_image_pull_policy,
+        "image_pull_secrets": image_pull_secrets,
+        "content_revision": content_revision,
+    }))
+    .map_err(|error| {
+        ServerError::UnsupportedConfig(format!(
+            "failed to fingerprint sandbox bootstrap configuration: {error}"
+        ))
+    })?;
+    Ok(format!("{:x}", Sha256::digest(material)))
+}
+
 const IRON_CONTROL_REGISTER_MAX_ATTEMPTS: u32 = 5;
 const IRON_CONTROL_REGISTER_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 
@@ -1374,6 +1525,16 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         }
         config.iron_control = args.iron_control.settings();
         config.tools = args.tools_source.to_config();
+        if let Some(image) = clean_optional_value(args.overlay_image.as_deref()) {
+            config.overlay_image = Some(OverlayImageConfig {
+                image,
+                image_pull_policy: clean_optional_value(args.overlay_image_pull_policy.as_deref()),
+                source_path: clean_optional_value(Some(args.overlay_image_source_path.as_str()))
+                    .unwrap_or_else(|| "/overlay".to_owned()),
+                mount_path: clean_optional_value(Some(args.sandbox_overlay_dir.as_str()))
+                    .unwrap_or_else(|| "/home/agent/overlay/org".to_owned()),
+            });
+        }
         // The chart label policy handles sandbox OTLP egress; keep the
         // per-sandbox proxy's own in-cluster OTLP egress explicit.
         config.otlp_egress = args.sandbox_otlp_egress_target()?;
@@ -1746,6 +1907,12 @@ struct IronProxySourceArgs {
     )]
     secret_ttl: String,
     #[arg(
+        long = "kubernetes-firewall-manager-secret-env-prefix",
+        env = "FIREWALL_MANAGER_SECRET_ENV_PREFIX",
+        default_value = ""
+    )]
+    secret_env_prefix: String,
+    #[arg(
         long = "kubernetes-op-connect-host",
         env = "KUBERNETES_OP_CONNECT_HOST"
     )]
@@ -1768,6 +1935,7 @@ impl IronProxySourceArgs {
             kind: self.source,
             op_vault: self.op_vault.clone(),
             ttl: self.secret_ttl.clone(),
+            env_prefix: self.secret_env_prefix.clone(),
         }
     }
 
@@ -2052,6 +2220,162 @@ mod tests {
     }
 
     #[test]
+    fn service_api_keys_must_be_distinct_across_trust_lanes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            (
+                "CENTAUR_CONTROL_API_KEY",
+                "shared-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "SLACKBOT_API_KEY",
+                "shared-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            ("GITHUBBOT_API_KEY", ""),
+            ("LINEARBOT_API_KEY", ""),
+            ("DISCORDBOT_API_KEY", ""),
+            ("TEAMSBOT_API_KEY", ""),
+            (
+                "WORKFLOW_API_KEY",
+                "workflow-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "SLACK_FEEDBACK_API_KEY",
+                "feedback-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "CENTAUR_JWT_SIGNING_SECRET",
+                "jwt-signing-key-xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+        ]);
+
+        let error = validate_service_api_key_separation()
+            .expect_err("equal control and Slackbot keys must fail startup");
+        assert!(error.to_string().contains("must contain distinct"));
+        assert!(!error.to_string().contains("shared-key"));
+    }
+
+    #[test]
+    fn configured_service_api_keys_must_be_at_least_32_bytes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            (
+                "CENTAUR_CONTROL_API_KEY",
+                "control-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            ("WORKFLOW_API_KEY", "short"),
+            (
+                "CENTAUR_JWT_SIGNING_SECRET",
+                "jwt-signing-key-xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+        ]);
+
+        let error = validate_service_api_key_separation().expect_err("short workflow key");
+        assert!(
+            error
+                .to_string()
+                .contains("WORKFLOW_API_KEY must contain at least 32 bytes")
+        );
+        assert!(!error.to_string().contains("short"));
+    }
+
+    #[test]
+    fn jwt_signing_key_must_be_distinct_from_service_credentials() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            (
+                "CENTAUR_CONTROL_API_KEY",
+                "shared-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "CENTAUR_JWT_SIGNING_SECRET",
+                "shared-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            ("SLACKBOT_API_KEY", ""),
+            ("GITHUBBOT_API_KEY", ""),
+            ("LINEARBOT_API_KEY", ""),
+            ("DISCORDBOT_API_KEY", ""),
+            ("TEAMSBOT_API_KEY", ""),
+            ("WORKFLOW_API_KEY", ""),
+            ("SLACK_FEEDBACK_API_KEY", ""),
+        ]);
+
+        let error = validate_service_api_key_separation()
+            .expect_err("equal signing and control keys must fail startup");
+        assert!(error.to_string().contains("must contain distinct"));
+        assert!(!error.to_string().contains("shared-key"));
+    }
+
+    #[test]
+    fn jwt_signing_key_must_be_at_least_32_bytes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_CONTROL_API_KEY", ""),
+            ("SLACKBOT_API_KEY", ""),
+            ("GITHUBBOT_API_KEY", ""),
+            ("LINEARBOT_API_KEY", ""),
+            ("DISCORDBOT_API_KEY", ""),
+            ("TEAMSBOT_API_KEY", ""),
+            ("WORKFLOW_API_KEY", ""),
+            ("SLACK_FEEDBACK_API_KEY", ""),
+            ("CENTAUR_JWT_SIGNING_SECRET", "short"),
+        ]);
+
+        let error = validate_service_api_key_separation().expect_err("short signing key");
+        assert!(
+            error
+                .to_string()
+                .contains("CENTAUR_JWT_SIGNING_SECRET must contain at least 32 bytes")
+        );
+        assert!(!error.to_string().contains("short"));
+    }
+
+    #[test]
+    fn distinct_service_api_keys_pass_startup_validation() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            (
+                "CENTAUR_CONTROL_API_KEY",
+                "control-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "SLACKBOT_API_KEY",
+                "slackbot-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "GITHUBBOT_API_KEY",
+                "githubbot-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "LINEARBOT_API_KEY",
+                "linearbot-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "DISCORDBOT_API_KEY",
+                "discordbot-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "TEAMSBOT_API_KEY",
+                "teamsbot-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "WORKFLOW_API_KEY",
+                "workflow-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "SLACK_FEEDBACK_API_KEY",
+                "feedback-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "CENTAUR_JWT_SIGNING_SECRET",
+                "jwt-signing-key-xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+        ]);
+
+        validate_service_api_key_separation().expect("distinct service keys");
+    }
+
+    #[test]
     fn iron_control_registration_retry_policy_is_transient_only() {
         let status_error = |status| {
             RegisterError::Control(IronControlError::Status {
@@ -2272,6 +2596,81 @@ mod tests {
         );
         assert_eq!(config.ready_timeout, Duration::from_secs(42));
         assert!(config.iron_proxy.is_none());
+    }
+
+    #[test]
+    fn agent_k8s_config_reads_transitional_overlay_image_flags() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--centaur-overlay-image",
+            "ghcr.io/tiplink/overlay:sha-test",
+            "--centaur-overlay-image-pull-policy",
+            "Always",
+            "--centaur-overlay-image-source-path",
+            "/org-overlay",
+            "--centaur-sandbox-overlay-dir",
+            "/home/agent/overlay/tiplink",
+        ])
+        .unwrap();
+
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let overlay = config.overlay_image.expect("overlay image should be set");
+        assert_eq!(overlay.image, "ghcr.io/tiplink/overlay:sha-test");
+        assert_eq!(overlay.image_pull_policy.as_deref(), Some("Always"));
+        assert_eq!(overlay.source_path, "/org-overlay");
+        assert_eq!(overlay.mount_path, "/home/agent/overlay/tiplink");
+    }
+
+    #[test]
+    fn sandbox_bootstrap_fingerprint_changes_with_repo_ref_and_overlay_image() {
+        let mut tools = ToolsConfig::new("TipLink/centaur", "centaur-agent:reviewed");
+        tools.git_ref = Some("1111111111111111111111111111111111111111".to_owned());
+        let overlay = OverlayImageConfig::new("fineas-overlay:sha-1111111");
+        let first = sandbox_bootstrap_fingerprint(
+            Some(&tools),
+            Some(&overlay),
+            Some("IfNotPresent"),
+            &["ghcr-pull".to_owned()],
+            Some("release-one"),
+        )
+        .expect("first fingerprint");
+
+        tools.git_ref = Some("2222222222222222222222222222222222222222".to_owned());
+        let repo_changed = sandbox_bootstrap_fingerprint(
+            Some(&tools),
+            Some(&overlay),
+            Some("IfNotPresent"),
+            &["ghcr-pull".to_owned()],
+            Some("release-one"),
+        )
+        .expect("repo fingerprint");
+        assert_ne!(first, repo_changed);
+
+        let overlay_changed = sandbox_bootstrap_fingerprint(
+            Some(&tools),
+            Some(&OverlayImageConfig::new("fineas-overlay:sha-2222222")),
+            Some("IfNotPresent"),
+            &["ghcr-pull".to_owned()],
+            Some("release-one"),
+        )
+        .expect("overlay fingerprint");
+        assert_ne!(repo_changed, overlay_changed);
+
+        let content_changed = sandbox_bootstrap_fingerprint(
+            Some(&tools),
+            Some(&OverlayImageConfig::new("fineas-overlay:sha-2222222")),
+            Some("IfNotPresent"),
+            &["ghcr-pull".to_owned()],
+            Some("release-two"),
+        )
+        .expect("content revision fingerprint");
+        assert_ne!(overlay_changed, content_changed);
     }
 
     #[test]

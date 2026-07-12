@@ -3,7 +3,7 @@ use std::pin::Pin;
 use centaur_session_core::{Session, ThreadKey};
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
-use reqwest::{Client as HttpClient, StatusCode};
+use reqwest::{Client as HttpClient, RequestBuilder, StatusCode};
 use thiserror::Error;
 
 use crate::types::{
@@ -11,10 +11,11 @@ use crate::types::{
     ExecuteSessionResponse,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CentaurClient {
     client: HttpClient,
     base_url: String,
+    bearer_token: Option<String>,
 }
 
 impl CentaurClient {
@@ -26,7 +27,15 @@ impl CentaurClient {
         Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            bearer_token: None,
         }
+    }
+
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        let token = token.trim();
+        self.bearer_token = (!token.is_empty()).then(|| token.to_owned());
+        self
     }
 
     pub async fn create_session(
@@ -71,7 +80,7 @@ impl CentaurClient {
             "{}/events?after_event_id={after_event_id}",
             self.session_url(thread_key)
         );
-        let response = self.client.get(&events_url).send().await?;
+        let response = self.authorize(self.client.get(&events_url)).send().await?;
         let response = ensure_response_success(response).await?;
         let stream = response
             .bytes_stream()
@@ -85,7 +94,10 @@ impl CentaurClient {
         T: serde::Serialize + ?Sized,
         R: serde::de::DeserializeOwned,
     {
-        let response = self.client.post(url).json(payload).send().await?;
+        let response = self
+            .authorize(self.client.post(url).json(payload))
+            .send()
+            .await?;
         let response = ensure_response_success(response).await?;
         Ok(response.json().await?)
     }
@@ -96,6 +108,13 @@ impl CentaurClient {
             self.base_url,
             urlencoding::encode(thread_key.as_str())
         )
+    }
+
+    fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
+        match self.bearer_token.as_deref() {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 }
 
