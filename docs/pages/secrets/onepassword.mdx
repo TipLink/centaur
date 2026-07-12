@@ -72,6 +72,7 @@ It must also include infrastructure secrets such as:
 ```text
 DATABASE_URL
 SLACKBOT_API_KEY
+CENTAUR_CONTROL_API_KEY
 SLACK_BOT_TOKEN
 SLACK_SIGNING_SECRET
 SANDBOX_SIGNING_KEY
@@ -79,6 +80,17 @@ IRON_MANAGEMENT_API_KEY
 ```
 
 Those are boot-time service secrets, not tool credentials.
+
+`CENTAUR_CONTROL_API_KEY` is required and must be a dedicated high-entropy
+control-plane value. It does not belong in the 1Password tool-credential vault
+or any sandbox. `SLACK_FEEDBACK_API_KEY` is optional but, when the feedback tool
+is enabled, must be a different value because it receives only the
+`feedback-improvement:*` session capability.
+
+For an existing deployment, provision the prefixed control key in
+`secretManager.existingSecretName` before upgrading. The API and Console
+Secret references are non-optional; adding the value to a 1Password item alone
+does not satisfy this boot-time Kubernetes Secret requirement.
 
 ## Name 1Password items
 

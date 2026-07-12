@@ -65,13 +65,22 @@ Minimum keys:
 | `SLACK_BOT_TOKEN` | Slackbot/API | Bot User OAuth Token from the Slack app. |
 | `SLACK_SIGNING_SECRET` | Slackbot/API | Used to verify Slack webhook signatures. |
 | `SLACKBOT_API_KEY` | Slackbot to API | Static service token; API bootstraps it into Postgres on startup with `agent` scope. |
+| `CENTAUR_CONTROL_API_KEY` | Console/operator to API | Dedicated high-entropy service token for administrative routes and global controls. Never reuse a bot key or expose this value to sandboxes. |
+| `SLACK_FEEDBACK_API_KEY` | Optional sandbox feedback tool to API | Separate narrow token that can create and operate only `feedback-improvement:*` sessions. |
 | `OP_CONNECT_TOKEN` | [iron-proxy](https://docs.iron.sh) 1Password Connect source (preferred) | Needed when `ironProxy.secretSource` is `onepassword-connect`. |
 | `OP_SERVICE_ACCOUNT_TOKEN` | [iron-proxy](https://docs.iron.sh) 1Password service-account source | Needed when `ironProxy.secretSource` is `onepassword`. |
 | `OP_VAULT` | [iron-proxy](https://docs.iron.sh) 1Password source | Vault name or id used for `op://` references (either mode). |
 
-`SLACKBOT_API_KEY` is not created with the admin API during initial boot, because
-the API process requires it before it can start. Generate a high-entropy value,
-store it in the infra Secret, and reuse the same value in Slackbot.
+`SLACKBOT_API_KEY` and `CENTAUR_CONTROL_API_KEY` are not created with the admin
+API during initial boot, because the API process requires them before it can
+start. Generate distinct high-entropy values, store them in the infra Secret,
+and reuse only the Slackbot value in Slackbot. Local bootstrap generates and
+preserves the control and feedback keys automatically.
+
+For upgrades using `secretManager.existingSecretName`, create the prefixed
+`CENTAUR_CONTROL_API_KEY` Secret entry before applying the new chart. The API
+and Console references are non-optional and otherwise produce a pod startup
+failure. This secret prerequisite is the first gate in the upgrade runbook.
 
 ## 3. Configure harness credentials
 
@@ -303,21 +312,28 @@ Run one agent turn from inside the api-rs deployment:
 THREAD_KEY=cli:production-smoke-codex
 THREAD_PATH=$(jq -rn --arg v "$THREAD_KEY" '$v|@uri')
 
-SESSION=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}" \
-  -H "Content-Type: application/json" \
-  -d '{"harness_type":"codex","on_harness_conflict":"restart"}')
+SESSION=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s -X POST "http://localhost:8080/api/session/$1" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
+    -H "Content-Type: application/json" \
+    -d '\''{"harness_type":"codex","on_harness_conflict":"restart"}'\''' sh "$THREAD_PATH")
 
-kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}/messages" \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","parts":[{"type":"text","text":"Reply with exactly PONG."}]}]}'
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s -X POST "http://localhost:8080/api/session/$1/messages" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
+    -H "Content-Type: application/json" \
+    -d '\''{"messages":[{"role":"user","parts":[{"type":"text","text":"Reply with exactly PONG."}]}]}'\''' sh "$THREAD_PATH"
 
-EXECUTE=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}/execute" \
-  -H "Content-Type: application/json" \
-  -d '{"input_lines":["{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reply with exactly PONG.\"}]}}"]}')
+EXECUTE=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s -X POST "http://localhost:8080/api/session/$1/execute" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
+    -H "Content-Type: application/json" \
+    -d '\''{"input_lines":["{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reply with exactly PONG.\"}]}}"]}'\''' sh "$THREAD_PATH")
 EXECUTION_ID=$(printf '%s' "$EXECUTE" | jq -r '.execution_id')
 
-kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -N \
-  "http://localhost:8080/api/session/${THREAD_PATH}/events?execution_id=${EXECUTION_ID}&after_event_id=0"
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s -N "http://localhost:8080/api/session/$1/events?execution_id=$2&after_event_id=0" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"' sh "$THREAD_PATH" "$EXECUTION_ID"
 ```
 
 Then run the same prompt through Slack:
@@ -340,8 +356,9 @@ If a run fails because the sandbox pod exits or is deleted, inspect the durable
 session and api-rs logs before retrying:
 
 ```bash
-kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s \
-  "http://localhost:8080/api/session/${THREAD_PATH}" | jq
+kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- \
+  sh -lc 'curl -s "http://localhost:8080/api/session/$1" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"' sh "$THREAD_PATH" | jq
 
 kubectl logs -n centaur-system deploy/centaur-centaur-api-rs --tail=200
 kubectl get pods -n centaur-system -l centaur.ai/managed=true

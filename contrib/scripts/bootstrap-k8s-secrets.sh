@@ -11,8 +11,12 @@ Usage: scripts/bootstrap-k8s-secrets.sh [--namespace NAMESPACE] [--force]
 Creates the required local-dev Kubernetes infra Secrets consumed by the Helm chart.
 When creating centaur-infra-env from scratch or with --force, requires
 OP_SERVICE_ACCOUNT_TOKEN, OP_VAULT, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET,
-and SLACKBOT_API_KEY in the shell environment. Existing Secrets are only topped
-up with newly generated optional keys when absent.
+and SLACKBOT_API_KEY in the shell environment. A stable
+CENTAUR_CONTROL_API_KEY is generated for Console/API administration, and a
+distinct SLACK_FEEDBACK_API_KEY is generated for the sandbox feedback tool.
+Existing Secrets are only topped up with newly generated keys when absent.
+All configured control, bot, workflow, and feedback API credentials must be
+pairwise distinct; api-rs refuses to start if trust lanes share a value.
 
 Optional 1Password Connect bootstrap (when ironProxy.manager.secretSource is
 set to onepassword-connect in the Helm values):
@@ -194,6 +198,35 @@ secret_key_present() {
   [[ -n "$value" ]]
 }
 
+assert_service_api_keys_distinct() {
+  local keys=(
+    CENTAUR_CONTROL_API_KEY
+    SLACKBOT_API_KEY
+    GITHUBBOT_API_KEY
+    LINEARBOT_API_KEY
+    DISCORDBOT_API_KEY
+    TEAMSBOT_API_KEY
+    WORKFLOW_API_KEY
+    SLACK_FEEDBACK_API_KEY
+  )
+  local names=()
+  local values=()
+  local key value index
+  for key in "${keys[@]}"; do
+    value="$(kubectl -n "$NAMESPACE" get secret centaur-infra-env \
+      -o "jsonpath={.data.${key}}" 2>/dev/null || true)"
+    [[ -n "$value" ]] || continue
+    for index in "${!values[@]}"; do
+      if [[ "$value" == "${values[$index]}" ]]; then
+        echo "${names[$index]} and $key must contain distinct service credentials" >&2
+        return 1
+      fi
+    done
+    names+=("$key")
+    values+=("$value")
+  done
+}
+
 if secret_exists centaur-infra-env; then
   patch_data=()
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
@@ -204,6 +237,12 @@ if secret_exists centaur-infra-env; then
   # under cached iron-proxy access tokens on every script run.
   if ! secret_key_present IRON_BROKER_TOKEN; then
     patch_data+=("\"IRON_BROKER_TOKEN\":\"$(rand_hex | base64 | tr -d '\n')\"")
+  fi
+  if ! secret_key_present CENTAUR_CONTROL_API_KEY; then
+    patch_data+=("\"CENTAUR_CONTROL_API_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
+  fi
+  if ! secret_key_present SLACK_FEEDBACK_API_KEY; then
+    patch_data+=("\"SLACK_FEEDBACK_API_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
   fi
   if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
     patch_data+=("\"LOCAL_DEV_API_KEY\":\"$(printf '%s' "$LOCAL_DEV_API_KEY" | base64 | tr -d '\n')\"")
@@ -302,6 +341,7 @@ if secret_exists centaur-infra-env; then
     kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
     echo "Updated optional keys in Secret centaur-infra-env in namespace $NAMESPACE"
   fi
+  assert_service_api_keys_distinct
   echo "Secret centaur-infra-env already exists in namespace $NAMESPACE; leaving unchanged"
 else
   POSTGRES_PASSWORD="$(rand_hex)"
@@ -322,6 +362,8 @@ else
     --from-literal=SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN"
     --from-literal=SLACK_SIGNING_SECRET="$SLACK_SIGNING_SECRET"
     --from-literal=SLACKBOT_API_KEY="$SLACKBOT_API_KEY"
+    --from-literal=CENTAUR_CONTROL_API_KEY="$(rand_hex)"
+    --from-literal=SLACK_FEEDBACK_API_KEY="$(rand_hex)"
     --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
     --from-literal=DATABASE_URL="$DATABASE_URL"
     --from-literal=IRON_CONTROL_DATABASE_URL="$IRON_CONTROL_DATABASE_URL"
@@ -370,6 +412,7 @@ else
     secret_args+=(--from-literal=GITHUBBOT_API_KEY="${GITHUBBOT_API_KEY:-$(rand_hex)}")
   fi
   kubectl "${secret_args[@]}" >/dev/null
+  assert_service_api_keys_distinct
   echo "Created Secret centaur-infra-env in namespace $NAMESPACE"
 fi
 

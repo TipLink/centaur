@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
@@ -153,6 +154,16 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                             break;
                         }
                     }
+                    Ok(command @ BlocksCommand::User { .. })
+                        if turn_active.load(Ordering::SeqCst) =>
+                    {
+                        if active_turn_tx
+                            .send(CodexActiveTurnRequest::Steer(Box::new(command)))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Ok(command @ BlocksCommand::User { .. }) => {
                         turn_active.store(true, Ordering::SeqCst);
                         if command_tx
@@ -198,7 +209,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 let result = (|| -> Result<()> {
                     if codex.is_none() {
                         otel::configure_codex_otel_for_startup(&trace_context)?;
-                        let mut child = CodexJsonRpcChild::spawn()?;
+                        let mut child = CodexJsonRpcChild::spawn(&trace_context)?;
                         initialize_codex(
                             &mut child,
                             &mut stdout,
@@ -259,6 +270,13 @@ enum CodexBlocksReaderInput {
 
 enum CodexActiveTurnRequest {
     Interrupt,
+    Steer(Box<BlocksCommand>),
+}
+
+#[derive(Default)]
+struct CodexActiveRequestState {
+    interrupt_request_id: Option<i64>,
+    steer_request_ids: HashSet<i64>,
 }
 
 fn drain_codex_active_turn_requests(rx: &Receiver<CodexActiveTurnRequest>) {
@@ -457,13 +475,18 @@ struct CodexJsonRpcChild {
 }
 
 impl CodexJsonRpcChild {
-    fn spawn() -> Result<Self> {
+    fn spawn(trace_context: &otel::TraceContext) -> Result<Self> {
         let bin = codex_bin();
-        let mut child = ProcessCommand::new(&bin)
+        let mut command = ProcessCommand::new(&bin);
+        command
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(thread_key) = centaur_thread_key_env_value(trace_context) {
+            command.env("CENTAUR_THREAD_KEY", thread_key);
+        }
+        let mut child = command
             .spawn()
             .map_err(|source| HarnessServerError::SpawnCodex {
                 bin: bin.clone(),
@@ -586,14 +609,14 @@ impl CodexJsonRpcChild {
         traceparent: Option<&str>,
     ) -> Result<TurnTermination> {
         let mut guard = TurnGuard::default();
-        let mut interrupt_request_id = None;
+        let mut active_requests = CodexActiveRequestState::default();
         loop {
             let value = match self.read_value_timeout(Duration::from_millis(50))? {
                 Some(value) => value,
                 None => {
-                    self.forward_pending_interrupt(
+                    self.forward_pending_active_requests(
                         active_turn_rx,
-                        &mut interrupt_request_id,
+                        &mut active_requests,
                         request_id,
                         thread_id,
                         turn_id,
@@ -607,11 +630,17 @@ impl CodexJsonRpcChild {
                 continue;
             }
             if let Some(id) = response_id(&value) {
-                if Some(id) == interrupt_request_id {
+                if Some(id) == active_requests.interrupt_request_id {
                     if let Some(error) = value.get("error") {
                         return Err(HarnessServerError::Protocol(format!(
                             "Codex app-server turn/interrupt request {id} failed: {error}"
                         )));
+                    }
+                    continue;
+                }
+                if active_requests.steer_request_ids.remove(&id) {
+                    if let Some(error) = value.get("error") {
+                        eprintln!("Codex app-server turn/steer request {id} failed: {error}");
                     }
                     continue;
                 }
@@ -637,9 +666,9 @@ impl CodexJsonRpcChild {
                     return Ok(TurnTermination::Done);
                 }
             }
-            self.forward_pending_interrupt(
+            self.forward_pending_active_requests(
                 active_turn_rx,
-                &mut interrupt_request_id,
+                &mut active_requests,
                 request_id,
                 thread_id,
                 turn_id,
@@ -648,31 +677,66 @@ impl CodexJsonRpcChild {
         }
     }
 
-    fn forward_pending_interrupt(
+    fn forward_pending_active_requests(
         &mut self,
         active_turn_rx: &Receiver<CodexActiveTurnRequest>,
-        interrupt_request_id: &mut Option<i64>,
+        active_requests: &mut CodexActiveRequestState,
         request_id: &mut i64,
         thread_id: &str,
         turn_id: &str,
         traceparent: Option<&str>,
     ) -> Result<()> {
-        while let Ok(CodexActiveTurnRequest::Interrupt) = active_turn_rx.try_recv() {
-            if interrupt_request_id.is_some() {
-                eprintln!("Codex blocks interrupt ignored: interrupt already requested");
-                continue;
+        while let Ok(request) = active_turn_rx.try_recv() {
+            match request {
+                CodexActiveTurnRequest::Interrupt => {
+                    if active_requests.interrupt_request_id.is_some() {
+                        eprintln!("Codex blocks interrupt ignored: interrupt already requested");
+                        continue;
+                    }
+                    let id = next_request_id(request_id);
+                    self.send_request(
+                        id,
+                        "turn/interrupt",
+                        json!({
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                        }),
+                        traceparent,
+                    )?;
+                    active_requests.interrupt_request_id = Some(id);
+                }
+                CodexActiveTurnRequest::Steer(command) => {
+                    let BlocksCommand::User {
+                        input,
+                        client_user_message_id,
+                        model,
+                        provider,
+                        reasoning,
+                        trace_context,
+                    } = *command
+                    else {
+                        continue;
+                    };
+                    if model.is_some() || provider.is_some() || reasoning.is_some() {
+                        eprintln!(
+                            "Codex blocks steering ignored turn-start-only overrides: \
+                             model={model:?} provider={provider:?} reasoning={reasoning:?}"
+                        );
+                    }
+                    let id = next_request_id(request_id);
+                    let mut params = json!({
+                        "threadId": thread_id,
+                        "expectedTurnId": turn_id,
+                        "input": input,
+                    });
+                    if let Some(client_user_message_id) = client_user_message_id {
+                        params["clientUserMessageId"] = Value::String(client_user_message_id);
+                    }
+                    let steer_traceparent = trace_context.effective_traceparent();
+                    self.send_request(id, "turn/steer", params, steer_traceparent.as_deref())?;
+                    active_requests.steer_request_ids.insert(id);
+                }
             }
-            let id = next_request_id(request_id);
-            self.send_request(
-                id,
-                "turn/interrupt",
-                json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                }),
-                traceparent,
-            )?;
-            *interrupt_request_id = Some(id);
         }
         Ok(())
     }
@@ -711,6 +775,14 @@ impl CodexJsonRpcChild {
             return Ok(Some(serde_json::from_str(trimmed)?));
         }
     }
+}
+
+fn centaur_thread_key_env_value(trace_context: &otel::TraceContext) -> Option<&str> {
+    trace_context
+        .thread_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_key| !thread_key.is_empty())
 }
 
 impl Drop for CodexJsonRpcChild {
@@ -946,6 +1018,28 @@ mod tests {
         assert_eq!(
             codex.model_provider_for(Some("   "), Some("vendor/model")),
             "openrouter"
+        );
+    }
+
+    #[test]
+    fn derives_child_thread_key_env_from_first_turn_trace_context() {
+        let trace_context = otel::TraceContext {
+            thread_key: Some(" slack:T123:C123:1780000000.000000 ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            centaur_thread_key_env_value(&trace_context),
+            Some("slack:T123:C123:1780000000.000000")
+        );
+
+        let blank_trace_context = otel::TraceContext {
+            thread_key: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(centaur_thread_key_env_value(&blank_trace_context), None);
+        assert_eq!(
+            centaur_thread_key_env_value(&otel::TraceContext::default()),
+            None
         );
     }
 

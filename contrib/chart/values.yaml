@@ -178,6 +178,34 @@ console:
     replicaCount: 1
     resources: {}
 
+# Managed short-lived token credentials for sandbox proxy rules. This
+# transitional bootstrap upserts the GitHub App installation credential into
+# the upstream Console credential-grant registry before api-rs starts.
+tokenBroker:
+  enabled: false
+  githubApp:
+    enabled: false
+    # Compatibility alias provisioned alongside the canonical `github-app`
+    # credential. The built-in infra role always consumes `github-app`; do not
+    # add a second same-scope proxy source for this alias.
+    credentialId: github-app
+    extraCredentialIds: []
+    credentialNamespaces:
+      - default
+      - infra
+    existingSecretName: ""
+    existingSecretKeys:
+      appId: app-id
+      installationId: installation-id
+      privateKey: private-key
+    bootstrap:
+      enabled: true
+      # Empty fields fall back to sandbox.image, which carries curl and jq.
+      image:
+        repository: ""
+        tag: ""
+        pullPolicy: ""
+
 # Values for the upstream 1Password Connect subchart
 # (https://github.com/1Password/connect-helm-charts/tree/main/charts/connect).
 # Deployment is gated on onepasswordConnect.connect.create AND on
@@ -195,7 +223,15 @@ secrets:
 
 overlay:
   mountPath: /app/overlay/org
+  sandboxMountPath: /home/agent/overlay/org
   systemPrompt: ""
+  # Deprecated transitional path retained for staged migration and rollback.
+  # Prefer overlays.sources for new deployments.
+  image:
+    repository: ""
+    tag: latest
+    pullPolicy: IfNotPresent
+    sourcePath: /overlay
 
 # Ordered repo-cache-backed overlays. Each source repo is synced by repo-cache;
 # api-rs reads tools/workflows from /var/lib/centaur/repos, while sandboxes read
@@ -338,6 +374,9 @@ apiRs:
     tag: latest
     pullPolicy: Always
   port: 8080
+  # Shared trusted control-plane key used by Console for authenticated session
+  # and workflow administration. Sandbox principals never receive this value.
+  controlApiKeySecretKey: CENTAUR_CONTROL_API_KEY
   # Public/local MCP endpoint advertised through OAuth protected-resource
   # metadata. Empty falls back to slackbotv2.mcpPublicUrl.
   mcpPublicUrl: ""
@@ -347,6 +386,11 @@ apiRs:
   sandboxReadyTimeoutSecs: 90
   sandboxWarmPoolSize: 3
   sandboxWarmPoolReplenishIntervalSecs: 5
+  # Optional operator-controlled input to the automatically computed sandbox
+  # boot-content revision. Normally the chart's source/image manifest is
+  # sufficient; bump this only for an external boot-copied input not represented
+  # by chart values.
+  sandboxContentRevision: ""
   # Capacity manager: when nonzero, api-rs keeps observed running-like
   # sandboxes at or below this limit by discarding ready warm sandboxes first,
   # then pausing least-recently-active idle session sandboxes. 0 disables.
@@ -362,6 +406,11 @@ apiRs:
   # in workflowAllowedNames as a comma/whitespace-separated string.
   workflowEnableMode: all
   workflowAllowedNames: ""
+  # Sandbox-facing workflow control API policy. Run creation/list/get/cancel
+  # additionally requires a Console JWT scoped to input.thread_key's Slack
+  # channel. Empty is deny-all; list only workflows intentionally callable by
+  # agent tools. Scheduled and authenticated webhook execution are unaffected.
+  workflowApiAllowedNames: ""
   # Scheduled ETL workflow configuration. The chart renders these into api-rs
   # env so workflow discovery sees the right schedules, then derives the
   # workflow-host passthrough list from the same non-secret config.
@@ -615,6 +664,11 @@ httpRoutes: []
 
 networkPolicy:
   enabled: true
+  # Transitional compatibility for sandboxes created before capability labels.
+  # New agent/proxy pods always carry api-server-enabled=true|false, and this
+  # policy selects only managed pods where that label is absent. Disable only
+  # after every old ready/claimed/running sandbox has drained.
+  legacyManagedByApiServerAccess: true
   ingressSourceNamespaces: []
   apiIngressSourceNamespaces: []
   ingressControllerNamespaces:
@@ -628,9 +682,10 @@ networkPolicy:
   # Egress to an in-cluster OTLP trace collector (e.g. Laminar) in another
   # namespace. The policy selects only pods labeled
   # centaur.ai/observability-enabled=true, matching observabilityEgress. api-rs
-  # always receives that label; sandboxes and proxy pods receive it only when
-  # their principal has observability enabled. The collector's own namespace
-  # must also admit ingress from this namespace's pods.
+  # always receives that label; sandbox pods receive it only when their
+  # principal has observability enabled. Iron-proxy pods use their explicit
+  # per-sandbox OTLP egress rule instead of this selector. The collector's own
+  # namespace must also admit ingress from this namespace's pods.
   otlpEgress:
     enabled: false
     # kubernetes.io/metadata.name of the collector's namespace, e.g. "laminar".

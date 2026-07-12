@@ -199,6 +199,16 @@ spec:
         - podSelector:
             matchLabels:
               centaur.ai/api-server-enabled: "true"
+{{- if .Values.networkPolicy.legacyManagedByApiServerAccess }}
+        # Transitional selector for pre-capability-label sandbox/proxy pods.
+        # Remove after the old warm pool and all assigned sessions are drained.
+        - podSelector:
+            matchLabels:
+              centaur.ai/managed-by: api-rs
+            matchExpressions:
+              - key: centaur.ai/api-server-enabled
+                operator: DoesNotExist
+{{- end }}
 {{- range .Values.networkPolicy.apiIngressSourceNamespaces }}
         - namespaceSelector:
             matchLabels:
@@ -231,6 +241,35 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.apiRs.port }}
+{{- if .Values.networkPolicy.legacyManagedByApiServerAccess }}
+---
+# Transitional egress companion for sandbox/proxy pods created before
+# centaur.ai/api-server-enabled was introduced. Default-on for staged upgrades;
+# disable only after all legacy sessions and warm sandboxes have drained.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-legacy-managed-by-api-server
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/managed-by: api-rs
+    matchExpressions:
+      - key: centaur.ai/api-server-enabled
+        operator: DoesNotExist
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+{{- end }}
 ---
 {{- if .Values.networkPolicy.observabilityEgress.enabled }}
 {{- if not .Values.networkPolicy.observabilityEgress.destinations }}
