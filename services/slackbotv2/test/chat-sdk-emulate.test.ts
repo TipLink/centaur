@@ -53,6 +53,11 @@ describe('normalizeSlackText', () => {
     )
   })
 
+  it('decodes Slack entities exactly once', () => {
+    expect(normalizeSlackText('&lt;tag&gt; &amp; &amp;lt;escaped&amp;gt;')).toBe(
+      '<tag> & &lt;escaped&gt;'
+    )
+  })
 })
 
 let emulator: Emulator

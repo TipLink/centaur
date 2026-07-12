@@ -12,7 +12,7 @@
  * another harness restarts the thread on the requested one. Harness/model/provider
  * choices are sticky at the Slack thread level: the last flag wins for later
  * turns in the same thread. `--model` accepts either a full model id
- * (claude-sonnet-4-6, gpt-5.2, ...), an amp mode (deep/fast), or a Claude alias
+ * (claude-sonnet-5, gpt-5.2, ...), an amp mode (deep/fast), or a Claude alias
  * (fable/opus/sonnet/haiku) which expands to the full id. Reasoning effort only
  * affects the codex harness (it maps to codex's `turn/start` `effort`) and stays
  * per-turn; other harnesses ignore it. The provider rides the blocks-protocol
@@ -46,12 +46,13 @@ const PROVIDER_FLAGS: Record<string, { provider: string; harnessType: string }> 
 }
 
 // Claude model aliases, usable both as bare flags (--opus) and as --model
-// values (--model opus). Bare-flag form also implies the claude-code harness.
+// values (--model opus). Either form implies claude-code unless an explicit
+// harness or provider flag selects something else.
 const CLAUDE_MODEL_ALIASES: Record<string, string> = {
   fable: 'claude-fable-5',
   haiku: 'claude-haiku-4-5',
   opus: 'claude-opus-4-8',
-  sonnet: 'claude-sonnet-4-6'
+  sonnet: 'claude-sonnet-5'
 }
 
 const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
@@ -99,13 +100,16 @@ export function extractMessageOverrides(text: string): MessageOverrides {
   let cleaned = text
   let harnessType: string | undefined
   let model: string | undefined
+  let modelAliasHarness: string | undefined
   let provider: string | undefined
   let reasoning: string | undefined
 
   const modelMatch = MODEL_FLAG_PATTERN.exec(cleaned)
   if (modelMatch) {
     const value = modelMatch[1]!
-    model = CLAUDE_MODEL_ALIASES[value.toLowerCase()] ?? value
+    const alias = CLAUDE_MODEL_ALIASES[value.toLowerCase()]
+    model = alias ?? value
+    if (alias) modelAliasHarness = 'claudecode'
     cleaned = stripMatch(cleaned, modelMatch)
   }
 
@@ -129,7 +133,7 @@ export function extractMessageOverrides(text: string): MessageOverrides {
     const match = flagPattern(flag).exec(cleaned)
     if (!match) continue
     model ??= shortcut.model
-    harnessType ??= shortcut.harnessType
+    modelAliasHarness ??= shortcut.harnessType
     cleaned = stripMatch(cleaned, match)
   }
 
@@ -140,6 +144,10 @@ export function extractMessageOverrides(text: string): MessageOverrides {
     harnessType ??= mapping.harnessType
     cleaned = stripMatch(cleaned, match)
   }
+
+  // An advertised Claude alias must remain usable when the deployment default
+  // is Codex. Explicit harness/provider flags above still win.
+  harnessType ??= modelAliasHarness
 
   return {
     cleanedText: cleaned === text ? text : cleaned.trim(),

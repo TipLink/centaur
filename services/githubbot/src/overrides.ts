@@ -8,7 +8,7 @@
  * Flags are stripped from the text before it reaches the agent. The harness
  * applies at session creation (the API pins a thread to one harness); the model
  * applies per turn via the blocks-protocol `model` field. `--model` accepts a
- * full model id (claude-sonnet-4-6, gpt-5.2, …) or a Claude alias
+ * full model id (claude-sonnet-5, gpt-5.2, …) or a Claude alias
  * (fable/opus/sonnet/haiku) which expands to the full id.
  */
 
@@ -28,12 +28,13 @@ const HARNESS_FLAGS: Record<string, string> = {
 };
 
 // Claude model aliases, usable both as bare flags (--opus) and as --model
-// values (--model opus). Bare-flag form also implies the claude-code harness.
+// values (--model opus). Either form implies claude-code unless an explicit
+// harness flag selects something else.
 const CLAUDE_MODEL_ALIASES: Record<string, string> = {
   fable: "claude-fable-5",
   haiku: "claude-haiku-4-5",
   opus: "claude-opus-4-8",
-  sonnet: "claude-sonnet-4-6",
+  sonnet: "claude-sonnet-5",
 };
 
 const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
@@ -50,11 +51,14 @@ export function extractMessageOverrides(text: string): MessageOverrides {
   let cleaned = text;
   let harnessType: string | undefined;
   let model: string | undefined;
+  let modelAliasHarness: string | undefined;
 
   const modelMatch = MODEL_FLAG_PATTERN.exec(cleaned);
   if (modelMatch) {
     const value = modelMatch[1]!;
-    model = CLAUDE_MODEL_ALIASES[value.toLowerCase()] ?? value;
+    const alias = CLAUDE_MODEL_ALIASES[value.toLowerCase()];
+    model = alias ?? value;
+    if (alias) modelAliasHarness = "claudecode";
     cleaned = stripMatch(cleaned, modelMatch);
   }
 
@@ -69,9 +73,13 @@ export function extractMessageOverrides(text: string): MessageOverrides {
     const match = flagPattern(flag).exec(cleaned);
     if (!match) continue;
     model ??= shortcut.model;
-    harnessType ??= shortcut.harnessType;
+    modelAliasHarness ??= shortcut.harnessType;
     cleaned = stripMatch(cleaned, match);
   }
+
+  // An advertised Claude alias must remain usable when the deployment default
+  // is Codex. Explicit harness flags above still win.
+  harnessType ??= modelAliasHarness;
 
   return {
     cleanedText: cleaned === text ? text : cleaned.trim(),

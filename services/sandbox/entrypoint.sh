@@ -22,6 +22,11 @@ if [ -n "${TOOL_DIRS:-}" ]; then
     export TOOL_DIRS
 fi
 
+case " ${NODE_OPTIONS:-} " in
+    *" --use-env-proxy "*) ;;
+    *) export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--use-env-proxy" ;;
+esac
+
 _add_pythonpath_entry() {
     local entry="$1"
     [ -d "$entry" ] || return 0
@@ -139,139 +144,7 @@ fi
 HARNESS_CONFIG_DIR="${CENTAUR_HARNESS_CONFIG_DIR:-$HOME_DIR/harness}"
 if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
     cp "$HARNESS_CONFIG_DIR/codex/config.toml" "$HOME_DIR/.codex/config.toml"
-    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" python3 - <<'PYEOF'
-from pathlib import Path
-import os
-import sys
-
-path = Path(os.environ["CODEX_CONFIG_PATH"])
-lines = path.read_text().splitlines()
-
-# CODEX_MODEL_REASONING_SUMMARY overrides model_reasoning_summary so deployments
-# can re-enable reasoning summaries (Codex >= 0.139 no longer emits them by
-# default) without rebuilding the sandbox image.
-summary = os.environ.get("CODEX_MODEL_REASONING_SUMMARY", "").strip()
-if summary:
-    if summary not in {"auto", "concise", "detailed", "none"}:
-        print(
-            f"ignoring invalid CODEX_MODEL_REASONING_SUMMARY: {summary!r} "
-            "(expected auto, concise, detailed, or none)",
-            file=sys.stderr,
-        )
-    else:
-        first_section = next(
-            (i for i, line in enumerate(lines) if line.lstrip().startswith("[")),
-            len(lines),
-        )
-        override = f'model_reasoning_summary = "{summary}"'
-        for i in range(first_section):
-            if lines[i].split("=", 1)[0].strip() == "model_reasoning_summary":
-                lines[i] = override
-                break
-        else:
-            lines.insert(first_section, override)
-
-features_start = next((i for i, line in enumerate(lines) if line.strip() == "[features]"), None)
-if features_start is None:
-    lines.extend(["", "[features]", "multi_agent = false", "multi_agent_v2 = false"])
-else:
-    features_end = next(
-        (i for i in range(features_start + 1, len(lines)) if lines[i].lstrip().startswith("[")),
-        len(lines),
-    )
-    feature_names = {"multi_agent", "multi_agent_v2"}
-    seen = set()
-    rewritten = []
-    for line in lines[features_start + 1 : features_end]:
-        stripped = line.strip()
-        name = stripped.split("=", 1)[0].strip() if "=" in stripped else None
-        if name in feature_names:
-            rewritten.append(f"{name} = false")
-            seen.add(name)
-        else:
-            rewritten.append(line)
-    for name in sorted(feature_names - seen):
-        rewritten.append(f"{name} = false")
-    lines = lines[: features_start + 1] + rewritten + lines[features_end:]
-
-# Optional deploy-time override of the codex reasoning effort. Lets a deployment
-# (e.g. an org overlay via sandbox.extraEnv) set the default without forking the
-# baked-in config.toml. Named after codex's own config key (model_reasoning_effort)
-# and validated against its ReasoningEffort enum; an unknown value is ignored (the
-# config default stands) rather than written.
-effort = (os.environ.get("CODEX_MODEL_REASONING_EFFORT") or "").strip().lower()
-if effort:
-    valid = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
-    if effort not in valid:
-        print(
-            f"ignoring invalid CODEX_MODEL_REASONING_EFFORT={effort!r}; "
-            f"expected one of {sorted(valid)}",
-            file=sys.stderr,
-        )
-    else:
-        # model_reasoning_effort is a top-level key, before the first [table].
-        first_table = next(
-            (i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines)
-        )
-        override = f'model_reasoning_effort = "{effort}"'
-        for i in range(first_table):
-            if lines[i].split("=", 1)[0].strip() == "model_reasoning_effort":
-                lines[i] = override
-                break
-        else:
-            lines.insert(first_table, override)
-
-text = "\n".join(lines).rstrip() + "\n"
-
-# CODEX_BEDROCK_REGION: when codex's built-in `amazon-bedrock` provider is enabled
-# (the api-rs sandbox env injects this), pin its AWS region from the SAME env var
-# that scopes iron-proxy's SigV4 re-signing, so the in-sandbox client signs/sends
-# for the region the proxy is bound to. One source of truth instead of a
-# hand-written CODEX_CONFIG_OVERLAY that can silently disagree and fail signing.
-# Applied before the overlay below, so an operator can still override it. tomli_w
-# quotes the value (no TOML injection); a parse failure just skips the patch.
-bedrock_region = (os.environ.get("CODEX_BEDROCK_REGION") or "").strip()
-if bedrock_region:
-    import tomllib
-    import tomli_w
-
-    try:
-        config = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        print(f"ignoring CODEX_BEDROCK_REGION patch: {exc}", file=sys.stderr)
-    else:
-        config.setdefault("model_providers", {}).setdefault(
-            "amazon-bedrock", {}
-        ).setdefault("aws", {})["region"] = bedrock_region
-        text = tomli_w.dumps(config)
-
-# CODEX_CONFIG_OVERLAY: deep-merge an operator-supplied TOML fragment over the
-# baked config so a deployment can configure codex -- e.g. point it at a custom
-# model provider via a [model_providers.*] block -- through sandbox.extraEnv,
-# without forking config.toml. Unset is a no-op; invalid TOML is ignored (the
-# baked config stands) rather than written.
-overlay_raw = (os.environ.get("CODEX_CONFIG_OVERLAY") or "").strip()
-if overlay_raw:
-    import tomllib
-    import tomli_w
-
-    def _deep_merge(base, overlay):
-        for key, value in overlay.items():
-            if isinstance(value, dict) and isinstance(base.get(key), dict):
-                _deep_merge(base[key], value)
-            else:
-                base[key] = value
-        return base
-
-    try:
-        merged = _deep_merge(tomllib.loads(text), tomllib.loads(overlay_raw))
-    except tomllib.TOMLDecodeError as exc:
-        print(f"ignoring invalid CODEX_CONFIG_OVERLAY: {exc}", file=sys.stderr)
-    else:
-        text = tomli_w.dumps(merged)
-
-path.write_text(text)
-PYEOF
+    CODEX_CONFIG_PATH="$HOME_DIR/.codex/config.toml" configure-codex-config
 else
     echo "missing Codex harness config: $HARNESS_CONFIG_DIR/codex/config.toml" >&2
     exit 1

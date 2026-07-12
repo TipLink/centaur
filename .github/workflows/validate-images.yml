@@ -31,7 +31,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +73,12 @@ jobs:
             context: .
             dockerfile: services/sandbox/Dockerfile
             target: sandbox
+          - service: agent
+            platform: linux/arm64
+            image: centaur-agent
+            context: .
+            dockerfile: services/sandbox/Dockerfile
+            target: sandbox
           - service: iron-proxy
             image: centaur-iron-proxy
             context: .
@@ -93,6 +99,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      - name: Derive platform slug
+        run: |
+          set -euo pipefail
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
+
       - name: Build ${{ matrix.image }} without registry credentials
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -103,5 +115,5 @@ jobs:
           push: false
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
-          cache-from: type=gha,scope=validate-${{ matrix.image }}-linux-amd64
-          cache-to: type=gha,mode=max,scope=validate-${{ matrix.image }}-linux-amd64
+          cache-from: type=gha,scope=validate-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+          cache-to: type=gha,mode=max,scope=validate-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}

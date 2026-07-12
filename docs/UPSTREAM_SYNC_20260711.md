@@ -15,6 +15,10 @@ the tested tree exactly, and satisfy the fork's signature policy.
 | Ordered tool overlays | `install_tool_shims.py` uses later-source replacement and matches package, project, and script identifiers for allow/block lists. |
 | Warm first-turn context | `harness-server` derives `CENTAUR_THREAD_KEY` from the first blocks-mode user line before spawning Codex app-server. |
 | Active Codex steering | A second user line during an active turn becomes `turn/steer`; its response is consumed rather than leaked into blocks output. |
+| Reviewed runtime pins | The sandbox retains TipLink's tested Codex `0.144.1` and Claude Code `2.1.198` pins. Paradigm's Codex `0.144.0` already supports GPT-5.6 Sol, while Claude Code `2.1.197` is the documented Sonnet 5 floor; the retained next-patch pins include later fixes and are verified in the image build. |
+| Sandbox development capabilities | Terraform and Playwright `1.58.0` with its native headless shell remain available on amd64 and arm64. `agent-browser` uses its installed Chrome on amd64 and an explicit Playwright-shell path on arm64, where its own installer and discovery do not work. Node tools opt into the sandbox's injected proxy without discarding existing `NODE_OPTIONS`. |
+| Table-aware Codex configuration | The entrypoint transforms the copied operator config as TOML, disables both multi-agent feature forms without colliding with a `[features.multi_agent_v2]` table, applies deployment reasoning and Bedrock settings, then lets a valid operator overlay win. It validates before atomically replacing the config. |
+| Claude model aliases on a Codex default | Slack, Linear, and GitHub aliases map Sonnet to `claude-sonnet-5`. A known Claude alias in `--model` selects Claude only when an explicit harness/provider flag has not already won; full model IDs remain pass-through escape hatches. |
 | Canonical session release | `POST /api/session/{thread_key}/release` locks the session row, fences the expected sandbox, rejects active work unless cancellation is explicit, clears stdout ownership on cancellation, and stops only the snapshotted sandbox. |
 | Ambient Slack channels | Configured root messages and replies execute without an explicit mention; messages outside the allowlist remain inert. |
 | Slack event dedupe | The patched Chat dependency dedupes by actionable bucket so a non-actionable `message` event cannot suppress a later `app_mention`. |
@@ -69,18 +73,65 @@ the tested tree exactly, and satisfy the fork's signature policy.
   sequential release patch.
 - Upstream repo-cache overlay sources are the target architecture. Image
   overlays are explicitly transitional, not a competing long-term source.
-- TipLink's managed proxy timeout patch, old Codex config bootstrap helper,
-  legacy GitHub identity enrichment, tool-specific MPP/Preqin/Drive changes,
-  and stale generated docs/workflows were not carried into core. Those are
-  either fixed upstream, obsolete under the new architecture, or belong in the
-  overlay/tool repositories.
+- TipLink's old managed-proxy patch is replaced by the current agent-k8s
+  implementation, which injects
+  `IRON_PROXY_UPSTREAM_RESPONSE_HEADER_TIMEOUT=120s` into every managed proxy.
+  Obsolete line-oriented portions of the old Codex bootstrap were replaced by
+  the retained table-aware transformer. Legacy GitHub identity enrichment,
+  tool-specific MPP/Preqin/Drive changes, and stale generated docs/workflows
+  were not carried into core; they are obsolete under the new architecture or
+  belong in overlay/tool repositories.
 - CodeQL findings in unchanged Paradigm code and inherited test fixtures are
   treated as upstream baseline, not fork patches. This sync carries neither
   analyzer-only rewrites nor `codeql[...]` suppression comments; review and
   rollout gates cover integration-owned behavior instead.
 - Claude-as-default changes were not retained in base Centaur. Harness defaults
   remain upstream-owned; Fineas-specific defaults belong in the deployment
-  overlay/configuration.
+  overlay/configuration. This does not remove the newer, reviewed Claude Code
+  pin used when a deployment explicitly selects Sonnet 5.
+
+## TipLink-only commit inventory
+
+`git cherry` identified 101 TipLink-only commits relative to the reviewed
+Paradigm baseline. Every commit is classified below; no commit is implicitly
+dropped.
+
+- Retained directly or satisfied by an identified upstream equivalent (36):
+  `91234d85 2a03d179 755b5f61 5ec8beb9 429e2be9 1d712a5e 6369763a
+  26f9db98 4978561a 7aa8f772 d6dcdb4d 567d1abc 6c522c51 46788900
+  65ce9902 9b5a4bbb f5636a0f 1882c8eb 7617924f 1e902a24 60f3272c
+  c59a82ae ea51b3ee 26527258 226b9dcd 5aa259cb f65fdc0b 3617f569
+  9d00faca 3d34dc7f 410d3769 abc0f356 b93bd640 b1a4569f e00ccb21
+  28bb47ee`.
+- Publication and upstream tracking retained through the redesigned trust
+  lanes (11): `b52e85ed 6de8d862 d4c87aff 5599cc51 093717ef a6a2fb33
+  1105c098 f30034f8 c3bf8c16 bbb543d2 cb100e05`.
+- Mixed commits split by behavior (4): `7dcdf72e` retains overlay-image
+  compatibility while dropping the old Python API; `163a7a88` retains GitHub
+  App intent through `CredentialGrants`; `79b5926a` retains workflow behavior
+  on the current host while dropping obsolete API shapes; `1f21791f` retains
+  Sonnet 5 aliases while dropping Claude-as-default.
+- Superseded, obsolete, or migrated out of core (39): `f54bace2 720fa29c
+  63576812 c823cd59 fa7940f6 508861b2 8f458c87 95f20ab3 2f0fec99
+  c154bde6 2d5fb4ed b8bbe0c1 c452b02b 2d999e0a 86e6ca2d 5da54a5e
+  ad5f8d34 ed4f52d2 d844ebab 0d3e0c43 f2bb2e46 40d2837c 87f26b5e
+  d058b5d3 4f007df0 e413aebc 86068044 1dc5130a 4215ada6 930b1a82
+  9895becb f247bdfb ce677374 3254b0a2 cf5b6749 45bb36e9 036e35ed
+  db630210 13ec857e`.
+- Net-reverted add/revert pairs with no baseline tree effect (4): `2595dcf1
+  f9d0b765 dda19688 7ac28097`.
+- CodeQL-only history intentionally ignored as inherited upstream baseline
+  (6): `a8adb1f8 9baa30cf 3a886f7f 2dfabef2 f58f1154 6b0c3b09`.
+- Historical follow-up rather than active-baseline carry (1): `07bd5f08`.
+  Its fallback-post retry was already absent from `ba2c01f5`; restoring it
+  requires a separate exactly-once delivery/receipt decision and test.
+
+Known one-for-one upstream equivalents include `d6dcdb4d` / `0691b1aa`,
+`c59a82ae` / `cc0c4c0c`, `f5636a0f` / `f6664689`, `1882c8eb` /
+`1c9a5d62`, `7617924f` / `e12b9d93`, `1e902a24` / `1f944521`,
+`60f3272c` / `f51239ee`, `26527258` / `2a6b838d`, and `226b9dcd` /
+`a90453b8`. The exact managed-proxy replacement for `9895becb` is the
+agent-k8s injection of `IRON_PROXY_UPSTREAM_RESPONSE_HEADER_TIMEOUT=120s`.
 
 ## Migration boundary
 

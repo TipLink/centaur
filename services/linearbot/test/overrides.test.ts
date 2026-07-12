@@ -66,7 +66,7 @@ describe("extractMessageOverrides", () => {
       model: "claude-opus-4-8",
     });
     expect(extractMessageOverrides("--sonnet fix it").model).toBe(
-      "claude-sonnet-4-6",
+      "claude-sonnet-5",
     );
     expect(extractMessageOverrides("--haiku fix it").model).toBe(
       "claude-haiku-4-5",
@@ -91,9 +91,11 @@ describe("extractMessageOverrides", () => {
       harnessType: "claudecode",
       model: "claude-opus-4-8",
     });
-    expect(extractMessageOverrides("--model Sonnet go").model).toBe(
-      "claude-sonnet-4-6",
-    );
+    expect(extractMessageOverrides("--model Sonnet go")).toEqual({
+      cleanedText: "go",
+      harnessType: "claudecode",
+      model: "claude-sonnet-5",
+    });
     expect(extractMessageOverrides("--model fable go").model).toBe(
       "claude-fable-5",
     );
@@ -131,6 +133,11 @@ describe("extractMessageOverrides", () => {
       extractMessageOverrides("--codex --model gpt-5.2-codex go").model,
     ).toBe("gpt-5.2-codex");
     expect(extractMessageOverrides("--amp --model fast go").model).toBe("fast");
+    expect(extractMessageOverrides("--model claude-sonnet-4-6 go")).toEqual({
+      cleanedText: "go",
+      harnessType: undefined,
+      model: "claude-sonnet-4-6",
+    });
   });
 
   test("explicit flags win over shortcut implications", () => {
@@ -138,6 +145,23 @@ describe("extractMessageOverrides", () => {
       cleanedText: "fix it",
       harnessType: "codex",
       model: "claude-opus-4-8",
+    });
+    expect(extractMessageOverrides("--codex --model Sonnet fix it")).toEqual({
+      cleanedText: "fix it",
+      harnessType: "codex",
+      model: "claude-sonnet-5",
+    });
+    expect(extractMessageOverrides("--meta --model Sonnet fix it")).toEqual({
+      cleanedText: "fix it",
+      harnessType: "codex",
+      model: "claude-sonnet-5",
+      provider: "responses",
+    });
+    expect(extractMessageOverrides("--meta --sonnet fix it")).toEqual({
+      cleanedText: "fix it",
+      harnessType: "codex",
+      model: "claude-sonnet-5",
+      provider: "responses",
     });
     expect(
       extractMessageOverrides("--sonnet --model claude-opus-4-8 fix it").model,
