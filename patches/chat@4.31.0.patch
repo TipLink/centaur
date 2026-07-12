@@ -1,0 +1,33 @@
+diff --git a/dist/index.js b/dist/index.js
+index 6af9d7fec34adeb8a7092a3ba0077d9f327a44d7..252b031dd39e65cb6c85d3b0e5c23eb1a3cc41c2 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -3443,7 +3443,27 @@ var Chat = class {
+       });
+       return;
+     }
+-    const dedupeKey = `dedupe:${adapter.name}:${message.id}`;
++    message.isMention = message.isMention || this.detectMention(adapter, message);
++    const isSubscribedForDedupe = await this._stateAdapter.isSubscribed(threadId);
++    const isDMForDedupe = adapter.isDM?.(threadId) ?? false;
++    const matchesPatternForDedupe = this.messagePatterns.some(({ pattern }) => {
++      const lastIndex = pattern.lastIndex;
++      const matches = pattern.test(message.text);
++      pattern.lastIndex = lastIndex;
++      return matches;
++    });
++    const hasAction = message.isMention || isDMForDedupe || isSubscribedForDedupe || matchesPatternForDedupe;
++    const hasHistoryPersistence = adapter.persistThreadHistory || adapter.persistMessageHistory;
++    const dedupeBucket = hasAction ? "action" : hasHistoryPersistence ? "history" : null;
++    if (!dedupeBucket) {
++      this.logger.debug("Skipping non-actionable message before dedupe", {
++        adapter: adapter.name,
++        messageId: message.id,
++        threadId
++      });
++      return;
++    }
++    const dedupeKey = `dedupe:${adapter.name}:${message.id}:${dedupeBucket}`;
+     const isFirstProcess = await this._stateAdapter.setIfNotExists(
+       dedupeKey,
+       true,

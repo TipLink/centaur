@@ -224,11 +224,14 @@ Expected paths include:
 /home/agent/github/your-org/centaur-acme/.agents/skills
 ```
 
-You can also inspect the api-rs session context for a thread:
+From a trusted operator shell, you can also inspect the api-rs session context
+for a thread. (Inside a sandbox, iron-proxy supplies the narrower per-principal
+JWT automatically; never copy the control key into a sandbox.)
 
 ```bash
 THREAD_PATH=$(jq -rn --arg v "$THREAD_KEY" '$v|@uri')
-curl -s "$CENTAUR_API_URL/api/session/${THREAD_PATH}" | jq
+curl -s "$CENTAUR_API_URL/api/session/${THREAD_PATH}" \
+  -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?required}" | jq
 ```
 
 ## What to change first

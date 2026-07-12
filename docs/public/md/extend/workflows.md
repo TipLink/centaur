@@ -94,10 +94,17 @@ These primitives compose into larger automations:
 
 ## Run a workflow
 
-Create a run through the API:
+The manual control API requires the trusted `CENTAUR_CONTROL_API_KEY` (or an
+optional dedicated `WORKFLOW_API_KEY`). Agent tools use
+a separate Console JWT lane: their workflow name must be listed in
+`WORKFLOW_API_ALLOWED_NAMES`, and `input.thread_key` must belong to one of the
+JWT's Slack upload channels.
+
+Create a run through the trusted operator lane:
 
 ```bash
 curl -s "$CENTAUR_API_URL/api/workflows/runs" \
+  -H "Authorization: Bearer $CENTAUR_CONTROL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_name": "nightly_report",
@@ -109,7 +116,8 @@ curl -s "$CENTAUR_API_URL/api/workflows/runs" \
 Inspect it:
 
 ```bash
-curl -s "$CENTAUR_API_URL/api/workflows/runs/$RUN_ID" | jq
+curl -s "$CENTAUR_API_URL/api/workflows/runs/$RUN_ID" \
+  -H "Authorization: Bearer $CENTAUR_CONTROL_API_KEY" | jq
 ```
 
 ## Schedule a workflow

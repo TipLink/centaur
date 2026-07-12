@@ -138,18 +138,21 @@ TTL is positive.
 ## Run it manually
 
 Use a manual run when enabling the feature or testing a configuration change.
-From inside the API deployment, localhost bypass avoids needing an external API
-key:
+The control endpoint remains authenticated on localhost; run curl inside the
+API deployment so the trusted `CENTAUR_CONTROL_API_KEY` never leaves the pod:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
-  http://localhost:8080/api/workflows/runs \
-  -H "Content-Type: application/json" \
-  -d '{
+kubectl exec -i -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
+  curl -s -X POST http://localhost:8080/api/workflows/runs \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
+    -H "Content-Type: application/json" --data-binary @-
+' <<'JSON'
+{
     "workflow_name": "slack_sync",
     "input": {"metadata": {"reason": "manual_check"}},
     "eager_start": true
-  }' | jq
+}
+JSON
 ```
 
 Then inspect the run:
@@ -157,34 +160,42 @@ Then inspect the run:
 ```bash
 RUN_ID=wfr_...
 
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
-  "http://localhost:8080/api/workflows/runs/${RUN_ID}" | jq
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
+  curl -s "http://localhost:8080/api/workflows/runs/$1" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"
+' sh "$RUN_ID" | jq
 ```
 
 To drain pending historical work immediately:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
-  http://localhost:8080/api/workflows/runs \
-  -H "Content-Type: application/json" \
-  -d '{
+kubectl exec -i -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
+  curl -s -X POST http://localhost:8080/api/workflows/runs \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
+    -H "Content-Type: application/json" --data-binary @-
+' <<'JSON'
+{
     "workflow_name": "slack_backfill",
     "input": {"channel_batch_limit": 10},
     "eager_start": true
-  }' | jq
+}
+JSON
 ```
 
 To force document projection after rows have synced:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
-  http://localhost:8080/api/workflows/runs \
-  -H "Content-Type: application/json" \
-  -d '{
+kubectl exec -i -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
+  curl -s -X POST http://localhost:8080/api/workflows/runs \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
+    -H "Content-Type: application/json" --data-binary @-
+' <<'JSON'
+{
     "workflow_name": "company_context_documents",
     "input": {},
     "eager_start": true
-  }' | jq
+}
+JSON
 ```
 
 ## Verify
@@ -192,8 +203,10 @@ kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
 Check the workflow schedules:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
-  http://localhost:8080/api/workflows/schedules | jq \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
+  curl -s http://localhost:8080/api/workflows/schedules \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"
+' | jq \
   '.schedules[]
    | select(.schedule_id == "slack_sync"
      or .schedule_id == "slack_backfill"
@@ -204,8 +217,10 @@ kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
 Check recent workflow runs:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
-  "http://localhost:8080/api/workflows/runs?limit=20" | jq \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
+  curl -s "http://localhost:8080/api/workflows/runs?limit=20" \
+    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"
+' | jq \
   '.runs[]
    | select(.workflow_name == "slack_sync"
      or .workflow_name == "slack_backfill"

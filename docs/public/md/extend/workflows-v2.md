@@ -118,6 +118,13 @@ The workflow host sandbox is separate from the agent sandbox. The workflow
 handler coordinates the run; the agent turn runs through the normal Centaur
 session runtime.
 
+Production deployments should keep `WORKFLOW_HOST_SANDBOX=true` (the default).
+`false` runs Python as a child process of api-rs for local development and is
+not an isolation boundary. Centaur removes its known control, bot, feedback,
+GitHub, Slack, and model-provider credentials from that child, but arbitrary
+ambient process configuration can still be visible; use only trusted workflow
+code in local mode.
+
 ### Declare webhook metadata in the workflow
 
 Expose a workflow through `WEBHOOKS`:
@@ -217,6 +224,7 @@ Then create a real run:
 
 ```bash
 curl -s "$CENTAUR_API_URL/api/workflows/runs" \
+  -H "Authorization: Bearer $CENTAUR_CONTROL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_name": "nightly_report",

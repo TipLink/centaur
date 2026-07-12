@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/mirror-prod-threads-snapshot.sh [all|snapshot|import]
+  bash scripts/mirror-prod-threads-snapshot.sh [all|snapshot|import]
 
 Creates a bounded, local-only snapshot of production thread/session data for
 Centaur Console UX work. The source connection is forced into a read-only

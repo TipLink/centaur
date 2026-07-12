@@ -35,6 +35,7 @@ These must exist for the normal Helm deployment. For local development,
 | `DATABASE_URL` | `secretManager.existingSecretName`; local bootstrap generates it. | API and Slackbot Postgres connection. |
 | `SLACK_SIGNING_SECRET` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack request signature verification. |
 | `SLACKBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Static API key bootstrapped for Slackbot. |
+| `CENTAUR_CONTROL_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it. The key name is configurable with `apiRs.controlApiKeySecretKey`. | Trusted Console/operator authorization for global and administrative API routes. Never expose it to sandboxes or reuse another service key; api-rs fails startup when configured trust-lane credentials collide. |
 | `SLACK_BOT_TOKEN` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack Web API access for Slackbot and api-rs Slack helpers. |
 | `SANDBOX_SIGNING_KEY` | `secretManager.existingSecretName`; local bootstrap generates it. | Signing key for short-lived sandbox API tokens. |
 | `IRON_MANAGEMENT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it. | Management key for API-created iron-proxy pods. |
@@ -51,6 +52,7 @@ Optional required-by-mode variables:
 | `LOCAL_DEV_API_KEY` | API env. | Static local admin/dev key bootstrapped into Postgres. |
 | `TEAMS_BOT_APP_ID`, `TEAMS_BOT_APP_PASSWORD`, `TEAMS_BOT_APP_TENANT_ID` | Local shell before `just bootstrap-secrets`; production Secret. | Required by Teamsbot when `teamsbot.enabled=true`. |
 | `TEAMSBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when Teams credentials are present and it is omitted. | Static API key used by Teamsbot. |
+| `SLACK_FEEDBACK_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it. | Optional second factor for the sandbox Slack feedback/improvement tool. The API also requires the caller's Console JWT and preserves that principal's capabilities. Keep it distinct from `CENTAUR_CONTROL_API_KEY`. |
 
 ## API
 
@@ -86,6 +88,8 @@ Optional required-by-mode variables:
 | `apiRs.metrics.annotations` | Helm value. | Additional scrape annotations for Prometheus-compatible collectors. |
 | `apiRs.activitySummary.*` | Helm values, default disabled. | Enables API-RS to summarize live session activity into durable `session.activity_summary` events. |
 | `SLACK_BOT_TOKEN` | Explicit `secretKeyRef` from `secretManager.existingSecretName`. | Slack Web API access for api-rs Slack proxy and workflow Slack helpers. |
+| `CENTAUR_CONTROL_API_KEY` | Required `secretKeyRef` from `secretManager.existingSecretName`. | Authorizes admin data routes, global sandbox drain, and trusted workflow/session control. Bot service keys remain session-API credentials but cannot authorize admin routes or global drain. |
+| `SLACK_FEEDBACK_API_KEY` | Optional `secretKeyRef` from `secretManager.existingSecretName`. | Combined with the caller JWT, authorizes only principal-bound `feedback-improvement:*` sessions through `X-Centaur-Feedback-Key`; it cannot elevate repo access or operate admin routes. |
 | `OPENAI_API_KEY` | Secret mounted into api-rs, or `apiRs.extraEnv` for local/dev overrides. | OpenAI credential for activity summaries; the feature stays disabled when no key is present. |
 | `SESSION_ACTIVITY_SUMMARY_MODEL` | `apiRs.activitySummary.model`, default `gpt-5.4-nano`. | Model used for the short live activity sentence. |
 

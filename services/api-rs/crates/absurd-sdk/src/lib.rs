@@ -402,6 +402,26 @@ impl Worker {
         let _ = self.shutdown.send(true);
         self.join.await?
     }
+
+    /// Stop intake immediately, then wait at most `timeout` for already
+    /// claimed handlers. On timeout abort the worker loop; dropping its
+    /// JoinSet aborts every remaining handler so caller cleanup guards run and
+    /// the task lease can be recovered by another worker.
+    pub async fn close_with_timeout(self, timeout: Duration) -> Result<bool> {
+        let _ = self.shutdown.send(true);
+        let mut join = self.join;
+        match tokio::time::timeout(timeout, &mut join).await {
+            Ok(result) => {
+                result??;
+                Ok(true)
+            }
+            Err(_) => {
+                join.abort();
+                let _ = join.await;
+                Ok(false)
+            }
+        }
+    }
 }
 
 impl Client {
@@ -870,6 +890,21 @@ impl Client {
                 }
             };
 
+            // A close signal can arrive while the database claim query is in
+            // flight. Do not launch that freshly claimed batch on a draining
+            // worker; relinquish it for another replica and exit intake.
+            if *shutdown.borrow() {
+                for task in tasks {
+                    if let Err(err) = self
+                        .defer_claimed_run(&task.run_id, options.poll_interval)
+                        .await
+                    {
+                        on_error(err);
+                    }
+                }
+                break;
+            }
+
             if tasks.is_empty() {
                 tokio::select! {
                     changed = shutdown.changed() => {
@@ -1210,6 +1245,31 @@ impl TaskContext {
 
     pub fn headers(&self) -> JsonObject {
         self.inner.headers.clone()
+    }
+
+    /// Spawn a child task on this context's queue through the same registered
+    /// client as the parent worker. This is the authenticated in-process path
+    /// for workflow hosts; no control-plane HTTP credential crosses into the
+    /// child process.
+    pub async fn spawn_child<P: Serialize>(
+        &self,
+        task_name: &str,
+        params: P,
+        mut options: SpawnOptions,
+    ) -> Result<SpawnResult> {
+        if let Some(queue) = options.queue.as_deref() {
+            if validate_queue_name(queue)? != self.inner.queue_name {
+                return Err(Error::QueueMismatch {
+                    task_name: task_name.to_owned(),
+                    registered_queue: self.inner.queue_name.clone(),
+                    requested_queue: queue.to_owned(),
+                });
+            }
+        }
+        // Keep the parent queue explicit so `Client::resolve_spawn` also
+        // verifies that a registered task has not been routed elsewhere.
+        options.queue = Some(self.inner.queue_name.clone());
+        self.inner.client.spawn(task_name, params, options).await
     }
 
     pub async fn step<T, F, Fut>(&self, name: &str, f: F) -> Result<T>
@@ -2036,7 +2096,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 mod tests {
     use super::*;
     use std::{
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         sync::OnceLock,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -2123,6 +2183,64 @@ mod tests {
         assert_eq!(payload["cancellation"]["max_delay"], json!(60));
         assert_eq!(payload["idempotency_key"], json!("idem-1"));
         assert!(!payload.contains_key("queue"));
+    }
+
+    #[tokio::test]
+    async fn spawn_child_rejects_a_task_registered_on_another_queue() -> Result<()> {
+        let parent_queue = unique_queue("parent_queue");
+        let child_queue = unique_queue("child_queue");
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@localhost/absurd_test")?;
+        let client = Client::from_pool_with_options(
+            pool,
+            ClientOptions {
+                queue_name: parent_queue.clone(),
+                ..ClientOptions::default()
+            },
+        )?;
+        client.register_task_with::<Value, Value, _, _>(
+            TaskRegistrationOptions {
+                name: "other-queue-task".to_owned(),
+                queue: Some(child_queue.clone()),
+                default_max_attempts: None,
+                default_cancellation: None,
+            },
+            |_params, _ctx| async { Ok(json!({"ok": true})) },
+        )?;
+        let ctx = TaskContext {
+            inner: Arc::new(TaskContextInner {
+                client,
+                queue_name: parent_queue.clone(),
+                task_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+                run_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+                task_name: "parent-task".to_owned(),
+                attempt: 1,
+                claim_timeout: Duration::from_secs(30),
+                headers: Map::new(),
+                wake_event: Mutex::new(None),
+                event_payload: Mutex::new(None),
+                checkpoint_cache: Mutex::new(HashMap::new()),
+                step_name_counter: Mutex::new(HashMap::new()),
+                on_lease_extended: Arc::new(|_| {}),
+            }),
+        };
+
+        let error = ctx
+            .spawn_child("other-queue-task", json!({}), SpawnOptions::default())
+            .await
+            .expect_err("a child task registered on another queue must be rejected");
+        assert!(matches!(
+            error,
+            Error::QueueMismatch {
+                task_name,
+                registered_queue,
+                requested_queue,
+            } if task_name == "other-queue-task"
+                && registered_queue == child_queue
+                && requested_queue == parent_queue
+        ));
+
+        Ok(())
     }
 
     #[test]
@@ -2438,6 +2556,79 @@ mod tests {
         assert_eq!(snapshot.result::<Value>()?, Some(json!({"ok": true})));
 
         drop(worker);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn integration_worker_close_timeout_aborts_active_handlers_when_database_url_is_set(
+    ) -> Result<()> {
+        let Some(pool) = optional_test_pool().await? else {
+            return Ok(());
+        };
+
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let queue = unique_queue("rust_close_timeout");
+        let app = Client::from_pool_with_options(
+            pool,
+            ClientOptions {
+                queue_name: queue,
+                ..ClientOptions::default()
+            },
+        )?;
+        app.create_queue(None, Default::default()).await?;
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        app.register_task("never", {
+            let started = started.clone();
+            let dropped = dropped.clone();
+            move |_params: Value, _ctx| {
+                let started = started.clone();
+                let dropped = dropped.clone();
+                async move {
+                    let _drop_signal = DropSignal(dropped);
+                    started.notify_one();
+                    std::future::pending::<Result<Value>>().await
+                }
+            }
+        })?;
+        app.register_task("after-close", |_params: Value, _ctx| async move {
+            Ok(json!({"unexpected": true}))
+        })?;
+        app.spawn("never", json!({}), Default::default()).await?;
+        let worker = app.start_worker(WorkerOptions {
+            worker_id: Some("rust-close-timeout-worker".to_owned()),
+            poll_interval: Duration::from_millis(10),
+            fatal_on_lease_timeout: false,
+            ..WorkerOptions::default()
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .map_err(|_| Error::Timeout("never task did not start".to_owned()))?;
+
+        assert!(!worker.close_with_timeout(Duration::from_millis(50)).await?);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| Error::Timeout("active handler was not aborted".to_owned()))?;
+
+        let after = app
+            .spawn("after-close", json!({}), Default::default())
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            app.fetch_task_result(&after.task_id, None).await?,
+            Some(TaskResultSnapshot::Pending),
+            "closed worker must not claim new work"
+        );
         Ok(())
     }
 }

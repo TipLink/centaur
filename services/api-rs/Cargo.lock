@@ -936,8 +936,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "centaur-sandbox-core",
+ "centaur-session-core",
  "centaur-session-sqlx",
  "centaur-telemetry",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1035,6 +1037,7 @@ name = "centaur-workflows"
 version = "0.1.0"
 dependencies = [
  "absurd-sdk",
+ "base64",
  "centaur-sandbox-core",
  "centaur-session-core",
  "centaur-session-runtime",
@@ -1044,9 +1047,11 @@ dependencies = [
  "chrono-tz",
  "cron",
  "futures-util",
+ "hmac 0.12.1",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "thiserror",
  "time",

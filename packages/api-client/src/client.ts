@@ -2,33 +2,64 @@ import axios, { type AxiosInstance } from "axios";
 
 export interface WorkflowRunOptions {
   workflowName: string;
-  triggerKey?: string;
+  idempotencyKey?: string;
   input?: Record<string, unknown>;
-  eagerStart?: boolean;
+  harnessType?: "codex" | "amp" | "claudecode";
+  maxAttempts?: number;
   timeoutMs?: number;
 }
 
-export interface WorkflowRunAccepted {
+export interface WorkflowRunCreated {
   ok: boolean;
   run_id: string;
-  workflow_name: string;
-  workflow_version?: string;
-  workflow_source_path?: string | null;
-  parent_run_id?: string | null;
-  root_run_id?: string | null;
+  task_id: string;
   status: string;
-  thread_key?: string | null;
+  created: boolean;
+}
+
+export interface WorkflowRun {
+  run_id: string;
+  task_id: string;
+  workflow_name: string;
+  status: string;
+  input: unknown;
+  result: unknown | null;
+  failure: unknown | null;
+  attempts: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReleaseThreadOptions {
+  releaseId?: string;
+  expectedSandboxId?: string;
+  cancelInflight?: boolean;
+}
+
+export interface ReleaseThreadResponse {
+  ok: boolean;
+  thread_key: string;
+  sandbox_id?: string | null;
+  release_id?: string | null;
+  expected_sandbox_id?: string | null;
+  cancel_inflight: boolean;
+  sandbox_released: boolean;
+  sandbox_release_error?: string | null;
   execution_id?: string | null;
-  output_json?: Record<string, unknown> | null;
-  error_text?: string | null;
-  latest_checkpoint_name?: string | null;
-  latest_step_kind?: string | null;
-  waiting_on?: Record<string, unknown> | null;
-  child_runs_count?: number;
-  created_at?: string | null;
-  started_at?: string | null;
-  completed_at?: string | null;
-  idempotent?: boolean;
+  execution_cancelled: boolean;
+}
+
+export interface RecordSessionDeliveryOptions {
+  messageId?: string;
+  outcome: string;
+}
+
+export interface RecordSessionDeliveryResponse {
+  ok: boolean;
+  created: boolean;
+  event_id: number;
+  execution_id: string;
+  thread_key: string;
 }
 
 export class CentaurClient {
@@ -46,72 +77,84 @@ export class CentaurClient {
     });
   }
 
-  async startWorkflowRun(opts: WorkflowRunOptions): Promise<WorkflowRunAccepted> {
+  async startWorkflowRun(opts: WorkflowRunOptions): Promise<WorkflowRunCreated> {
     const { data } = await this.http.post(
       "/api/workflows/runs",
       {
         workflow_name: opts.workflowName,
-        trigger_key: opts.triggerKey,
+        idempotency_key: opts.idempotencyKey,
         input: opts.input ?? {},
-        eager_start: opts.eagerStart ?? false,
+        harness_type: opts.harnessType,
+        max_attempts: opts.maxAttempts,
       },
       {
         timeout: opts.timeoutMs,
       },
     );
-    return data as WorkflowRunAccepted;
+    return data as WorkflowRunCreated;
   }
 
-  async getWorkflowRun(runId: string): Promise<WorkflowRunAccepted> {
+  async getWorkflowRun(runId: string): Promise<{ ok: boolean; run: WorkflowRun }> {
     const { data } = await this.http.get(`/api/workflows/runs/${encodeURIComponent(runId)}`);
-    return data as WorkflowRunAccepted;
+    return data as { ok: boolean; run: WorkflowRun };
   }
 
   async listWorkflowRuns(opts?: {
     workflowName?: string;
     threadKey?: string;
-    status?: string;
-    parentRunId?: string;
     limit?: number;
-  }): Promise<{ ok: boolean; items: WorkflowRunAccepted[] }> {
+  }): Promise<{ ok: boolean; runs: WorkflowRun[] }> {
     const { data } = await this.http.get("/api/workflows/runs", {
       params: {
         workflow_name: opts?.workflowName,
         thread_key: opts?.threadKey,
-        status: opts?.status,
-        parent_run_id: opts?.parentRunId,
         limit: opts?.limit,
       },
     });
-    return data as { ok: boolean; items: WorkflowRunAccepted[] };
+    return data as { ok: boolean; runs: WorkflowRun[] };
   }
 
-  async getWorkflowChildren(
-    runId: string,
-    limit = 200,
-  ): Promise<{ ok: boolean; items: WorkflowRunAccepted[] }> {
-    const { data } = await this.http.get(
-      `/api/workflows/runs/${encodeURIComponent(runId)}/children`,
+  async cancelWorkflowRun(runId: string): Promise<{ ok: boolean; status: "cancelled" }> {
+    const { data } = await this.http.post(`/api/workflows/runs/${encodeURIComponent(runId)}/cancel`);
+    return data as { ok: boolean; status: "cancelled" };
+  }
+
+  async releaseThread(
+    threadKey: string,
+    opts: ReleaseThreadOptions = {},
+  ): Promise<ReleaseThreadResponse> {
+    const { data } = await this.http.post(
+      `/api/session/${encodeURIComponent(threadKey)}/release`,
       {
-        params: { limit },
+        release_id: opts.releaseId,
+        expected_sandbox_id: opts.expectedSandboxId,
+        cancel_inflight: opts.cancelInflight ?? false,
       },
     );
-    return data as { ok: boolean; items: WorkflowRunAccepted[] };
+    return data as ReleaseThreadResponse;
   }
 
-  async cancelWorkflowRun(runId: string): Promise<WorkflowRunAccepted> {
-    const { data } = await this.http.post(`/api/workflows/runs/${encodeURIComponent(runId)}/cancel`);
-    return data as WorkflowRunAccepted;
+  async recordSessionDelivery(
+    threadKey: string,
+    executionId: string,
+    opts: RecordSessionDeliveryOptions,
+  ): Promise<RecordSessionDeliveryResponse> {
+    const { data } = await this.http.post(
+      `/api/session/${encodeURIComponent(threadKey)}/executions/${encodeURIComponent(executionId)}/delivery`,
+      {
+        message_id: opts.messageId,
+        outcome: opts.outcome,
+      },
+    );
+    return data as RecordSessionDeliveryResponse;
   }
 
   async sendWorkflowEvent(opts: {
-    eventType: string;
-    correlationId: string;
+    eventName: string;
     payload?: Record<string, unknown>;
   }): Promise<Record<string, unknown>> {
     const { data } = await this.http.post("/api/workflows/events", {
-      event_type: opts.eventType,
-      correlation_id: opts.correlationId,
+      event_name: opts.eventName,
       payload: opts.payload ?? {},
     });
     return data as Record<string, unknown>;
