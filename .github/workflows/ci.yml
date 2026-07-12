@@ -79,6 +79,8 @@ jobs:
             '^services/api-rs/' \
             '^\.github/rollback-bridge-reviewed-forward-commit$' \
             '^\.github/scripts/check-rollback-bridge-workflows\.sh$' \
+            '^\.github/scripts/resolve-runnable-image-digest\.sh$' \
+            '^\.github/scripts/test-resolve-runnable-image-digest\.sh$' \
             '^\.github/scripts/test-rollback-bridge-publication-trigger\.sh$' \
             '^\.github/workflows/publish-images\.yml$' \
             '^\.github/workflows/validate-images\.yml$' \
@@ -300,7 +302,7 @@ jobs:
         working-directory: reviewed-forward/services/api-rs
         env:
           BIND_ADDR: 127.0.0.1:18081
-          CENTAUR_CONTROL_API_KEY: integration-control-key
+          CENTAUR_CONTROL_API_KEY: integration-control-key-0123456789abcdef
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:15432/centaur?sslmode=disable
           PYTHON_WORKFLOW_HOST_PATH: ${{ github.workspace }}/reviewed-forward/services/workflow-python/workflow_host.py
           PYTHON_WORKFLOW_HOST_PYTHON: python3
@@ -341,7 +343,7 @@ jobs:
           API_INTEGRATION_WORKFLOW_DIR: ${{ runner.temp }}/api-integration-workflows
           BIND_ADDR: 127.0.0.1:18080
           CENTAUR_API_URL: http://127.0.0.1:18080
-          CENTAUR_CONTROL_API_KEY: integration-control-key
+          CENTAUR_CONTROL_API_KEY: integration-control-key-0123456789abcdef
           CENTAUR_ROLLBACK_BRIDGE_PAUSE_WORKFLOWS: "true"
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:15432/centaur?sslmode=disable
           ROLLBACK_BRIDGE_FORWARD_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:15432/centaur?sslmode=disable

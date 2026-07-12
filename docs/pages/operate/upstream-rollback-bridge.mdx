@@ -35,7 +35,11 @@ Fineas upstream-sync runbook in
   SHA to agree. It allows 120 seconds of future clock skew and fails closed
   once the attestation is 900 seconds old. If Actions queueing exceeds that
   window, rerun the helper and create a new timestamped tag; never delete or
-  recreate an attestation ref. Both paths emit only
+  recreate an attestation ref. The 900-second window bounds admission to the
+  package-writing workflow; it does not claim that a native multi-arch build
+  finishes inside that window. Hold the verified updater scope unchanged until
+  the descriptor completes. If it changes, supersede the run and repeat the
+  live check with a new immutable attestation ref. Both paths emit only
   `reviewed-<full-bridge-sha>` tags for exactly four linux/arm64 bridge runtime
   rows: API, Slackbot v2, agent, and IronProxy. Other branch/tag events cannot
   publish. This namespace cannot match the legacy updater's deploy-shaped
@@ -47,6 +51,13 @@ Fineas upstream-sync runbook in
   pull-request workflow preserves the historical `Publish Images` check
   context but has read-only repository permissions, receives no registry
   credentials, and builds with `push: false`.
+- Publication run `29175125487` at bridge head `a08bbe41` is superseded audit
+  evidence. Its BuildKit outputs were attested OCI indexes, while the final
+  tags resolved to runnable platform children; the old descriptor comparison
+  used the wrong identity and failed. The tags remain immutable, but that run
+  produced no approved descriptor and must never populate an infra lock. The
+  corrected publisher records merge-index and runnable-child digests
+  separately and requires the final arm64 child to equal this run's child.
 - Set `CENTAUR_ROLLBACK_BRIDGE_PAUSE_WORKFLOWS=true` explicitly. The bridge
   refuses to start when the value is absent, false, or malformed. With the
   fence acknowledged, it starts no absurd workers, schedule ticks, metadata

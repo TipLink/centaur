@@ -108,10 +108,18 @@ grep -Fq 'type=raw,value=reviewed-${{ github.sha }}' "$publisher" ||
   fail "publisher must use the reviewed-full-commit tag namespace"
 grep -Fq 'tag="reviewed-${RELEASE_REVISION}"' "$publisher" ||
   fail "release descriptor must use the reviewed-full-commit tag namespace"
-grep -Fq 'pattern: digests-*-linux-arm64' "$publisher" ||
-  fail "release descriptor must download this run's arm64 digest artifacts"
-grep -Fq 'if [[ "$digest" != "$built_digest" ]]' "$publisher" ||
-  fail "release descriptor must bind each tagged arm64 digest to this run's build artifact"
+grep -Fq 'pattern: merge-index-digests-${{ matrix.image }}-*' "$publisher" ||
+  fail "manifest merge must consume this run's attested per-platform index digests"
+grep -Fq 'working-directory: ${{ runner.temp }}/merge-index-digests' "$publisher" ||
+  fail "manifest merge must preserve the attested index digest inputs"
+grep -Fq 'if [[ "${#merge_index_digest_files[@]}" -ne 2 ]]' "$publisher" ||
+  fail "manifest merge must require both attested platform index digests"
+grep -Fq 'pattern: runnable-digests-*-linux-arm64' "$publisher" ||
+  fail "release descriptor must download this run's runnable arm64 child digests"
+grep -Fq 'resolve-runnable-image-digest.sh' "$publisher" ||
+  fail "build must resolve each runnable platform child from its attested index"
+grep -Fq 'if [[ "$digest" != "$run_child_digest" ]]' "$publisher" ||
+  fail "release descriptor must bind each tagged arm64 child to this run's runnable child"
 grep -Fq 'refusing to overwrite immutable reviewed tag' "$publisher" ||
   fail "publisher must refuse to overwrite an existing reviewed tag"
 if grep -Eq 'type=sha|value=(latest|main|edge)|sha-\$\{|::7' "$publisher"; then
@@ -129,8 +137,24 @@ actual_descriptor_rows="$(awk '
 
 grep -Fq '.github/rollback-bridge-reviewed-forward-commit' "$ci" ||
   fail "CI does not read the central reviewed forward commit pin"
+mapfile -t integration_control_keys < <(
+  awk -F ': ' '/^[[:space:]]+CENTAUR_CONTROL_API_KEY: / { print $2 }' "$ci"
+)
+[[ "${#integration_control_keys[@]}" -eq 2 ]] ||
+  fail "CI must configure exactly two forward integration control keys"
+for integration_control_key in "${integration_control_keys[@]}"; do
+  [[ "${#integration_control_key}" -ge 32 ]] ||
+    fail "CI contains a forward integration control key shorter than 32 bytes"
+done
+unset integration_control_key integration_control_keys
 grep -Fq '.github/rollback-bridge-reviewed-forward-commit' "$publisher" ||
   fail "publisher does not read the central reviewed forward commit pin"
+for resolver_path in \
+  '^\.github/scripts/resolve-runnable-image-digest\.sh$' \
+  '^\.github/scripts/test-resolve-runnable-image-digest\.sh$'; do
+  grep -Fq "$resolver_path" "$ci" ||
+    fail "CI change detection does not cover $resolver_path"
+done
 placeholder="__REVIEWED_FORWARD_""COMMIT_REQUIRED__"
 unexpected_placeholder_files="$(
   git grep -lF "$placeholder" -- .github services docs 2>/dev/null |
@@ -141,5 +165,6 @@ if [[ -n "$unexpected_placeholder_files" ]]; then
 fi
 
 bash .github/scripts/test-rollback-bridge-publication-trigger.sh
+bash .github/scripts/test-resolve-runnable-image-digest.sh
 
 echo "rollback bridge workflow safety checks passed"
