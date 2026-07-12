@@ -166,6 +166,11 @@ spec:
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
             - name: CENTAUR_CONSOLE_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+            - name: CENTAUR_CONSOLE_CENTAUR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.apiRs.controlApiKeySecretKey }}
 {{- end }}
           securityContext:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}

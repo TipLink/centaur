@@ -1,36 +1,26 @@
-name: Docs
+name: Deploy Docs
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/docs.yml
-      - docs/**
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/docs.yml
-      - docs/**
   workflow_dispatch:
+    inputs:
+      confirm_reviewed_main:
+        description: Confirm this deploy is from reviewed main
+        required: true
+        type: boolean
 
 concurrency:
-  group: docs-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: docs-deploy
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  build-and-deploy:
-    # Preserve the historical check context while PR execution is now build-only.
-    name: Build and deploy docs
+  deploy:
+    name: Deploy reviewed docs
+    if: github.ref == 'refs/heads/main' && inputs.confirm_reviewed_main
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      matrix:
-        worker:
-          - name: docs
-            directory: docs
     defaults:
       run:
         working-directory: docs
@@ -55,3 +45,11 @@ jobs:
 
       - name: Build docs
         run: npm run build
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: docs
+          command: deploy --config wrangler.ci.jsonc

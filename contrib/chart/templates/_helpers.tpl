@@ -133,6 +133,27 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- toJson $sources -}}
 {{- end -}}
 
+{{- /*
+Hash every configured input whose contents are copied into a sandbox at boot.
+The API folds this value into SandboxSpec, making warm-pool identity sensitive
+to skills/workflow/prompt-only sources as well as tools and transitional images.
+Refs and image tags must still be immutable in production; this is an identity
+bridge, not a resolver for mutable branches or tags.
+*/ -}}
+{{- define "centaur.sandboxContentRevision" -}}
+{{- $payload := dict
+      "schemaVersion" 1
+      "overlaySources" (include "centaur.overlaySources" . | fromJsonArray)
+      "repositoryRefs" (.Values.repoCache.repositoryRefs | default dict)
+      "sandboxImage" (.Values.sandbox.image | default dict)
+      "ironProxyImage" (.Values.ironProxy.image | default dict)
+      "overlayImage" (.Values.overlay.image | default dict)
+      "overlaySystemPrompt" (.Values.overlay.systemPrompt | default "")
+      "sandboxHarness" (.Values.sandbox.harnessEngine | default "")
+      "operatorRevision" (.Values.apiRs.sandboxContentRevision | default "") -}}
+{{- toJson $payload | sha256sum -}}
+{{- end -}}
+
 {{- define "centaur.httpRouteName" -}}
 {{- $suffix := default (printf "route-%v" .index) .route.name -}}
 {{- printf "%s-%s" (include "centaur.fullname" .root) $suffix | trunc 63 | trimSuffix "-" -}}
