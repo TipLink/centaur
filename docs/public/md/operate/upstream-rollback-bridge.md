@@ -25,21 +25,28 @@ Fineas upstream-sync runbook in
   the four exact bridge repositories or the `reviewed-<full-bridge-sha>` tag
   namespace, and core review has frozen the exact forward commit. The current
   legacy updater manages only the separate Fineas overlay repository and its
-  allow-list accepts only deploy-shaped `sha-<7>` tags. The manual workflow
-  requires an explicit acknowledgement of that live scope proof and the exact
-  frozen commit as a matching dispatch input before it emits reviewed
+  allow-list accepts only deploy-shaped `sha-<7>` tags. A human with Actions
+  permission can use the manual path, which requires an explicit live-scope
+  acknowledgement and the exact frozen forward commit. A restricted
+  contents-write principal can instead create one new lightweight tag named
+  `rollback-bridge-publish-live-scope-verified-<bridge40>-forward-<forward40>-at-<unix-seconds>`
+  immediately after the same read-only live check. The release gate requires
+  the tag object, checkout, event SHA, embedded bridge SHA, and frozen forward
+  SHA to agree. It allows 120 seconds of future clock skew and fails closed
+  once the attestation is 900 seconds old. If Actions queueing exceeds that
+  window, rerun the helper and create a new timestamped tag; never delete or
+  recreate an attestation ref. Both paths emit only
   `reviewed-<full-bridge-sha>` tags for exactly four linux/arm64 bridge runtime
-  rows: API, Slackbot v2, agent, and IronProxy. This namespace cannot match the
-  legacy updater's deploy-shaped `sha-<7>` tags; Console web/worker remains on
-  the forward image. Publication creates inert artifacts and a descriptor; it
-  is not rollout authorization. The infra runbook still requires global Image
-  Updater removal and the Argo automation freeze before consuming the
-  descriptor in Git or changing any Argo pin. The separate pull-request
-  workflow preserves the
-  historical `Publish Images` check context but has read-only repository
-  permissions, receives no registry credentials, and builds with `push: false`.
-  Push/tag events on this emergency branch do not publish; only the confirmed
-  manual dispatch can mutate GHCR.
+  rows: API, Slackbot v2, agent, and IronProxy. Other branch/tag events cannot
+  publish. This namespace cannot match the legacy updater's deploy-shaped
+  `sha-<7>` tags; Console web/worker remains on the forward image. The publisher
+  has no Kubernetes credentials. Publication creates inert artifacts and a
+  descriptor; it is not rollout authorization. The infra runbook still
+  requires global Image Updater removal and the Argo automation freeze before
+  consuming the descriptor in Git or changing any Argo pin. The separate
+  pull-request workflow preserves the historical `Publish Images` check
+  context but has read-only repository permissions, receives no registry
+  credentials, and builds with `push: false`.
 - Set `CENTAUR_ROLLBACK_BRIDGE_PAUSE_WORKFLOWS=true` explicitly. The bridge
   refuses to start when the value is absent, false, or malformed. With the
   fence acknowledged, it starts no absurd workers, schedule ticks, metadata

@@ -79,6 +79,7 @@ jobs:
             '^services/api-rs/' \
             '^\.github/rollback-bridge-reviewed-forward-commit$' \
             '^\.github/scripts/check-rollback-bridge-workflows\.sh$' \
+            '^\.github/scripts/test-rollback-bridge-publication-trigger\.sh$' \
             '^\.github/workflows/publish-images\.yml$' \
             '^\.github/workflows/validate-images\.yml$' \
             '^\.github/workflows/ci\.yml$'

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Workflow expressions and shell variables below are literal guards.
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -29,9 +30,29 @@ fi
 grep -Fq 'service: [api-rs, slackbotv2, linearbot, discordbot, teamsbot, agent, iron-proxy, console]' "$validator" ||
   fail "PR validator must preserve the historical eight-image required-check matrix"
 
-grep -q '^  workflow_dispatch:$' "$publisher" || fail "publisher must be manual-only"
-if grep -Eq '^  (push|pull_request):' "$publisher"; then
-  fail "publisher must not run on push or pull request events"
+grep -q '^  workflow_dispatch:$' "$publisher" ||
+  fail "publisher must preserve the confirmed manual path"
+expected_push_trigger=$'  push:\n    tags:\n      - '\''rollback-bridge-publish-live-scope-verified-*'\'''
+actual_push_trigger="$(awk '
+  $0 == "  push:" { capture = 1 }
+  capture && /^[^[:space:]]/ { exit }
+  capture { print }
+' "$publisher")"
+[[ "$actual_push_trigger" == "$expected_push_trigger" ]] ||
+  fail "publisher push trigger must contain only the exact live-scope tag prefix"
+if grep -Eq '^  (pull_request|create|schedule):' "$publisher"; then
+  fail "publisher must not run for branches, pull requests, create events, or schedules"
+fi
+expected_tag_pattern='^rollback-bridge-publish-live-scope-verified-([0-9a-f]{40})-forward-([0-9a-f]{40})-at-([1-9][0-9]{9})$'
+actual_tag_pattern="$(awk -F "'" '/^[[:space:]]*tag_pattern=/{ print $2 }' "$publisher")"
+[[ "$actual_tag_pattern" == "$expected_tag_pattern" ]] ||
+  fail "publisher tag parser must require exact full SHAs and exactly ten timestamp digits"
+valid_trigger_tag="rollback-bridge-publish-live-scope-verified-$(printf 'a%.0s' {1..40})-forward-$(printf 'b%.0s' {1..40})-at-1234567890"
+oversized_trigger_tag="${valid_trigger_tag}1"
+[[ "$valid_trigger_tag" =~ $actual_tag_pattern ]] ||
+  fail "publisher tag parser rejected its exact valid trigger shape"
+if [[ "$oversized_trigger_tag" =~ $actual_tag_pattern ]]; then
+  fail "publisher tag parser accepted an overflow-capable timestamp"
 fi
 grep -q '^      live_updater_scope_verified:$' "$publisher" ||
   fail "publisher must require an explicit live updater-scope acknowledgement"
@@ -42,6 +63,20 @@ grep -Fq 'none of the four exact bridge repositories is in image-list' "$publish
 if grep -qE 'image_updater_disabled|IMAGE_UPDATER_DISABLED' "$publisher"; then
   fail "publisher must not claim that global Image Updater disablement is a publication precondition"
 fi
+for required_trigger_guard in \
+  'TRIGGER_REF_CREATED: ${{ github.event.created }}' \
+  'git cat-file -t "$TRIGGER_SHA"' \
+  '"$bridge_commit" != "$TRIGGER_SHA"' \
+  '"$tag_bridge_commit" != "$bridge_commit"' \
+  '"$tag_forward_commit" != "$commit"' \
+  '/git/ref/tags/${encoded_ref}' \
+  "'.object.type'" \
+  "'.object.sha'" \
+  'attested_at > now + 120' \
+  'now - attested_at > 900'; do
+  grep -Fq "$required_trigger_guard" "$publisher" ||
+    fail "publisher is missing exact tag trigger guard: $required_trigger_guard"
+done
 if grep -Eq 'kubectl|KUBECONFIG|kubeconfig' "$publisher"; then
   fail "publisher must not receive Kubernetes access"
 fi
@@ -104,5 +139,7 @@ unexpected_placeholder_files="$(
 if [[ -n "$unexpected_placeholder_files" ]]; then
   fail "the unresolved forward commit placeholder may exist only in $pin"
 fi
+
+bash .github/scripts/test-rollback-bridge-publication-trigger.sh
 
 echo "rollback bridge workflow safety checks passed"

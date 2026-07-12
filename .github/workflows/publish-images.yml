@@ -12,6 +12,9 @@ on:
         description: Exact frozen reviewed-forward commit recorded by this bridge
         required: true
         type: string
+  push:
+    tags:
+      - 'rollback-bridge-publish-live-scope-verified-*'
 
 concurrency:
   # Tags are global registry state, so every dispatch must serialize across
@@ -38,31 +41,100 @@ jobs:
       forward_commit: ${{ steps.forward_pin.outputs.commit }}
     env:
       DISPATCH_FORWARD_COMMIT: ${{ inputs.reviewed_forward_commit }}
+      GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       LIVE_UPDATER_SCOPE_VERIFIED: ${{ inputs.live_updater_scope_verified }}
+      TRIGGER_API_URL: ${{ github.api_url }}
+      TRIGGER_EVENT_NAME: ${{ github.event_name }}
+      TRIGGER_REF: ${{ github.ref }}
+      TRIGGER_REF_CREATED: ${{ github.event.created }}
+      TRIGGER_REF_NAME: ${{ github.ref_name }}
+      TRIGGER_REF_TYPE: ${{ github.ref_type }}
+      TRIGGER_REPOSITORY: ${{ github.repository }}
+      TRIGGER_SHA: ${{ github.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
 
-      - name: Require live updater scope proof and the frozen forward commit
+      - name: Require an exact reviewed publication trigger
         id: forward_pin
         run: |
           set -euo pipefail
           IFS=$'\n\t'
-          if [[ "$LIVE_UPDATER_SCOPE_VERIFIED" != "true" ]]; then
-            echo "read the live child annotations and verify that none of the four exact bridge repositories is in image-list and every relevant allow-tags rule excludes reviewed-40 before publication" >&2
-            exit 1
-          fi
           commit="$(tr -d '\r\n' < .github/rollback-bridge-reviewed-forward-commit)"
           if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
             echo ".github/rollback-bridge-reviewed-forward-commit must contain the frozen lowercase 40-character commit SHA" >&2
             exit 1
           fi
-          if [[ "$DISPATCH_FORWARD_COMMIT" != "$commit" ]]; then
-            echo "dispatch reviewed_forward_commit does not match the bridge's frozen forward commit" >&2
+          bridge_commit="$(git rev-parse HEAD)"
+          if [[ ! "$bridge_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "checked-out rollback bridge revision is not a full lowercase commit SHA" >&2
             exit 1
           fi
+          object_type="$(git cat-file -t "$TRIGGER_SHA" 2>/dev/null || true)"
+          if [[ "$object_type" != "commit" || "$bridge_commit" != "$TRIGGER_SHA" ]]; then
+            echo "publication trigger must resolve directly to the exact checked-out bridge commit" >&2
+            exit 1
+          fi
+
+          case "$TRIGGER_EVENT_NAME" in
+            workflow_dispatch)
+              if [[ "$LIVE_UPDATER_SCOPE_VERIFIED" != "true" ]]; then
+                echo "read the live child annotations and verify that none of the four exact bridge repositories is in image-list and every relevant allow-tags rule excludes reviewed-40 before publication" >&2
+                exit 1
+              fi
+              if [[ "$DISPATCH_FORWARD_COMMIT" != "$commit" ]]; then
+                echo "dispatch reviewed_forward_commit does not match the bridge's frozen forward commit" >&2
+                exit 1
+              fi
+              ;;
+            push)
+              if [[ "$TRIGGER_REF_TYPE" != "tag" || "$TRIGGER_REF_CREATED" != "true" ||
+                "$TRIGGER_REF" != "refs/tags/${TRIGGER_REF_NAME}" ]]; then
+                echo "publication tag trigger must be a newly created tag ref" >&2
+                exit 1
+              fi
+              tag_pattern='^rollback-bridge-publish-live-scope-verified-([0-9a-f]{40})-forward-([0-9a-f]{40})-at-([1-9][0-9]{9})$'
+              if [[ ! "$TRIGGER_REF_NAME" =~ $tag_pattern ]]; then
+                echo "publication tag does not match the exact live-scope attestation format" >&2
+                exit 1
+              fi
+              tag_bridge_commit="${BASH_REMATCH[1]}"
+              tag_forward_commit="${BASH_REMATCH[2]}"
+              attested_at="${BASH_REMATCH[3]}"
+              if [[ "$tag_bridge_commit" != "$bridge_commit" ||
+                "$tag_forward_commit" != "$commit" ]]; then
+                echo "publication tag bridge or forward commit does not match the reviewed checkout" >&2
+                exit 1
+              fi
+              encoded_ref="$(jq -nr --arg value "$TRIGGER_REF_NAME" '$value|@uri')"
+              ref_json="$(curl --fail --silent --show-error \
+                --header "Authorization: Bearer ${GITHUB_API_TOKEN}" \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                "${TRIGGER_API_URL}/repos/${TRIGGER_REPOSITORY}/git/ref/tags/${encoded_ref}")"
+              if [[ "$(jq -er '.ref' <<<"$ref_json")" != "$TRIGGER_REF" ||
+                "$(jq -er '.object.type' <<<"$ref_json")" != "commit" ||
+                "$(jq -er '.object.sha' <<<"$ref_json")" != "$TRIGGER_SHA" ]]; then
+                echo "publication ref must be a lightweight tag directly targeting the trigger commit" >&2
+                exit 1
+              fi
+              now="$(date +%s)"
+              if ((attested_at > now + 120)); then
+                echo "publication tag live-scope timestamp is more than 120 seconds in the future" >&2
+                exit 1
+              fi
+              if ((now - attested_at > 900)); then
+                echo "publication tag live-scope proof is older than 900 seconds; rerun the read-only helper and create a new tag" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "unsupported rollback bridge publication trigger: $TRIGGER_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   tag-absence-gate:
@@ -119,10 +191,9 @@ jobs:
 
   # Build each image natively per platform (amd64 on x64 runners, arm64 on
   # arm runners), push by digest, and hand the digests to the merge job below
-  # which assembles the multi-arch manifest. This package-write workflow is
-  # manual-only and requires confirmation from a read of the live child
-  # annotations that the four repositories and reviewed-full namespace are
-  # outside Image Updater's scope.
+  # which assembles the multi-arch manifest. Package writes require either the
+  # confirmed manual path or the exact,
+  # short-lived contents-write tag attestation validated above.
   build:
     needs: tag-absence-gate
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
