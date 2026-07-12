@@ -8,6 +8,10 @@ module Mcp
 
     skip_before_action :require_login, only: %i[metadata register authorize token]
     skip_before_action :require_active_account, only: %i[metadata register authorize token]
+    # OAuth dynamic registration and token exchange are machine-to-machine
+    # endpoints with no browser session authority. Authorization approval keeps
+    # Rails CSRF protection; these two endpoints authenticate the protocol
+    # request itself (PKCE for code exchange).
     skip_forgery_protection only: %i[register token]
 
     ACCESS_TOKEN_TTL_SECONDS = 1.hour.to_i

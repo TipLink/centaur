@@ -53,6 +53,10 @@ module Api
                             :early_refresh_slack_seconds, :early_refresh_fraction,
                             :max_refresh_interval_seconds, :refresh_timeout_seconds,
                             labels: {}, scopes: [])
+        base[:grant] = normalize_grant(base[:grant]) if base[:grant].present?
+        if base[:grant].blank? && attrs[:credential_kind].present?
+          base[:grant] = normalize_grant(attrs[:credential_kind])
+        end
         # A PUT upsert by foreign_id sets identity before assignment; a blank body
         # value must not wipe it.
         base.delete(:foreign_id) if base[:foreign_id].blank? && ref.foreign_id.present?
@@ -80,7 +84,10 @@ module Api
 
       def apply_client_secret(ref, attrs)
         secret = attrs[:client_secret]
-        ref.client_secret = secret if secret.present?
+        return if secret.blank?
+
+        ref.client_secret = secret
+        reset_refresh_state(ref) if ref.grant == BrokerCredential::GITHUB_APP_INSTALLATION
       end
 
       # These fields are write-only initial/re-auth values. Supplying any
@@ -98,10 +105,18 @@ module Api
         end
         return unless changed
 
+        reset_refresh_state(ref)
+      end
+
+      def reset_refresh_state(ref)
         ref.dead = false
         ref.dead_reason = nil
         ref.failure_count = 0
         ref.next_attempt_at = Time.current
+      end
+
+      def normalize_grant(value)
+        value == "oauth_refresh_token" ? "refresh_token" : value
       end
 
       # Observability only. The client_secret, username/password/api_key, the

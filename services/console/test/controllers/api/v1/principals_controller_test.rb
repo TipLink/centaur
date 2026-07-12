@@ -50,7 +50,7 @@ module Api
           data["labels"]
         )
         assert_equal "all", data["sandbox_repo_cache"]
-        assert_not data.key?("sandbox_repo_cache_enabled")
+        assert_equal true, data["sandbox_repo_cache_enabled"]
         assert_equal true, data["sandbox_observability_enabled"]
         assert_equal true, data["sandbox_api_server_enabled"]
       end
@@ -115,7 +115,7 @@ module Api
           data["slack_channel_permissions"]
         )
         assert_equal "all", data["sandbox_repo_cache"]
-        assert_not data.key?("sandbox_repo_cache_enabled")
+        assert_equal true, data["sandbox_repo_cache_enabled"]
         assert_equal true, data["sandbox_observability_enabled"]
         assert_equal true, data["sandbox_api_server_enabled"]
       end
@@ -257,7 +257,7 @@ module Api
 
         data = json_body.fetch("data")
         assert_equal "public", data["sandbox_repo_cache"]
-        assert_not data.key?("sandbox_repo_cache_enabled")
+        assert_equal false, data["sandbox_repo_cache_enabled"]
         assert_equal false, data["sandbox_observability_enabled"]
         assert_equal false, data["sandbox_api_server_enabled"]
       end

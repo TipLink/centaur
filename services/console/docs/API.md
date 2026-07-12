@@ -802,11 +802,22 @@ Returns `201`. Response shape (note that `credentials` echoes each source as `{ 
 
 ## Broker credentials
 
-A broker credential is an OAuth credential whose token lifecycle iron-control manages itself. iron-control runs the refresh loop, mints fresh access tokens before they expire, and delivers the current access token to `iron-proxy` inline through [proxy sync](#proxy-sync) wherever a [`token_broker` secret source](#secret-sources) references the credential by its `id`.
+A broker credential is a managed short-lived access token whose lifecycle iron-control owns. `grant: "refresh_token"` refreshes an OAuth refresh-token credential, `grant: "password"` can bootstrap from username/password, `grant: "preqin"` uses Preqin's Operational API token flow, and `grant: "github_app_installation"` mints GitHub App installation tokens by signing an App JWT. iron-control runs the refresh loop, mints fresh access tokens before they expire, and delivers the current access token to `iron-proxy` inline through [proxy sync](#proxy-sync) wherever a [`token_broker` secret source](#secret-sources) references the credential by its `id`.
 
 Unlike the secret types above, a broker credential is not granted directly and is not injected on its own. It is referenced by a `token_broker` source on a grantable secret (typically a [static secret](#static-secrets)), which carries the rules and injection config. Refresh tokens, usernames, passwords, and API keys never leave iron-control.
 
-The token credentials it refreshes with are fields on the credential, resolved by iron-control itself. `client_id` is not secret and is returned in responses; `client_secret`, password-grant fields, Preqin API keys, and the `token_endpoint_headers` values are encrypted at rest and never returned.
+The token credentials it refreshes with are fields on the credential, resolved by iron-control itself. `client_id` is not secret and is returned in responses; `client_secret`, password-grant fields, Preqin API keys, GitHub App private keys, and the `token_endpoint_headers` values are encrypted at rest and never returned.
+
+GitHub traffic is wired to this broker by the built-in sandbox proxy fragment (`centaur-iron-proxy/src/infra.yaml`): `github.com` and `api.github.com` already carry a `token_broker` source referencing the `github-app` credential, so a deployment only needs to provision that credential — no per-deployment static secret. The Helm chart can provision it at api-rs startup when `tokenBroker.githubApp.enabled=true` and `tokenBroker.githubApp.existingSecretName` points at a Kubernetes Secret containing the App ID, installation ID, and private key. The fragment uses a `replace` (placeholder swap) rather than a header `inject`, which preserves the caller's auth scheme: `git` over HTTPS keeps its Basic `x-access-token:<token>` form (`github.com` rejects `Bearer` for git transport) while the REST API keeps `Bearer`. To provision it manually instead of via Helm, run:
+
+`tokenBroker.githubApp.credentialId` and `extraCredentialIds` are compatibility aliases provisioned alongside the canonical `github-app` credential. They are bootstrap-only unless a separate, explicitly scoped secret references them; the built-in GitHub rules intentionally have one source so equal-priority credentials cannot compete for the same Authorization header.
+
+```
+centaur-perms broker create --namespace default --foreign-id github-app \
+  --grant github_app_installation --client-id "$GITHUB_APP_ID" \
+  --client-secret "$GITHUB_APP_PRIVATE_KEY" \
+  --token-endpoint "https://api.github.com/app/installations/$GITHUB_APP_INSTALLATION_ID/access_tokens"
+```
 
 ### Attributes
 
@@ -816,13 +827,13 @@ The token credentials it refreshes with are fields on the credential, resolved b
 | `foreign_id`                   | optional    | Unique per namespace. Immutable. |
 | `name`, `description`          | optional    | |
 | `labels`                       | optional    | |
-| `grant`                        | optional    | One of `refresh_token`, `password`, or `preqin`. Defaults to `refresh_token`. |
-| `token_endpoint`               | conditional | Token endpoint the refresh request is sent to. Required except `preqin`, which uses the fixed `https://api.preqin.com/connect/token` endpoint. |
+| `grant`                        | optional    | One of `refresh_token`, `password`, `preqin`, or `github_app_installation`. Defaults to `refresh_token`. |
+| `token_endpoint`               | conditional | Token endpoint the refresh request is sent to. Required except `preqin`, which uses the fixed `https://api.preqin.com/connect/token` endpoint. For GitHub Apps, this is the installation access-token endpoint. |
 | `scopes`                       | optional    | Array of strings. |
-| `client_id`                    | conditional | OAuth client id. Required for standalone `refresh_token` and `password` credentials. Returned in responses. Not used for `preqin`. |
-| `client_secret`                | optional    | OAuth client secret. Write-only and encrypted at rest; omit for public clients. Never returned. |
+| `client_id`                    | conditional | OAuth client id or GitHub App ID. Required for standalone `refresh_token`, `password`, and `github_app_installation` credentials. Returned in responses. Not used for `preqin`. |
+| `client_secret`                | conditional | OAuth client secret or GitHub App private key PEM. Write-only and encrypted at rest; required for GitHub App credentials. Never returned. |
 | `token_endpoint_headers`       | optional    | Object mapping header name to a string value, sent on the refresh request. Values are write-only and encrypted; only the header names are returned (as `token_endpoint_header_names`). |
-| `refresh_token`                | optional    | Write-only initial value for `refresh_token` credentials. Also used by `password` credentials when the provider returns one. Supplying a value schedules the credential immediately and clears dead state. Never returned. |
+| `refresh_token`                | optional    | Write-only initial value for `refresh_token` credentials. Also used by `password` and `preqin` credentials when the provider returns one. Supplying a value schedules the credential immediately and clears dead state. Never returned. |
 | `username`                     | conditional | Required for `password` credentials. Write-only and encrypted at rest. Never returned. |
 | `password`                     | conditional | Required for `password` credentials. Write-only and encrypted at rest. Never returned. |
 | `api_key`                      | conditional | Required for `preqin` credentials. Write-only and encrypted at rest. Never returned. |
@@ -1270,7 +1281,7 @@ A grant attaches exactly one secret to a **grantee** — either a principal or a
 
 ### Create
 
-`POST /api/v1/grants` — supply exactly one grantee (`principal_id` **or** `role_id`) plus exactly one of `static_secret_id`, `gcp_auth_secret_id`, `aws_auth_secret_id`, `oauth_token_secret_id`, `pg_dsn_secret_id`, or `hmac_secret_id`:
+`POST /api/v1/grants` — supply exactly one grantee (`principal_id` **or** `role_id`) plus exactly one of `static_secret_id`, `gcp_auth_secret_id`, `gcp_id_token_secret_id`, `aws_auth_secret_id`, `oauth_token_secret_id`, `pg_dsn_secret_id`, or `hmac_secret_id`:
 
 ```json
 { "data": { "principal_id": "prn_...", "static_secret_id": "ssr_..." } }
@@ -1296,7 +1307,7 @@ Returns `201`. The response includes the one grantee key and the one secret-type
 }
 ```
 
-Referencing a missing grantee or secret returns `404`. Supplying no grantee returns `422` with `"must reference one of principal_id, role_id"`; supplying no secret returns `422` with `"must reference one of static_secret_id, gcp_auth_secret_id, aws_auth_secret_id, oauth_token_secret_id, pg_dsn_secret_id, hmac_secret_id"`.
+Referencing a missing grantee or secret returns `404`. Supplying no grantee returns `422` with `"must reference one of principal_id, role_id"`; supplying no secret returns `422` with `"must reference one of static_secret_id, gcp_auth_secret_id, gcp_id_token_secret_id, aws_auth_secret_id, oauth_token_secret_id, pg_dsn_secret_id, hmac_secret_id"`.
 
 ### List by grantee
 

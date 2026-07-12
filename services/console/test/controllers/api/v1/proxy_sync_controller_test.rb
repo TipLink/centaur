@@ -304,6 +304,61 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     assert_equal "PROD_API_KEY", bumped.last
   end
 
+  test "infra role delivers the built-in GitHub broker replacement to sandbox principals" do
+    admin = users(:acme_admin)
+    credential = BrokerCredential.create!(
+      namespace: "acme",
+      foreign_id: "github-app",
+      name: "GitHub App installation token",
+      grant: BrokerCredential::GITHUB_APP_INSTALLATION,
+      token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+      client_id: "12345",
+      client_secret: "private-key",
+      access_token: "ghs-live-installation-token",
+      expires_at: 1.hour.from_now,
+      last_refresh: Time.current,
+      created_by: admin
+    )
+    secret = StaticSecret.new(
+      namespace: "acme",
+      foreign_id: "infra-github-app",
+      name: "github-app",
+      replace_config: {
+        "proxy_value" => "GITHUB_TOKEN",
+        "match_headers" => [ "Authorization" ]
+      },
+      labels: { "managed-by" => "centaur" },
+      created_by: admin
+    )
+    secret.build_source(
+      source_type: "token_broker",
+      config: {
+        "credential_id" => credential.foreign_id,
+        "credential_namespace" => credential.namespace
+      }
+    )
+    secret.rules.build(host: "github.com", position: 0)
+    secret.rules.build(host: "api.github.com", position: 1)
+    secret.save!
+    Grant.create!(role: roles(:acme_infra), static_secret: secret, created_by: admin)
+
+    assert_equal secret, secret.source.static_secret
+    assert_includes @proxy.principal.roles, roles(:acme_infra)
+    assert_includes @proxy.principal.granted_static_secrets, secret
+
+    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+    assert_response :ok
+
+    entry = json_body.fetch("secrets").find do |candidate|
+      candidate.dig("replace", "proxy_value") == "GITHUB_TOKEN"
+    end
+    refute_nil entry
+    assert_equal "ghs-live-installation-token", entry.dig("source", "value")
+    assert_equal "control_plane", entry.dig("source", "type")
+    assert_equal [ "Authorization" ], entry.dig("replace", "match_headers")
+    assert_equal [ "github.com", "api.github.com" ], entry.fetch("rules").map { |rule| rule.fetch("host") }
+  end
+
   test "an unassigned proxy syncs an empty config with unassigned status" do
     unassigned_token = "iprx_#{'c' * 64}"
     post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers(unassigned_token)

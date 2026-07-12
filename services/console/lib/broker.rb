@@ -13,7 +13,7 @@ module Broker
   # from unrecoverable ones (RFC 6749 5.2 error codes), which mark the credential
   # dead until a human re-auths.
   class RefreshError < Error
-    STAGES = %w[network http oauth parse].freeze
+    STAGES = %w[network http oauth github config parse].freeze
 
     attr_reader :stage, :code, :status, :retryable
 

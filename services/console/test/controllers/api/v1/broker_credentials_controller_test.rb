@@ -33,6 +33,7 @@ module Api
         assert_equal "https://oauth2.googleapis.com/token", data["token_endpoint"]
         assert_equal "gmail-client-id", data["client_id"]
         assert_equal "refresh_token", data["grant"]
+        refute data.key?("credential_kind")
         refute data.key?("client_secret")
         refute data.key?("username")
         refute data.key?("password")
@@ -75,6 +76,8 @@ module Api
         assert_response :created
         data = json_body.fetch("data")
         assert_equal "the-client-id", data["client_id"]
+        assert_equal "refresh_token", data["grant"]
+        refute data.key?("credential_kind")
         refute data.key?("client_secret")
         refute data.key?("refresh_token")
         assert_equal [ "X-Api-Key" ], data["token_endpoint_header_names"]
@@ -84,6 +87,57 @@ module Api
         assert_equal "super-secret-seed", created.refresh_token # persisted + decryptable
         assert_equal "the-client-secret", created.client_secret
         assert_equal({ "X-Api-Key" => "k" }, created.token_endpoint_headers)
+      end
+
+      test "create accepts a github app installation credential without a refresh token" do
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "fineas-github-app",
+            grant: "github_app_installation",
+            token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+            client_id: "12345",
+            client_secret: "-----BEGIN RSA PRIVATE KEY-----\nprivate\n-----END RSA PRIVATE KEY-----"
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "github_app_installation", data["grant"]
+        assert_equal "12345", data["client_id"]
+        refute data.key?("credential_kind")
+        refute data.key?("client_secret")
+        refute data.key?("refresh_token")
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_nil created.refresh_token
+        assert_equal "-----BEGIN RSA PRIVATE KEY-----\nprivate\n-----END RSA PRIVATE KEY-----", created.client_secret
+      end
+
+      test "create maps legacy credential_kind to grant" do
+        body = {
+          data: {
+            namespace: "acme", foreign_id: "fineas-github-app-legacy",
+            credential_kind: "github_app_installation",
+            token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+            client_id: "12345",
+            client_secret: "-----BEGIN RSA PRIVATE KEY-----\nprivate\n-----END RSA PRIVATE KEY-----"
+          }
+        }
+
+        assert_difference -> { BrokerCredential.count } => 1 do
+          post api_v1_broker_credentials_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :created
+        data = json_body.fetch("data")
+        assert_equal "github_app_installation", data["grant"]
+        refute data.key?("credential_kind")
+
+        created = BrokerCredential.find_by_oid(data["id"])
+        assert_nil created.refresh_token
+        assert_equal "github_app_installation", created.grant
       end
 
       test "create password grant stores initial values and redacts secrets" do
@@ -255,6 +309,26 @@ module Api
 
         bc.reload
         assert_equal "new-key", bc.api_key
+        refute bc.dead?
+        assert_nil bc.dead_reason
+        assert_equal 0, bc.failure_count
+        assert bc.next_attempt_at.present?
+      end
+
+      test "github app private key update clears dead state and reschedules" do
+        bc = BrokerCredential.create!(namespace: "acme", foreign_id: "github-app-dead",
+                                      grant: "github_app_installation",
+                                      token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+                                      client_id: "12345", client_secret: "old-key",
+                                      dead: true, dead_reason: "invalid_private_key", failure_count: 3,
+                                      created_by: users(:acme_admin))
+
+        body = { data: { client_secret: "new-key" } }
+        patch api_v1_broker_credential_url(id: bc.oid), params: body.to_json, headers: auth_headers
+        assert_response :ok
+
+        bc.reload
+        assert_equal "new-key", bc.client_secret
         refute bc.dead?
         assert_nil bc.dead_reason
         assert_equal 0, bc.failure_count

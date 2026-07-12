@@ -18,6 +18,8 @@ class BrokerCredential < ApplicationRecord
 
   include ForeignIdCollisionGuard
 
+  GITHUB_APP_INSTALLATION = Broker::CredentialGrants::GITHUB_APP_INSTALLATION
+
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
 
@@ -48,6 +50,7 @@ class BrokerCredential < ApplicationRecord
   has_one :static_secret, dependent: :nullify
 
   attr_writer :refresh_client
+  attr_writer :github_app_client
 
   # Refuse to delete a credential that token_broker sources still reference: there
   # is no FK to cascade or nullify, so deletion would silently leave those secrets
@@ -116,6 +119,10 @@ class BrokerCredential < ApplicationRecord
     @refresh_client ||= Broker::RefreshClient.new
   end
 
+  def github_app_client
+    @github_app_client ||= Broker::GithubAppInstallationClient.new
+  end
+
   def refresh_scopes_for_provider
     oauth_app&.provider_strategy&.refresh_scopes(scopes) || scopes
   end
@@ -151,7 +158,7 @@ class BrokerCredential < ApplicationRecord
     with_lock do
       return if dead?
 
-      outcome = perform_refresh
+      outcome = perform_refresh(now: now)
       if outcome.dead_reason
         mark_dead!(outcome.dead_reason)
       elsif outcome.result
@@ -176,8 +183,8 @@ class BrokerCredential < ApplicationRecord
     PrincipalCredentialReconciliation.new.apply_for_credential(self)
   end
 
-  def perform_refresh
-    Broker::CredentialGrants.refresh(self)
+  def perform_refresh(now:)
+    Broker::CredentialGrants.refresh(self, now: now)
   end
 
   def apply_success!(result, now:, clear_refresh_token:)

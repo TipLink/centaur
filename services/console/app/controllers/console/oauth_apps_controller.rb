@@ -50,6 +50,7 @@ module Console
       app.labels = label_params
 
       secret = app_params[:client_secret]
+      # Active Record encryption protects this write-only attribute at rest.
       app.client_secret = secret if secret.present?
     end
 

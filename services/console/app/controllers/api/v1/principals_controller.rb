@@ -108,6 +108,10 @@ module Api
           labels: principal.labels_with_sandbox_capabilities,
           slack_channel_permissions: principal.slack_channel_permissions_payload,
           sandbox_repo_cache: principal.sandbox_repo_cache,
+          # Transitional expand/contract field for the pre-enum api-rs kept
+          # live during the Console-first rollout. Remove only after every old
+          # runtime generation is retired.
+          sandbox_repo_cache_enabled: principal.sandbox_repo_cache == "all",
           sandbox_observability_enabled: principal.sandbox_observability_enabled,
           sandbox_api_server_enabled: principal.sandbox_api_server_enabled,
           created_at: principal.created_at,

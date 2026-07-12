@@ -13,8 +13,6 @@ module ApiServer
       upload_channels = principal.slack_upload_channel_ids
       download_channels = principal.slack_download_channel_ids
       history_channels = principal.slack_history_channel_ids
-      return nil if upload_channels.empty? && download_channels.empty? && history_channels.empty?
-
       signing_secret = ENV["CENTAUR_JWT_SIGNING_SECRET"].to_s
       return nil if signing_secret.blank?
 

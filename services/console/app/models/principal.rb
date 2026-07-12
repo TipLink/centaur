@@ -1,6 +1,7 @@
 require "uri"
 
 class Principal < ApplicationRecord
+  FEEDBACK_API_SECRET_NAME = "SLACK_FEEDBACK_API_KEY".freeze
   oid_prefix "prn"
 
   include ForeignIdCollisionGuard
@@ -255,7 +256,17 @@ class Principal < ApplicationRecord
   end
 
   def proxy_secrets_for(served)
-    served[:static].map(&:to_proxy_secret)
+    served[:static].map do |secret|
+      entry = secret.to_proxy_secret
+      next entry unless secret.name == FEEDBACK_API_SECRET_NAME
+
+      # Tool manifests cannot know a Helm release-qualified Service hostname.
+      # The API accepts this credential only alongside the generated caller
+      # JWT and binds feedback-improvement:* sessions to that principal, so
+      # extend only its request rules to the JWT's canonical API hosts.
+      entry["rules"] = (entry.fetch("rules", []) + api_server_hosts.map { |host| { "host" => host } }).uniq
+      entry
+    end
   end
 
   def generated_proxy_secrets
@@ -265,8 +276,6 @@ class Principal < ApplicationRecord
 
   def api_server_jwt_secret
     return nil unless sandbox_api_server_enabled?
-
-    return nil if slack_jwt_channel_ids.empty?
 
     token = ApiServer::Jwt.encode_for_principal(self)
     return nil if token.blank?
