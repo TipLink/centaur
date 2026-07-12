@@ -90,7 +90,7 @@ fn http_inherits_tool_level_hosts() {
 #[test]
 fn parses_inject_secret() {
     let parsed = tools::parse_secret(
-        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", inject_formatter = "Bearer {{.Value}}", hosts = ["api.example.com"]}"#),
+        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", inject_formatter = "Bearer {{.Value}}", hosts = ["api.example.com"], methods = ["post"], paths = ["/api/upload"]}"#),
         &[],
     )
     .unwrap();
@@ -100,6 +100,39 @@ fn parses_inject_secret() {
     assert_eq!(http.mode, SecretMode::Inject);
     assert_eq!(http.inject_header.as_deref(), Some("Authorization"));
     assert_eq!(http.inject_formatter.as_deref(), Some("Bearer {{.Value}}"));
+    assert_eq!(http.methods, vec!["POST".to_owned()]);
+    assert_eq!(http.paths, vec!["/api/upload".to_owned()]);
+}
+
+#[test]
+fn http_rejects_invalid_request_scope() {
+    let err = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["api.example.com"], methods = ["BREW"]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("method"), "{err}");
+
+    let err = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["api.example.com"], paths = ["api/upload"]}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("must start with '/'"), "{err}");
+
+    let err = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["api.example.com"], methods = []}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("must not be empty"), "{err}");
+
+    let err = tools::parse_secret(
+        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["api.example.com"], paths = []}"#),
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("must not be empty"), "{err}");
 }
 
 #[test]
@@ -450,6 +483,63 @@ fn translates_http_replace_to_static_input() {
     assert_eq!(input.rules[0].host.as_deref(), Some("slack.com"));
 }
 
+#[test]
+fn translates_http_request_scope_to_static_rules() {
+    let secrets = vec![
+        tools::parse_secret(
+            &entry(r#"{type = "http", name = "SLACK_UPLOAD_TOKEN", secret_ref = "SLACK_BOT_TOKEN", mode = "inject", inject_header = "Authorization", inject_formatter = "Bearer {{.Value}}", hosts = ["slack.com", "www.slack.com"], methods = ["POST"], paths = ["/api/files.getUploadURLExternal", "/api/files.completeUploadExternal"]}"#),
+            &[],
+        )
+        .unwrap(),
+        tools::parse_secret(
+            &entry(r#"{type = "http", name = "SLACK_UPLOAD_TOKEN", secret_ref = "SLACK_BOT_TOKEN", mode = "inject", inject_header = "Authorization", inject_formatter = "Bearer {{.Value}}", hosts = ["slack.com", "www.slack.com"], methods = ["GET", "POST"], paths = ["/api/files.info"]}"#),
+            &[],
+        )
+        .unwrap(),
+    ];
+    let out = translate::translate("default", "tool-slack", &secrets, &SourcePolicy::env());
+    assert_eq!(out.inputs.len(), 2);
+    let SecretInput::Static(upload) = &out.inputs[0] else {
+        panic!("expected static")
+    };
+    assert_eq!(upload.name, "SLACK_UPLOAD_TOKEN");
+    assert_eq!(
+        upload.source.config,
+        serde_json::json!({ "var": "SLACK_BOT_TOKEN" })
+    );
+    assert_eq!(upload.rules.len(), 2);
+    assert_eq!(upload.rules[0].host.as_deref(), Some("slack.com"));
+    assert_eq!(upload.rules[0].http_methods, vec!["POST".to_owned()]);
+    assert_eq!(
+        upload.rules[0].paths,
+        vec![
+            "/api/files.getUploadURLExternal".to_owned(),
+            "/api/files.completeUploadExternal".to_owned()
+        ]
+    );
+    assert_eq!(upload.rules[1].host.as_deref(), Some("www.slack.com"));
+    assert_eq!(upload.rules[1].http_methods, upload.rules[0].http_methods);
+    assert_eq!(upload.rules[1].paths, upload.rules[0].paths);
+
+    let SecretInput::Static(info) = &out.inputs[1] else {
+        panic!("expected static")
+    };
+    assert_eq!(info.name, "SLACK_UPLOAD_TOKEN");
+    assert_eq!(
+        info.source.config,
+        serde_json::json!({ "var": "SLACK_BOT_TOKEN" })
+    );
+    assert_eq!(info.rules.len(), 2);
+    assert_eq!(info.rules[0].host.as_deref(), Some("slack.com"));
+    assert_eq!(
+        info.rules[0].http_methods,
+        vec!["GET".to_owned(), "POST".to_owned()]
+    );
+    assert_eq!(info.rules[0].paths, vec!["/api/files.info".to_owned()]);
+    assert_eq!(info.rules[1].host.as_deref(), Some("www.slack.com"));
+    assert_eq!(info.rules[1].http_methods, info.rules[0].http_methods);
+    assert_eq!(info.rules[1].paths, info.rules[0].paths);
+}
 #[test]
 fn translates_gcp_auth_defaults_scopes_when_unset() {
     let secrets = vec![

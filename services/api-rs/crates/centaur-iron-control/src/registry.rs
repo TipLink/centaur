@@ -30,6 +30,10 @@ use crate::models::{
 };
 use crate::util::{managed_labels, slugify};
 
+const HTTP_METHODS: &[&str] = &[
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "*",
+];
+
 /// A role to register secrets against. ``foreign_id`` is the stable upsert key
 /// (e.g. ``infra`` or ``tool-github``); ``name`` is the human label.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -398,7 +402,7 @@ pub fn source_from_placeholder(
 ) -> SecretSource {
     match policy.kind {
         SourceKind::Env => {
-            let mut config = json!({ "var": placeholder });
+            let mut config = json!({ "var": format!("{}{}", policy.env_prefix, placeholder) });
             insert_json_key(&mut config, json_key);
             SecretSource {
                 source_type: "env".to_owned(),
@@ -483,14 +487,90 @@ fn rules_from_values(role: &str, rules: &[YamlValue]) -> Result<Vec<RequestRule>
             if host.is_none() && cidr.is_none() {
                 return Err(malformed(role, "request rule must set host or cidr"));
             }
+            if yaml_get(rule, "http_methods").is_some() && yaml_get(rule, "methods").is_some() {
+                return Err(malformed(
+                    role,
+                    "request rule must declare only one of methods or http_methods",
+                ));
+            }
             Ok(RequestRule {
                 host,
                 cidr,
-                http_methods: yaml_string_array(yaml_get(rule, "http_methods")),
-                paths: yaml_string_array(yaml_get(rule, "paths")),
+                http_methods: request_methods(
+                    role,
+                    yaml_get(rule, "http_methods").or_else(|| yaml_get(rule, "methods")),
+                )?,
+                paths: request_paths(role, yaml_get(rule, "paths"))?,
             })
         })
         .collect()
+}
+
+fn request_scope_string_array(
+    role: &str,
+    value: Option<&YamlValue>,
+    key: &str,
+) -> Result<Vec<String>, TranslateError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(sequence) = value.as_sequence() else {
+        return Err(malformed(
+            role,
+            &format!("request rule {key} must be an array of strings"),
+        ));
+    };
+    if sequence.is_empty() {
+        return Err(malformed(
+            role,
+            &format!("request rule {key} must not be empty"),
+        ));
+    }
+    sequence
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    malformed(
+                        role,
+                        &format!("request rule {key} must contain only non-empty strings"),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn request_methods(role: &str, value: Option<&YamlValue>) -> Result<Vec<String>, TranslateError> {
+    request_scope_string_array(role, value, "methods")?
+        .into_iter()
+        .map(|method| {
+            let method = method.to_ascii_uppercase();
+            if HTTP_METHODS.contains(&method.as_str()) {
+                Ok(method)
+            } else {
+                Err(malformed(
+                    role,
+                    &format!("request rule method {method:?} must be one of {HTTP_METHODS:?}"),
+                ))
+            }
+        })
+        .collect()
+}
+
+fn request_paths(role: &str, value: Option<&YamlValue>) -> Result<Vec<String>, TranslateError> {
+    let paths = request_scope_string_array(role, value, "paths")?;
+    for path in &paths {
+        if !path.starts_with('/') {
+            return Err(malformed(
+                role,
+                &format!("request rule path {path:?} must start with '/'"),
+            ));
+        }
+    }
+    Ok(paths)
 }
 
 // ---------------------------------------------------------------------------
@@ -955,10 +1035,25 @@ pub fn unique_foreign_id(candidate: String, used: &mut BTreeSet<String>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use centaur_iron_proxy::load_fragment_str;
+    use centaur_iron_proxy::{infra_fragment, load_fragment_str};
 
     fn env_policy() -> SourcePolicy {
         SourcePolicy::env()
+    }
+
+    #[test]
+    fn env_policy_prefixes_the_resolved_environment_key() {
+        let source = source_from_placeholder(
+            &SourcePolicy::env().with_env_prefix("CENTAUR_"),
+            "SLACK_FEEDBACK_API_KEY",
+            None,
+        );
+
+        assert_eq!(source.source_type, "env");
+        assert_eq!(
+            source.config,
+            json!({ "var": "CENTAUR_SLACK_FEEDBACK_API_KEY" })
+        );
     }
 
     #[test]
@@ -1010,6 +1105,79 @@ transforms:
     }
 
     #[test]
+    fn proxy_style_request_methods_translate_to_request_rules() {
+        let fragment = load_fragment_str(
+            r#"
+transforms:
+  - name: secrets
+    config:
+      secrets:
+        - id: SLACK_SEARCH_TOKEN
+          source:
+            placeholder: SLACK_SEARCH_TOKEN
+          inject:
+            header: Authorization
+            formatter: "Bearer {{.Value}}"
+          rules:
+            - host: slack.com
+              methods: [POST]
+              paths: [/api/search.messages]
+"#,
+        )
+        .unwrap();
+        let inputs =
+            secret_inputs_from_fragment("default", "tool-slack", &fragment, &env_policy()).unwrap();
+        let SecretInput::Static(input) = &inputs[0] else {
+            panic!("expected a static secret");
+        };
+        assert_eq!(input.rules.len(), 1);
+        assert_eq!(input.rules[0].host.as_deref(), Some("slack.com"));
+        assert_eq!(input.rules[0].http_methods, vec!["POST".to_owned()]);
+        assert_eq!(
+            input.rules[0].paths,
+            vec!["/api/search.messages".to_owned()]
+        );
+    }
+
+    #[test]
+    fn malformed_request_scopes_do_not_translate_as_unscoped_rules() {
+        for rule in [
+            "methods: POST",
+            "methods: []",
+            "methods: [POST, 123]",
+            "methods: [TRACE]",
+            "http_methods: [POST]\n              methods: [GET]",
+            "paths: /api/search.messages",
+            "paths: []",
+            "paths: [/api/search.messages, 123]",
+            "paths: [api/search.messages]",
+        ] {
+            let fragment = load_fragment_str(&format!(
+                r#"
+transforms:
+  - name: secrets
+    config:
+      secrets:
+        - id: SLACK_SEARCH_TOKEN
+          source:
+            placeholder: SLACK_SEARCH_TOKEN
+          inject:
+            header: Authorization
+          rules:
+            - host: slack.com
+              {rule}
+"#
+            ))
+            .unwrap();
+
+            let err =
+                secret_inputs_from_fragment("default", "tool-slack", &fragment, &env_policy())
+                    .unwrap_err();
+            assert!(matches!(err, TranslateError::Malformed { .. }), "{err:?}");
+        }
+    }
+
+    #[test]
     fn translates_token_broker_inject_secret() {
         let fragment = load_fragment_str(
             r#"
@@ -1042,6 +1210,46 @@ transforms:
         assert_eq!(inject.header.as_deref(), Some("Authorization"));
         assert_eq!(inject.formatter.as_deref(), Some("Bearer {{.Value}}"));
         assert!(input.replace_config.is_none());
+    }
+
+    #[test]
+    fn built_in_github_broker_becomes_infra_replace_secret() {
+        let fragment = infra_fragment().expect("built-in infra fragment parses");
+        let inputs =
+            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        let input = inputs
+            .iter()
+            .find_map(|input| match input {
+                SecretInput::Static(input) if input.foreign_id == "infra-github-app" => Some(input),
+                _ => None,
+            })
+            .expect("built-in GitHub broker static secret");
+
+        assert_eq!(input.name, "github-app");
+        assert_eq!(input.source.source_type, "token_broker");
+        assert_eq!(
+            input.source.config,
+            json!({
+                "credential_id": "github-app",
+                "credential_namespace": "default",
+            })
+        );
+        assert!(input.inject_config.is_none());
+        let replace = input.replace_config.as_ref().expect("replace config");
+        assert_eq!(replace.proxy_value, "GITHUB_TOKEN");
+        assert_eq!(replace.match_headers, vec!["Authorization"]);
+        assert_eq!(
+            input
+                .rules
+                .iter()
+                .filter_map(|rule| rule.host.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["github.com", "api.github.com"]
+        );
+        assert_eq!(
+            input.labels.get("managed-by").map(String::as_str),
+            Some("centaur")
+        );
     }
 
     #[test]

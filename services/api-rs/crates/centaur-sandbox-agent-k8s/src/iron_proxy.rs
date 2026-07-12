@@ -1911,15 +1911,15 @@ fn sandbox_labels(id: &SandboxId) -> BTreeMap<String, String> {
 }
 
 fn iron_proxy_labels(id: &SandboxId, api_server_enabled: bool) -> BTreeMap<String, String> {
-    let mut labels = BTreeMap::from([
+    BTreeMap::from([
         (MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned()),
         (SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned()),
         (IRON_PROXY_LABEL.to_owned(), "true".to_owned()),
-    ]);
-    if api_server_enabled {
-        labels.insert(API_SERVER_ENABLED_LABEL.to_owned(), "true".to_owned());
-    }
-    labels
+        (
+            API_SERVER_ENABLED_LABEL.to_owned(),
+            api_server_enabled.to_string(),
+        ),
+    ])
 }
 
 fn unique_suffix() -> String {
@@ -2059,7 +2059,12 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
-        assert!(!iron_proxy_labels(&id, false).contains_key(API_SERVER_ENABLED_LABEL));
+        assert_eq!(
+            iron_proxy_labels(&id, false)
+                .get(API_SERVER_ENABLED_LABEL)
+                .map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]

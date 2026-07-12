@@ -213,6 +213,12 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub sandbox_id: Option<String>,
+    /// Digest binding the deployment boot-content generation to the sandbox
+    /// ID that received it. `None` is a legacy/untracked assignment; an older
+    /// rollback writer may also leave a stale `Some` after clearing/changing
+    /// `sandbox_id`, which fails ID-bound validation on the next forward turn.
+    #[serde(default)]
+    pub sandbox_content_revision: Option<String>,
     /// Capabilities applied to the currently assigned sandbox. `None` means the
     /// sandbox predates capability tracking; callers may treat it as compatible
     /// only with the default-enabled profile.

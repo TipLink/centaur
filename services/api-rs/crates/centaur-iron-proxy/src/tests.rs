@@ -57,9 +57,16 @@ fn harness_auth_fragments_are_baked_in() {
         Some("120s")
     );
     let placeholders = placeholder_env(&[infra]);
-    for name in ["GITHUB_TOKEN", "SLACK_BOT_TOKEN"] {
-        assert_eq!(placeholders.get(name).map(String::as_str), None);
-    }
+    assert_eq!(
+        placeholders.get("GITHUB_TOKEN").map(String::as_str),
+        Some("GITHUB_TOKEN")
+    );
+    // Slack's bot credential is control-plane-only and is not part of the
+    // shared infra fragment.
+    assert_eq!(
+        placeholders.get("SLACK_BOT_TOKEN").map(String::as_str),
+        None
+    );
 }
 
 #[test]
@@ -119,5 +126,23 @@ fn shipped_proxy_allowlist_preserves_railway_project_tokens() {
         headers
             .iter()
             .any(|header| header.as_str() == Some("project-access-token"))
+    );
+}
+
+#[test]
+fn shipped_proxy_allowlist_preserves_workflow_task_capabilities() {
+    let config: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../../iron-proxy/iron-proxy.yaml")).unwrap();
+    let transforms = config["transforms"].as_sequence().unwrap();
+    let header_allowlist = transforms
+        .iter()
+        .find(|transform| transform["name"].as_str() == Some("header_allowlist"))
+        .unwrap();
+    let headers = header_allowlist["config"]["headers"].as_sequence().unwrap();
+
+    assert!(
+        headers
+            .iter()
+            .any(|header| { header.as_str() == Some("x-centaur-workflow-task-token") })
     );
 }
