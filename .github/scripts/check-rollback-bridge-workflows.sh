@@ -7,6 +7,7 @@ publisher=.github/workflows/publish-images.yml
 validator=.github/workflows/validate-images.yml
 ci=.github/workflows/ci.yml
 pin=.github/rollback-bridge-reviewed-forward-commit
+sandbox_dockerfile=services/sandbox/Dockerfile
 
 fail() {
   echo "rollback bridge workflow safety check failed: $*" >&2
@@ -147,6 +148,21 @@ for integration_control_key in "${integration_control_keys[@]}"; do
     fail "CI contains a forward integration control key shorter than 32 bytes"
 done
 unset integration_control_key integration_control_keys
+
+grep -Fq 'ENV AGENT_BROWSER_EXECUTABLE_PATH=/home/agent/.local/bin/centaur-agent-browser-chromium' \
+  "$sandbox_dockerfile" ||
+  fail "rollback sandbox must expose the reviewed native browser path"
+grep -Fq 'amd64)' "$sandbox_dockerfile" ||
+  fail "rollback sandbox must bind agent-browser Chrome on amd64"
+grep -Fq 'arm64)' "$sandbox_dockerfile" ||
+  fail "rollback sandbox must bind Playwright Chromium on arm64"
+grep -Fq -- "-type f -path '*/chrome-linux/headless_shell'" "$sandbox_dockerfile" ||
+  fail "rollback sandbox arm64 path must use the installed Playwright shell"
+grep -Fq 'ln -sf "$browser" "$AGENT_BROWSER_EXECUTABLE_PATH"' "$sandbox_dockerfile" ||
+  fail "rollback sandbox must create the stable browser executable link"
+grep -Fq '"$AGENT_BROWSER_EXECUTABLE_PATH" --version' "$sandbox_dockerfile" ||
+  fail "rollback sandbox build must execute the selected browser"
+
 grep -Fq '.github/rollback-bridge-reviewed-forward-commit' "$publisher" ||
   fail "publisher does not read the central reviewed forward commit pin"
 for resolver_path in \

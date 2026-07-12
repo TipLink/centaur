@@ -111,6 +111,7 @@ RUN set -eux; \
 
 # ── Global npm CLIs (root) ──────────────────────────────────────────────────
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/home/agent/.local/bin/centaur-agent-browser-chromium
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm install -g --prefer-online --force \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
@@ -123,6 +124,7 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
     && playwright --version | grep -F "${PLAYWRIGHT_VERSION}" \
+    && agent-browser --version | grep -F "0.26.0" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
 
 # ── Browser automation deps (must run as root before USER agent) ─────────────
@@ -181,10 +183,23 @@ RUN set -eux; \
     rm -f /tmp/amp.sha256; \
     amp --version >/dev/null
 
-# ── agent-browser: download Chrome binary (runs as agent, deps already installed) ─
-RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
-      agent-browser install; \
-    fi
+# ── agent-browser: bind a native browser on both deployment architectures ───
+RUN set -eux; \
+    mkdir -p "$HOME/.local/bin"; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) \
+        agent-browser install; \
+        browser="$(find "$HOME/.agent-browser/browsers" \
+          -type f -path '*/chrome-*/chrome' -print -quit)" ;; \
+      arm64) \
+        browser="$(find "$PLAYWRIGHT_BROWSERS_PATH" \
+          -type f -path '*/chrome-linux/headless_shell' -print -quit)" ;; \
+      *) echo unsupported-architecture >&2; exit 1 ;; \
+    esac; \
+    test -n "$browser"; \
+    test -x "$browser"; \
+    ln -sf "$browser" "$AGENT_BROWSER_EXECUTABLE_PATH"; \
+    "$AGENT_BROWSER_EXECUTABLE_PATH" --version
 
 # ── Agent skills + workspace setup (rarely changes) ─────────────────────────
 RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked \
