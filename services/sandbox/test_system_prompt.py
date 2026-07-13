@@ -22,10 +22,22 @@ class SystemPromptTest(unittest.TestCase):
 
         self.assertNotIn("[Active deployment]", prompt)
         self.assertIn("$CENTAUR_HARNESS_TYPE", prompt)
+        self.assertNotIn("You have full access to Centaur's internal observability", prompt)
+        self.assertIn("Observability access is deployment- and principal-scoped", prompt)
+        self.assertIn("Do not assume ordinary sandbox principals can use", prompt)
         self.assertIn("centaur-tools call vlogs thread_logs", prompt)
         self.assertIn("centaur-tools call vlogs thread_trace", prompt)
         self.assertNotIn("|  vlogs thread_logs", prompt)
         self.assertNotIn("|  vlogs thread_trace", prompt)
+
+    def test_slack_to_linear_attachments_use_a_local_file(self) -> None:
+        prompt = SYSTEM_PROMPT.read_text()
+
+        self.assertIn("attach a Slack file to a Linear issue", prompt)
+        self.assertIn("local path with `slack download`", prompt)
+        self.assertIn("Linear tool's `upload_file` method", prompt)
+        self.assertNotIn("attachment_id", prompt)
+        self.assertNotIn("attachment_url", prompt)
 
     def test_model_and_harness_switching_answer_guidance_is_present(self) -> None:
         prompt = SYSTEM_PROMPT.read_text()

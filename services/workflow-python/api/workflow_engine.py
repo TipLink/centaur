@@ -115,28 +115,6 @@ class WorkflowContext:
     async def call_tool(self, tool: str, method: str, args: dict[str, Any] | None = None) -> Any:
         return await WorkflowToolManager(self._rpc).call_tool_raw(tool, method, args or {})
 
-    async def start_workflow(
-        self,
-        workflow_name: str,
-        input: Any = None,
-        *,
-        idempotency_key: str | None = None,
-        harness_type: str | None = None,
-        max_attempts: int | None = None,
-    ) -> Any:
-        request: dict[str, Any] = {
-            "type": "ctx.start_workflow",
-            "workflow_name": workflow_name,
-            "input": {} if input is None else input,
-        }
-        if idempotency_key is not None:
-            request["idempotency_key"] = idempotency_key
-        if harness_type is not None:
-            request["harness_type"] = harness_type
-        if max_attempts is not None:
-            request["max_attempts"] = max_attempts
-        return await self._rpc.request(request)
-
     async def post_to_slack(self, channel: str, text: str, **kwargs: Any) -> Any:
         return await self._rpc.request(
             {
