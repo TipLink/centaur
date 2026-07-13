@@ -70,7 +70,6 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 | `ctx.sleep(name, duration)` | Suspend and resume later. |
 | `ctx.sleep_until(name, when)` | Resume at a specific time. |
 | `ctx.wait_for_event(name, event_type, correlation_id)` | Wait for an external event. |
-| `ctx.start_workflow(...)` | Start a child workflow and continue immediately. |
 | `ctx.wait_for_workflow(...)` | Wait for a child workflow to finish. |
 | `ctx.run_workflow(...)` | Start and wait in one call. |
 | `ctx.start_agent(...)` | Start an agent turn. |

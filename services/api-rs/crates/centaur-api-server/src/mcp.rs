@@ -310,13 +310,36 @@ fn mcp_centaur_tool_catalog() -> Result<Vec<DiscoveredTool>, ApiError> {
     }
     .resolve_tool_dirs()
     .map_err(|error| ApiError::Internal(error.to_string()))?;
-    let tools = discover_tool_catalog(&dirs)
+    let tool_allowlist = effective_sandbox_env("TOOL_ALLOWLIST");
+    let tool_blocklist = effective_sandbox_env("TOOL_BLOCKLIST");
+    let tools = discover_tool_catalog(&dirs, tool_allowlist.as_deref(), tool_blocklist.as_deref())
         .map_err(|error| ApiError::Internal(error.to_string()))?
         .tools;
     if !cfg!(test) {
         *CATALOG_CACHE.lock().unwrap() = Some((Instant::now(), tools.clone()));
     }
     Ok(tools)
+}
+
+fn effective_sandbox_env(name: &str) -> Option<String> {
+    env::var("SESSION_SANDBOX_EXTRA_ENV")
+        .ok()
+        .and_then(|raw| sandbox_extra_env_value(&raw, name))
+        .or_else(|| env::var(name).ok())
+}
+
+fn sandbox_extra_env_value(raw: &str, name: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(raw).ok()?;
+    let entry = parsed.as_array()?.iter().rev().find(|item| {
+        item.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate.trim() == name)
+    })?;
+    Some(match entry.get("value") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+    })
 }
 
 fn mcp_find_centaur_tool(name: &str) -> Result<Option<DiscoveredTool>, ApiError> {
@@ -855,6 +878,27 @@ mod mcp_tests {
             .unwrap()
             .as_nanos();
         env::temp_dir().join(format!("{prefix}-{}-{suffix}", std::process::id()))
+    }
+
+    #[test]
+    fn tool_filters_follow_effective_sandbox_extra_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("TOOL_ALLOWLIST", "api-only"),
+            (
+                "SESSION_SANDBOX_EXTRA_ENV",
+                r#"[{"name":"TOOL_ALLOWLIST","value":"old"},{"name":"TOOL_ALLOWLIST","value":"sandbox"},{"name":"TOOL_BLOCKLIST","value":"blocked"}]"#,
+            ),
+        ]);
+
+        assert_eq!(
+            effective_sandbox_env("TOOL_ALLOWLIST").as_deref(),
+            Some("sandbox")
+        );
+        assert_eq!(
+            effective_sandbox_env("TOOL_BLOCKLIST").as_deref(),
+            Some("blocked")
+        );
     }
 
     fn test_tool(project_dir: PathBuf) -> DiscoveredTool {
