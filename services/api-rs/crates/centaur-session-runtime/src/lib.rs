@@ -26,8 +26,8 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    PgSessionStore, RecordExecutionDeliveryResult, ReleaseSessionResult, SandboxCapacityCandidate,
-    SessionEventListener, SessionStoreError, WorkflowOwnedSandbox, default_metadata,
+    PgSessionStore, ReleaseSessionResult, SandboxCapacityCandidate, SessionEventListener,
+    SessionStoreError, WorkflowOwnedSandbox, default_metadata,
 };
 use centaur_telemetry::{
     export_thread_trace_root_span, record_sandbox_warm_pool_claim,
@@ -57,18 +57,6 @@ use title_generator::{
 
 pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
-pub const SESSION_DELIVERY_COMPLETED_EVENT: &str = "session.delivery_completed";
-
-fn is_slack_message_id(value: &str) -> bool {
-    let Some((seconds, fraction)) = value.split_once('.') else {
-        return false;
-    };
-    (10..=20).contains(&seconds.len())
-        && fraction.len() == 6
-        && seconds.bytes().all(|byte| byte.is_ascii_digit())
-        && fraction.bytes().all(|byte| byte.is_ascii_digit())
-}
-
 const EVENT_STREAM_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const STEERING_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STEERING_STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1772,66 +1760,6 @@ impl SessionRuntime {
             .await;
         self.spawn_session_title_generation(thread_key);
         Ok(message_ids)
-    }
-
-    /// Record proof that Slack confirmed a final answer was visible for this
-    /// exact execution. Replays return the original event without inserting a
-    /// duplicate receipt.
-    pub async fn record_slack_delivery(
-        &self,
-        thread_key: &ThreadKey,
-        execution_id: &str,
-        message_id: Option<&str>,
-        outcome: &str,
-    ) -> Result<RecordExecutionDeliveryResult, SessionRuntimeError> {
-        if !thread_key.as_str().starts_with("slack:") {
-            return Err(SessionRuntimeError::BadRequest(
-                "Slack delivery receipts require a Slack thread key".to_owned(),
-            ));
-        }
-        let execution_id = execution_id.trim();
-        if execution_id.is_empty() || execution_id.len() > 128 {
-            return Err(SessionRuntimeError::BadRequest(
-                "execution_id must be between 1 and 128 characters".to_owned(),
-            ));
-        }
-        let outcome = outcome.trim();
-        if outcome.is_empty()
-            || outcome.len() > 64
-            || !outcome
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        {
-            return Err(SessionRuntimeError::BadRequest(
-                "delivery outcome must contain only lowercase letters, digits, and underscores"
-                    .to_owned(),
-            ));
-        }
-        let message_id = message_id.map(str::trim).filter(|value| !value.is_empty());
-        if message_id.is_some_and(|value| !is_slack_message_id(value)) {
-            return Err(SessionRuntimeError::BadRequest(
-                "delivery message_id is invalid".to_owned(),
-            ));
-        }
-
-        self.store
-            .record_execution_delivery(
-                thread_key,
-                execution_id,
-                SESSION_DELIVERY_COMPLETED_EVENT,
-                json!({
-                    "thread_key": thread_key.as_str(),
-                    "execution_id": execution_id,
-                    "message_id": message_id,
-                    "outcome": outcome,
-                }),
-            )
-            .await?
-            .ok_or_else(|| {
-                SessionRuntimeError::BadRequest(
-                    "execution does not belong to the requested thread".to_owned(),
-                )
-            })
     }
 
     fn spawn_session_title_generation(&self, thread_key: &ThreadKey) {
@@ -7267,14 +7195,6 @@ mod tests {
     use centaur_session_core::SessionStatus;
     use serde_json::json;
     use time::OffsetDateTime;
-
-    #[test]
-    fn slack_delivery_message_ids_accept_only_slack_timestamps() {
-        assert!(is_slack_message_id("1783737926.397459"));
-        assert!(!is_slack_message_id("secret answer content"));
-        assert!(!is_slack_message_id("1783737926"));
-        assert!(!is_slack_message_id("1783737926.39745x"));
-    }
 
     #[test]
     fn sandbox_repo_cache_label_controls_access() {
