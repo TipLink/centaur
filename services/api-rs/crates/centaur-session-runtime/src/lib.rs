@@ -2101,30 +2101,14 @@ impl SessionRuntime {
             .store
             .list_workflow_owned_sandboxes(workflow_run_id)
             .await?;
-        self.stop_workflow_owned_sessions(sessions, "run", workflow_run_id, reason)
-            .await
-    }
-
-    /// Stop every implicit session created by any attempt of one durable task.
-    /// Run ids change across retries; the task id is the cancellation identity.
-    pub async fn stop_workflow_task_owned_sandboxes(
-        &self,
-        workflow_task_id: &str,
-        reason: &str,
-    ) -> Result<WorkflowSandboxCleanupReport, SessionRuntimeError> {
-        let sessions = self
-            .store
-            .list_workflow_task_owned_sandboxes(workflow_task_id)
-            .await?;
-        self.stop_workflow_owned_sessions(sessions, "task", workflow_task_id, reason)
+        self.stop_workflow_owned_sessions(sessions, workflow_run_id, reason)
             .await
     }
 
     async fn stop_workflow_owned_sessions(
         &self,
         sessions: Vec<WorkflowOwnedSandbox>,
-        scope_kind: &'static str,
-        scope_id: &str,
+        workflow_run_id: &str,
         reason: &str,
     ) -> Result<WorkflowSandboxCleanupReport, SessionRuntimeError> {
         let mut report = WorkflowSandboxCleanupReport::default();
@@ -2132,7 +2116,7 @@ impl SessionRuntime {
         for session in sessions {
             let sandbox_id = session.sandbox_id;
             let thread_key = session.thread_key;
-            let release_id = format!("workflow:{scope_kind}:{scope_id}:{reason}");
+            let release_id = format!("workflow:run:{workflow_run_id}:{reason}");
             let outcome = match self
                 .release_thread(&thread_key, Some(&release_id), sandbox_id.as_deref(), true)
                 .await
@@ -2145,8 +2129,7 @@ impl SessionRuntime {
                     warn!(
                         thread_key = %thread_key,
                         sandbox_id = sandbox_id.as_deref(),
-                        workflow_scope_kind = scope_kind,
-                        workflow_scope_id = scope_id,
+                        workflow_run_id,
                         reason,
                         %error,
                         "failed to release workflow-owned session"
@@ -2178,8 +2161,7 @@ impl SessionRuntime {
                     warn!(
                         thread_key = %thread_key,
                         sandbox_id,
-                        workflow_scope_kind = scope_kind,
-                        workflow_scope_id = scope_id,
+                        workflow_run_id,
                         %error,
                         "failed to mark workflow-owned warm sandbox failed"
                     );
@@ -2194,8 +2176,7 @@ impl SessionRuntime {
                     json!({
                         "thread_key": thread_key.as_str(),
                         "sandbox_id": sandbox_id,
-                        "workflow_run_id": (scope_kind == "run").then_some(scope_id),
-                        "workflow_task_id": (scope_kind == "task").then_some(scope_id),
+                        "workflow_run_id": workflow_run_id,
                         "reason": reason,
                         "missing": outcome.sandbox_missing,
                         "cleared": outcome.session.sandbox_id.is_none(),
@@ -2208,8 +2189,7 @@ impl SessionRuntime {
                 warn!(
                     thread_key = %thread_key,
                     sandbox_id,
-                    workflow_scope_kind = scope_kind,
-                    workflow_scope_id = scope_id,
+                    workflow_run_id,
                     %error,
                     "failed to append workflow sandbox cleanup event"
                 );
@@ -10512,68 +10492,6 @@ mod adoption_tests {
                 && event.payload["workflow_run_id"] == json!(workflow_run_id)
                 && event.payload["cleared"] == json!(true)
         }));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn workflow_task_cleanup_covers_sessions_from_multiple_retry_attempts() {
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let _serial = TEST_LOCK.lock().await;
-        let workflow_task_id = format!("task-{}", uuid::Uuid::new_v4());
-        let mut expected_sandboxes = Vec::new();
-        let mut thread_keys = Vec::new();
-        for attempt in ["first", "retry"] {
-            let thread_key = ThreadKey::parse(format!(
-                "test:wf-task-cleanup-{attempt}-{}",
-                uuid::Uuid::new_v4()
-            ))
-            .unwrap();
-            let sandbox_id = format!("sbx-{attempt}-{}", uuid::Uuid::new_v4());
-            store
-                .create_or_get_session(
-                    &thread_key,
-                    &HarnessType::Codex,
-                    None,
-                    json!({
-                        "source": "absurd_workflow",
-                        "workflow_task_id": workflow_task_id,
-                        "workflow_run_id": format!("run-{attempt}"),
-                        "workflow_owned_thread": true,
-                    }),
-                )
-                .await
-                .expect("create attempt session");
-            store
-                .update_sandbox_id(&thread_key, Some(&sandbox_id))
-                .await
-                .expect("assign attempt sandbox");
-            expected_sandboxes.push(sandbox_id);
-            thread_keys.push(thread_key);
-        }
-
-        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
-        let runtime = runtime_with(&store, backend.clone());
-        let report = runtime
-            .stop_workflow_task_owned_sandboxes(&workflow_task_id, "workflow_cancelled")
-            .await
-            .expect("cleanup all task attempts");
-
-        let mut stopped = report.stopped;
-        stopped.sort();
-        expected_sandboxes.sort();
-        assert_eq!(stopped, expected_sandboxes);
-        for thread_key in thread_keys {
-            assert_eq!(
-                store.get_session(&thread_key).await.unwrap().sandbox_id,
-                None
-            );
-            assert!(events(&store, &thread_key).await.iter().any(|event| {
-                event.event_type == "session.workflow_sandbox_stopped"
-                    && event.payload["workflow_task_id"] == json!(workflow_task_id)
-                    && event.payload["workflow_run_id"].is_null()
-            }));
-        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
