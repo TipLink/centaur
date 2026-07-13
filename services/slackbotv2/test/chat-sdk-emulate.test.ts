@@ -19,7 +19,6 @@ import {
   type SlackbotV2ApiMessage,
   type SlackbotV2CreateSessionRequest,
   type SlackbotV2ExecuteSessionRequest,
-  type SlackbotV2RecordDeliveryRequest,
   type SlackbotV2SessionMessage
 } from '../src/index'
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
@@ -456,16 +455,6 @@ describe('slackbotv2', () => {
       threadKey(parent.ts)
     ])
     expect(codexApi.executes).toHaveLength(2)
-    expect(codexApi.deliveries).toHaveLength(2)
-    expect(codexApi.deliveries.map(delivery => delivery.body.outcome)).toEqual([
-      'primary',
-      'primary'
-    ])
-    expect(codexApi.deliveries.map(delivery => delivery.executionId)).toEqual([
-      'exe-1',
-      'exe-3'
-    ])
-    expect(codexApi.deliveries.every(delivery => Boolean(delivery.body.message_id))).toBe(true)
 
     const firstAppend = codexApi.appends[0]!
     expect(firstAppend.threadKey).toBe(threadKey(parent.ts))
@@ -1869,14 +1858,6 @@ describe('slackbotv2', () => {
     expect(renderedText).toContain(
       'Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway'
     )
-    expect(codexApi.deliveries).toHaveLength(1)
-    expect(codexApi.deliveries[0]).toEqual(
-      expect.objectContaining({
-        body: expect.objectContaining({ outcome: 'primary' }),
-        executionId: 'exe-1',
-        threadKey: threadKey(parent.ts)
-      })
-    )
   })
 
   it('renders successful completions with no final answer as visible Slack text', async () => {
@@ -2165,14 +2146,6 @@ describe('slackbotv2', () => {
     expect(texts.filter(text =>
       text.includes('TOO_LONG_FALLBACK_VISIBLE')
     )).toHaveLength(1)
-    expect(codexApi.deliveries).toHaveLength(1)
-    expect(codexApi.deliveries[0]).toEqual(
-      expect.objectContaining({
-        body: expect.objectContaining({ outcome: 'fallback' }),
-        executionId: 'exe-1',
-        threadKey: key
-      })
-    )
     const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
     expect(threadState).toEqual(
       expect.objectContaining({
@@ -2405,8 +2378,6 @@ describe('slackbotv2', () => {
       text.includes(durableFinalAnswer)
     )
     expect(visibleFinalReplies).toHaveLength(1)
-    expect(codexApi.deliveries).toHaveLength(1)
-    expect(codexApi.deliveries[0]?.body.outcome).toBe('fallback')
     const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
     expect(threadState).toEqual(
       expect.objectContaining({
@@ -3899,17 +3870,9 @@ describe('slackbotv2', () => {
       })
     )
     expect(Number(recoveredThreadState?.lastEventId)).toBeGreaterThan(0)
-    expect(codexApi.deliveries).toHaveLength(1)
-    expect(codexApi.deliveries[0]).toEqual(
-      expect.objectContaining({
-        body: expect.objectContaining({ outcome: 'recovery_primary' }),
-        executionId: 'exe-recovery',
-        threadKey: key
-      })
-    )
   })
 
-  it('records a receipt after a visible non-retryable recovery error', async () => {
+  it('renders a visible non-retryable recovery error', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
 
@@ -3946,14 +3909,6 @@ describe('slackbotv2', () => {
     }, 2000)
 
     expect(await threadText(parent.ts)).toContain('Execution failed')
-    expect(codexApi.deliveries).toHaveLength(1)
-    expect(codexApi.deliveries[0]).toEqual(
-      expect.objectContaining({
-        body: expect.objectContaining({ outcome: 'recovery_stream_error' }),
-        executionId: 'exe-recovery-error',
-        threadKey: key
-      })
-    )
   })
 
   it('skips stale render obligations from Chat SDK state on startup', async () => {
@@ -5037,17 +4992,12 @@ type MockSessionEvent = {
   threadKey: string
 }
 
-type MockSessionDelivery = MockSessionRequest<SlackbotV2RecordDeliveryRequest> & {
-  executionId: string
-}
-
 type MockSessionApi = {
   appends: MockSessionRequest<SlackbotV2AppendMessagesRequest>[]
   autoRespond: boolean
   close(): Promise<void>
   closeStreams(): void
   creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[]
-  deliveries: MockSessionDelivery[]
   emitOutputLine(threadKey: string, line: string, executionId?: string): void
   emitOutputLines(threadKey: string, lines: string[], executionId?: string): void
   emitSessionEvent(threadKey: string, event: string, data: unknown, executionId?: string): void
@@ -5066,7 +5016,6 @@ type MockSessionApi = {
 async function startMockCodexApi(): Promise<MockSessionApi> {
   const appends: MockSessionRequest<SlackbotV2AppendMessagesRequest>[] = []
   const creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[] = []
-  const deliveries: MockSessionDelivery[] = []
   const eventRequests: MockSessionEventRequest[] = []
   const events: MockSessionEvent[] = []
   const executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[] = []
@@ -5088,7 +5037,6 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     void handleMockCodexRequest(req, res, {
       appends,
       creates,
-      deliveries,
       events,
       eventRequests,
       executes,
@@ -5139,13 +5087,11 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   const api: MockSessionApi = {
     appends,
     creates,
-    deliveries,
     eventRequests,
     executes,
     reset() {
       appends.length = 0
       creates.length = 0
-      deliveries.length = 0
       eventRequests.length = 0
       events.length = 0
       executes.length = 0
@@ -5247,7 +5193,6 @@ async function handleMockCodexRequest(
     appends: MockSessionRequest<SlackbotV2AppendMessagesRequest>[]
     autoRespond: boolean
     creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[]
-    deliveries: MockSessionDelivery[]
     events: MockSessionEvent[]
     eventRequests: MockSessionEventRequest[]
     executeHold: Promise<void> | null
@@ -5267,27 +5212,6 @@ async function handleMockCodexRequest(
   }
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${input.port}`)
-  const deliveryMatch = /^\/api\/session\/([^/]+)\/executions\/([^/]+)\/delivery$/.exec(
-    url.pathname
-  )
-  if (deliveryMatch?.[1] && deliveryMatch[2]) {
-    const threadKey = decodeURIComponent(deliveryMatch[1])
-    const executionId = decodeURIComponent(deliveryMatch[2])
-    const request = await nodeRequestToWebRequest(req, url)
-    const body = (await request.json()) as SlackbotV2RecordDeliveryRequest
-    input.deliveries.push({ body, executionId, threadKey })
-    await sendWebResponse(
-      res,
-      Response.json({
-        created: input.deliveries.filter(delivery => delivery.executionId === executionId).length === 1,
-        event_id: 10_000 + input.deliveries.length,
-        execution_id: executionId,
-        ok: true,
-        thread_key: threadKey
-      })
-    )
-    return
-  }
   const match = /^\/api\/session\/([^/]+)(?:\/(messages|execute|events))?$/.exec(url.pathname)
   if (!match?.[1]) {
     await sendWebResponse(res, new Response('not found', { status: 404 }))

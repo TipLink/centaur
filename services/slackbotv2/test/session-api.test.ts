@@ -7,7 +7,6 @@ import {
   harnessRestartPreamble,
   interruptSessionExecution,
   openSessionEventStream,
-  recordSessionDelivery,
   serializeAttachment,
   serializeMessage
 } from '../src/session-api'
@@ -89,15 +88,6 @@ function fakeApi(responses: { createSession?: Array<{ body?: unknown; status: nu
       return Response.json({
         execution_id: 'exec-1',
         interrupted: true,
-        ok: true,
-        thread_key: 'slack:C1:1700000000.000100'
-      })
-    }
-    if (url.endsWith('/delivery')) {
-      return Response.json({
-        created: true,
-        event_id: 42,
-        execution_id: 'exec:1',
         ok: true,
         thread_key: 'slack:C1:1700000000.000100'
       })
@@ -263,29 +253,6 @@ describe('session interruption', () => {
       'http://api.test/api/session/slack%3AC1%3A1700000000.000100/interrupt'
     )
     expect(interrupt?.body).toEqual({ reason: 'Interrupted from Slack by U1' })
-  })
-})
-
-describe('session delivery receipts', () => {
-  test('posts only receipt metadata to the exact encoded execution endpoint', async () => {
-    const { fetchFn, requests } = fakeApi()
-
-    const response = await recordSessionDelivery(
-      options(fetchFn),
-      'slack:C1:1700000000.000100',
-      'exec:1',
-      { message_id: '1700000001.000200', outcome: 'fallback' }
-    )
-
-    expect(response).toMatchObject({ created: true, event_id: 42 })
-    const delivery = requests.find(request => request.url.endsWith('/delivery'))
-    expect(delivery?.url).toBe(
-      'http://api.test/api/session/slack%3AC1%3A1700000000.000100/executions/exec%3A1/delivery'
-    )
-    expect(delivery?.body).toEqual({
-      message_id: '1700000001.000200',
-      outcome: 'fallback'
-    })
   })
 })
 
