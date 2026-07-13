@@ -1453,30 +1453,6 @@ impl PgSessionStore {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
-    /// List every implicit session owned by a durable workflow task across all
-    /// of its attempts. A retry gets a new run id but retains the task id, so
-    /// cancellation/reaping must use this scope to avoid leaking a suspended
-    /// session created by a newer attempt.
-    pub async fn list_workflow_task_owned_sandboxes(
-        &self,
-        workflow_task_id: &str,
-    ) -> Result<Vec<WorkflowOwnedSandbox>, SessionStoreError> {
-        let rows = sqlx::query_as::<_, WorkflowOwnedSandboxRow>(
-            r#"
-            select thread_key, sandbox_id
-            from sessions
-            where metadata->>'workflow_owned_thread' = 'true'
-              and metadata->>'workflow_task_id' = $1
-            order by thread_key
-            "#,
-        )
-        .bind(workflow_task_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(TryInto::try_into).collect()
-    }
-
     pub async fn update_sandbox_id(
         &self,
         thread_key: &ThreadKey,

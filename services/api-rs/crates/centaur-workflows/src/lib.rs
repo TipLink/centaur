@@ -111,15 +111,6 @@ const LOCAL_WORKFLOW_HOST_DENIED_ENVS: &[&str] = &[
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn workflow_owned_thread_key(run_id: &str, task_id: &str, workflow_name: &str) -> String {
-    format!(
-        "wf:{}:{}:agent:{}",
-        run_id.replace('-', ""),
-        task_id.replace('-', ""),
-        workflow_name
-    )
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 struct WorkflowTaskTokenClaims {
     version: u8,
@@ -258,7 +249,6 @@ struct WorkflowRuntimeInner {
     slack_live_client: Client,
     etl_client: Client,
     etl_backfill_client: Client,
-    session_runtime: SessionRuntime,
     workers: StdMutex<Option<Vec<Worker>>>,
     metadata_reconciler: StdMutex<Option<JoinHandle<()>>>,
     draining: AtomicBool,
@@ -802,7 +792,6 @@ impl WorkflowRuntime {
                 },
                 webhook_registry.clone(),
                 schedule_registry.clone(),
-                session_runtime.clone(),
                 interval,
             )
         });
@@ -813,7 +802,6 @@ impl WorkflowRuntime {
                 slack_live_client,
                 etl_client,
                 etl_backfill_client,
-                session_runtime,
                 workers: StdMutex::new(Some(vec![
                     worker,
                     slack_live_worker,
@@ -997,17 +985,6 @@ impl WorkflowRuntime {
         ] {
             if let Some(run) = self.get_run_for_queue(queue_name, run_id).await? {
                 client.cancel_task(&run.task_id, Some(queue_name)).await?;
-                let cleanup = self
-                    .inner
-                    .session_runtime
-                    .stop_workflow_task_owned_sandboxes(&run.task_id, "workflow_cancelled")
-                    .await?;
-                if !cleanup.failed.is_empty() {
-                    return Err(WorkflowRuntimeError::Internal(format!(
-                        "workflow {run_id} was cancelled but {} owned sandbox cleanup(s) failed",
-                        cleanup.failed.len()
-                    )));
-                }
                 return Ok(());
             }
         }
@@ -1925,7 +1902,6 @@ fn spawn_workflow_metadata_reconciler(
     workflow_clients: WorkflowQueueClients,
     webhook_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
     schedule_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
-    session_runtime: SessionRuntime,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1959,13 +1935,7 @@ fn spawn_workflow_metadata_reconciler(
                         warn!(%error, "failed to record workflow queue metrics");
                     }
                     if let Err(error) = reaper
-                        .reap(
-                            &workflow_clients,
-                            &schedule_client,
-                            &session_runtime,
-                            &metadata,
-                            &schedules,
-                        )
+                        .reap(&workflow_clients, &schedule_client, &metadata, &schedules)
                         .await
                     {
                         warn!(%error, "failed to reap removed workflow tasks");
@@ -2193,7 +2163,6 @@ impl RemovedWorkflowReaper {
         &mut self,
         workflow_clients: &WorkflowQueueClients,
         schedule_client: &Client,
-        session_runtime: &SessionRuntime,
         metadata: &PythonWorkflowMetadata,
         schedules: &BTreeMap<String, RegisteredWorkflowSchedule>,
     ) -> Result<(), WorkflowRuntimeError> {
@@ -2214,7 +2183,9 @@ impl RemovedWorkflowReaper {
             (WORKFLOW_ETL_QUEUE, &workflow_clients.etl),
             (WORKFLOW_ETL_BACKFILL_QUEUE, &workflow_clients.etl_backfill),
         ] {
-            for (task_id, name) in fetch_active_workflow_tasks(client, queue_name).await? {
+            for (task_id, name) in
+                fetch_active_named_tasks(client, queue_name, WORKFLOW_TASK, "workflow_name").await?
+            {
                 active_runs.push((queue_name, task_id, name));
             }
         }
@@ -2241,15 +2212,6 @@ impl RemovedWorkflowReaper {
             if let Err(error) = client.cancel_task(task_id, Some(queue_name)).await {
                 warn!(%error, queue_name, task_id, "failed to cancel run of removed workflow");
             } else {
-                let cleanup = session_runtime
-                    .stop_workflow_task_owned_sandboxes(task_id, "workflow_removed")
-                    .await?;
-                if !cleanup.failed.is_empty() {
-                    return Err(WorkflowRuntimeError::Internal(format!(
-                        "removed workflow task {task_id} was cancelled but {} owned sandbox cleanup(s) failed",
-                        cleanup.failed.len()
-                    )));
-                }
                 info!(queue_name, task_id, "cancelled run of removed workflow");
             }
         }
@@ -2288,37 +2250,6 @@ impl RemovedWorkflowReaper {
         }
         Ok(())
     }
-}
-
-/// Returns `(task_id, workflow_name)` for active workflow tasks. Cancellation
-/// and implicit-session cleanup are task scoped so retries cannot race a stale
-/// attempt snapshot.
-async fn fetch_active_workflow_tasks(
-    client: &Client,
-    queue_name: &str,
-) -> Result<Vec<(String, String)>, WorkflowRuntimeError> {
-    let (task_table, _) = absurd_queue_tables(queue_name)?;
-    let rows = sqlx::query(&format!(
-        r#"
-        select
-            t.task_id::text as task_id,
-            t.params->>'workflow_name' as name
-        from {task_table} t
-        where t.task_name = $1
-          and t.state not in {ABSURD_TERMINAL_TASK_STATES}
-        "#,
-    ))
-    .bind(WORKFLOW_TASK)
-    .fetch_all(client.pool())
-    .await?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| {
-            let task_id: String = row.try_get("task_id").ok()?;
-            let name: Option<String> = row.try_get("name").ok()?;
-            Some((task_id, name?))
-        })
-        .collect())
 }
 
 /// Returns `(task_id, name)` for every non-terminal task in the queue, where
@@ -2729,9 +2660,10 @@ async fn run_centaur_workflow_inner(
                 .step("agent_turn", || {
                     let session_runtime = session_runtime.clone();
                     let harness_type = input.harness_type.clone();
+                    let thread_key =
+                        format!("wf:{}:agent:agent_turn", ctx.task_id().replace('-', ""));
                     let task_id = ctx.task_id().to_owned();
                     let run_id = ctx.run_id().to_owned();
-                    let thread_key = workflow_owned_thread_key(&run_id, &task_id, "agent_turn");
                     async move {
                         let client_message_id = format!("absurd-workflow:{task_id}:native:user");
                         let metadata = json!({
@@ -3438,12 +3370,6 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
-        Some("ctx.start_workflow") => {
-            match start_python_child_workflow(message, ctx, input).await {
-                Ok(value) => Ok(value),
-                Err(error) => Err(error.to_string()),
-            }
-        }
         Some("ctx.call_tool") => match call_python_workflow_tool(message).await {
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
@@ -3470,99 +3396,6 @@ async fn handle_python_context_request(
             "error": error,
         }),
     })
-}
-
-async fn start_python_child_workflow(
-    message: &Value,
-    ctx: &TaskContext,
-    parent: &WorkflowTaskInput,
-) -> Result<Value, WorkflowRuntimeError> {
-    let workflow_name = message
-        .get("workflow_name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            WorkflowRuntimeError::BadRequest("ctx.start_workflow requires workflow_name".to_owned())
-        })?;
-    WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
-
-    let target_queue = queue_name_for_class(workflow_queue_class(workflow_name));
-    if target_queue != ctx.queue_name() {
-        return Err(WorkflowRuntimeError::BadRequest(format!(
-            "ctx.start_workflow cannot cross queues: parent queue {:?}, target queue {:?}",
-            ctx.queue_name(),
-            target_queue
-        )));
-    }
-
-    let harness_type = match message.get("harness_type") {
-        Some(Value::String(raw)) => HarnessType::from_str(raw).map_err(|_| {
-            WorkflowRuntimeError::BadRequest(format!(
-                "ctx.start_workflow has unsupported harness_type {raw:?}"
-            ))
-        })?,
-        Some(Value::Null) | None => parent.harness_type.clone(),
-        Some(_) => {
-            return Err(WorkflowRuntimeError::BadRequest(
-                "ctx.start_workflow harness_type must be a string".to_owned(),
-            ));
-        }
-    };
-    let max_attempts = match message.get("max_attempts") {
-        Some(Value::Number(value)) => {
-            let value = value.as_i64().ok_or_else(|| {
-                WorkflowRuntimeError::BadRequest(
-                    "ctx.start_workflow max_attempts must be an integer".to_owned(),
-                )
-            })?;
-            let value = i32::try_from(value).map_err(|_| {
-                WorkflowRuntimeError::BadRequest(
-                    "ctx.start_workflow max_attempts is out of range".to_owned(),
-                )
-            })?;
-            if value < 1 {
-                return Err(WorkflowRuntimeError::BadRequest(
-                    "ctx.start_workflow max_attempts must be at least 1".to_owned(),
-                ));
-            }
-            Some(value)
-        }
-        Some(Value::Null) | None => None,
-        Some(_) => {
-            return Err(WorkflowRuntimeError::BadRequest(
-                "ctx.start_workflow max_attempts must be an integer".to_owned(),
-            ));
-        }
-    };
-    let idempotency_key = message
-        .get("idempotency_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let spawn = ctx
-        .spawn_child(
-            WORKFLOW_TASK,
-            WorkflowTaskInput {
-                workflow_name: workflow_name.to_owned(),
-                input: message.get("input").cloned().unwrap_or_else(|| json!({})),
-                harness_type,
-            },
-            SpawnOptions {
-                max_attempts,
-                idempotency_key,
-                ..SpawnOptions::default()
-            },
-        )
-        .await?;
-    Ok(json!({
-        "ok": true,
-        "run_id": spawn.run_id,
-        "task_id": spawn.task_id,
-        "status": "queued",
-        "created": spawn.created,
-    }))
 }
 
 fn parse_python_duration_seconds(message: &Value) -> Result<Duration, String> {
@@ -3622,7 +3455,11 @@ async fn run_python_agent_turn(
         .map(ToOwned::to_owned);
     let workflow_owned_thread = explicit_thread_key.is_none();
     let thread_key = explicit_thread_key.unwrap_or_else(|| {
-        workflow_owned_thread_key(ctx.run_id(), ctx.task_id(), &input.workflow_name)
+        format!(
+            "wf:{}:agent:{}",
+            ctx.task_id().replace('-', ""),
+            input.workflow_name
+        )
     });
     let harness_type = parse_agent_harness(&args)?.unwrap_or_else(|| input.harness_type.clone());
     let persona_id = args
@@ -4239,16 +4076,6 @@ mod tests {
                     .any(|(key, value)| { *key == std::ffi::OsStr::new(name) && value.is_none() })
             );
         }
-    }
-
-    #[test]
-    fn workflow_owned_thread_keys_are_attempt_scoped() {
-        let first = workflow_owned_thread_key("run-1111", "task-fixed", "repair");
-        let retry = workflow_owned_thread_key("run-2222", "task-fixed", "repair");
-
-        assert_ne!(first, retry);
-        assert!(first.contains("run1111:taskfixed"));
-        assert!(retry.contains("run2222:taskfixed"));
     }
 
     #[test]
