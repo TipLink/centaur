@@ -23,7 +23,6 @@ the tested tree exactly, and satisfy the fork's signature policy.
 | Ambient Slack channels | Configured root messages and replies execute without an explicit mention; messages outside the allowlist remain inert. |
 | Slack event dedupe | The patched Chat dependency dedupes by actionable bucket so a non-actionable `message` event cannot suppress a later `app_mention`. |
 | Durable terminal reconciliation | Slack compares streamed markdown with the durable terminal result and replaces divergent output. |
-| Durable Slack delivery proof | After Slack confirms a primary, reconciled, fallback, or visible-error message, Slackbot records one idempotent `session.delivery_completed` event through a Slackbot-key-only route bound to the exact thread and execution. |
 | Generic HTTP secret scopes | Method/path scopes are retained through discovery, permission translation, and iron-control registration. |
 | Least-privilege Slack ETL token | The reviewed TipLink #68 intent is ported to the current `match_headers` manifest schema: `SLACK_ETL_TOKEN` can replace `Authorization` only for the four ETL Slack Web API paths over `GET`/`POST` and for `GET` downloads from `files.slack.com`. A real-manifest translation test locks the resulting iron-control rules. |
 | GitHub App installation tokens | The grant is registered in upstream `Broker::CredentialGrants`; the model delegates validation and refresh to that registry. Helm bootstraps the canonical credential before api-rs starts, and the built-in infra role grants a scheme-preserving `GITHUB_TOKEN` replacement for `github.com` and `api.github.com` to sandbox principals. |
@@ -68,6 +67,10 @@ the tested tree exactly, and satisfy the fork's signature policy.
   layered onto the durable upstream pipeline.
 - Upstream's in-process Slack handoff retry replaces TipLink's older dedupe-key
   deletion/retry mechanics.
+- TipLink's custom `session.delivery_completed` receipt path was used only by
+  the retired silent-thread trace/capture workflows. Upstream render
+  obligations, terminal reconciliation, and fallback delivery remain the
+  active reliability mechanisms.
 - Upstream stdout-owner leases, adoption, shutdown handoff, sandbox capacity,
   capability labels, and API routing are authoritative. Session release was
   redesigned around those ownership fences rather than replaying the old
@@ -125,7 +128,7 @@ dropped.
   (6): `a8adb1f8 9baa30cf 3a886f7f 2dfabef2 f58f1154 6b0c3b09`.
 - Historical follow-up rather than active-baseline carry (1): `07bd5f08`.
   Its fallback-post retry was already absent from `ba2c01f5`; restoring it
-  requires a separate exactly-once delivery/receipt decision and test.
+  requires a separate exactly-once delivery decision and test.
 
 Known one-for-one upstream equivalents include `d6dcdb4d` / `0691b1aa`,
 `c59a82ae` / `cc0c4c0c`, `f5636a0f` / `f6664689`, `1882c8eb` /
@@ -166,23 +169,15 @@ SQLx/Rails checksum manifests and CI guards are included in this branch.
    does not enter the package/deployment lanes. If a run creates only a subset
    of final tags, never delete or move them and never retry that head; supersede
    it with a new signed PR commit and repeat the complete gate.
-2. Establish a zero-overlap delivery-writer boundary before the full runtime
-   sync: disable cloudflared ingress, drain active work, and scale every old
-   api-rs and Slackbot replica to zero. Do not allow old and receipt-writing
-   Slackbot replicas to serve concurrently; the silent-trace scanner uses the
-   earliest durable receipt as its rollout cutoff.
-3. Deploy the complete api-rs and Slackbot revision with legacy network-policy
+2. Deploy the complete api-rs and Slackbot revision with legacy network-policy
    access and `overlay.image` compatibility enabled, then restore ingress.
-4. Run one controlled Slack turn. Confirm its primary or fallback message is
-   visible and verify exactly one `session.delivery_completed` event exists for
-   its `(thread_key, execution_id)` before enabling or accepting silent-trace
-   scanning. With no receipt, the scanner must report
-   `delivery_receipt_writer_not_activated` and start no captures.
-5. Let workload-key reconciliation retire stale unclaimed warm sandboxes;
+3. Run one controlled Slack turn and confirm its primary or fallback message
+   is visible through the retained render-obligation recovery path.
+4. Let workload-key reconciliation retire stale unclaimed warm sandboxes;
    existing assigned sessions replace their sandbox on their next owned turn,
    while explicit cancellation still uses canonical release.
-6. Verify new ready pods carry capability labels, repo-backed prompts, and the
+5. Verify new ready pods carry capability labels, repo-backed prompts, and the
    expected workload key.
-7. Drain all legacy sessions, then disable
+6. Drain all legacy sessions, then disable
    `networkPolicy.legacyManagedByApiServerAccess` and eventually remove the
    image-overlay values from the Fineas deployment.

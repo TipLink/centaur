@@ -62,9 +62,8 @@ use crate::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
         InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, ListWorkflowRunsQuery,
-        OnHarnessConflict, RecordSessionDeliveryRequest, RecordSessionDeliveryResponse,
-        ReleaseThreadRequest, ReleaseThreadResponse, SessionContextResponse, SessionSseEvent,
-        SlackThreadContext, stream_error_sse,
+        OnHarnessConflict, ReleaseThreadRequest, ReleaseThreadResponse, SessionContextResponse,
+        SessionSseEvent, SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -244,10 +243,6 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/api/session/{thread_key}/interrupt",
             post(interrupt_session_execution),
-        )
-        .route(
-            "/api/session/{thread_key}/executions/{execution_id}/delivery",
-            post(record_session_delivery),
         )
         .route("/api/session/{thread_key}/release", post(release_thread))
         .route("/api/session/{thread_key}/events", get(stream_events))
@@ -616,31 +611,6 @@ async fn interrupt_session_execution(
         ok: true,
         interrupted: outcome.interrupted,
         execution_id: outcome.execution_id,
-        thread_key,
-    }))
-}
-
-async fn record_session_delivery(
-    State(state): State<AppState>,
-    _authorization: SlackDeliveryAuthorization,
-    Path((raw_thread_key, execution_id)): Path<(String, String)>,
-    Json(request): Json<RecordSessionDeliveryRequest>,
-) -> Result<Json<RecordSessionDeliveryResponse>, ApiError> {
-    let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let outcome = state
-        .runtime()?
-        .record_slack_delivery(
-            &thread_key,
-            &execution_id,
-            request.message_id.as_deref(),
-            &request.outcome,
-        )
-        .await?;
-    Ok(Json(RecordSessionDeliveryResponse {
-        ok: true,
-        created: outcome.created,
-        event_id: outcome.event.event_id,
-        execution_id,
         thread_key,
     }))
 }
@@ -2232,9 +2202,6 @@ impl FromRequestParts<AppState> for WorkflowApiAuthorization {
 #[derive(Debug)]
 struct SessionApiAuthorization(WorkflowApiAuthorization);
 
-#[derive(Debug)]
-struct SlackDeliveryAuthorization;
-
 impl WorkflowApiClaims {
     fn allows_channel(&self, channel_id: &str) -> bool {
         self.slack
@@ -2348,38 +2315,6 @@ impl FromRequestParts<AppState> for SessionApiAuthorization {
         _state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         authorize_session_api(&parts.headers).map(Self)
-    }
-}
-
-fn authorize_slack_delivery_headers(
-    headers: &HeaderMap,
-    configured_key: Option<&str>,
-) -> Result<(), ApiError> {
-    // Parse authentication first so an anonymous request is always rejected
-    // as unauthorized, even when the service itself is misconfigured.
-    let presented = bearer_token(headers)?;
-    let expected = configured_key
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::Internal("SLACKBOT_API_KEY is not configured".to_owned()))?;
-    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-        return Ok(());
-    }
-    Err(ApiError::Unauthorized(
-        "invalid Slack delivery service token".to_owned(),
-    ))
-}
-
-impl FromRequestParts<AppState> for SlackDeliveryAuthorization {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        _state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let key = env::var("SLACKBOT_API_KEY").ok();
-        authorize_slack_delivery_headers(&parts.headers, key.as_deref())?;
-        Ok(Self)
     }
 }
 
@@ -3763,44 +3698,6 @@ mod workflow_api_tests {
         assert!(claims_owns_session(&claims, Some("prn_test")));
         assert!(!claims_owns_session(&claims, Some("prn_other")));
         assert!(!claims_owns_session(&claims, None));
-    }
-
-    #[test]
-    fn slack_delivery_receipts_accept_only_the_dedicated_slackbot_bearer() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer slackbot-secret".parse().unwrap());
-        authorize_slack_delivery_headers(&headers, Some("slackbot-secret")).unwrap();
-
-        for forged in [
-            "Bearer control-secret",
-            "Bearer workflow-secret",
-            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcm5fZm9yZ2VkIn0.signature",
-        ] {
-            headers.insert("authorization", forged.parse().unwrap());
-            assert!(matches!(
-                authorize_slack_delivery_headers(&headers, Some("slackbot-secret")),
-                Err(ApiError::Unauthorized(_))
-            ));
-        }
-
-        headers.remove("authorization");
-        headers.insert("x-api-key", "slackbot-secret".parse().unwrap());
-        assert!(matches!(
-            authorize_slack_delivery_headers(&headers, Some("slackbot-secret")),
-            Err(ApiError::Unauthorized(_))
-        ));
-
-        headers.remove("x-api-key");
-        assert!(matches!(
-            authorize_slack_delivery_headers(&headers, None),
-            Err(ApiError::Unauthorized(_))
-        ));
-
-        headers.insert("authorization", "Bearer slackbot-secret".parse().unwrap());
-        assert!(matches!(
-            authorize_slack_delivery_headers(&headers, None),
-            Err(ApiError::Internal(_))
-        ));
     }
 }
 

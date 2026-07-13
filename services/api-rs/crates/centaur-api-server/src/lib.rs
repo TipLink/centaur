@@ -240,12 +240,6 @@ mod tests {
                 .body(Body::from(r#"{"input_lines":[]}"#))
                 .unwrap(),
             Request::builder()
-                .method(Method::POST)
-                .uri("/api/session/slack%3AC123%3A123.456/executions/exe-1/delivery")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"outcome":"primary"}"#))
-                .unwrap(),
-            Request::builder()
                 .method(Method::GET)
                 .uri("/api/session/slack%3AC123%3A123.456/events")
                 .body(Body::empty())

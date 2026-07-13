@@ -49,19 +49,6 @@ export interface ReleaseThreadResponse {
   execution_cancelled: boolean;
 }
 
-export interface RecordSessionDeliveryOptions {
-  messageId?: string;
-  outcome: string;
-}
-
-export interface RecordSessionDeliveryResponse {
-  ok: boolean;
-  created: boolean;
-  event_id: number;
-  execution_id: string;
-  thread_key: string;
-}
-
 export class CentaurClient {
   readonly http: AxiosInstance;
 
@@ -132,21 +119,6 @@ export class CentaurClient {
       },
     );
     return data as ReleaseThreadResponse;
-  }
-
-  async recordSessionDelivery(
-    threadKey: string,
-    executionId: string,
-    opts: RecordSessionDeliveryOptions,
-  ): Promise<RecordSessionDeliveryResponse> {
-    const { data } = await this.http.post(
-      `/api/session/${encodeURIComponent(threadKey)}/executions/${encodeURIComponent(executionId)}/delivery`,
-      {
-        message_id: opts.messageId,
-        outcome: opts.outcome,
-      },
-    );
-    return data as RecordSessionDeliveryResponse;
   }
 
   async sendWorkflowEvent(opts: {

@@ -119,33 +119,4 @@ describe("CentaurClient", () => {
       },
     );
   });
-
-  it("records a Slack delivery receipt against the exact session execution", async () => {
-    const client = new CentaurClient({
-      apiUrl: "http://api.local",
-      apiKey: "slackbot-key",
-    });
-    const postMock = vi.spyOn(client.http, "post").mockResolvedValue({
-      data: {
-        ok: true,
-        created: true,
-        event_id: 42,
-        execution_id: "exec:123",
-        thread_key: "slack:T:C:1.2",
-      },
-    });
-
-    await client.recordSessionDelivery("slack:T:C:1.2", "exec:123", {
-      messageId: "1780000000.000100",
-      outcome: "fallback",
-    });
-
-    expect(postMock).toHaveBeenCalledWith(
-      "/api/session/slack%3AT%3AC%3A1.2/executions/exec%3A123/delivery",
-      {
-        message_id: "1780000000.000100",
-        outcome: "fallback",
-      },
-    );
-  });
 });

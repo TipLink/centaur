@@ -114,21 +114,6 @@ pub struct InterruptSessionExecutionResponse {
     pub thread_key: ThreadKey,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RecordSessionDeliveryRequest {
-    pub message_id: Option<String>,
-    pub outcome: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct RecordSessionDeliveryResponse {
-    pub ok: bool,
-    pub created: bool,
-    pub event_id: i64,
-    pub execution_id: String,
-    pub thread_key: ThreadKey,
-}
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct EventsQuery {
     pub after_event_id: Option<i64>,
