@@ -44,7 +44,7 @@ echo "SLACK_THREAD_TS=${SLACK_THREAD_TS:-}"
 echo "SLACK_CHANNEL_NAME=${SLACK_CHANNEL_NAME:-}"
 ```
 
-If `SLACK_CHANNEL_ID` or `SLACK_THREAD_TS` is missing, infer it from `CENTAUR_THREAD_KEY` when possible. New Slack thread keys are `slack:<team_id>:<channel_id>:<thread_ts>`; older persisted threads may still use `slack:<channel_id>:<thread_ts>`.
+If `SLACK_CHANNEL_ID` or `SLACK_THREAD_TS` is missing, infer it from `CENTAUR_THREAD_KEY` when possible. Slack thread keys are usually `slack:<channel_id>:<thread_ts>`.
 
 ### 1. Tool Loading
 
@@ -127,7 +127,7 @@ Pass when the command succeeds and returns valid search output. Empty results ar
 Find another accessible Slack file from the current channel. Prefer a result outside the current thread, but do not use files from other channels. `search_files` filters by filename or title, so start broad with an empty query:
 
 ```bash
-centaur-tools call slack search_files '{"query":"", "max_results":5}'
+centaur-tools call slack search_files '{"channel_id":"'"${SLACK_CHANNEL_ID}"'","query":"","max_results":5}'
 ```
 
 Pick a result whose `channels` includes `${SLACK_CHANNEL_ID}`. If possible, avoid the file uploaded earlier in this QA run so the check proves download-and-reupload of an existing channel file. Download it:
@@ -157,7 +157,7 @@ company_context list --limit 3 --json
 company_context search "centaur" --limit 3 --json
 ```
 
-Pass when the tool returns a valid JSON payload with `status: ok`, even if no documents match. Fail on database connection errors, permission errors, missing `CENTAUR_POSTGRES_DSN`, or malformed results.
+Pass when the tool returns a valid JSON payload with `status: ok`, even if no documents match. Fail on database connection errors, permission errors, missing `COMPANY_CONTEXT_DSN`, or malformed results.
 
 If company context returns `upstream connection failed`, use runtime evidence before suggesting a code fix:
 
@@ -299,7 +299,7 @@ responses; Slack does not render them reliably. Use this exact shape:
 
 ```text
 *Setup*
-- *Thread context:* PASS - C123:1712345678.000000, key slack:T123:C123:...
+- *Thread context:* PASS - C123:1712345678.000000, key slack:C123:...
 - *Tool loading:* PASS - 72 tools; expected slack/company_context/vlogs/vmetrics present
 
 *Slack*

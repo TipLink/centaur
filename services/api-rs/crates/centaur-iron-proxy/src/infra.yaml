@@ -8,33 +8,14 @@ transforms:
   - name: secrets
     config:
       secrets:
-        - replace:
-            proxy_value: XAI_API_KEY
-            match_headers: ["Authorization"]
-          rules: [{ host: api.x.ai }]
-        - replace:
-            proxy_value: GEMINI_API_KEY
-            match_headers: ["X-Goog-Api-Key"]
-          rules: [{ host: generativelanguage.googleapis.com }]
-        - replace:
-            proxy_value: AMP_API_KEY
-            match_headers: ["Authorization"]
-          rules: [{ host: ampcode.com }]
-        # GitHub App installation tokens expire ~1h after mint, so the static
-        # value baked into the sandbox at start goes stale within a long-lived
-        # (~48h) sandbox and git/gh start failing with HTTP 401. Source the
-        # replacement value from the `github-app` broker credential (a
-        # github_app_installation BrokerCredential managed by iron-control,
-        # provisioned by the Helm chart's tokenBroker.githubApp bootstrap or
-        # manually via `centaur-perms broker create`), which
-        # mints and rotates the installation token so every request gets a live
-        # one. Keep `replace` (not `inject`) so the request's existing auth
-        # scheme is preserved: git over HTTPS keeps its Basic `x-access-token`
-        # form (github.com rejects `Bearer` for git transport) while the REST
-        # API keeps Bearer -- both just get the placeholder swapped for the
-        # current token. The `GITHUB_TOKEN` placeholder is still injected into
-        # the sandbox env (it is this entry's proxy_value).
-        - source:
+        # The Helm bootstrap guarantees the canonical `github-app` credential
+        # exists before api-rs starts. Register this source on the shared infra
+        # role so every new sandbox principal receives the rotating token.
+        # Replace the placeholder instead of injecting a header: git HTTPS uses
+        # Basic x-access-token auth while the REST API uses Bearer, and both
+        # must preserve their caller-selected scheme.
+        - id: github-app
+          source:
             type: token_broker
             credential_id: github-app
           replace:

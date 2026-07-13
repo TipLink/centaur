@@ -46,11 +46,7 @@ class Proxy < ApplicationRecord
   end
 
   def sync_config_snapshot
-    config = if principal
-      Principal.with_managed_proxy_config(PrincipalSyncConfigSnapshot.fetch_for(principal).payload)
-    else
-      Principal::EMPTY_CONFIG
-    end
+    config = principal ? PrincipalSyncConfigSnapshot.fetch_for(principal).payload : Principal::EMPTY_CONFIG
     { config_hash: config_hash_for(config), config: config }
   end
 

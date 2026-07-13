@@ -1,4 +1,4 @@
-name: Weekly Upstream Sync
+name: Weekly Upstream Audit
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: upstream-sync
+  group: upstream-audit
   cancel-in-progress: false
 
 permissions:
@@ -15,16 +15,16 @@ permissions:
 
 env:
   BASE_BRANCH: main
-  SYNC_BRANCH: automation/upstream-sync
   UPSTREAM_BRANCH: main
+  UPSTREAM_OWNER: paradigmxyz
   UPSTREAM_REPO: paradigmxyz/centaur
 
 jobs:
   open-pr:
-    name: Open upstream sync PR
+    name: Open untrusted upstream audit PR
     runs-on: ubuntu-latest
     steps:
-      - name: Create Centaur GitHub App token
+      - name: Create pull-request-only GitHub App token
         id: app_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
@@ -32,34 +32,34 @@ jobs:
           private-key: ${{ secrets.FINEAS_GITHUB_APP_PRIVATE_KEY }}
           owner: TipLink
           repositories: centaur
-          permission-contents: write
           permission-pull-requests: write
 
-      - name: Checkout
+      - name: Checkout trusted base
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          token: ${{ steps.app_token.outputs.token }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Update upstream sync branch
-        id: sync
+      - name: Audit upstream ancestry and signatures
+        id: audit
         env:
-          APP_TOKEN: ${{ steps.app_token.outputs.token }}
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
+          parent="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')"
+          if [[ "$parent" != "$UPSTREAM_REPO" ]]; then
+            echo "expected $GITHUB_REPOSITORY to remain a fork of $UPSTREAM_REPO; found ${parent:-none}" >&2
+            exit 1
+          fi
+
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          git fetch --no-tags \
-            "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            "${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
-          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          git fetch --no-tags origin "${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
 
           base_sha="$(git rev-parse "origin/${BASE_BRANCH}")"
           upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
           merge_base="$(git merge-base "$base_sha" "$upstream_sha")"
-
           {
             echo "base_sha=$base_sha"
             echo "upstream_sha=$upstream_sha"
@@ -68,33 +68,55 @@ jobs:
 
           if git merge-base --is-ancestor "$upstream_sha" "$base_sha"; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            existing_pr="$(gh pr list \
-              --repo "$GITHUB_REPOSITORY" \
-              --head "$SYNC_BRANCH" \
-              --base "$BASE_BRANCH" \
-              --state open \
-              --json number \
-              --jq '.[0].number // empty')"
-            if [ -n "$existing_pr" ]; then
-              gh pr close "$existing_pr" \
-                --repo "$GITHUB_REPOSITORY" \
-                --comment "Closing because ${UPSTREAM_REPO}/${UPSTREAM_BRANCH} is already contained in ${BASE_BRANCH}."
-            fi
+            echo "verified_commit_count=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          git push --force \
-            "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            "$upstream_sha:refs/heads/${SYNC_BRANCH}"
+          mapfile -t commits < <(git rev-list --reverse "${base_sha}..${upstream_sha}")
+          if [[ "${#commits[@]}" -eq 0 ]]; then
+            echo "upstream is not contained, but no upstream-only commits were found" >&2
+            exit 1
+          fi
+          failed=()
+          for commit in "${commits[@]}"; do
+            verification="$(gh api "repos/${UPSTREAM_REPO}/commits/${commit}" \
+              --jq '[.commit.verification.verified, .commit.verification.reason] | @tsv')"
+            verified="${verification%%$'\t'*}"
+            reason="${verification#*$'\t'}"
+            if [[ "$verified" != "true" ]]; then
+              failed+=("${commit}:${reason:-unknown}")
+            fi
+          done
+          if [[ "${#failed[@]}" -ne 0 ]]; then
+            printf 'refusing unverified upstream commit(s):\n' >&2
+            printf '  %s\n' "${failed[@]}" >&2
+            exit 1
+          fi
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "verified_commit_count=${#commits[@]}" >> "$GITHUB_OUTPUT"
 
-      - name: Build PR body
-        if: steps.sync.outputs.changed == 'true'
+      - name: Close stale audit PR when already contained
+        if: steps.audit.outputs.changed == 'false'
         env:
-          BASE_SHA: ${{ steps.sync.outputs.base_sha }}
-          MERGE_BASE: ${{ steps.sync.outputs.merge_base }}
-          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          existing_pr="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${BASE_BRANCH}&head=${UPSTREAM_OWNER}:${UPSTREAM_BRANCH}&per_page=100" \
+            --jq '.[0].number // empty')"
+          if [[ -n "$existing_pr" ]]; then
+            gh pr close "$existing_pr" --repo "$GITHUB_REPOSITORY" \
+              --comment "Closing because ${UPSTREAM_REPO}/${UPSTREAM_BRANCH} is already contained in ${BASE_BRANCH}."
+          fi
+
+      - name: Build audit PR body
+        if: steps.audit.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ steps.audit.outputs.base_sha }}
+          MERGE_BASE: ${{ steps.audit.outputs.merge_base }}
+          UPSTREAM_SHA: ${{ steps.audit.outputs.upstream_sha }}
+          VERIFIED_COMMIT_COUNT: ${{ steps.audit.outputs.verified_commit_count }}
         run: |
           set -euo pipefail
 
@@ -110,22 +132,19 @@ jobs:
           base_sha = os.environ["BASE_SHA"]
           merge_base = os.environ["MERGE_BASE"]
           upstream_sha = os.environ["UPSTREAM_SHA"]
+          verified_count = int(os.environ["VERIFIED_COMMIT_COUNT"])
           base_branch = os.environ["BASE_BRANCH"]
-          sync_branch = os.environ["SYNC_BRANCH"]
           upstream_branch = os.environ["UPSTREAM_BRANCH"]
+          upstream_owner = os.environ["UPSTREAM_OWNER"]
           upstream_repo = os.environ["UPSTREAM_REPO"]
           runner_temp = Path(os.environ["RUNNER_TEMP"])
-          body_path = runner_temp / "upstream-sync-body.md"
+          body_path = runner_temp / "upstream-audit-body.md"
 
           def git(*args: str, cwd: str | Path = ".") -> str:
-              return subprocess.check_output(
-                  ["git", *args],
-                  cwd=cwd,
-                  text=True,
-              ).strip()
+              return subprocess.check_output(["git", *args], cwd=cwd, text=True).strip()
 
-          def lines(command: list[str]) -> list[str]:
-              output = git(*command)
+          def lines(args: list[str]) -> list[str]:
+              output = git(*args)
               return [line for line in output.splitlines() if line.strip()]
 
           commit_lines = lines(
@@ -133,7 +152,6 @@ jobs:
           )
           file_rows = lines(["diff", "--name-status", f"{merge_base}..{upstream_sha}"])
           file_names = lines(["diff", "--name-only", f"{merge_base}..{upstream_sha}"])
-
           risk_prefixes = (
               ".github/workflows/",
               "contrib/chart/",
@@ -148,7 +166,7 @@ jobs:
               if path.startswith(risk_prefixes) or any(term in path.lower() for term in risk_terms)
           ]
 
-          probe_dir = Path(tempfile.mkdtemp(prefix="upstream-sync-merge-", dir=runner_temp))
+          probe_dir = Path(tempfile.mkdtemp(prefix="upstream-audit-merge-", dir=runner_temp))
           conflict_files: list[str] = []
           merge_failed = False
           try:
@@ -193,7 +211,6 @@ jobs:
           risky = [f"- `{path}`" for path in risk_files]
           conflicts = [f"- `{path}`" for path in conflict_files]
           compare_url = f"https://github.com/{upstream_repo}/compare/{merge_base}...{upstream_sha}"
-
           if conflict_files:
               merge_probe = f"Local merge probe found {len(conflict_files)} conflicting file(s)."
           elif merge_failed:
@@ -202,14 +219,20 @@ jobs:
               merge_probe = "No local merge conflicts detected."
 
           body = f"""## Summary
-          - sync `{upstream_repo}/{upstream_branch}` into `{base_branch}`
+          - compare `{upstream_repo}/{upstream_branch}` with `{base_branch}`
           - upstream HEAD: `{upstream_sha}`
           - base HEAD at generation: `{base_sha}`
-          - upstream commits not yet in `{base_branch}`: {len(commit_lines)}
+          - GitHub-verified upstream-only commits: {verified_count}
           - files changed upstream since merge-base: {len(file_rows)}
           - merge probe: {merge_probe}
 
-          This PR is intentionally human-in-the-loop. Merge it with a normal merge commit so TipLink-specific history stays intact.
+          This is a draft, untrusted cross-repository audit PR directly from
+          `{upstream_owner}:{upstream_branch}`. It deliberately does not copy upstream code
+          into a same-repository branch, so pull-request workflows receive the external-head
+          token/secret boundary before human review. Do not merge it directly when compatibility
+          work is required; create a reviewed integration branch pinned to the recorded upstream
+          SHA and preserve both histories. The moving PR head is not an integration input unless
+          the `Verify recorded upstream SHA and signatures` check matches this body and is green.
 
           ## Upstream Compare
           {compare_url}
@@ -226,51 +249,45 @@ jobs:
           ## Conflicts
           {limited(conflicts, limit=40)}
 
-          ## After Merge
-          - `publish-images.yml` should publish new `ghcr.io/tiplink/centaur/*` images.
-          - The existing promotion job should open or update the Fineas infra PR that bumps deployed image/chart pins.
-          - Merge the infra PR after reviewing the pins, then let Argo deploy.
+          ## Required integration audit
+          - Treat this PR as an upstream-delta signal, never deployment authorization.
+          - Classify every fork patch as retained, superseded upstream, migrated, or dropped with evidence.
+          - Re-run migration lineage, security-boundary, overlay, rollback-bridge, and immutable-descriptor gates.
+          - Roll out only through the reviewed Fineas infra PR DAG and operator acceptance stages.
 
-          Generated by the weekly upstream sync workflow from `{sync_branch}`.
+          Generated by the weekly upstream audit workflow.
           """
           body_path.write_text("\n".join(line.strip() for line in body.splitlines()) + "\n")
-          print(body_path)
           PY
 
-      - name: Open or update PR
-        if: steps.sync.outputs.changed == 'true'
+      - name: Open or update untrusted audit PR
+        if: steps.audit.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
           set -euo pipefail
-
-          title="chore: sync upstream Centaur"
-          body_file="${RUNNER_TEMP}/upstream-sync-body.md"
-          existing_pr="$(gh pr list \
-            --repo "$GITHUB_REPOSITORY" \
-            --head "$SYNC_BRANCH" \
-            --base "$BASE_BRANCH" \
-            --state open \
-            --json number \
+          body_file="${RUNNER_TEMP}/upstream-audit-body.md"
+          existing_pr="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${BASE_BRANCH}&head=${UPSTREAM_OWNER}:${UPSTREAM_BRANCH}&per_page=100" \
             --jq '.[0].number // empty')"
-
-          if [ -n "$existing_pr" ]; then
-            gh pr edit "$existing_pr" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$title" \
+          if [[ -n "$existing_pr" ]]; then
+            gh pr edit "$existing_pr" --repo "$GITHUB_REPOSITORY" \
+              --title "chore: audit current upstream Centaur" \
               --body-file "$body_file"
             pr_url="$(gh pr view "$existing_pr" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
           else
-            pr_url="$(gh pr create \
-              --repo "$GITHUB_REPOSITORY" \
-              --base "$BASE_BRANCH" \
-              --head "$SYNC_BRANCH" \
-              --title "$title" \
-              --body-file "$body_file")"
+            jq -n \
+              --arg title "chore: audit current upstream Centaur" \
+              --arg head "${UPSTREAM_OWNER}:${UPSTREAM_BRANCH}" \
+              --arg base "$BASE_BRANCH" \
+              --rawfile body "$body_file" \
+              '{title: $title, head: $head, base: $base, body: $body, draft: true}' \
+              >"${RUNNER_TEMP}/create-upstream-pr.json"
+            pr_url="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+              --input "${RUNNER_TEMP}/create-upstream-pr.json" --jq .html_url)"
           fi
-
           {
-            echo "### Upstream sync PR"
+            echo "### Upstream audit PR"
             echo
             echo "$pr_url"
           } >> "$GITHUB_STEP_SUMMARY"

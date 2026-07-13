@@ -137,22 +137,67 @@ pub enum SessionStatus {
     Archived,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxRepoCacheAccess {
+    None,
+    Public,
+    #[default]
+    All,
+}
+
+impl SandboxRepoCacheAccess {
+    pub const fn enabled(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Public => "public",
+            Self::All => "all",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "public" => Some(Self::Public),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    pub const fn from_legacy_enabled(enabled: bool) -> Self {
+        if enabled { Self::All } else { Self::None }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxCapabilities {
-    pub repo_cache_enabled: bool,
+    #[serde(default)]
+    pub repo_cache: SandboxRepoCacheAccess,
     pub observability_enabled: bool,
+    pub api_server_enabled: bool,
 }
 
 impl SandboxCapabilities {
     pub const fn default_enabled() -> Self {
         Self {
-            repo_cache_enabled: true,
+            repo_cache: SandboxRepoCacheAccess::All,
             observability_enabled: true,
+            api_server_enabled: true,
         }
     }
 
     pub const fn is_default_enabled(&self) -> bool {
-        self.repo_cache_enabled && self.observability_enabled
+        matches!(self.repo_cache, SandboxRepoCacheAccess::All)
+            && self.observability_enabled
+            && self.api_server_enabled
+    }
+
+    pub const fn repo_cache_enabled(&self) -> bool {
+        self.repo_cache.enabled()
     }
 }
 
@@ -165,7 +210,15 @@ impl Default for SandboxCapabilities {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub thread_key: ThreadKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub sandbox_id: Option<String>,
+    /// Digest binding the deployment boot-content generation to the sandbox
+    /// ID that received it. `None` is a legacy/untracked assignment; an older
+    /// rollback writer may also leave a stale `Some` after clearing/changing
+    /// `sandbox_id`, which fails ID-bound validation on the next forward turn.
+    #[serde(default)]
+    pub sandbox_content_revision: Option<String>,
     /// Capabilities applied to the currently assigned sandbox. `None` means the
     /// sandbox predates capability tracking; callers may treat it as compatible
     /// only with the default-enabled profile.
@@ -178,6 +231,10 @@ pub struct Session {
     /// iron-control principal OID this session's egress proxy binds to,
     /// captured at registration so a resumed session can recreate its sandbox.
     pub iron_control_principal: Option<String>,
+    /// Last meaningful activity for the currently assigned sandbox. This is
+    /// the eviction signal for capacity pressure and intentionally separate
+    /// from `updated_at`, which also changes for metadata/status writes.
+    pub sandbox_last_active_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }

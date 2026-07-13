@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{env, str::FromStr};
 
 use centaur_api_server::{
     client::{CentaurClient, SseEvent as ApiSseEvent, SseEventStream},
@@ -79,7 +79,12 @@ async fn main() -> Result<()> {
     if generated_thread_key {
         eprintln!("thread_key={}", thread_key.as_str());
     }
-    let client = CentaurClient::new(args.api_url.as_str());
+    let api_key = env::var("CENTAUR_API_KEY")
+        .or_else(|_| env::var("CENTAUR_CONTROL_API_KEY"))
+        .wrap_err(
+            "CENTAUR_API_KEY or CENTAUR_CONTROL_API_KEY is required for authenticated session API access",
+        )?;
+    let client = CentaurClient::new(args.api_url.as_str()).with_bearer_token(api_key);
 
     if attach_mode {
         let events = client

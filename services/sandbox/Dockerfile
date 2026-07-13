@@ -35,15 +35,17 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     google-api-python-client>=2.100.0 \
     google-auth-httplib2>=0.2.0 \
     google-auth-oauthlib>=1.2.0 \
+    feedparser>=6.0.0 \
     httplib2>=0.20.0 \
     httpx>=0.28.0 \
     opentelemetry-proto==1.42.1 \
     pysocks>=1.7.1 \
+    rich>=13.0.0 \
     slack-sdk==3.39.0 \
     tomli-w==1.2.0 \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
-# ── GitHub CLI + Node.js 24 (LTS) + Docker CLI + Terraform (single layer, cached) ─
+# ── GitHub CLI + Node.js 24 + Docker CLI + Terraform (single layer) ──────────
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -60,6 +62,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
       | tee /etc/apt/sources.list.d/hashicorp.list > /dev/null \
     && apt-get update && apt-get install -y --no-install-recommends gh nodejs docker-ce-cli terraform \
+    && terraform version \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info
 
 # ── Non-root agent user ─────────────────────────────────────────────────────
@@ -111,6 +114,7 @@ RUN set -eux; \
 
 # ── Global npm CLIs (root) ──────────────────────────────────────────────────
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/home/agent/.local/bin/centaur-agent-browser-chromium
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm install -g --prefer-online --force \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
@@ -123,9 +127,12 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
     && playwright --version | grep -F "${PLAYWRIGHT_VERSION}" \
+    && agent-browser --version | grep -F "0.26.0" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
 
 # ── Browser automation deps (must run as root before USER agent) ─────────────
+# Playwright's headless shell provides a native browser on both amd64 and arm64.
+# agent-browser still installs its preferred Chrome build on amd64 below.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     playwright install --with-deps --only-shell chromium \
@@ -143,11 +150,13 @@ ARG BUN_VERSION=bun-v1.3.13
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --profile minimal --component rustfmt --component clippy \
+      | sh -s -- -y --profile minimal --default-toolchain nightly --component rustfmt --component clippy \
+    && rustup toolchain install stable --profile minimal \
     && rustc --version \
     && cargo --version \
-    && rustfmt --version \
-    && clippy-driver --version \
+    && cargo +stable --version \
+    && cargo +nightly fmt --version \
+    && cargo +nightly clippy --version \
     && rm -rf "$HOME/.rustup/toolchains"/*/share/doc "$HOME/.rustup/toolchains"/*/share/man
 RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,target=/home/agent/.cargo/git,uid=1001,gid=1001,sharing=locked \
@@ -181,25 +190,40 @@ RUN set -eux; \
     rm -f /tmp/amp.sha256; \
     amp --version >/dev/null
 
-# ── agent-browser: download Chrome binary (runs as agent, deps already installed) ─
-RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
-      agent-browser install; \
-    fi
+# ── agent-browser: bind a native browser on both deployment architectures ───
+RUN set -eux; \
+    mkdir -p "$HOME/.local/bin"; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) \
+        agent-browser install; \
+        browser="$(find "$HOME/.agent-browser/browsers" \
+          -type f -path '*/chrome-*/chrome' -print -quit)" ;; \
+      arm64) \
+        browser="$(find "$PLAYWRIGHT_BROWSERS_PATH" \
+          -type f -path '*/chrome-linux/headless_shell' -print -quit)" ;; \
+      *) echo unsupported-architecture >&2; exit 1 ;; \
+    esac; \
+    test -n "$browser"; \
+    test -x "$browser"; \
+    ln -sf "$browser" "$AGENT_BROWSER_EXECUTABLE_PATH"; \
+    "$AGENT_BROWSER_EXECUTABLE_PATH" --version
 
 # ── Agent skills + workspace setup (rarely changes) ─────────────────────────
 RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked \
     npx -y skills add vercel-labs/agent-browser
+# git-branch configures each writable clone with the publishing GitHub account.
+# A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
 RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
     && git config --global init.defaultBranch main \
     && git config --global push.autoSetupRemote true \
+    && git config --global core.hooksPath /opt/centaur/git-hooks \
     && git config --global --add safe.directory '*' \
-    && git config --global user.name "Centaur AI" \
-    && git config --global user.email "ai@centaur.local"
+    && git config --global user.useConfigOnly true
 
 # ==============================================================================
 # Final thin stage: only frequently-changing local files below.
-# Changing harness_session.py / SYSTEM_PROMPT.md / entrypoint.sh / config helpers
-# rebuilds only the COPY layers — the entire toolchain stage stays cached.
+# Changing harness_session.py / SYSTEM_PROMPT.md / entrypoint.sh rebuilds only
+# the COPY layers — the entire toolchain stage stays cached.
 # ==============================================================================
 
 FROM toolchain AS sandbox
@@ -211,30 +235,33 @@ RUN rm -f /etc/sudoers.d/agent
 # Pre-create it as 0755 so the agent user can traverse into it at runtime.
 RUN install -d -m 0755 /etc/centaur /opt/centaur
 COPY --link centaur_sdk/ /opt/centaur/centaur_sdk/
+COPY --link --chmod=0755 services/sandbox/git-hooks/ /opt/centaur/git-hooks/
 COPY --link --chown=1001:1001 tools/ /opt/centaur/tools/
 COPY --link --chmod=644 services/sandbox/codex-auth.json /etc/centaur/codex-auth.default.json
 COPY --link --chmod=644 services/sandbox/claude-credentials.json /etc/centaur/claude-credentials.default.json
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/workflow-python/workflow_host.py /usr/local/bin/workflow-host
+COPY --link services/workflow-python/api/ /usr/local/bin/api/
 COPY --link --chmod=755 services/sandbox/git-branch.sh /usr/local/bin/git-branch
 COPY --link --chmod=755 services/sandbox/install_tool_shims.py /usr/local/bin/install-tool-shims
+COPY --link --chmod=755 services/sandbox/centaur_tool_host.py /usr/local/bin/centaur-tool-host
+COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-cache-sync
+COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
+COPY --link --chmod=755 services/sandbox/select_overlay_prompt.sh /usr/local/bin/select-overlay-prompt
 COPY --link --chmod=755 services/sandbox/configure_codex_config.py /usr/local/bin/configure-codex-config
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
+COPY --link --chown=1001:1001 crates/harness-server/ /opt/centaur/harness-server-src/
 
 USER agent
 WORKDIR /home/agent
 
-# Build from a bind mount instead of COPY: COPY --link into /tmp rebuilds the
-# parent directory chain in its own layer, clobbering /tmp's root:root 1777
-# sticky metadata with agent:agent 0755, which broke /tmp writes for any
-# non-1001 user (e.g. the root-with-dropped-caps repo-cache). A bind mount
-# leaves no trace in the image and caches on source content just like COPY.
-RUN --mount=type=bind,source=crates/harness-server,target=/harness-server-src \
-    --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
+# Keep harness-server source as a real image input so crate changes invalidate
+# the install layer. Do not COPY into /tmp; that can clobber /tmp's sticky bit.
+RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,target=/home/agent/.cargo/git,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,target=/home/agent/.cache/harness-server-target,uid=1001,gid=1001,sharing=locked \
     CARGO_TARGET_DIR=/home/agent/.cache/harness-server-target \
-    cargo install --locked --path /harness-server-src --root /home/agent/.local
+    cargo install --locked --path /opt/centaur/harness-server-src --root /home/agent/.local
 
 # No RUN instructions after these — all repo-local content at the very end.
 COPY --link --chown=1001:1001 .agents/skills/ /home/agent/.agents/skills/
@@ -244,4 +271,4 @@ COPY --link --chown=1001:1001 services/sandbox/SYSTEM_PROMPT.md /home/agent/AGEN
 
 ENTRYPOINT ["/entrypoint.sh"]
 # Default CMD uses Rust blocks mode; pass --mode=jsonrpc for raw App Server JSON-RPC.
-CMD ["harness-server", "claude-code"]
+CMD ["harness-server", "codex"]

@@ -37,7 +37,6 @@ def test_credential_status_does_not_treat_stub_placeholders_as_present():
     configure(StubBackend())
     status = PreqinClient().credential_status()
 
-    assert status["PREQIN_OPERATIONAL_TOKEN"]["present"] is False
     assert status["PREQIN_USERNAME"]["present"] is False
     assert status["PREQIN_API_KEY"]["present"] is False
 
@@ -67,7 +66,7 @@ def test_operational_get_uses_proxy_token_placeholder_before_direct_auth():
     assert fake.gets[0]["headers"]["Authorization"] == f"Bearer {OPERATIONAL_TOKEN_PLACEHOLDER}"
 
 
-def test_operational_get_without_proxy_token_or_direct_credentials_sends_no_auth(monkeypatch):
+def test_operational_get_without_proxy_token_or_direct_credentials_leaves_auth_to_proxy(monkeypatch):
     monkeypatch.setenv(OPERATIONAL_TOKEN_PLACEHOLDER, "")
     configure(StubBackend())
     fake = FakeHttpClient()
@@ -80,7 +79,8 @@ def test_operational_get_without_proxy_token_or_direct_credentials_sends_no_auth
     assert fake.gets[0]["headers"] == {"Accept": "application/json"}
 
 
-def test_auth_health_uses_proxy_token_placeholder_without_direct_credentials():
+def test_auth_health_uses_injected_auth_without_direct_credentials(monkeypatch):
+    monkeypatch.setenv(OPERATIONAL_TOKEN_PLACEHOLDER, "")
     configure(StubBackend())
     fake = FakeHttpClient()
     client = PreqinClient()
@@ -93,7 +93,7 @@ def test_auth_health_uses_proxy_token_placeholder_without_direct_credentials():
     assert not fake.posts
     assert fake.gets[0]["url"] == "https://api.preqin.com/api/FundManager"
     assert fake.gets[0]["params"] == {"Size": 1, "Page": 1}
-    assert fake.gets[0]["headers"]["Authorization"] == f"Bearer {OPERATIONAL_TOKEN_PLACEHOLDER}"
+    assert fake.gets[0]["headers"] == {"Accept": "application/json"}
 
 
 def test_auth_health_uses_direct_credentials_for_local_runs(monkeypatch):

@@ -9,6 +9,10 @@ pub struct SourcePolicy {
     pub kind: SourceKind,
     pub op_vault: String,
     pub ttl: String,
+    /// Prefix applied to Kubernetes Secret keys exposed through envFrom.
+    /// Placeholder names remain canonical in tool manifests; env-backed
+    /// iron-control sources resolve the actual prefixed environment key.
+    pub env_prefix: String,
 }
 
 impl SourcePolicy {
@@ -24,11 +28,17 @@ impl SourcePolicy {
         Self::new(SourceKind::OnePasswordConnect, op_vault, ttl)
     }
 
+    pub fn with_env_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.env_prefix = prefix.into();
+        self
+    }
+
     fn new(kind: SourceKind, op_vault: impl Into<String>, ttl: impl Into<String>) -> Self {
         Self {
             kind,
             op_vault: op_vault.into(),
             ttl: ttl.into(),
+            env_prefix: String::new(),
         }
     }
 }

@@ -1,19 +1,10 @@
-{{- $hasSlackbotV2 := .Values.slackbotv2.enabled -}}
-{{- $hasLinearbot := .Values.linearbot.enabled -}}
-{{- if and .Values.ingress.enabled (or $hasSlackbotV2 $hasLinearbot) }}
-{{- if and .Values.ingress.defaultBackend $hasSlackbotV2 $hasLinearbot }}
-{{- fail "ingress.defaultBackend cannot be used when both slackbotv2.enabled and linearbot.enabled are true; set ingress.defaultBackend=false to render path rules" }}
-{{- end }}
-{{- $ingressComponent := "slackbotv2" -}}
-{{- if and (not $hasSlackbotV2) $hasLinearbot -}}
-{{- $ingressComponent = "linearbot" -}}
-{{- end -}}
+{{- if and .Values.ingress.enabled (or .Values.slackbotv2.enabled .Values.linearbot.enabled .Values.githubbot.enabled) }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "centaur.componentName" (dict "root" . "component" $ingressComponent) }}
+  name: {{ include "centaur.componentName" (dict "root" . "component" "slackbotv2") }}
   labels:
-{{ include "centaur.componentLabels" (dict "root" . "component" $ingressComponent) | nindent 4 }}
+{{ include "centaur.componentLabels" (dict "root" . "component" "slackbotv2") | nindent 4 }}
   {{- with .Values.ingress.annotations }}
   annotations:
 {{ toYaml . | nindent 4 }}
@@ -25,7 +16,7 @@ spec:
   {{- if .Values.ingress.defaultBackend }}
   defaultBackend:
     service:
-      name: {{ include "centaur.componentName" (dict "root" . "component" $ingressComponent) }}
+      name: {{ include "centaur.componentName" (dict "root" . "component" "slackbotv2") }}
       port:
         number: 3001
   {{- else }}
@@ -35,7 +26,7 @@ spec:
       {{- end }}
       http:
         paths:
-{{- if $hasLinearbot }}
+{{- if .Values.linearbot.enabled }}
           # Linear webhook deliveries route to the linearbot; everything else
           # stays with slackbotv2 (the catch-all below). Funnel-style
           # defaultBackend ingresses cannot route both — use httpRoutes or a
@@ -48,7 +39,18 @@ spec:
                 port:
                   number: 3001
 {{- end }}
-{{- if $hasSlackbotV2 }}
+{{- if .Values.githubbot.enabled }}
+          # GitHub webhook deliveries (issue/PR comments + review requests) route
+          # to the githubbot.
+          - path: /api/webhooks/github
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.componentName" (dict "root" . "component" "githubbot") }}
+                port:
+                  number: 3001
+{{- end }}
+{{- if .Values.slackbotv2.enabled }}
           - path: /
             pathType: Prefix
             backend:

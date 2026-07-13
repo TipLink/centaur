@@ -1,41 +1,5 @@
-diff --git a/dist/index.d.ts b/dist/index.d.ts
-index 2a2330e6fd397fb18b42242fedef682fd57122e8..ce6f6569198bcb81708cdc7e4f68d8edb117f594 100644
---- a/dist/index.d.ts
-+++ b/dist/index.d.ts
-@@ -232,6 +232,9 @@ interface SlackOAuthCallbackOptions {
- }
- /** Slack-specific thread ID data */
- interface SlackThreadId {
-+    teamId?: string;
-+    team?: string;
-+    team_id?: string;
-     channel: string;
-     threadTs: string;
- }
-@@ -904,6 +907,10 @@ declare class SlackAdapter implements Adapter<SlackThreadId, unknown> {
-      */
-     getChannelVisibility(threadId: string): ChannelVisibility;
-     decodeThreadId(threadId: string): SlackThreadId;
-+    protected decodeChannelId(channelId: string): {
-+        teamId?: string;
-+        channel: string;
-+    };
-     parseMessage(raw: SlackEvent): Message<unknown>;
-     /**
-      * Synchronous message parsing without user lookup.
-@@ -919,8 +926,8 @@ declare class SlackAdapter implements Adapter<SlackThreadId, unknown> {
-      * Fetch channel-level messages (conversations.history, not thread replies).
-      */
-     fetchChannelMessages(channelId: string, options?: FetchOptions): Promise<FetchResult<unknown>>;
--    protected fetchChannelMessagesForward(channel: string, limit: number, cursor?: string): Promise<FetchResult<unknown>>;
--    protected fetchChannelMessagesBackward(channel: string, limit: number, cursor?: string): Promise<FetchResult<unknown>>;
-+    protected fetchChannelMessagesForward(channel: string, teamId: string | undefined, limit: number, cursor?: string): Promise<FetchResult<unknown>>;
-+    protected fetchChannelMessagesBackward(channel: string, teamId: string | undefined, limit: number, cursor?: string): Promise<FetchResult<unknown>>;
-     /**
-      * List threads in a Slack channel.
-      * Fetches channel history and filters for messages with replies.
 diff --git a/dist/index.js b/dist/index.js
-index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a3fb0efba 100644
+index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f32ccc951 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -31,6 +31,216 @@ import {
@@ -255,19 +219,41 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a
  
  // src/cards.ts
  import {
-@@ -1472,6 +1682,7 @@ var SlackAdapter = class _SlackAdapter {
-       return;
-     }
-     const threadId = channel && (threadTs || messageTs) ? this.encodeThreadId({
-+      teamId: payload.team?.id || payload.container?.team_id,
-       channel,
-       threadTs: threadTs || messageTs || ""
-     }) : "";
-@@ -2001,10 +2212,14 @@ var SlackAdapter = class _SlackAdapter {
-     const isDM = event.channel_type === "im";
-     const threadTs = isDM ? event.thread_ts || "" : event.thread_ts || event.ts;
-     const threadId = this.encodeThreadId({
-+      teamId: event.team_id || event.team,
+@@ -352,6 +562,15 @@ import {
+ } from "chat";
+ var BARE_MENTION_PATTERN = /(?<![<\w/])@(\w+)/g;
+ var URL_PATTERN = /\bhttps?:\/\/[^\s<>]+/g;
++function plainTextPreservingBlocks(node) {
++  if (node.type === "root" || node.type === "blockquote") {
++    return getNodeChildren(node).map(plainTextPreservingBlocks).filter(Boolean).join(node.type === "root" ? "\n\n" : "\n");
++  }
++  if (node.type === "list" || node.type === "listItem") {
++    return getNodeChildren(node).map(plainTextPreservingBlocks).filter(Boolean).join("\n");
++  }
++  return toPlainText(node);
++}
+ var SlackFormatConverter = class extends BaseFormatConverter {
+   /**
+    * Render an AST to standard markdown. Slack accepts this directly via
+@@ -366,6 +585,17 @@ var SlackFormatConverter = class extends BaseFormatConverter {
+   toAst(mrkdwn) {
+     return parseMarkdown(slackMrkdwnToMarkdown(mrkdwn));
+   }
++  /**
++   * Extract plain text for incoming `message` events. The base implementation
++   * flattens the whole AST with mdast-util-to-string, which concatenates
++   * sibling block nodes with NO separator: `--model=fable\n\nexamine ...`
++   * became `--model=fableexamine ...`, gluing every paragraph boundary in the
++   * message. Preserve block boundaries instead — paragraphs join with a blank
++   * line, list items and blockquote lines with a newline.
++   */
++  extractPlainText(mrkdwn) {
++    return plainTextPreservingBlocks(this.toAst(mrkdwn));
++  }
+   /**
+    * Build the Slack API payload fields for a message.
+    *
+@@ -2004,7 +2234,10 @@ var SlackAdapter = class _SlackAdapter {
        channel: event.channel,
        threadTs
      });
@@ -279,39 +265,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a
      const factory = async () => {
        const msg = await this.parseSlackMessage(event, threadId);
        if (isMention) {
-@@ -2090,6 +2305,7 @@ var SlackAdapter = class _SlackAdapter {
-       );
-     }
-     const threadId = this.encodeThreadId({
-+      teamId: event.team_id || event.team,
-       channel: event.item.channel,
-       threadTs: parentTs
-     });
-@@ -2137,6 +2353,7 @@ var SlackAdapter = class _SlackAdapter {
-     }
-     const { channel_id, thread_ts, user_id, context } = event.assistant_thread;
-     const threadId = this.encodeThreadId({
-+      teamId: context?.team_id,
-       channel: channel_id,
-       threadTs: thread_ts
-     });
-@@ -2177,6 +2394,7 @@ var SlackAdapter = class _SlackAdapter {
-     }
-     const { channel_id, thread_ts, user_id, context } = event.assistant_thread;
-     const threadId = this.encodeThreadId({
-+      teamId: context?.team_id,
-       channel: channel_id,
-       threadTs: thread_ts
-     });
-@@ -2233,6 +2451,7 @@ var SlackAdapter = class _SlackAdapter {
-       {
-         userId: event.user,
-         channelId: this.encodeThreadId({
-+          teamId: event.team,
-           channel: event.channel,
-           threadTs: ""
-         }),
-@@ -2520,10 +2739,10 @@ var SlackAdapter = class _SlackAdapter {
+@@ -2520,10 +2753,10 @@ var SlackAdapter = class _SlackAdapter {
        formatted: this.formatConverter.toAst(text),
        raw: event,
        author: {
@@ -324,7 +278,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a
          isMe
        },
        metadata: {
-@@ -3452,26 +3671,251 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3452,26 +3685,251 @@ var SlackAdapter = class _SlackAdapter {
      }
      this.logger.debug("Slack: starting stream", { channel, threadTs });
      const token = await this.getToken();
@@ -585,7 +539,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a
      const sendStructuredChunk = async (chunk) => {
        if (!structuredChunksSupported) {
          return;
-@@ -3481,8 +3925,45 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3481,8 +3939,45 @@ var SlackAdapter = class _SlackAdapter {
        await flushMarkdownDelta(delta);
        lastAppended = committable;
        try {
@@ -632,7 +586,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a
          structuredChunksSupported = false;
          this.logger.warn(
            "Structured streaming chunk failed, falling back to text-only streaming. Ensure your Slack app manifest includes assistant_view, assistant:write scope, and @slack/web-api >= 7.14.0",
-@@ -3497,31 +3978,91 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3497,31 +3992,91 @@ var SlackAdapter = class _SlackAdapter {
        await flushMarkdownDelta(delta);
        lastAppended = committable;
      };
@@ -652,7 +606,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a
 +        } else {
 +          await sendStructuredChunk(chunk);
 +        }
-+      }
+       }
 +      renderer.finish();
 +      const finalCommittable = renderer.getCommittableText();
 +      const finalDelta = finalCommittable.slice(lastAppended.length);
@@ -715,7 +669,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a
 +            error: stopError
 +          });
 +        }
-       }
++      }
 +      annotateSlackAnswerLost(error, !sourceConsumed || answerStopFailed);
 +      throw error;
      }
@@ -743,67 +697,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a
      };
    }
    /**
-@@ -3729,7 +4270,7 @@ var SlackAdapter = class _SlackAdapter {
-     }
-   }
-   encodeThreadId(platformData) {
--    return `slack:${platformData.channel}:${platformData.threadTs}`;
-+    return `slack:${platformData.channel}:${platformData.threadTs}`;
-   }
-   /**
-    * Check if a thread is a direct message conversation.
-@@ -3762,21 +4304,49 @@ var SlackAdapter = class _SlackAdapter {
-   }
-   decodeThreadId(threadId) {
-     const parts = threadId.split(":");
--    if (parts.length < 2 || parts.length > 3 || parts[0] !== "slack") {
-+    if (parts.length < 2 || parts.length > 4 || parts[0] !== "slack") {
-       throw new ValidationError(
-         "slack",
-         `Invalid Slack thread ID: ${threadId}`
-       );
-     }
-+    if (parts.length === 4) {
-+      return {
-+        teamId: parts[1],
-+        team: parts[1],
-+        team_id: parts[1],
-+        channel: parts[2],
-+        threadTs: parts[3]
-+      };
-+    }
-     return {
-       channel: parts[1],
-       threadTs: parts.length === 3 ? parts[2] : ""
-     };
-   }
-+  decodeChannelId(channelId) {
-+    const parts = channelId.split(":");
-+    if (parts.length === 3 && parts[0] === "slack") {
-+      return {
-+        teamId: parts[1],
-+        channel: parts[2]
-+      };
-+    }
-+    if (parts.length === 2 && parts[0] === "slack") {
-+      return {
-+        channel: parts[1]
-+      };
-+    }
-+    throw new ValidationError(
-+      "slack",
-+      `Invalid Slack channel ID: ${channelId}`
-+    );
-+  }
-   parseMessage(raw) {
-     const event = raw;
-     const threadTs = event.thread_ts || event.ts || "";
-     const threadId = this.encodeThreadId({
-+      teamId: event.team_id || event.team,
-       channel: event.channel || "",
-       threadTs
-     });
-@@ -3798,10 +4368,10 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3798,10 +4353,10 @@ var SlackAdapter = class _SlackAdapter {
        formatted: this.formatConverter.toAst(text),
        raw: event,
        author: {
@@ -816,145 +710,3 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..82c1259a0726d66da5bb2665d8708e8a
          isMe
        },
        metadata: {
-@@ -3823,32 +4393,28 @@ var SlackAdapter = class _SlackAdapter {
-    * Slack thread IDs are "slack:CHANNEL:THREAD_TS", channel ID is "slack:CHANNEL".
-    */
-   channelIdFromThreadId(threadId) {
--    const { channel } = this.decodeThreadId(threadId);
--    return `slack:${channel}`;
-+    const { teamId, channel } = this.decodeThreadId(threadId);
-+    return teamId ? `slack:${teamId}:${channel}` : `slack:${channel}`;
-   }
-   /**
-    * Fetch channel-level messages (conversations.history, not thread replies).
-    */
-   async fetchChannelMessages(channelId, options = {}) {
--    const channel = channelId.split(":")[1];
--    if (!channel) {
--      throw new ValidationError(
--        "slack",
--        `Invalid Slack channel ID: ${channelId}`
--      );
--    }
-+    const { teamId, channel } = this.decodeChannelId(channelId);
-     const direction = options.direction ?? "backward";
-     const limit = options.limit || 100;
-     try {
-       if (direction === "forward") {
-         return await this.fetchChannelMessagesForward(
-           channel,
-+          teamId,
-           limit,
-           options.cursor
-         );
-       }
-       return await this.fetchChannelMessagesBackward(
-         channel,
-+        teamId,
-         limit,
-         options.cursor
-       );
-@@ -3856,7 +4422,7 @@ var SlackAdapter = class _SlackAdapter {
-       this.handleSlackError(error);
-     }
-   }
--  async fetchChannelMessagesForward(channel, limit, cursor) {
-+  async fetchChannelMessagesForward(channel, teamId, limit, cursor) {
-     this.logger.debug("Slack API: conversations.history (forward)", {
-       channel,
-       limit,
-@@ -3874,7 +4440,11 @@ var SlackAdapter = class _SlackAdapter {
-     const messages = await Promise.all(
-       slackMessages.map((msg) => {
-         const threadTs = msg.thread_ts || msg.ts || "";
--        const threadId = `slack:${channel}:${threadTs}`;
-+        const threadId = this.encodeThreadId({
-+          teamId: teamId || msg.team_id || msg.team,
-+          channel,
-+          threadTs
-+        });
-         return this.parseSlackMessage(msg, threadId, {
-           skipSelfMention: false
-         });
-@@ -3892,7 +4462,7 @@ var SlackAdapter = class _SlackAdapter {
-       nextCursor
-     };
-   }
--  async fetchChannelMessagesBackward(channel, limit, cursor) {
-+  async fetchChannelMessagesBackward(channel, teamId, limit, cursor) {
-     this.logger.debug("Slack API: conversations.history (backward)", {
-       channel,
-       limit,
-@@ -3911,7 +4481,11 @@ var SlackAdapter = class _SlackAdapter {
-     const messages = await Promise.all(
-       chronological.map((msg) => {
-         const threadTs = msg.thread_ts || msg.ts || "";
--        const threadId = `slack:${channel}:${threadTs}`;
-+        const threadId = this.encodeThreadId({
-+          teamId: teamId || msg.team_id || msg.team,
-+          channel,
-+          threadTs
-+        });
-         return this.parseSlackMessage(msg, threadId, {
-           skipSelfMention: false
-         });
-@@ -3934,13 +4508,7 @@ var SlackAdapter = class _SlackAdapter {
-    * Fetches channel history and filters for messages with replies.
-    */
-   async listThreads(channelId, options = {}) {
--    const channel = channelId.split(":")[1];
--    if (!channel) {
--      throw new ValidationError(
--        "slack",
--        `Invalid Slack channel ID: ${channelId}`
--      );
--    }
-+    const { teamId, channel } = this.decodeChannelId(channelId);
-     const limit = options.limit || 50;
-     try {
-       this.logger.debug("Slack API: conversations.history (listThreads)", {
-@@ -3964,7 +4532,11 @@ var SlackAdapter = class _SlackAdapter {
-       const threads = await Promise.all(
-         selected.map(async (msg) => {
-           const threadTs = msg.ts || "";
--          const threadId = `slack:${channel}:${threadTs}`;
-+          const threadId = this.encodeThreadId({
-+            teamId: teamId || msg.team_id || msg.team,
-+            channel,
-+            threadTs
-+          });
-           const rootMessage = await this.parseSlackMessage(msg, threadId, {
-             skipSelfMention: false
-           });
-@@ -3989,13 +4561,7 @@ var SlackAdapter = class _SlackAdapter {
-    * Fetch Slack channel info/metadata.
-    */
-   async fetchChannelInfo(channelId) {
--    const channel = channelId.split(":")[1];
--    if (!channel) {
--      throw new ValidationError(
--        "slack",
--        `Invalid Slack channel ID: ${channelId}`
--      );
--    }
-+    const { channel } = this.decodeChannelId(channelId);
-     try {
-       this.logger.debug("Slack API: conversations.info (channel)", { channel });
-       const result = await this._client.conversations.info(
-@@ -4032,14 +4598,8 @@ var SlackAdapter = class _SlackAdapter {
-    * Post a top-level message to a channel (not in a thread).
-    */
-   async postChannelMessage(channelId, message) {
--    const channel = channelId.split(":")[1];
--    if (!channel) {
--      throw new ValidationError(
--        "slack",
--        `Invalid Slack channel ID: ${channelId}`
--      );
--    }
--    const syntheticThreadId = `slack:${channel}:`;
-+    const { teamId, channel } = this.decodeChannelId(channelId);
-+    const syntheticThreadId = this.encodeThreadId({ teamId, channel, threadTs: "" });
-     return await this.postMessage(syntheticThreadId, message);
-   }
-   renderFormatted(content) {

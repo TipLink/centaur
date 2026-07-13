@@ -33,22 +33,6 @@ WEBHOOKS = [
         "trigger_key": {"type": "header", "header": "X-GitHub-Delivery"},
         "allowed_methods": ["POST"],
         "allowed_content_types": ["application/json", "application/x-www-form-urlencoded"],
-        "filter": {
-            "all": [
-                {
-                    "source": "header",
-                    "key": "x-github-event",
-                    "op": "equals",
-                    "value": "issues",
-                },
-                {
-                    "source": "body",
-                    "key": "action",
-                    "op": "in",
-                    "values": ["opened", "reopened"],
-                },
-            ]
-        },
     }
 ]
 

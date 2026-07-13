@@ -52,8 +52,16 @@ https://api.acme.com/api/webhooks/slack
 The webhook does not use a Centaur API key. Slack signs every request with
 `X-Slack-Signature` and `X-Slack-Request-Timestamp`; the Slackbot validates that
 HMAC signature with `SLACK_SIGNING_SECRET` before it routes the event to the API.
-After validation, the Slackbot calls Centaur's agent API with
+After validation, the Slackbot calls Centaur's api-rs session API with
 `SLACKBOT_API_KEY`.
+
+Ingress bot keys are session-API service credentials; they are not global
+operator credentials or per-channel authorization. Administrative data routes, workflow administration,
+and fleet-wide operations such as sandbox drain require the distinct
+`CENTAUR_CONTROL_API_KEY`. Sandbox tools never receive that key. The optional
+feedback tool instead combines `SLACK_FEEDBACK_API_KEY` with its Console JWT;
+the API binds each `feedback-improvement:*` session to that caller's existing
+principal and capabilities.
 
 During a Slack delivery, the API owns the execution state while Slackbot owns
 Slack rendering: opening or updating the thread UI, streaming chunks, rendering

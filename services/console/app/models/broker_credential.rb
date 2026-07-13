@@ -18,15 +18,13 @@ class BrokerCredential < ApplicationRecord
 
   include ForeignIdCollisionGuard
 
-  GITHUB_APP_INSTALLATION = "github_app_installation"
+  GITHUB_APP_INSTALLATION = Broker::CredentialGrants::GITHUB_APP_INSTALLATION
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
 
   PREQIN_TOKEN_ENDPOINT = Broker::CredentialGrants::PREQIN_TOKEN_ENDPOINT
-  GRANTS = (Broker::CredentialGrants::GRANTS + [ GITHUB_APP_INSTALLATION ]).uniq.freeze
-  REFRESHABLE_WITHOUT_TOKEN_GRANTS =
-    (Broker::CredentialGrants::REFRESHABLE_WITHOUT_TOKEN_GRANTS + [ GITHUB_APP_INSTALLATION ]).uniq.freeze
+  GRANTS = Broker::CredentialGrants::GRANTS
 
   # The access token must keep at least this much life past the scheduled
   # refresh, regardless of slack/fraction. Mirrors the 60s floor in
@@ -76,7 +74,7 @@ class BrokerCredential < ApplicationRecord
       .where("(\"broker_credentials\".\"grant\" = ? AND " \
              "(last_refresh IS NULL OR refresh_token IS NOT NULL)) OR " \
              "\"broker_credentials\".\"grant\" IN (?)",
-             "refresh_token", REFRESHABLE_WITHOUT_TOKEN_GRANTS)
+             "refresh_token", Broker::CredentialGrants::REFRESHABLE_WITHOUT_TOKEN_GRANTS)
       .where("next_attempt_at IS NULL OR next_attempt_at <= ?", Time.current)
   }
 
@@ -87,8 +85,7 @@ class BrokerCredential < ApplicationRecord
   validates :token_endpoint, presence: true
   # client_id is sourced from the linked OauthApp for flow-minted credentials, so
   # it is only required for standalone grants whose strategy uses it.
-  validates :client_id, presence: true,
-            if: -> { github_app_installation? || Broker::CredentialGrants.client_id_required?(self) }
+  validates :client_id, presence: true, if: -> { Broker::CredentialGrants.client_id_required?(self) }
   validates :external_user_key, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE },
             length: { maximum: 128 }, allow_nil: true
   validates :early_refresh_fraction,
@@ -99,7 +96,6 @@ class BrokerCredential < ApplicationRecord
   validate :scopes_is_an_array
   validate :grant_credentials_present
   validate :token_endpoint_headers_valid
-  validate :github_app_private_key_present
 
   # OAuth client identity used for refresh. Flow-minted credentials delegate to
   # their OauthApp so a client-secret rotation on the app applies to every
@@ -121,6 +117,10 @@ class BrokerCredential < ApplicationRecord
   # attr_writer and the strategy registry can stay outside the ActiveRecord model.
   def refresh_client
     @refresh_client ||= Broker::RefreshClient.new
+  end
+
+  def github_app_client
+    @github_app_client ||= Broker::GithubAppInstallationClient.new
   end
 
   def refresh_scopes_for_provider
@@ -183,26 +183,9 @@ class BrokerCredential < ApplicationRecord
     PrincipalCredentialReconciliation.new.apply_for_credential(self)
   end
 
-  def github_app_client
-    @github_app_client ||= Broker::GithubAppInstallationClient.new
-  end
-
   def perform_refresh(now:)
-    if github_app_installation?
-      result = github_app_client.mint(
-        token_endpoint: token_endpoint,
-        app_id: effective_client_id,
-        private_key_pem: effective_client_secret,
-        timeout: refresh_timeout_seconds,
-        now: now
-      )
-      return Broker::CredentialGrants::Outcome.new(result: result, clear_refresh_token: true, dead_reason: nil)
-    end
-
-    Broker::CredentialGrants.refresh(self)
+    Broker::CredentialGrants.refresh(self, now: now)
   end
-
-  def github_app_installation? = grant == GITHUB_APP_INSTALLATION
 
   def apply_success!(result, now:, clear_refresh_token:)
     expires_in = result.expires_in&.positive? ? result.expires_in : DEFAULT_EXPIRES_IN_SECONDS
@@ -275,8 +258,6 @@ class BrokerCredential < ApplicationRecord
   end
 
   def grant_credentials_present
-    return if github_app_installation?
-
     Broker::CredentialGrants.validate(self)
   end
 
@@ -285,12 +266,6 @@ class BrokerCredential < ApplicationRecord
     valid = token_endpoint_headers.is_a?(Hash) &&
             token_endpoint_headers.all? { |k, v| k.is_a?(String) && v.is_a?(String) }
     errors.add(:token_endpoint_headers, "must be an object mapping header names to string values") unless valid
-  end
-
-  def github_app_private_key_present
-    return unless github_app_installation?
-
-    errors.add(:client_secret, "can't be blank for a GitHub App installation credential") if effective_client_secret.blank?
   end
 
   def default_preqin_token_endpoint

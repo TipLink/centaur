@@ -43,11 +43,10 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
 
     body = json_body
     assert_match(/\Asha256:[0-9a-f]{64}\z/, body.fetch("config_hash"))
-    assert_equal "120s", body.dig("proxy", "upstream_response_header_timeout")
     secrets = body.fetch("secrets")
     assert_equal 2, secrets.length
 
-    # Unsupported top-level fields stay absent so the proxy no-ops on them.
+    # Omitted top-level fields stay absent so the proxy no-ops on them.
     refute body.key?("rules")
     refute body.key?("mcp")
     refute body.key?("ingest_token")
@@ -67,22 +66,6 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
       "SELECT payload FROM principal_sync_config_snapshots WHERE id = #{snapshot.id}"
     )
     refute_includes raw, "s3cr3t-db-pass"
-  end
-
-  test "sync overlays managed proxy settings onto cached snapshots" do
-    legacy_payload = Principal::EMPTY_CONFIG.deep_dup
-    legacy_payload.delete("proxy")
-
-    PrincipalSyncConfigSnapshot.create!(
-      principal: @proxy.principal,
-      principal_cache_version: @proxy.principal.sync_config_cache_version,
-      payload: legacy_payload
-    )
-
-    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
-    assert_response :ok
-
-    assert_equal "120s", json_body.dig("proxy", "upstream_response_header_timeout")
   end
 
   test "secret changes bump principal cache version and build a new snapshot" do
@@ -321,6 +304,61 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     assert_equal "PROD_API_KEY", bumped.last
   end
 
+  test "infra role delivers the built-in GitHub broker replacement to sandbox principals" do
+    admin = users(:acme_admin)
+    credential = BrokerCredential.create!(
+      namespace: "acme",
+      foreign_id: "github-app",
+      name: "GitHub App installation token",
+      grant: BrokerCredential::GITHUB_APP_INSTALLATION,
+      token_endpoint: "https://api.github.com/app/installations/42/access_tokens",
+      client_id: "12345",
+      client_secret: "private-key",
+      access_token: "ghs-live-installation-token",
+      expires_at: 1.hour.from_now,
+      last_refresh: Time.current,
+      created_by: admin
+    )
+    secret = StaticSecret.new(
+      namespace: "acme",
+      foreign_id: "infra-github-app",
+      name: "github-app",
+      replace_config: {
+        "proxy_value" => "GITHUB_TOKEN",
+        "match_headers" => [ "Authorization" ]
+      },
+      labels: { "managed-by" => "centaur" },
+      created_by: admin
+    )
+    secret.build_source(
+      source_type: "token_broker",
+      config: {
+        "credential_id" => credential.foreign_id,
+        "credential_namespace" => credential.namespace
+      }
+    )
+    secret.rules.build(host: "github.com", position: 0)
+    secret.rules.build(host: "api.github.com", position: 1)
+    secret.save!
+    Grant.create!(role: roles(:acme_infra), static_secret: secret, created_by: admin)
+
+    assert_equal secret, secret.source.static_secret
+    assert_includes @proxy.principal.roles, roles(:acme_infra)
+    assert_includes @proxy.principal.granted_static_secrets, secret
+
+    post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+    assert_response :ok
+
+    entry = json_body.fetch("secrets").find do |candidate|
+      candidate.dig("replace", "proxy_value") == "GITHUB_TOKEN"
+    end
+    refute_nil entry
+    assert_equal "ghs-live-installation-token", entry.dig("source", "value")
+    assert_equal "control_plane", entry.dig("source", "type")
+    assert_equal [ "Authorization" ], entry.dig("replace", "match_headers")
+    assert_equal [ "github.com", "api.github.com" ], entry.fetch("rules").map { |rule| rule.fetch("host") }
+  end
+
   test "an unassigned proxy syncs an empty config with unassigned status" do
     unassigned_token = "iprx_#{'c' * 64}"
     post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers(unassigned_token)
@@ -329,7 +367,6 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     body = json_body
     assert_equal "unassigned", body.fetch("status")
     assert_nil body.fetch("principal_id")
-    assert_equal "120s", body.dig("proxy", "upstream_response_header_timeout")
     assert_empty body.fetch("secrets")
     assert_empty body.fetch("transforms")
   end

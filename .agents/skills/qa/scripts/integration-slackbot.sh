@@ -99,16 +99,6 @@ urlencode() {
   jq -rn --arg value "$1" '$value|@uri'
 }
 
-slack_thread_key() {
-  local channel="$1"
-  local thread_ts="$2"
-  if [[ -n "$SLACK_SMOKE_TEAM_ID" ]]; then
-    printf 'slack:%s:%s:%s\n' "$SLACK_SMOKE_TEAM_ID" "$channel" "$thread_ts"
-  else
-    printf 'slack:%s:%s\n' "$channel" "$thread_ts"
-  fi
-}
-
 api_request() {
   local method="$1"
   local url="$2"
@@ -144,13 +134,7 @@ api_request() {
 slack_tool_json() {
   local method="$1"
   local body="${2:-{}}"
-
-  if ! command -v centaur-tools >/dev/null 2>&1; then
-    echo "    centaur-tools is required for Slack tool smoke checks." >&2
-    return 1
-  fi
-
-  centaur-tools call slack "$method" "$body" | jq -c '.'
+  api_request POST "${API_URL}/tools/slack/${method}" "$body" | jq -c '.result'
 }
 
 resolve_smoke_channel() {
@@ -344,29 +328,33 @@ wait_for_thread_reply() {
   return 1
 }
 
-wait_for_session_events() {
+wait_for_execution_id() {
   local thread_key="$1"
-  local out_file="$2"
   local encoded_thread
   encoded_thread=$(urlencode "$thread_key")
 
   for _ in $(seq 1 "$SMOKE_POLL_ATTEMPTS"); do
-    : > "$out_file"
-    capture_execution_events "$thread_key" "$out_file" || return 1
-    if [[ -s "$out_file" ]]; then
+    local executions_json
+    executions_json=$(api_request GET "${API_URL}/agent/threads/${encoded_thread}/executions?limit=1") || return 1
+
+    local execution_id
+    execution_id=$(jq -r '.executions[0].execution_id // empty' <<<"$executions_json")
+    if [[ -n "$execution_id" ]]; then
+      printf '%s\n' "$execution_id"
       return 0
     fi
 
     sleep "$SMOKE_POLL_SLEEP_SECONDS"
   done
 
-  echo "    timed out waiting for session events for ${thread_key}"
+  echo "    timed out waiting for an execution for ${thread_key}"
   return 1
 }
 
 capture_execution_events() {
   local thread_key="$1"
-  local out_file="$2"
+  local execution_id="$2"
+  local out_file="$3"
   local encoded_thread
   encoded_thread=$(urlencode "$thread_key")
 
@@ -374,7 +362,7 @@ capture_execution_events() {
   set +e
   curl -sS -N --max-time "$EVENT_STREAM_TIMEOUT_SECONDS" \
     "${AUTH_ARGS[@]}" \
-    "${API_URL}/api/session/${encoded_thread}/events?poll_ms=1000" \
+    "${API_URL}/agent/threads/${encoded_thread}/events?execution_id=${execution_id}&poll_ms=1000" \
     > "$out_file"
   curl_status=$?
   set -e
@@ -382,6 +370,10 @@ capture_execution_events() {
   # curl exits 28 when --max-time closes an otherwise healthy SSE stream.
   if [[ "$curl_status" -ne 0 && "$curl_status" -ne 28 ]]; then
     echo "    execution event stream failed with curl status ${curl_status}"
+    return 1
+  fi
+  if [[ ! -s "$out_file" ]]; then
+    echo "    execution event stream produced no events"
     return 1
   fi
 }
@@ -422,10 +414,13 @@ assert_execution_upload_stream() {
   local thread_key="$1"
   local require_permalink="${2:-1}"
 
+  local execution_id
+  execution_id=$(wait_for_execution_id "$thread_key") || return 1
+
   local events_file
   events_file=$(mktemp)
-  wait_for_session_events "$thread_key" "$events_file" || {
-    echo "    failed to capture session events for ${thread_key}"
+  capture_execution_events "$thread_key" "$execution_id" "$events_file" || {
+    echo "    failed to capture execution events for ${execution_id}"
     rm -f "$events_file"
     return 1
   }
@@ -569,8 +564,7 @@ smoke_chart_case() {
   local thread_ts
   channel=$(jq -r '.channel' <<<"$seed_json")
   thread_ts=$(jq -r '.ts' <<<"$seed_json")
-  local thread_key
-  thread_key=$(slack_thread_key "$channel" "$thread_ts")
+  local thread_key="${channel}:${thread_ts}"
 
   local chart_body
   chart_body=$(build_event_body \
@@ -596,8 +590,7 @@ smoke_generated_media_case() {
   local thread_ts
   channel=$(jq -r '.channel' <<<"$seed_json")
   thread_ts=$(jq -r '.ts' <<<"$seed_json")
-  local thread_key
-  thread_key=$(slack_thread_key "$channel" "$thread_ts")
+  local thread_key="${channel}:${thread_ts}"
 
   local media_body
   media_body=$(build_event_body \

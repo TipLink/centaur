@@ -97,7 +97,7 @@ export type LinearbotOptions = {
   connectStateOnStart?: boolean;
   /**
    * Harness for new threads when no --claude/--amp/--codex flag is given
-   * (HarnessType wire value: codex | amp | claudecode). Defaults to claudecode.
+   * (HarnessType wire value: codex | amp | claudecode). Defaults to codex.
    */
   defaultHarnessType?: string;
   fetch?: LinearbotFetch;
@@ -188,6 +188,8 @@ export type ForwardSessionInput = {
   messages: LinearbotApiMessage[];
   /** Per-turn model override parsed from message flags (--model/--opus/...). */
   model?: string;
+  /** Per-turn model provider override parsed from message flags (--meta). */
+  provider?: string;
   onEventId(eventId: number): void;
   openStream: boolean;
   threadId: string;

@@ -41,23 +41,38 @@ const HTTP_METHODS: &[&str] = &[
 ];
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ToolDiscoveryConfig {
-    pub(crate) tool_dirs: Option<String>,
-    pub(crate) tools_path: Option<PathBuf>,
-    pub(crate) tools_overlay_path: Option<PathBuf>,
-    pub(crate) plugins_dir: Option<PathBuf>,
-    pub(crate) tools_config: Option<PathBuf>,
+pub struct ToolDiscoveryConfig {
+    pub tool_dirs: Option<String>,
+    pub public_tool_dirs: Option<String>,
+    pub tools_path: Option<PathBuf>,
+    pub tools_overlay_path: Option<PathBuf>,
+    pub plugins_dir: Option<PathBuf>,
+    pub tools_config: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DiscoveredToolProxyFragment {
-    pub(crate) fragment: ProxyFragment,
-    pub(crate) tool_count: usize,
-    pub(crate) secret_count: usize,
+pub struct DiscoveredToolProxyFragment {
+    pub fragment: ProxyFragment,
+    pub tool_count: usize,
+    pub secret_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiscoveredToolCatalog {
+    pub(crate) tools: Vec<DiscoveredTool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiscoveredTool {
+    pub(crate) name: String,
+    pub(crate) package: String,
+    pub(crate) description: Option<String>,
+    pub(crate) client_module: String,
+    pub(crate) project_dir: PathBuf,
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ToolDiscoveryError {
+pub enum ToolDiscoveryError {
     #[error("failed to read {path}: {source}")]
     Read {
         path: PathBuf,
@@ -75,7 +90,7 @@ pub(crate) enum ToolDiscoveryError {
 }
 
 impl ToolDiscoveryConfig {
-    pub(crate) fn resolve_tool_dirs(&self) -> Result<Vec<PathBuf>, ToolDiscoveryError> {
+    pub fn resolve_tool_dirs(&self) -> Result<Vec<PathBuf>, ToolDiscoveryError> {
         if let Some(tool_dirs) = clean_optional_str(self.tool_dirs.as_deref()) {
             return Ok(split_tool_dirs(&tool_dirs));
         }
@@ -114,9 +129,17 @@ impl ToolDiscoveryConfig {
         });
         Ok(vec![root.join("tools")])
     }
+
+    pub fn resolve_public_tool_dirs(&self) -> Vec<PathBuf> {
+        self.public_tool_dirs
+            .as_deref()
+            .and_then(|value| clean_optional_str(Some(value)))
+            .map(|value| split_tool_dirs(&value))
+            .unwrap_or_default()
+    }
 }
 
-pub(crate) fn discover_tool_proxy_fragment(
+pub fn discover_tool_proxy_fragment(
     tool_dirs: &[PathBuf],
 ) -> Result<DiscoveredToolProxyFragment, ToolDiscoveryError> {
     let tools = collect_plugin_metadata(tool_dirs)?.tools;
@@ -139,13 +162,81 @@ pub(crate) fn discover_tool_proxy_fragment(
     })
 }
 
-pub(crate) fn discover_persona_registry(
+pub fn discover_persona_registry(
     tool_dirs: &[PathBuf],
     default_persona_id: Option<String>,
 ) -> Result<PersonaRegistry, ToolDiscoveryError> {
     let plugins = collect_plugin_metadata(tool_dirs)?;
     PersonaRegistry::new(plugins.personas, default_persona_id, plugins.overlay_chain)
         .map_err(ToolDiscoveryError::Invalid)
+}
+
+pub(crate) fn discover_tool_catalog(
+    tool_dirs: &[PathBuf],
+    tool_allowlist: Option<&str>,
+    tool_blocklist: Option<&str>,
+) -> Result<DiscoveredToolCatalog, ToolDiscoveryError> {
+    let allowlist = parse_tool_name_filter(tool_allowlist);
+    let blocklist = parse_tool_name_filter(tool_blocklist);
+    let mut tools = BTreeMap::new();
+
+    // Match services/sandbox/install_tool_shims.py: scan TOOL_DIRS in order,
+    // filter by package-directory, project, or script name, and let the last
+    // package that declares a script name own that script.
+    for base_dir in tool_dirs {
+        if !base_dir.exists() {
+            continue;
+        }
+        for tool_dir in candidate_tool_dirs(base_dir)? {
+            let pyproject_path = tool_dir.join("pyproject.toml");
+            let Some(LoadedPluginMeta::Tool(tool)) =
+                load_plugin_meta(base_dir, &tool_dir, &pyproject_path)?
+            else {
+                continue;
+            };
+            let identifiers = tool_identifiers(&tool);
+            if !allowlist.is_empty() && identifiers.is_disjoint(&allowlist) {
+                continue;
+            }
+            if !identifiers.is_disjoint(&blocklist) {
+                continue;
+            }
+            for script_name in tool.script_names {
+                if blocklist.contains(&script_name) {
+                    continue;
+                }
+                tools.insert(
+                    script_name.clone(),
+                    DiscoveredTool {
+                        name: script_name,
+                        package: tool.package.clone(),
+                        description: tool.description.clone(),
+                        client_module: tool.client_module.clone(),
+                        project_dir: tool.dir.clone(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(DiscoveredToolCatalog {
+        tools: tools.into_values().collect(),
+    })
+}
+
+fn parse_tool_name_filter(value: Option<&str>) -> BTreeSet<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn tool_identifiers(tool: &LoadedToolMeta) -> BTreeSet<String> {
+    let mut identifiers = BTreeSet::from([tool.name.clone(), tool.package.clone()]);
+    identifiers.extend(tool.script_names.iter().cloned());
+    identifiers
 }
 
 fn split_tool_dirs(value: &str) -> Vec<PathBuf> {
@@ -284,6 +375,11 @@ fn parse_toml(path: &Path, contents: &str) -> Result<TomlValue, ToolDiscoveryErr
 #[derive(Clone, Debug)]
 struct LoadedToolMeta {
     name: String,
+    dir: PathBuf,
+    package: String,
+    description: Option<String>,
+    client_module: String,
+    script_names: Vec<String>,
     secrets: Vec<ToolSecret>,
 }
 
@@ -439,7 +535,7 @@ fn load_plugin_meta(
         .and_then(|value| value.get("centaur"))
         .unwrap_or(&default_tool_conf);
     if tool_conf.get("type").and_then(TomlValue::as_str) != Some("persona") {
-        return load_tool_meta(source_root, plugin_dir, tool_conf)
+        return load_tool_meta(source_root, plugin_dir, &pyproject, tool_conf)
             .map(|meta| meta.map(LoadedPluginMeta::Tool));
     }
     let id = plugin_dir
@@ -476,6 +572,7 @@ fn load_plugin_meta(
 fn load_tool_meta(
     source_root: &Path,
     tool_dir: &Path,
+    pyproject: &TomlValue,
     tool_conf: &TomlValue,
 ) -> Result<Option<LoadedToolMeta>, ToolDiscoveryError> {
     let name = tool_dir
@@ -485,6 +582,39 @@ fn load_tool_meta(
             ToolDiscoveryError::Invalid(format!("invalid tool path {}", tool_dir.display()))
         })?
         .to_owned();
+    let default_project_conf = TomlValue::Table(Default::default());
+    let project_conf = pyproject.get("project").unwrap_or(&default_project_conf);
+    let package = project_conf
+        .get("name")
+        .and_then(TomlValue::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| name.clone());
+    let description = project_conf
+        .get("description")
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let client_module = tool_conf
+        .get("module")
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("client.py")
+        .to_owned();
+    let script_names = project_conf
+        .get("scripts")
+        .and_then(TomlValue::as_table)
+        .map(|scripts| {
+            let mut names = scripts
+                .keys()
+                .filter(|script| !script.contains('/') && !script.contains('\0'))
+                .cloned()
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        })
+        .unwrap_or_default();
     let default_hosts = string_array(tool_conf.get("hosts"));
     let labels = tool_labels(&name, &overlay_name_for_root(source_root));
     let secrets = match parse_secret_list(tool_conf.get("secrets"), &default_hosts, &labels)
@@ -506,7 +636,15 @@ fn load_tool_meta(
             return Ok(None);
         }
     };
-    Ok(Some(LoadedToolMeta { name, secrets }))
+    Ok(Some(LoadedToolMeta {
+        name,
+        dir: tool_dir.to_path_buf(),
+        package,
+        description,
+        client_module,
+        script_names,
+        secrets,
+    }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1586,6 +1724,22 @@ mod tests {
     }
 
     #[test]
+    fn resolves_public_tool_dirs_from_explicit_env_string() {
+        let config = ToolDiscoveryConfig {
+            public_tool_dirs: Some("/public-base:/public-overlay".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.resolve_public_tool_dirs(),
+            vec![
+                PathBuf::from("/public-base"),
+                PathBuf::from("/public-overlay")
+            ]
+        );
+    }
+
+    #[test]
     fn resolves_sandbox_style_tools_path_and_overlay_path() {
         let config = ToolDiscoveryConfig {
             tools_path: Some(PathBuf::from("/base")),
@@ -1597,6 +1751,89 @@ mod tests {
             config.resolve_tool_dirs().unwrap(),
             vec![PathBuf::from("/base"), PathBuf::from("/overlay")]
         );
+    }
+
+    #[test]
+    fn tool_catalog_matches_sandbox_filters_and_script_precedence() {
+        let temp = temp_dir("api-rs-tool-catalog");
+        let base = temp.join("base");
+        let overlay = temp.join("overlay");
+        write_tool(
+            &base.join("category").join("alpha-dir"),
+            r#"
+[project]
+name = "alpha-project"
+
+[project.scripts]
+alpha = "alpha:main"
+shared = "alpha:main"
+"#,
+        );
+        write_tool(
+            &base.join("category").join("beta-dir"),
+            r#"
+[project]
+name = "beta-project"
+
+[project.scripts]
+beta = "beta:main"
+"#,
+        );
+        write_tool(
+            &base.join("category").join("blocked-dir"),
+            r#"
+[project]
+name = "blocked-project"
+
+[project.scripts]
+blocked = "blocked:main"
+safe-sibling = "blocked:main"
+"#,
+        );
+        write_tool(
+            &base.join("category").join("phantom"),
+            r#"
+[project]
+name = "phantom-project"
+"#,
+        );
+        write_tool(
+            &overlay.join("category").join("replacement"),
+            r#"
+[project]
+name = "overlay-project"
+
+[project.scripts]
+overlay = "overlay:main"
+shared = "overlay:main"
+"#,
+        );
+
+        let catalog = discover_tool_catalog(
+            &[base.clone(), overlay.clone()],
+            Some("alpha-dir,beta-project,overlay,blocked-dir,phantom"),
+            Some("blocked"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            catalog
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "overlay", "shared"]
+        );
+        let shared = catalog
+            .tools
+            .iter()
+            .find(|tool| tool.name == "shared")
+            .expect("shared script");
+        assert_eq!(shared.package, "overlay-project");
+        assert_eq!(shared.project_dir, overlay.join("category/replacement"));
+        assert!(catalog.tools.iter().all(|tool| tool.name != "safe-sibling"));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]

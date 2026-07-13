@@ -5,12 +5,12 @@ on:
   push:
     branches: [ main ]
 
-permissions:
-  contents: read
-
 defaults:
   run:
     working-directory: services/console
+
+permissions:
+  contents: read
 
 jobs:
   console_changes:
@@ -149,7 +149,6 @@ jobs:
           IRON_CONTROL_DB_PORT: 5432
           IRON_CONTROL_DB_USERNAME: postgres
           IRON_CONTROL_DB_PASSWORD: postgres
-          # RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
         run: bin/rails db:test:prepare test
 
   console-ci-success:

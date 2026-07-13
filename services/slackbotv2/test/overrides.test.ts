@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { SlackFormatConverter } from '@chat-adapter/slack'
 import { extractMessageOverrides } from '../src/overrides'
 
 describe('extractMessageOverrides', () => {
@@ -64,19 +65,66 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('--fable fix it').model).toBe('claude-fable-5')
   })
 
+  test('--meta selects the Meta provider and codex harness', () => {
+    expect(extractMessageOverrides('--meta fix it')).toEqual({
+      cleanedText: 'fix it',
+      harnessType: 'codex',
+      model: undefined,
+      provider: 'responses',
+      reasoning: undefined
+    })
+  })
+
   test('--model expands claude aliases to full model ids', () => {
     expect(extractMessageOverrides('--claude --model opus go')).toEqual({
       cleanedText: 'go',
       harnessType: 'claudecode',
       model: 'claude-opus-4-8'
     })
-    expect(extractMessageOverrides('--model Sonnet go').model).toBe('claude-sonnet-5')
+    expect(extractMessageOverrides('--model Sonnet go')).toEqual({
+      cleanedText: 'go',
+      harnessType: 'claudecode',
+      model: 'claude-sonnet-5'
+    })
     expect(extractMessageOverrides('--model fable go').model).toBe('claude-fable-5')
+  })
+
+  test('--model accepts a newline immediately after the value', () => {
+    expect(extractMessageOverrides('--claude --model=fable\nwhat model are you')).toEqual({
+      cleanedText: 'what model are you',
+      harnessType: 'claudecode',
+      model: 'claude-fable-5',
+      reasoning: undefined
+    })
+    expect(
+      extractMessageOverrides('@Centaur AI --claude --model=fable\r\nwhat model are you')
+    ).toEqual({
+      cleanedText: '@Centaur AI what model are you',
+      harnessType: 'claudecode',
+      model: 'claude-fable-5',
+      reasoning: undefined
+    })
+  })
+
+  test('--model accepts a rendered line break immediately after the value', () => {
+    expect(extractMessageOverrides('--claude --model=fable<br>what model are you')).toEqual({
+      cleanedText: 'what model are you',
+      harnessType: 'claudecode',
+      model: 'claude-fable-5',
+      reasoning: undefined
+    })
   })
 
   test('--model passes non-alias values through verbatim', () => {
     expect(extractMessageOverrides('--codex --model gpt-5.2-codex go').model).toBe('gpt-5.2-codex')
     expect(extractMessageOverrides('--amp --model fast go').model).toBe('fast')
+    expect(extractMessageOverrides('--model claude-sonnet-4-6 go')).toEqual({
+      cleanedText: 'go',
+      harnessType: undefined,
+      model: 'claude-sonnet-4-6',
+      provider: undefined,
+      reasoning: undefined
+    })
   })
 
   test('explicit flags win over shortcut implications', () => {
@@ -84,6 +132,27 @@ describe('extractMessageOverrides', () => {
       cleanedText: 'fix it',
       harnessType: 'codex',
       model: 'claude-opus-4-8',
+      reasoning: undefined
+    })
+    expect(extractMessageOverrides('--codex --model Sonnet fix it')).toEqual({
+      cleanedText: 'fix it',
+      harnessType: 'codex',
+      model: 'claude-sonnet-5',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(extractMessageOverrides('--bedrock --model Sonnet fix it')).toEqual({
+      cleanedText: 'fix it',
+      harnessType: 'codex',
+      model: 'claude-sonnet-5',
+      provider: 'amazon-bedrock',
+      reasoning: undefined
+    })
+    expect(extractMessageOverrides('--bedrock --sonnet fix it')).toEqual({
+      cleanedText: 'fix it',
+      harnessType: 'codex',
+      model: 'claude-sonnet-5',
+      provider: 'amazon-bedrock',
       reasoning: undefined
     })
     expect(extractMessageOverrides('--sonnet --model claude-opus-4-8 fix it').model).toBe(
@@ -113,6 +182,12 @@ describe('extractMessageOverrides', () => {
       model: undefined,
       reasoning: undefined
     })
+    expect(extractMessageOverrides('--model\nwhat model are you')).toEqual({
+      cleanedText: '--model\nwhat model are you',
+      harnessType: undefined,
+      model: undefined,
+      reasoning: undefined
+    })
   })
 
   test('parses -rsn with space or equals', () => {
@@ -135,6 +210,10 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('-rsn med fix it').reasoning).toBe('medium')
     expect(extractMessageOverrides('-rsn hi fix it').reasoning).toBe('high')
     expect(extractMessageOverrides('-rsn xhi fix it').reasoning).toBe('xhigh')
+  })
+
+  test('-rsn accepts the GPT-5.6 max effort', () => {
+    expect(extractMessageOverrides('-rsn max fix it').reasoning).toBe('max')
   })
 
   test('-rsn combines with a harness flag', () => {
@@ -189,5 +268,56 @@ describe('extractMessageOverrides', () => {
   test('--bedrock does not match flags embedded in words', () => {
     expect(extractMessageOverrides('--bedrocky hi').provider).toBeUndefined()
     expect(extractMessageOverrides('the --bedrock flag').provider).toBe('amazon-bedrock')
+  })
+
+  test('--meta combines with a reasoning override', () => {
+    expect(extractMessageOverrides('--meta -rsn high fix it')).toEqual({
+      cleanedText: 'fix it',
+      harnessType: 'codex',
+      model: undefined,
+      provider: 'responses',
+      reasoning: 'high'
+    })
+  })
+})
+
+// The adapter's plain-text extraction feeds extractMessageOverrides. The
+// unpatched @chat-adapter/slack flattened the parsed AST with
+// mdast-util-to-string, which joins sibling paragraphs with NO separator —
+// `--model=fable\n\nexamine ...` reached the parser as `--model=fableexamine
+// ...` and the harness got a nonexistent model. The patched converter
+// preserves block boundaries; these tests exercise the real pipeline.
+describe('SlackFormatConverter.extractPlainText + extractMessageOverrides', () => {
+  const converter = new SlackFormatConverter()
+
+  test('paragraph break after --model survives plain-text extraction', () => {
+    const mrkdwn =
+      '--claude --model=fable\n\nexamine <https://github.com/paradigmxyz/centaur/pull/921|github.com/paradigmxyz/centaur/pull/921>. cross reference that PR.'
+    const text = converter.extractPlainText(mrkdwn)
+    expect(text).toBe(
+      '--claude --model=fable\n\nexamine github.com/paradigmxyz/centaur/pull/921. cross reference that PR.'
+    )
+    expect(extractMessageOverrides(text)).toEqual({
+      cleanedText: 'examine github.com/paradigmxyz/centaur/pull/921. cross reference that PR.',
+      harnessType: 'claudecode',
+      model: 'claude-fable-5',
+      reasoning: undefined
+    })
+  })
+
+  test('single newlines and paragraph breaks are both preserved', () => {
+    expect(converter.extractPlainText('--model=fable\nexamine this')).toBe(
+      '--model=fable\nexamine this'
+    )
+    expect(converter.extractPlainText('line1\n\nline2\nline3')).toBe('line1\n\nline2\nline3')
+  })
+
+  test('list items and blockquotes keep line boundaries', () => {
+    expect(converter.extractPlainText('- item1\n- item2\n\nafter list')).toBe(
+      'item1\nitem2\n\nafter list'
+    )
+    expect(converter.extractPlainText('> quoted line\n\nafter quote')).toBe(
+      'quoted line\n\nafter quote'
+    )
   })
 })

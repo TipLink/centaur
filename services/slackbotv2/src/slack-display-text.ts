@@ -337,105 +337,23 @@ function finalizeDisplayLines(lines: string[]): string {
 }
 
 function normalizeSlackFallbackText(input: string): string {
-  return normalizeSlackMarkup(input)
+  return input
+    .replace(/<([a-z]+:\/\/[^>|]+)\|([^>]+)>/gi, '$2 ($1)')
+    .replace(/<([a-z]+:\/\/[^>]+)>/gi, '$1')
+    .replace(/<#([A-Z0-9]+)\|([^>]+)>/g, '#$2 ($1)')
+    .replace(/<#([A-Z0-9]+)>/g, '#$1')
+    .replace(/<@([A-Z0-9]+)>/g, '@$1')
+    .replace(/<!subteam\^([A-Z0-9]+)\|([^>]+)>/g, '@$2')
+    .replace(/<!(channel|here|everyone)>/g, '@$1')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .split('\n')
     .map(line => line.replace(/[ \t]+/g, ' ').trim())
     .filter(Boolean)
     .join('\n')
-}
-
-function normalizeSlackMarkup(input: string): string {
-  let output = ''
-  let index = 0
-  while (index < input.length) {
-    const open = input.indexOf('<', index)
-    if (open === -1) {
-      output += decodeSlackEntities(input.slice(index))
-      break
-    }
-    output += decodeSlackEntities(input.slice(index, open))
-    const close = input.indexOf('>', open + 1)
-    if (close === -1) {
-      output += decodeSlackEntities(input.slice(open))
-      break
-    }
-    const token = input.slice(open + 1, close)
-    output += slackTokenText(token) ?? decodeSlackEntities(input.slice(open, close + 1))
-    index = close + 1
-  }
-  return output
-}
-
-function slackTokenText(token: string): string | undefined {
-  if (token.startsWith('#')) {
-    const { label, value } = splitSlackToken(token.slice(1))
-    return label
-      ? `#${decodeSlackEntities(label)} (${decodeSlackEntities(value)})`
-      : `#${decodeSlackEntities(value)}`
-  }
-  if (token.startsWith('@')) return `@${decodeSlackEntities(token.slice(1))}`
-  if (token.startsWith('!subteam^')) {
-    const { label, value } = splitSlackToken(token.slice('!subteam^'.length))
-    return `@${decodeSlackEntities(label || value)}`
-  }
-  if (token === '!channel' || token === '!here' || token === '!everyone') {
-    return `@${token.slice(1)}`
-  }
-  if (!hasUrlScheme(token)) return undefined
-  const { label, value } = splitSlackToken(token)
-  return label
-    ? `${decodeSlackEntities(label)} (${decodeSlackEntities(value)})`
-    : decodeSlackEntities(value)
-}
-
-function splitSlackToken(token: string): { label: string; value: string } {
-  const separator = token.indexOf('|')
-  if (separator === -1) return { label: '', value: token }
-  return {
-    label: token.slice(separator + 1),
-    value: token.slice(0, separator)
-  }
-}
-
-function hasUrlScheme(token: string): boolean {
-  const schemeEnd = token.indexOf('://')
-  if (schemeEnd <= 0) return false
-  for (let index = 0; index < schemeEnd; index += 1) {
-    const code = token.charCodeAt(index)
-    const isLowercaseLetter = code >= 97 && code <= 122
-    const isUppercaseLetter = code >= 65 && code <= 90
-    if (!isLowercaseLetter && !isUppercaseLetter) return false
-  }
-  return true
-}
-
-function decodeSlackEntities(input: string): string {
-  let output = ''
-  let index = 0
-  while (index < input.length) {
-    const entity = input.indexOf('&', index)
-    if (entity === -1) {
-      output += input.slice(index)
-      break
-    }
-    output += input.slice(index, entity)
-    if (input.startsWith('&amp;', entity)) {
-      output += '&'
-      index = entity + 5
-    } else if (input.startsWith('&lt;', entity)) {
-      output += '<'
-      index = entity + 4
-    } else if (input.startsWith('&gt;', entity)) {
-      output += '>'
-      index = entity + 4
-    } else {
-      output += '&'
-      index = entity + 1
-    }
-  }
-  return output
 }
 
 function truncateRawDisplayText(text: string): string {

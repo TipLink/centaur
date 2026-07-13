@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -18,6 +19,8 @@ from typing import Any
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+
+from centaur_sdk import secret
 
 from .client import (
     _retry_on_ratelimit,
@@ -29,7 +32,6 @@ from .client import (
 
 # Feedback database location
 FEEDBACK_DB_PATH = Path.home() / ".cache" / "paradigm-slack" / "feedback.db"
-CENTAUR_API_KEY_FILE = Path("/home/agent/.api_key")
 
 # Heuristic signals for feedback detection
 NEGATIVE_REACTIONS = {"thumbsdown", "-1", "x", "confused", "thinking_face", "bug", "facepalm"}
@@ -114,17 +116,28 @@ class SaveFeedbackResult:
 
 
 class CentaurAgentClient:
-    """Minimal client for starting a background improvement agent run."""
+    """Minimal client for starting a background improvement agent session."""
 
     def __init__(self, base_url: str | None = None, api_key: str | None = None):
-        self.base_url = (base_url or os.environ.get("CENTAUR_API_URL") or "http://api:8000").rstrip("/")
+        if secret("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true").strip().lower() == "false":
+            raise RuntimeError(
+                "Dispatching feedback improvement runs requires the API server sandbox "
+                "capability, but it is disabled for this principal."
+            )
+        self.base_url = (base_url or os.getenv("CENTAUR_API_URL") or "http://api:8000").rstrip("/")
+        # The server requires this scoped key together with the proxy-injected
+        # caller JWT, then binds the child session to that same principal.
         self.api_key = api_key or _load_centaur_api_key()
         if not self.api_key:
-            raise RuntimeError("CENTAUR_API_KEY is required to start an improvement agent run")
+            raise RuntimeError("SLACK_FEEDBACK_API_KEY not set")
 
-    def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request_json(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            # Keep this credential separate from Authorization: Console's
+            # proxy injects the caller JWT there for the same API host.
+            "X-Centaur-Feedback-Key": self.api_key,
             "Accept": "application/json",
         }
         data: bytes | None = None
@@ -160,57 +173,62 @@ class CentaurAgentClient:
         persona_id: str = "eng",
         thread_key: str | None = None,
     ) -> dict[str, Any]:
-        """Spawn, message, and execute a background improvement agent run."""
-        thread_key = thread_key or f"feedback-improvement:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}:{uuid.uuid4().hex[:8]}"
-        spawn = self._request_json(
-            "POST",
-            "/agent/spawn",
-            {
-                "thread_key": thread_key,
-                "harness": harness,
-                "persona_id": persona_id,
-            },
+        """Create a session, persist the prompt, and execute it."""
+        thread_key = thread_key or (
+            f"feedback-improvement:{datetime.now(datetime.UTC).strftime('%Y%m%dT%H%M%SZ')}:{uuid.uuid4().hex[:8]}"
         )
-        assignment_generation = spawn["assignment_generation"]
+        thread_path = urllib.parse.quote(thread_key, safe="")
 
         self._request_json(
             "POST",
-            "/agent/message",
+            f"/api/session/{thread_path}",
             {
-                "thread_key": thread_key,
-                "assignment_generation": assignment_generation,
-                "role": "user",
-                "parts": [{"type": "text", "text": prompt}],
+                "harness_type": harness,
+                "persona_id": persona_id,
                 "metadata": {"source": "slack-feedback-loop"},
+                "on_harness_conflict": "restart",
+            },
+        )
+
+        parts = [{"type": "text", "text": prompt}]
+        self._request_json(
+            "POST",
+            f"/api/session/{thread_path}/messages",
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "parts": parts,
+                        "metadata": {"source": "slack-feedback-loop"},
+                    }
+                ],
             },
         )
 
         execute = self._request_json(
             "POST",
-            "/agent/execute",
+            f"/api/session/{thread_path}/execute",
             {
-                "thread_key": thread_key,
-                "assignment_generation": assignment_generation,
-                "execute_id": f"feedback-improvement-{uuid.uuid4().hex[:12]}",
-                "harness": harness,
-                "delivery": {"platform": "dev"},
-                "metadata": {"source": "slack-feedback-loop"},
+                "idempotency_key": f"feedback-improvement-{uuid.uuid4().hex[:12]}",
+                "metadata": {"source": "slack-feedback-loop", "delivery": {"platform": "dev"}},
+                "input_lines": [
+                    json.dumps(
+                        {"type": "user", "message": {"content": parts}},
+                        separators=(",", ":"),
+                    )
+                ],
             },
         )
 
         return {
             "thread_key": thread_key,
-            "assignment_generation": assignment_generation,
             "execution_id": execute["execution_id"],
             "status": execute.get("status"),
         }
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {
-        row["name"]
-        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-    }
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
@@ -245,15 +263,7 @@ def _severity_filter_clause(min_severity: str | None) -> tuple[str, list[str]]:
 
 
 def _load_centaur_api_key() -> str | None:
-    for env_name in ("CENTAUR_AGENT_API_KEY", "CENTAUR_API_KEY"):
-        value = os.environ.get(env_name, "").strip()
-        if value:
-            return value
-    try:
-        value = CENTAUR_API_KEY_FILE.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return value or None
+    return secret("SLACK_FEEDBACK_API_KEY", "").strip() or None
 
 
 def _bot_message_looks_like_error(text: str) -> bool:
@@ -439,8 +449,10 @@ def classify_feedback(signals: FeedbackSignals, messages: list[dict]) -> tuple[s
     if signals.has_bot_error:
         category = "cli_bug"
     elif (
-        signals.has_positive_reaction or signals.positive_keywords_found
-    ) and not signals.has_negative_reaction and not signals.negative_keywords_found:
+        (signals.has_positive_reaction or signals.positive_keywords_found)
+        and not signals.has_negative_reaction
+        and not signals.negative_keywords_found
+    ):
         category = "success"
     elif signals.repeated_requests:
         category = "routing_error"
@@ -847,7 +859,7 @@ def build_improvement_prompt(items: list[FeedbackItem], channels: list[str]) -> 
     prompt = [
         "You are working on paradigmxyz/centaur.",
         "Investigate and fix the highest-leverage issues surfaced by Slack feedback.",
-        "Use git-branch paradigmxyz/centaur fix-slack-feedback before editing because the host mount is read-only.",
+        "Use git-branch paradigmxyz/centaur before editing because the host mount is read-only.",
         "Read the linked Slack permalinks and Amp threads when they are relevant, then make code changes in the repo.",
         "Prefer the smallest fixes that materially improve agent behavior.",
         "When done, open a PR with a concise summary of the fixes.",

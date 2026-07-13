@@ -1,0 +1,150 @@
+name: Publish Images
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/validate-images.yml
+      - .github/workflows/publish-images.yml
+      - .github/scripts/resolve-runnable-image-digest.sh
+      - .github/scripts/verify-registry-tag-absent.sh
+      - .github/scripts/verify-reviewed-image-release.sh
+      - .github/scripts/test-resolve-runnable-image-digest.sh
+      - .github/scripts/test-verify-registry-tag-absent.sh
+      - .github/scripts/test-verify-reviewed-image-release.sh
+      - services/**
+      - crates/harness-server/**
+      - harness/**
+      - centaur_sdk/**
+      - packages/**
+      - tools/**
+      - workflows/**
+      - scripts/bootstrap-k8s-secrets.sh
+      - scripts/probe-agent-harness-image.sh
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - .agents/skills/**
+
+concurrency:
+  group: validate-images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_BUILD_PROFILE: debug
+
+jobs:
+  build:
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [api-rs, slackbotv2, linearbot, discordbot, githubbot, teamsbot, agent, iron-proxy, console]
+        platform: [linux/amd64]
+        include:
+          - service: api-rs
+            image: centaur-api-rs
+            context: .
+            dockerfile: services/api-rs/Dockerfile
+            target: ""
+          - service: slackbotv2
+            image: centaur-slackbotv2
+            context: .
+            dockerfile: services/slackbotv2/Dockerfile
+            target: ""
+          - service: linearbot
+            image: centaur-linearbot
+            context: .
+            dockerfile: services/linearbot/Dockerfile
+            target: ""
+          - service: discordbot
+            image: centaur-discordbot
+            context: .
+            dockerfile: services/discordbot/Dockerfile
+            target: ""
+          - service: githubbot
+            image: centaur-githubbot
+            context: .
+            dockerfile: services/githubbot/Dockerfile
+            target: ""
+          - service: teamsbot
+            image: centaur-teamsbot
+            context: .
+            dockerfile: services/teamsbot/Dockerfile
+            target: ""
+          - service: agent
+            image: centaur-agent
+            context: .
+            dockerfile: services/sandbox/Dockerfile
+            target: sandbox
+          - service: agent
+            platform: linux/arm64
+            image: centaur-agent
+            context: .
+            dockerfile: services/sandbox/Dockerfile
+            target: sandbox
+          - service: iron-proxy
+            image: centaur-iron-proxy
+            context: .
+            dockerfile: services/iron-proxy/Dockerfile
+            target: ""
+          - service: console
+            image: centaur-console
+            context: services/console
+            dockerfile: services/console/Dockerfile
+            target: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Derive platform slug
+        run: |
+          set -euo pipefail
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.image }} without registry credentials
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: ${{ matrix.service == 'agent' }}
+          tags: ${{ matrix.service == 'agent' && format('{0}:validate-{1}', matrix.image, env.PLATFORM_SLUG) || '' }}
+          build-args: |
+            RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
+          cache-from: type=gha,scope=validate-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+          cache-to: type=gha,mode=max,scope=validate-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+
+      - name: Probe packaged agent harness
+        if: matrix.service == 'agent'
+        env:
+          AGENT_IMAGE: ${{ matrix.image }}:validate-${{ env.PLATFORM_SLUG }}
+        run: bash scripts/probe-agent-harness-image.sh "$AGENT_IMAGE"
+
+  image-validation-success:
+    name: Image validation success
+    runs-on: ubuntu-latest
+    if: always()
+    needs: build
+    steps:
+      - name: Require every image validation build to succeed
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_RESULT" != "success" ]]; then
+            echo "image validation matrix result is $BUILD_RESULT; expected success" >&2
+            exit 1
+          fi

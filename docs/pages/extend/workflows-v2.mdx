@@ -69,32 +69,28 @@ Supported v2 primitives:
 
 ### Keep imports narrow
 
-Workflow files should import only the workflow context compatibility module:
+Workflow files should import only the supported workflow-host API surface they
+need:
 
 ```python
 from api.workflow_engine import WorkflowContext
+from api.runtime_control import ControlPlaneError
 ```
 
-Do not import Python API internals such as:
+Supported workflow-host modules are `api.workflow_engine`,
+`api.runtime_control`, `api.app`, and `api.metrics`.
 
-```python
-from api.runtime_control import canonical_json
-from api.vm_metrics import workflow_counter
-```
-
-Those modules were implementation details of the Python API service. In v2,
-the workflow host provides a small compatibility surface instead of the whole
-Python API package.
+Do not import unrelated API-service internals or another workflow domain's local
+helpers. Domain-specific helpers should live next to the workflows that own
+them, for example `workflows/slack/metrics.py`.
 
 If a workflow needs a helper, move it into the workflow file, a shared overlay
-module, or a supported workflow-host compatibility shim.
+module, or a supported workflow-host API module.
 
-### Make stepped side effects idempotent
+### Put side effects behind steps
 
-The handler may be replayed after a crash or retry. `ctx.step(...)`
-checkpoints only after the callback returns. If the callback performs an
-external write, use a stable provider-side idempotency key or upsert so replay
-does not duplicate the side effect:
+The handler may be replayed after a crash or retry. Any external write should
+be wrapped in `ctx.step(...)` so the result is checkpointed:
 
 ```python
 async def handler(inp: dict, ctx: WorkflowContext) -> dict:
@@ -184,8 +180,8 @@ For each existing workflow:
    `api.workflow_engine.WorkflowContext`.
 3. Confirm third-party Python packages are installed in the workflow-host
    sandbox image.
-4. Make Slack posts, database writes, external HTTP calls, and tool calls
-   idempotent before putting them in `ctx.step(...)`.
+4. Wrap Slack posts, database writes, external HTTP calls, and tool calls in
+   `ctx.step(...)` when they must not repeat.
 5. Replace direct agent-control-plane calls with `ctx.agent_turn(...)`.
 6. If the workflow uses `ctx._pool`, confirm the workflow-host sandbox receives
    `DATABASE_URL`.
@@ -196,10 +192,10 @@ For each existing workflow:
 
 ## Known gaps
 
-The v2 POC supports the workflow model, but it does not yet emulate the full
-Python API package. Workflows that import `api.runtime_control`, `api.vm_metrics`,
-or other Python API internals need a compatibility shim or a small local helper
-before they are v2-ready.
+The v2 workflow host intentionally exposes a narrow Python API package.
+Workflows that import unrelated API-service internals should move that behavior
+into the workflow-host API surface or a small local helper owned by the workflow
+domain before they are v2-ready.
 
 `ctx.call_tool(...)` is a compatibility surface in the Python workflow host. It
 uses the generated `centaur-tools call` bridge against the installed tool
@@ -221,6 +217,7 @@ Then create a real run:
 
 ```bash
 curl -s "$CENTAUR_API_URL/api/workflows/runs" \
+  -H "Authorization: Bearer $CENTAUR_CONTROL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_name": "nightly_report",

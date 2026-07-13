@@ -1,9 +1,8 @@
+import base64
 import email.message
 import json
-from urllib.parse import urlparse
 
 import pytest
-from centaur_sdk.tool_sdk import ToolContext, reset_tool_context, set_tool_context
 from slack.client import SlackAuthError, SlackClient, SlackRateLimitError
 from slack_sdk.errors import SlackApiError
 
@@ -44,6 +43,8 @@ class _FakeWebClient:
         self.share_outcomes: list[bool] = []
         self.files_info_calls: list[dict] = []
         self.files_delete_calls: list[dict] = []
+        self.files_list_calls: list[dict] = []
+        self.files_list_pages: list[dict] = []
         self._shares_by_file: dict[str, dict] = {}
 
     def chat_postMessage(self, **kwargs):
@@ -114,11 +115,12 @@ class _FakeWebClient:
         self.files_delete_calls.append(kwargs)
         return {"ok": True}
 
-    def api_call(self, method: str, *, params: dict | None = None, json: dict | None = None):
-        payload = json if json is not None else params or {}
-        self.api_calls.append((method, payload))
-        if method == "assistant.search.context":
-            return {"ok": True, "results": {"messages": []}}
+    def files_list(self, **kwargs):
+        self.files_list_calls.append(kwargs)
+        return self.files_list_pages.pop(0)
+
+    def api_call(self, method: str, *, params: dict):
+        self.api_calls.append((method, params))
         return {"ok": True, "messages": {"matches": []}}
 
 
@@ -127,10 +129,6 @@ def _make_client() -> tuple[SlackClient, _FakeWebClient]:
     fake_web_client = _FakeWebClient()
     client._client = fake_web_client
     client._search_client = fake_web_client
-    client._upload_client = fake_web_client
-    client.token = "SLACK_BOT_TOKEN"
-    client.search_token = "SLACK_SEARCH_TOKEN"
-    client.upload_token = "SLACK_UPLOAD_TOKEN"
     client._user_cache = {}
     client._ratelimit_deadlines = {}
     client._resolve_channel = lambda channel: "C123"  # type: ignore[method-assign]
@@ -146,26 +144,6 @@ def _make_slack_error(
         message=message,
         response=_FakeSlackResponse(error=error, status_code=status_code),
     )
-
-
-def test_client_can_initialize_with_search_token_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    clients: list[_FakeWebClient] = []
-
-    def fake_web_client(**kwargs):
-        client = _FakeWebClient()
-        client.last_kwargs = kwargs
-        clients.append(client)
-        return client
-
-    monkeypatch.setattr("slack.client.WebClient", fake_web_client)
-
-    client = SlackClient(bot_token="", search_token="SLACK_SEARCH_TOKEN")
-
-    assert client.token == ""
-    assert client.search_token == "SLACK_SEARCH_TOKEN"
-    assert client._search_client is clients[1]
-    assert clients[0].last_kwargs["token"] == ""
-    assert clients[1].last_kwargs["token"] == "SLACK_SEARCH_TOKEN"
 
 
 def test_send_message_forwards_unfurl_flags() -> None:
@@ -224,6 +202,45 @@ def test_send_dm_opens_dm_and_posts_message() -> None:
     assert fake_web_client.last_kwargs is not None
     assert fake_web_client.last_kwargs["channel"] == "D123"
     assert fake_web_client.last_kwargs["unfurl_links"] is False
+
+
+def _restore_real_resolve_channel(client: SlackClient) -> None:
+    client._resolve_channel = SlackClient._resolve_channel.__get__(client)  # type: ignore[method-assign]
+
+
+def test_resolve_channel_opens_dm_for_user_id() -> None:
+    client, fake_web_client = _make_client()
+    _restore_real_resolve_channel(client)
+
+    assert client._resolve_channel("<@U123ABC>") == "D123"
+    assert fake_web_client.open_calls == [{"users": "U123ABC"}]
+
+
+def test_resolve_channel_opens_dm_for_at_username() -> None:
+    client, fake_web_client = _make_client()
+    _restore_real_resolve_channel(client)
+    client._get_user_cache = lambda: {"U123ABC": "georgios"}  # type: ignore[method-assign]
+
+    assert client._resolve_channel("@georgios") == "D123"
+    assert fake_web_client.open_calls == [{"users": "U123ABC"}]
+
+
+def test_resolve_channel_rejects_unknown_at_username() -> None:
+    client, _ = _make_client()
+    _restore_real_resolve_channel(client)
+    client._get_user_cache = lambda: {"U123ABC": "georgios"}  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="not found in workspace"):
+        client._resolve_channel("@nobody")
+
+
+def test_resolve_channel_still_resolves_channel_names() -> None:
+    client, fake_web_client = _make_client()
+    _restore_real_resolve_channel(client)
+
+    assert client._resolve_channel("paradigm-pulse") == "C123"
+    assert client._resolve_channel("C456DEF") == "C456DEF"
+    assert fake_web_client.open_calls == []
 
 
 def test_retry_on_ratelimit_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -400,8 +417,588 @@ def test_get_channel_history_page_preserves_non_auth_error_shape() -> None:
         client.get_channel_history_page("paradigm-pulse")
 
 
-def test_search_messages_with_channel_ids_uses_rts_without_history_scan() -> None:
+def test_get_channel_history_proxy_calls_centaur_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.parse
+    import urllib.request
+
+    client, _ = _make_client()
+    request_info: dict[str, str | None] = {}
+
+    def fake_urlopen(req, *args, **kwargs):
+        request_info["url"] = req.full_url
+        request_info["authorization"] = req.get_header("Authorization")
+        body = json.dumps(
+            {
+                "ok": True,
+                "messages": [{"type": "message", "ts": "1700000000.000001"}],
+                "has_more": False,
+            }
+        ).encode()
+        return _FakeHTTPResponse(body, "application/json")
+
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api.internal:8080")
+    monkeypatch.setenv("CENTAUR_API_BEARER_TOKEN", "test-jwt")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    result = client.get_channel_history_proxy(
+        "<#C123456789|general>",
+        cursor="next",
+        include_all_metadata=True,
+        inclusive=False,
+        latest="1700000000.000002",
+        limit=999,
+        oldest=0,
+    )
+
+    assert result["ok"] is True
+    assert request_info["authorization"] == "Bearer test-jwt"
+    parsed = urllib.parse.urlparse(request_info["url"])
+    assert parsed.scheme == "http"
+    assert parsed.netloc == "api.internal:8080"
+    assert parsed.path == "/api/slack/channels/C123456789/history"
+    query = urllib.parse.parse_qs(parsed.query)
+    assert query == {
+        "cursor": ["next"],
+        "include_all_metadata": ["true"],
+        "inclusive": ["false"],
+        "latest": ["1700000000.000002"],
+        "limit": ["999"],
+        "oldest": ["0.000000"],
+    }
+
+
+def test_get_channel_history_proxy_validates_inputs() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(ValueError, match="channel_id"):
+        client.get_channel_history_proxy("general")
+
+    with pytest.raises(ValueError, match="between 1 and 999"):
+        client.get_channel_history_proxy("C123456789", limit=1000)
+
+
+def test_list_channels_proxy_calls_centaur_api() -> None:
+    client, _ = _make_client()
+
+    def fake_get_json(path, params):
+        assert path == "/api/slack/channels"
+        assert params == {}
+        return {
+            "ok": True,
+            "channels": [
+                {
+                    "id": "C222222222",
+                    "name": "random",
+                    "purpose": "",
+                    "topic": "Chat",
+                    "member_count": 3,
+                    "is_private": False,
+                    "is_member": True,
+                    "can_upload": True,
+                    "can_download": False,
+                    "can_read_history": False,
+                },
+                {
+                    "id": "C111111111",
+                    "name": "general",
+                    "purpose": "Company",
+                    "topic": "",
+                    "member_count": 10,
+                    "is_private": False,
+                    "is_member": True,
+                    "can_upload": False,
+                    "can_download": True,
+                    "can_read_history": True,
+                },
+            ],
+        }
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    assert [channel["id"] for channel in client.list_channels_proxy()] == [
+        "C111111111",
+        "C222222222",
+    ]
+    assert [channel["id"] for channel in client.list_channels_proxy(history_only=True)] == [
+        "C111111111"
+    ]
+
+
+def test_list_files_proxy_calls_centaur_api() -> None:
+    client, _ = _make_client()
+
+    def fake_get_json(path, params):
+        assert path == "/api/slack/files"
+        assert params == {
+            "channel_id": "C123456789",
+            "limit": 20,
+            "page": 3,
+        }
+        return {
+            "ok": True,
+            "files": [{"id": "F123456789", "name": "report.pdf"}],
+            "page": 3,
+            "has_more": True,
+        }
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    result = client.list_files_proxy("<#C123456789|general>", page=3, limit=20)
+
+    assert result["files"] == [{"id": "F123456789", "name": "report.pdf"}]
+    assert result["has_more"] is True
+
+
+def test_list_files_proxy_validates_inputs() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(ValueError, match="channel_id"):
+        client.list_files_proxy("general")
+
+    with pytest.raises(ValueError, match="between 1 and 200"):
+        client.list_files_proxy("C123456789", limit=201)
+
+    with pytest.raises(ValueError, match="page"):
+        client.list_files_proxy("C123456789", page=0)
+
+
+def test_get_thread_replies_proxy_calls_centaur_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.parse
+    import urllib.request
+
+    client, _ = _make_client()
+    request_info: dict[str, str | None] = {}
+
+    def fake_urlopen(req, *args, **kwargs):
+        request_info["url"] = req.full_url
+        request_info["authorization"] = req.get_header("Authorization")
+        body = json.dumps(
+            {
+                "ok": True,
+                "messages": [{"type": "message", "ts": "1700000000.000001"}],
+                "has_more": False,
+            }
+        ).encode()
+        return _FakeHTTPResponse(body, "application/json")
+
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api.internal:8080")
+    monkeypatch.setenv("CENTAUR_API_BEARER_TOKEN", "test-jwt")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    result = client.get_thread_replies_proxy(
+        "<#C123456789|general>",
+        "1700000000.000001",
+        cursor="next",
+        inclusive=False,
+        latest="1700000000.000002",
+        limit=999,
+        oldest=0,
+    )
+
+    assert result["ok"] is True
+    assert request_info["authorization"] == "Bearer test-jwt"
+    parsed = urllib.parse.urlparse(request_info["url"])
+    assert parsed.scheme == "http"
+    assert parsed.netloc == "api.internal:8080"
+    assert parsed.path == "/api/slack/channels/C123456789/threads/1700000000.000001/replies"
+    query = urllib.parse.parse_qs(parsed.query)
+    assert query == {
+        "cursor": ["next"],
+        "inclusive": ["false"],
+        "latest": ["1700000000.000002"],
+        "limit": ["999"],
+        "oldest": ["0.000000"],
+    }
+
+
+def test_get_thread_replies_proxy_validates_inputs() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(ValueError, match="channel_id"):
+        client.get_thread_replies_proxy("general", "1700000000.000001")
+
+    with pytest.raises(ValueError, match="thread_ts"):
+        client.get_thread_replies_proxy("C123456789", "")
+
+    with pytest.raises(ValueError, match="between 1 and 999"):
+        client.get_thread_replies_proxy("C123456789", "1700000000.000001", limit=1000)
+
+
+def test_upload_file_proxy_posts_file_bytes_to_centaur_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.parse
+    import urllib.request
+
+    client, _ = _make_client()
+    request_info: dict[str, object] = {}
+
+    def fake_urlopen(req, *args, **kwargs):
+        request_info["url"] = req.full_url
+        request_info["headers"] = {key.lower(): value for key, value in req.header_items()}
+        request_info["data"] = req.data
+        body = json.dumps(
+            {
+                "ok": True,
+                "file_id": "F123456789",
+                "channel_id": "C123456789",
+                "file": {"id": "F123456789"},
+            }
+        ).encode()
+        return _FakeHTTPResponse(body, "application/json")
+
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api.internal:8080")
+    monkeypatch.setenv("CENTAUR_API_BEARER_TOKEN", "test-jwt")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    result = client.upload_file_proxy(
+        channel_id="C123456789",
+        content_base64=base64.b64encode(b"hello").decode(),
+        filename="hello.txt",
+        thread_ts="1700000000.000001",
+        title="Hello",
+        initial_comment="uploaded",
+        content_type="text/plain",
+        alt_txt="hello file",
+        snippet_type="text",
+    )
+
+    assert result["file_id"] == "F123456789"
+    assert request_info["data"] == b"hello"
+    headers = request_info["headers"]
+    assert isinstance(headers, dict)
+    assert headers["authorization"] == "Bearer test-jwt"
+    assert headers["content-type"] == "text/plain"
+    parsed = urllib.parse.urlparse(request_info["url"])
+    assert parsed.path == "/api/slack/files/upload"
+    assert urllib.parse.parse_qs(parsed.query) == {
+        "channel_id": ["C123456789"],
+        "filename": ["hello.txt"],
+        "thread_ts": ["1700000000.000001"],
+        "title": ["Hello"],
+        "initial_comment": ["uploaded"],
+        "content_type": ["text/plain"],
+        "alt_txt": ["hello file"],
+        "snippet_type": ["text"],
+    }
+
+
+def test_download_file_proxy_returns_base64_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.parse
+    import urllib.request
+
+    client, _ = _make_client()
+    request_info: dict[str, str | None] = {}
+
+    def fake_urlopen(req, *args, **kwargs):
+        request_info["url"] = req.full_url
+        request_info["authorization"] = req.get_header("Authorization")
+        return _FakeHTTPResponse(
+            b"%PDF",
+            "application/pdf",
+            {"Content-Disposition": 'attachment; filename="report.pdf"'},
+        )
+
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api.internal:8080")
+    monkeypatch.setenv("CENTAUR_API_BEARER_TOKEN", "test-jwt")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    result = client.download_file_proxy(file_id="F123456789", channel_id="C123456789")
+
+    assert result == {
+        "file_id": "F123456789",
+        "channel_id": "C123456789",
+        "filename": "report.pdf",
+        "content_type": "application/pdf",
+        "size_bytes": 4,
+        "content_base64": base64.b64encode(b"%PDF").decode(),
+    }
+    assert request_info["authorization"] == "Bearer test-jwt"
+    parsed = urllib.parse.urlparse(request_info["url"])
+    assert parsed.path == "/api/slack/files/F123456789/download"
+    assert urllib.parse.parse_qs(parsed.query) == {"channel_id": ["C123456789"]}
+
+
+def test_file_info_proxy_calls_centaur_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.parse
+    import urllib.request
+
+    client, _ = _make_client()
+    request_info: dict[str, str | None] = {}
+
+    def fake_urlopen(req, *args, **kwargs):
+        request_info["url"] = req.full_url
+        request_info["authorization"] = req.get_header("Authorization")
+        body = json.dumps(
+            {
+                "ok": True,
+                "file_id": "F123456789",
+                "channel_id": "C123456789",
+                "file": {"id": "F123456789", "name": "report.pdf"},
+            }
+        ).encode()
+        return _FakeHTTPResponse(body, "application/json")
+
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api.internal:8080")
+    monkeypatch.setenv("CENTAUR_API_BEARER_TOKEN", "test-jwt")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    result = client.file_info_proxy(file_id="F123456789", channel_id="<#C123456789|general>")
+
+    assert result["file"] == {"id": "F123456789", "name": "report.pdf"}
+    assert request_info["authorization"] == "Bearer test-jwt"
+    parsed = urllib.parse.urlparse(request_info["url"])
+    assert parsed.path == "/api/slack/files/F123456789/info"
+    assert urllib.parse.parse_qs(parsed.query) == {"channel_id": ["C123456789"]}
+
+
+def test_get_channel_members_proxy_paginates_and_resolves_names() -> None:
+    client, _ = _make_client()
+    client._get_user_cache = lambda: {"U111111111": "alice", "U222222222": "bob"}  # type: ignore[method-assign]
+    calls: list[tuple[str, dict]] = []
+
+    def fake_get_json(path, params):
+        calls.append((path, params))
+        if params["cursor"] is None:
+            return {
+                "ok": True,
+                "members": ["U111111111"],
+                "response_metadata": {"next_cursor": "next"},
+            }
+        return {
+            "ok": True,
+            "members": ["U222222222"],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    result = client.get_channel_members_proxy("<#C123456789|general>", limit=10)
+
+    assert calls == [
+        ("/api/slack/channels/C123456789/members", {"limit": 10, "cursor": None}),
+        ("/api/slack/channels/C123456789/members", {"limit": 9, "cursor": "next"}),
+    ]
+    assert result == [
+        {"id": "U111111111", "name": "alice"},
+        {"id": "U222222222", "name": "bob"},
+    ]
+
+
+def test_file_proxy_methods_validate_inputs() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(ValueError, match="filename"):
+        client.upload_file_proxy(
+            channel_id="C123456789",
+            content_base64=base64.b64encode(b"hello").decode(),
+            filename=" ",
+        )
+    with pytest.raises(ValueError, match="valid base64"):
+        client.upload_file_proxy(
+            channel_id="C123456789",
+            content_base64="not base64",
+            filename="hello.txt",
+        )
+    with pytest.raises(ValueError, match="file_id"):
+        client.download_file_proxy(file_id="bad", channel_id="C123456789")
+    with pytest.raises(ValueError, match="file_id"):
+        client.file_info_proxy(file_id="bad", channel_id="C123456789")
+    with pytest.raises(ValueError, match="channel_id"):
+        client.get_channel_members_proxy(channel_id="general")
+
+
+def test_search_files_uses_proxy_with_user_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = _make_client()
+    monkeypatch.setenv("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true")
+    client._get_user_cache = lambda: {"U123456789": "alice"}  # type: ignore[method-assign]
+
+    def fake_list_files_proxy(**kwargs):
+        assert kwargs == {"channel_id": "C123456789", "limit": 200, "page": 1}
+        return {
+            "ok": True,
+            "has_more": False,
+            "files": [
+                {
+                    "id": "F123456789",
+                    "name": "quarterly-report.pdf",
+                    "title": "Q4 Report",
+                    "filetype": "pdf",
+                    "size": 1234,
+                    "user": "U123456789",
+                    "channels": ["C123456789"],
+                    "permalink": "https://slack.example/files/F123456789",
+                    "url_private": "https://files.example/F123456789",
+                    "created": 1700000000,
+                },
+                {
+                    "id": "F987654321",
+                    "name": "diagram.png",
+                    "title": "Architecture Diagram",
+                    "filetype": "png",
+                    "size": 5678,
+                    "user": "U987654321",
+                    "channels": ["C123456789"],
+                    "permalink": "https://slack.example/files/F987654321",
+                    "url_private": "https://files.example/F987654321",
+                    "created": 1700000001,
+                },
+            ],
+        }
+
+    client.list_files_proxy = fake_list_files_proxy  # type: ignore[method-assign]
+
+    results = client.search_files("C123456789", "report", max_results=20)
+
+    assert results == [
+        {
+            "id": "F123456789",
+            "name": "quarterly-report.pdf",
+            "title": "Q4 Report",
+            "filetype": "pdf",
+            "size": 1234,
+            "user": "alice",
+            "channels": ["C123456789"],
+            "permalink": "https://slack.example/files/F123456789",
+            "url_private": "https://files.example/F123456789",
+            "created": 1700000000,
+        }
+    ]
+
+
+def test_search_files_raises_when_api_proxy_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = _make_client()
+    monkeypatch.setenv("CENTAUR_SANDBOX_API_SERVER_ENABLED", "false")
+
+    with pytest.raises(RuntimeError, match="proxy requires"):
+        client.search_files("C123456789", "report", max_results=10)
+
+
+def test_search_files_paginates_proxy_until_enough_matches() -> None:
+    client, _ = _make_client()
+    client._get_user_cache = lambda: {"U123456789": "alice"}  # type: ignore[method-assign]
+    calls: list[dict] = []
+
+    def fake_list_files_proxy(**kwargs):
+        calls.append(kwargs)
+        if kwargs["page"] == 1:
+            return {
+                "ok": True,
+                "has_more": True,
+                "files": [
+                    {
+                        "id": "F000000001",
+                        "name": "diagram.png",
+                        "title": "Diagram",
+                        "filetype": "png",
+                        "size": 1234,
+                        "user": "U123456789",
+                        "channels": ["C123456789"],
+                        "permalink": "https://slack.example/files/F000000001",
+                        "url_private": "https://files.example/F000000001",
+                        "created": 1700000000,
+                    }
+                ],
+            }
+        return {
+            "ok": True,
+            "has_more": False,
+            "files": [
+                {
+                    "id": "F123456789",
+                    "name": "quarterly-report.pdf",
+                    "title": "Q4 Report",
+                    "filetype": "pdf",
+                    "size": 1234,
+                    "user": "U123456789",
+                    "channels": ["C123456789"],
+                    "permalink": "https://slack.example/files/F123456789",
+                    "url_private": "https://files.example/F123456789",
+                    "created": 1700000001,
+                }
+            ],
+        }
+
+    client.list_files_proxy = fake_list_files_proxy  # type: ignore[method-assign]
+
+    results = client.search_files("C111111111", "report", max_results=10)
+
+    assert calls == [
+        {"channel_id": "C111111111", "limit": 200, "page": 1},
+        {"channel_id": "C111111111", "limit": 200, "page": 2},
+    ]
+    assert [result["id"] for result in results] == ["F123456789"]
+
+
+def test_search_files_direct_uses_direct_files_list_when_api_proxy_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client, fake_web_client = _make_client()
+    monkeypatch.setenv("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true")
+    client._get_user_cache = lambda: {"U123456789": "alice"}  # type: ignore[method-assign]
+    client.list_files_proxy = pytest.fail  # type: ignore[method-assign]
+    fake_web_client.files_list_pages = [
+        {
+            "paging": {"page": 1, "pages": 1},
+            "files": [
+                {
+                    "id": "F123456789",
+                    "name": "quarterly-report.pdf",
+                    "title": "Q4 Report",
+                    "filetype": "pdf",
+                    "size": 1234,
+                    "user": "U123456789",
+                    "channels": ["C123456789"],
+                    "permalink": "https://slack.example/files/F123456789",
+                    "url_private": "https://files.example/F123456789",
+                    "created": 1700000000,
+                }
+            ]
+        }
+    ]
+
+    results = client.search_files_direct("report", max_results=10)
+
+    assert fake_web_client.files_list_calls == [{"count": 200, "page": 1}]
+    assert results[0]["user"] == "alice"
+
+
+def test_search_messages_with_channel_ids_scans_proxy_history_without_listing() -> None:
+    client, fake_web_client = _make_client()
+    client._get_user_cache = lambda: {"UGZCSQTPE": "matt", "U1": "alice"}  # type: ignore[method-assign]
+    history_by_channel = {
+        "C05HUE4KLF2": {
+            "messages": [
+                {"user": "UGZCSQTPE", "text": "Matt note about inference", "ts": "300.000000"},
+                {"user": "U1", "text": "unrelated", "ts": "299.000000"},
+            ]
+        },
+        "C042WDDP89Y": {
+            "messages": [{"user": "U1", "text": "Matt mentioned here", "ts": "200.000000"}]
+        },
+        "C0A174PPJDS": {
+            "messages": [{"user": "UGZCSQTPE", "text": "nothing relevant", "ts": "100.000000"}]
+        },
+    }
+    proxy_calls: list[dict] = []
+
+    def history_proxy(channel_id: str, **kwargs):
+        proxy_calls.append({"channel_id": channel_id, **kwargs})
+        return history_by_channel[channel_id]
+
+    client.get_channel_history_proxy = history_proxy  # type: ignore[method-assign]
 
     results = client.search_messages(
         "Matt",
@@ -410,30 +1007,35 @@ def test_search_messages_with_channel_ids_uses_rts_without_history_scan() -> Non
         messages_per_channel=25,
     )
 
-    assert fake_web_client.api_calls == [
-        (
-            "assistant.search.context",
-            {
-                "query": (
-                    "Matt in:<#C05HUE4KLF2> in:<#C042WDDP89Y> "
-                    "in:<#C0A174PPJDS>"
-                ),
-                "content_types": ["messages"],
-                "channel_types": ["public_channel"],
-                "limit": 10,
-                "sort": "timestamp",
-                "sort_dir": "desc",
-                "disable_semantic_search": True,
-            },
-        )
-    ]
+    assert fake_web_client.api_calls == []
     assert fake_web_client.list_calls == []
     assert fake_web_client.history_calls == []
-    assert results == []
+    assert sorted(call["channel_id"] for call in proxy_calls) == sorted(
+        [
+            "C05HUE4KLF2",
+            "C042WDDP89Y",
+            "C0A174PPJDS",
+        ]
+    )
+    assert sorted(call["limit"] for call in proxy_calls) == [25, 25, 25]
+    assert sorted(item["channel_id"] for item in results) == ["C042WDDP89Y", "C05HUE4KLF2"]
 
 
-def test_search_messages_passes_channel_and_user_modifiers_to_rts() -> None:
+def test_search_messages_parses_channel_and_user_modifiers_locally() -> None:
     client, fake_web_client = _make_client()
+    client._get_user_cache = lambda: {"UGZCSQTPE": "matt", "U1": "alice"}  # type: ignore[method-assign]
+    proxy_calls: list[dict] = []
+
+    def history_proxy(channel_id: str, **kwargs):
+        proxy_calls.append({"channel_id": channel_id, **kwargs})
+        return {
+            "messages": [
+                {"user": "UGZCSQTPE", "text": "Scott Wu on inference", "ts": "300.000000"},
+                {"user": "U1", "text": "also about inference", "ts": "301.000000"},
+            ]
+        }
+
+    client.get_channel_history_proxy = history_proxy  # type: ignore[method-assign]
 
     results = client.search_messages(
         "from:<@UGZCSQTPE> in:<#C042WDDP89Y>",
@@ -441,68 +1043,12 @@ def test_search_messages_passes_channel_and_user_modifiers_to_rts() -> None:
         messages_per_channel=25,
     )
 
-    assert fake_web_client.api_calls == [
-        (
-            "assistant.search.context",
-            {
-                "query": "from:<@UGZCSQTPE> in:<#C042WDDP89Y>",
-                "content_types": ["messages"],
-                "channel_types": ["public_channel"],
-                "limit": 5,
-                "sort": "timestamp",
-                "sort_dir": "desc",
-                "disable_semantic_search": True,
-            },
-        )
-    ]
+    assert fake_web_client.api_calls == []
     assert fake_web_client.list_calls == []
     assert fake_web_client.history_calls == []
-    assert results == []
-
-
-def test_workspace_search_requires_search_token() -> None:
-    client, _ = _make_client()
-    client.search_token = ""
-    client._search_client = None
-    client.list_bot_channels = lambda **_: (_ for _ in ()).throw(  # type: ignore[method-assign]
-        AssertionError("workspace search must not scan bot-visible channels")
-    )
-
-    with pytest.raises(RuntimeError, match="SLACK_SEARCH_TOKEN not set"):
-        client.search_messages("deploy", max_results=5)
-
-
-def test_workspace_search_refuses_bot_token_fallback_when_rts_fails() -> None:
-    client, fake_web_client = _make_client()
-    client.list_bot_channels = lambda **_: (_ for _ in ()).throw(  # type: ignore[method-assign]
-        AssertionError("workspace search must not scan bot-visible channels")
-    )
-
-    def fail_native_search(method: str, *, json: dict):
-        fake_web_client.api_calls.append((method, json))
-        raise _make_slack_error(error="invalid_auth", status_code=200)
-
-    fake_web_client.api_call = fail_native_search  # type: ignore[method-assign]
-
-    with pytest.raises(RuntimeError, match="refusing SLACK_BOT_TOKEN fallback"):
-        client.search_messages("deploy", max_results=5)
-
-    assert fake_web_client.api_calls == [
-        (
-            "assistant.search.context",
-            {
-                "query": "deploy",
-                "content_types": ["messages"],
-                "channel_types": ["public_channel"],
-                "limit": 5,
-                "sort": "timestamp",
-                "sort_dir": "desc",
-                "disable_semantic_search": True,
-            },
-        )
-    ]
-    assert fake_web_client.user_conversations_calls == []
-    assert fake_web_client.history_calls == []
+    assert proxy_calls == [{"channel_id": "C042WDDP89Y", "limit": 25}]
+    assert len(results) == 1
+    assert results[0]["user_id"] == "UGZCSQTPE"
 
 
 def test_list_channels_returns_cache_when_slack_rate_limited() -> None:
@@ -641,38 +1187,6 @@ def test_upload_file_surfaces_structured_auth_failure() -> None:
     }
 
 
-def test_upload_file_requires_dedicated_upload_token() -> None:
-    client, _ = _make_client()
-    client._upload_client = None
-    client.upload_token = ""
-
-    with pytest.raises(RuntimeError, match="SLACK_UPLOAD_TOKEN"):
-        client.upload_file(
-            "paradigm-pulse",
-            thread_ts="1780035646.228899",
-            content_base64="dGVzdA==",
-            filename="chart.png",
-        )
-
-
-def test_upload_file_uses_dedicated_upload_client() -> None:
-    client, fake_bot_client = _make_client()
-    fake_upload_client = _FakeWebClient()
-    client._upload_client = fake_upload_client
-
-    client.upload_file(
-        channel_id="C123",
-        thread_ts="1780035646.228899",
-        content_base64="dGVzdA==",
-        filename="chart.png",
-    )
-
-    assert fake_upload_client.upload_count == 1
-    assert fake_upload_client.files_info_calls == [{"file": "F1"}]
-    assert fake_bot_client.upload_count == 0
-    assert fake_bot_client.files_info_calls == []
-
-
 def test_upload_file_accepts_channel_id_alias_and_returns_preview() -> None:
     client, fake_web_client = _make_client()
 
@@ -719,7 +1233,7 @@ def test_upload_file_uses_explicit_destination() -> None:
     assert fake_web_client.last_kwargs["thread_ts"] == "201.000000"
 
 
-def test_upload_file_requires_channel_when_not_in_slack_context() -> None:
+def test_upload_file_requires_explicit_channel() -> None:
     client, _ = _make_client()
 
     with pytest.raises(ValueError, match="channel is required"):
@@ -730,35 +1244,15 @@ def test_upload_file_requires_channel_when_not_in_slack_context() -> None:
         )
 
 
-def test_upload_file_requires_explicit_channel_in_slack_context() -> None:
+def test_upload_file_requires_explicit_thread_ts() -> None:
     client, _ = _make_client()
-    token = set_tool_context(
-        ToolContext(name="slack", thread_key="slack:C-thread:1777910337.403889"),
-    )
-    try:
-        with pytest.raises(ValueError, match="pass channel or channel_id explicitly"):
-            client.upload_file(
-                None,
-                content_base64="dGVzdA==",
-                filename="chart.png",
-            )
-    finally:
-        reset_tool_context(token)
 
-
-def test_upload_file_requires_explicit_channel_in_team_scoped_thread_key() -> None:
-    client, _ = _make_client()
-    token = set_tool_context(
-        ToolContext(
-            name="slack",
-            thread_key="slack:T0AQQ46PL4C:C0B0XS7BLA3:1780035646.228899",
+    with pytest.raises(ValueError, match="thread_ts is required"):
+        client.upload_file(
+            channel_id="C123",
+            content_base64="dGVzdA==",
+            filename="random_data.csv",
         )
-    )
-    try:
-        with pytest.raises(ValueError, match="pass channel or channel_id explicitly"):
-            client.upload_file(content_base64="dGVzdA==", filename="random_data.csv")
-    finally:
-        reset_tool_context(token)
 
 
 def test_upload_file_uploads_once_and_returns_when_share_lands(monkeypatch) -> None:
@@ -861,65 +1355,19 @@ def test_upload_file_rejects_local_path_argument() -> None:
 def test_upload_file_requires_a_content_source() -> None:
     client, _ = _make_client()
 
-    with pytest.raises(ValueError, match="content_base64, attachment_id, or attachment_url"):
+    with pytest.raises(ValueError, match="content_base64 is required"):
         client.upload_file("paradigm-pulse", thread_ts="1780035646.228899")
-
-
-def test_attachment_url_must_use_centaur_api(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, _ = _make_client()
-    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
-
-    with pytest.raises(ValueError, match="configured Centaur API"):
-        client._download_attachment_bytes(attachment_url="https://evil.example/file")
-
-
-def test_attachment_url_requires_attachment_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, _ = _make_client()
-    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
-
-    with pytest.raises(ValueError, match="attachment download path"):
-        client._download_attachment_bytes(attachment_url="/not-attachments/file")
-
-
-def test_upload_file_reads_thread_scoped_attachment(monkeypatch: pytest.MonkeyPatch) -> None:
-    import urllib.request
-
-    client, fake_web_client = _make_client()
-    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
-    token = set_tool_context(
-        ToolContext(name="slack", thread_key="slack:T1:C123:1780035646.228899"),
-    )
-
-    def fake_urlopen(req, *args, **kwargs):
-        assert req.full_url == (
-            "http://api:8000/agent/attachments/att_123/download"
-            "?thread_key=slack%3AT1%3AC123%3A1780035646.228899"
-        )
-        return _FakeHTTPResponse(b"report,data\n1,2\n", "text/csv")
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    try:
-        result = client.upload_file(
-            channel_id="C123",
-            thread_ts="1780035646.228899",
-            attachment_id="att_123",
-            filename="report.csv",
-        )
-    finally:
-        reset_tool_context(token)
-
-    assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["file"] == b"report,data\n1,2\n"
-    assert fake_web_client.last_kwargs["filename"] == "report.csv"
-    assert result["preview"]["mime_type"] == "text/csv"
 
 
 class _FakeHTTPResponse:
     """Minimal stand-in for urllib's HTTPResponse context manager."""
 
-    def __init__(self, body: bytes, content_type: str) -> None:
+    def __init__(
+        self, body: bytes, content_type: str, headers: dict[str, str] | None = None
+    ) -> None:
         self._body = body
         self._content_type = content_type
+        self._headers = headers or {}
 
     def __enter__(self) -> "_FakeHTTPResponse":
         return self
@@ -934,6 +1382,8 @@ class _FakeHTTPResponse:
     def headers(self) -> "email.message.Message":
         msg = email.message.Message()
         msg["Content-Type"] = self._content_type
+        for key, value in self._headers.items():
+            msg[key] = value
         return msg
 
 
@@ -957,7 +1407,7 @@ def test_fetch_slack_file_returns_file_metadata_and_bytes(
     client.token = "SLACK_BOT_TOKEN"
 
     def fake_urlopen(req, *args, **kwargs):
-        if urlparse(req.full_url).hostname == "files.slack.com":
+        if "files.slack.com" in req.full_url:
             assert req.get_header("Authorization") == "Bearer SLACK_BOT_TOKEN"
             return _FakeHTTPResponse(b"%PDF-1.4 report", "application/pdf")
         raise AssertionError(f"unexpected url {req.full_url}")
@@ -973,56 +1423,19 @@ def test_fetch_slack_file_returns_file_metadata_and_bytes(
     assert body == b"%PDF-1.4 report"
 
 
-def test_download_file_stores_slack_file_as_attachment(monkeypatch: pytest.MonkeyPatch) -> None:
-    import slack.client as slack_client_module
-    import urllib.request
-
-    client, _ = _make_client()
-    client.token = "SLACK_BOT_TOKEN"
-    stored: dict = {}
-
-    def fake_urlopen(req, *args, **kwargs):
-        assert urlparse(req.full_url).hostname == "files.slack.com"
-        return _FakeHTTPResponse(b"%PDF-1.4 report", "application/pdf")
-
-    def fake_save_attachment(**kwargs):
-        stored.update(kwargs)
-        return {"attachment_id": "attachment_123"}
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(slack_client_module, "save_attachment", fake_save_attachment)
-
-    result = client.download_file("https://files.slack.com/files-pri/T1-F1/report.pdf")
-
-    assert stored == {
-        "name": "report.pdf",
-        "mime_type": "application/pdf",
-        "data": b"%PDF-1.4 report",
-        "source_url": "https://files.slack.com/files-pri/T1-F1/report.pdf",
-    }
-    assert result == {
-        "attachment_id": "attachment_123",
-        "filename": "report.pdf",
-        "mime_type": "application/pdf",
-        "size_bytes": 15,
-    }
-
-
-def test_native_search_uses_dedicated_rts_search_client() -> None:
+def test_native_search_uses_dedicated_search_client() -> None:
     client, fake_bot_client = _make_client()
     fake_search_client = _FakeWebClient()
-    fake_search_client.api_call = lambda method, *, json: {  # type: ignore[method-assign]
+    fake_search_client.api_call = lambda method, *, params: {  # type: ignore[method-assign]
         "ok": True,
-        "results": {
-            "messages": [
+        "messages": {
+            "matches": [
                 {
-                    "author_user_id": "U1",
-                    "author_name": "alice",
-                    "content": "deploy <@U2>",
-                    "message_ts": "200.000000",
+                    "user": "U1",
+                    "text": "deploy <@U2>",
+                    "ts": "200.000000",
                     "permalink": "https://slack.com/archives/C123/p200000000",
-                    "channel_id": "C123",
-                    "channel_name": "paradigm-pulse",
+                    "channel": {"id": "C123", "name": "paradigm-pulse"},
                     "thread_ts": "200.000000",
                     "reply_count": 2,
                 }

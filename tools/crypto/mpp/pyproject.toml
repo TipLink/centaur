@@ -25,6 +25,3 @@ packages = ["."]
 
 [tool.centaur]
 module = "client.py"
-secrets = [
-    {type = "http", name = "MPP_PRIVATE_KEY", mode = "replace", match_headers = ["X-MPP-Key"], hosts = ["parallelmpp.dev", "coingecko.mpp.paywithlocus.com", "graph.codex.io", "agents.allium.so", "api.dune.com"]},
-]

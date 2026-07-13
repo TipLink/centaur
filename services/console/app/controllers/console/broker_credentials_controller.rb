@@ -10,6 +10,7 @@ module Console
 
     layout "console"
 
+    before_action :require_admin
     before_action :set_credential, only: %i[edit update destroy]
 
     def new
@@ -69,6 +70,7 @@ module Console
 
       secret = credential_params[:client_secret]
       if secret.present?
+        # Active Record encryption protects this write-only attribute at rest.
         credential.client_secret = secret
         reset_refresh_state(credential) if credential.grant == BrokerCredential::GITHUB_APP_INSTALLATION
       end

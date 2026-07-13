@@ -1,206 +1,122 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { CentaurClient, type StreamEvent } from "../src/client";
-
-async function collectEvents(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
-  const collected: StreamEvent[] = [];
-  for await (const event of events) {
-    collected.push(event);
-  }
-  return collected;
-}
-
-function sseResponse(body: string, init?: ResponseInit): Response {
-  return new Response(
-    new ReadableStream({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode(body));
-        controller.close();
-      },
-    }),
-    {
-      status: 200,
-      headers: { "Content-Type": "text/event-stream" },
-      ...init,
-    },
-  );
-}
+import { CentaurClient } from "../src/client";
 
 describe("CentaurClient", () => {
   afterEach(() => {
     vi.restoreAllMocks();
-    vi.unstubAllGlobals();
   });
 
-  it("parses SSE ids, events, JSON data, [DONE], and invalid JSON payloads", async () => {
-    const fetchMock = vi.fn(async () => sseResponse([
-      "id: 11",
-      "event: amp_raw_event",
-      'data: {"type":"assistant","message":{"content":"hello"}}',
-      "",
-      "id: 12",
-      "event: done",
-      "data: [DONE]",
-      "",
-      "id: 13",
-      "data: not-json",
-      "",
-      "",
-    ].join("\n")));
-    vi.stubGlobal("fetch", fetchMock);
-
+  it("starts workflow runs through the workflow API", async () => {
     const client = new CentaurClient({
       apiUrl: "http://api.local",
       apiKey: "test-key",
     });
-
-    await expect(collectEvents(client.streamEvents({ threadKey: "thread-1" }))).resolves.toEqual([
-      {
-        eventId: 11,
-        eventKind: "amp_raw_event",
-        data: { type: "assistant", message: { content: "hello" } },
-      },
-      {
-        eventId: 13,
-        eventKind: "message",
-        data: { type: "unknown", raw: "not-json" },
-      },
-    ]);
-  });
-
-  it("URL encodes Slack thread keys in event stream URLs", async () => {
-    const fetchMock = vi.fn(async () => sseResponse(""));
-    vi.stubGlobal("fetch", fetchMock);
-    const client = new CentaurClient({
-      apiUrl: "http://api.local",
-      apiKey: "test-key",
+    const postMock = vi.spyOn(client.http, "post").mockResolvedValue({
+      data: { ok: true, run_id: "run-123", task_id: "task-123", status: "queued", created: true },
     });
 
-    await collectEvents(client.streamEvents({
-      threadKey: "slack:T123:C123:1700000000.000100",
-      executionId: "exe-1",
-      afterEventId: 42,
-      pollMs: 250,
-    }));
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://api.local/api/session/slack%3AT123%3AC123%3A1700000000.000100/events?after_event_id=42&execution_id=exe-1&poll_ms=250",
-      expect.objectContaining({
-        method: "GET",
-        headers: {
-          Authorization: "Bearer test-key",
-          "X-Centaur-Thread-Key": "slack:T123:C123:1700000000.000100",
-        },
+    await expect(
+      client.startWorkflowRun({
+        workflowName: "nightly",
+        idempotencyKey: "trigger-1",
+        input: { topic: "incidents" },
+        harnessType: "codex",
+        maxAttempts: 3,
+        timeoutMs: 5000,
       }),
+    ).resolves.toMatchObject({ run_id: "run-123" });
+
+    expect(postMock).toHaveBeenCalledWith(
+      "/api/workflows/runs",
+      {
+        workflow_name: "nightly",
+        idempotency_key: "trigger-1",
+        input: { topic: "incidents" },
+        harness_type: "codex",
+        max_attempts: 3,
+      },
+      { timeout: 5000 },
     );
   });
 
-  it("uses session API routes for path-based session calls", async () => {
+  it("reads and mutates workflow runs through workflow endpoints", async () => {
+    const client = new CentaurClient({
+      apiUrl: "http://api.local",
+      apiKey: "test-key",
+    });
+    const getMock = vi.spyOn(client.http, "get").mockResolvedValue({
+      data: { ok: true, run_id: "run:123", workflow_name: "nightly", status: "completed" },
+    });
+    const postMock = vi.spyOn(client.http, "post").mockResolvedValue({
+      data: { ok: true, run_id: "run:123", workflow_name: "nightly", status: "cancelled" },
+    });
+
+    await client.getWorkflowRun("run:123");
+    await client.listWorkflowRuns({
+      workflowName: "nightly",
+      threadKey: "slack:C:1",
+      limit: 5,
+    });
+    await client.cancelWorkflowRun("run:123");
+
+    expect(getMock).toHaveBeenNthCalledWith(1, "/api/workflows/runs/run%3A123");
+    expect(getMock).toHaveBeenNthCalledWith(2, "/api/workflows/runs", {
+      params: {
+        workflow_name: "nightly",
+        thread_key: "slack:C:1",
+        limit: 5,
+      },
+    });
+    expect(postMock).toHaveBeenCalledWith("/api/workflows/runs/run%3A123/cancel");
+  });
+
+  it("sends workflow events", async () => {
     const client = new CentaurClient({
       apiUrl: "http://api.local",
       apiKey: "test-key",
     });
     const postMock = vi.spyOn(client.http, "post").mockResolvedValue({ data: { ok: true } });
-    const threadKey = "slack:T123:C123:1700000000.000100";
 
-    await client.spawn({
-      threadKey,
-      harness: "codex",
-      spawnId: "spawn:1",
-      personaId: "persona-1",
-      agentsMdOverride: "custom instructions",
-    });
-    await client.message({
-      threadKey,
-      assignmentGeneration: 3,
-      messageId: "msg:1",
-      parts: [{ type: "text", text: "hello" }],
-      userId: "U123",
-      metadata: { platform: "slack" },
-    });
-    await client.execute({
-      threadKey,
-      assignmentGeneration: 3,
-      executeId: "exec:1",
-      harness: "codex",
-      platform: "slack",
-      userId: "U123",
-      metadata: { source: "test" },
-    });
-    await client.releaseThread(threadKey, {
-      releaseId: "release:1",
-      cancelInflight: true,
+    await client.sendWorkflowEvent({
+      eventName: "approval.received",
+      payload: { approved: true, correlation_id: "corr-1" },
     });
 
-    expect(postMock).toHaveBeenNthCalledWith(
-      1,
-      "/api/session/slack%3AT123%3AC123%3A1700000000.000100",
-      {
-        harness_type: "codex",
-        persona_id: "persona-1",
-        metadata: {
-          spawn_id: "spawn:1",
-          agents_md_override: "custom instructions",
-        },
-      },
-    );
-    expect(postMock).toHaveBeenNthCalledWith(
-      2,
-      "/api/session/slack%3AT123%3AC123%3A1700000000.000100/messages",
-      {
-        messages: [
-          {
-            client_message_id: "msg:1",
-            role: "user",
-            parts: [{ type: "text", text: "hello" }],
-            metadata: {
-              platform: "slack",
-              assignment_generation: 3,
-              user_id: "U123",
-            },
-          },
-        ],
-      },
-    );
-    expect(postMock).toHaveBeenNthCalledWith(
-      3,
-      "/api/session/slack%3AT123%3AC123%3A1700000000.000100/execute",
-      {
-        idempotency_key: "exec:1",
-        metadata: {
-          source: "test",
-          assignment_generation: 3,
-          harness: "codex",
-          platform: "slack",
-          user_id: "U123",
-        },
-        input_lines: [],
-      },
-    );
-    expect(postMock).toHaveBeenNthCalledWith(
-      4,
-      "/api/session/slack%3AT123%3AC123%3A1700000000.000100/release",
-      {
-        release_id: "release:1",
-        cancel_inflight: true,
-      },
-    );
+    expect(postMock).toHaveBeenCalledWith("/api/workflows/events", {
+      event_name: "approval.received",
+      payload: { approved: true, correlation_id: "corr-1" },
+    });
   });
 
-  it("throws useful errors for non-OK event stream responses", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(
-      "upstream unavailable",
-      { status: 503, statusText: "Service Unavailable" },
-    )));
+  it("releases a session through the canonical owner-fenced endpoint", async () => {
     const client = new CentaurClient({
       apiUrl: "http://api.local",
       apiKey: "test-key",
     });
+    const postMock = vi.spyOn(client.http, "post").mockResolvedValue({
+      data: {
+        ok: true,
+        thread_key: "slack:T:C:1.2",
+        cancel_inflight: true,
+        sandbox_released: true,
+        execution_cancelled: true,
+      },
+    });
 
-    await expect(
-      collectEvents(client.streamEvents({ threadKey: "slack:T123:C123:1700000000.000100" })),
-    ).rejects.toThrow(
-      "/api/session/{thread}/events failed (503): upstream unavailable",
+    await client.releaseThread("slack:T:C:1.2", {
+      releaseId: "rel-123",
+      expectedSandboxId: "asbx-reviewed",
+      cancelInflight: true,
+    });
+
+    expect(postMock).toHaveBeenCalledWith(
+      "/api/session/slack%3AT%3AC%3A1.2/release",
+      {
+        release_id: "rel-123",
+        expected_sandbox_id: "asbx-reviewed",
+        cancel_inflight: true,
+      },
     );
   });
 });

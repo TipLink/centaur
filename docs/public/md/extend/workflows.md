@@ -1,14 +1,14 @@
 ---
 title: Creating Workflows
-description: Add durable Centaur workflows with checkpointed steps, sleeps, schedules, webhooks, Slack posts, tool calls, and agent turns.
+description: Add durable Centaur workflows with checkpointed steps, sleeps, events, child workflows, and agent turns.
 ---
 
 # Creating Workflows
 
-Workflows are Python handlers that run through Centaur's durable api-rs
-workflow engine. They are useful when the task is longer than one agent turn:
-polling, branching, retries, scheduled syncs, webhook handling, or coordinating
-agent runs.
+Workflows are Python handlers that run through Centaur's durable workflow
+engine. They are useful when the task is longer than one agent turn: polling,
+branching, retries, waiting for external events, or coordinating multiple agent
+runs.
 
 Use a workflow when the system needs durable progress rather than a single
 request-response turn. Common examples include scheduled reports, ETL syncs,
@@ -37,6 +37,7 @@ An optional `Input` dataclass gives structured inputs.
 
 ```python
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from api.workflow_engine import WorkflowContext
@@ -53,10 +54,10 @@ class Input:
 
 async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     data = await ctx.step("collect", lambda: {"topic": inp.topic})
-    await ctx.sleep_for("settle", 30)
+    await ctx.sleep("settle", timedelta(seconds=30))
     result = await ctx.run_agent(
-        f"Write a short report about {data['topic']}",
-        thread_key=f"workflow:{ctx.run_id}:nightly_report",
+        "summarize",
+        text=f"Write a short report about {data['topic']}",
     )
     return {"channel": inp.channel, "report": result}
 ```
@@ -65,18 +66,17 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 
 | Primitive | Use it for |
 |-----------|------------|
-| `ctx.step(name, fn)` | Run a deterministic or idempotent operation and cache its result after the callback succeeds. |
-| `ctx.sleep_for(name, seconds)` | Suspend and resume later. |
+| `ctx.step(name, fn)` | Run a side effect once and cache its result. |
+| `ctx.sleep(name, duration)` | Suspend and resume later. |
 | `ctx.sleep_until(name, when)` | Resume at a specific time. |
-| `ctx.agent_turn(text, **kwargs)` / `ctx.run_agent(text, **kwargs)` | Start an agent turn and wait for the result. |
-| `ctx.call_tool(tool, method, args)` | Call a tool through the workflow-host `centaur-tools call` bridge. |
-| `ctx.post_to_slack(channel, text, **kwargs)` | Post to Slack through the api-rs Slack context path. |
-| `ctx._pool` | Access the workflow database pool when the workflow-host sandbox receives `DATABASE_URL`. |
+| `ctx.wait_for_event(name, event_type, correlation_id)` | Wait for an external event. |
+| `ctx.wait_for_workflow(...)` | Wait for a child workflow to finish. |
+| `ctx.run_workflow(...)` | Start and wait in one call. |
+| `ctx.start_agent(...)` | Start an agent turn. |
+| `ctx.run_agent(...)` | Start an agent turn and wait for the result. |
 
-The handler may re-execute after a restart. `ctx.step(...)` memoizes the result
-after its callback returns, so writes and external API calls inside a step must
-still be idempotent. If the host crashes after the external side effect but
-before the checkpoint commits, the step can replay.
+The handler may re-execute after a restart. Put external side effects behind
+`ctx.step(...)` so completed work is not repeated.
 
 These primitives compose into larger automations:
 
@@ -84,17 +84,26 @@ These primitives compose into larger automations:
   or business-hours monitor without a human prompt.
 - **Polling loops**: sleep between checks for CI, blockchain confirmations,
   billing state, deploy health, or vendor exports.
-- **Event-driven flows**: expose a signed webhook and let the handler process a
-  normalized webhook envelope.
+- **Event-driven flows**: wait for a webhook, approval, upload, or callback and
+  continue from the last checkpoint.
+- **Fan-out/fan-in orchestration**: start child workflows for independent work
+  and wait for all of them before producing a final result.
 - **Agent orchestration**: use agents for judgment-heavy steps while the
   workflow owns timing, retries, state, and final delivery.
 
 ## Run a workflow
 
-Create a run through the API:
+The manual control API requires the trusted `CENTAUR_CONTROL_API_KEY` (or an
+optional dedicated `WORKFLOW_API_KEY`). Agent tools use
+a separate Console JWT lane: their workflow name must be listed in
+`WORKFLOW_API_ALLOWED_NAMES`, and `input.thread_key` must belong to one of the
+JWT's Slack upload channels.
+
+Create a run through the trusted operator lane:
 
 ```bash
 curl -s "$CENTAUR_API_URL/api/workflows/runs" \
+  -H "Authorization: Bearer $CENTAUR_CONTROL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_name": "nightly_report",
@@ -106,7 +115,8 @@ curl -s "$CENTAUR_API_URL/api/workflows/runs" \
 Inspect it:
 
 ```bash
-curl -s "$CENTAUR_API_URL/api/workflows/runs/$RUN_ID" | jq
+curl -s "$CENTAUR_API_URL/api/workflows/runs/$RUN_ID" \
+  -H "Authorization: Bearer $CENTAUR_CONTROL_API_KEY" | jq
 ```
 
 ## Schedule a workflow
@@ -154,9 +164,8 @@ declared in the schedule instead of inferred from wall-clock state when
 possible.
 
 For workflows that may run longer than their schedule interval, make each tick
-idempotent. Put writes and external API calls in named `ctx.step(...)` blocks
-only when they use stable provider-side idempotency keys or upserts, derive
-those keys from the scheduled window, and have the handler detect
+idempotent. Put writes and external API calls in named `ctx.step(...)` blocks,
+derive stable keys from the scheduled window, and have the handler detect
 already-processed periods before starting expensive work.
 
 Interval schedules are useful when exact wall-clock alignment does not matter:
@@ -182,29 +191,24 @@ entrypoints such as GitHub issue triage, billing events, or deploy callbacks.
 ```python
 from typing import Any
 
+from api.webhooks import HeaderTriggerKey, HmacAuth, WebhookSpec
 from api.workflow_engine import WorkflowContext
 
 
 WORKFLOW_NAME = "github_issue_triage"
 
 WEBHOOKS = [
-    {
-        "slug": "github-issue-triage",
-        "provider": "github",
-        "auth": {"type": "github", "secret_ref": "GITHUB_WEBHOOK_SECRET"},
-        "trigger_key": {"type": "header", "header": "X-GitHub-Delivery"},
-        "allowed_methods": ["POST"],
-        "allowed_content_types": [
+    WebhookSpec(
+        slug="github-issue-triage",
+        provider="github",
+        auth=HmacAuth.github(secret_ref="GITHUB_WEBHOOK_SECRET"),
+        trigger_key=HeaderTriggerKey("X-GitHub-Delivery"),
+        allowed_methods=["POST"],
+        allowed_content_types=[
             "application/json",
             "application/x-www-form-urlencoded",
         ],
-        "filter": {
-            "all": [
-                {"source": "header", "key": "x-github-event", "op": "equals", "value": "issues"},
-                {"source": "body", "key": "action", "op": "in", "values": ["opened", "reopened"]},
-            ]
-        },
-    }
+    )
 ]
 
 
@@ -212,6 +216,9 @@ async def handler(inp: dict[str, Any], ctx: WorkflowContext) -> dict[str, Any]:
     webhook = inp["webhook"]
     headers = webhook["headers"]
     payload = webhook["body"]
+
+    if headers.get("x-github-event") != "issues":
+        return {"skipped": True, "reason": "unsupported_event"}
 
     issue = payload["issue"]
     repo = payload["repository"]["full_name"]
@@ -233,17 +240,11 @@ For GitHub, set the webhook secret to the same value as
 GitHub's default `application/x-www-form-urlencoded` payloads also work when
 that content type is listed in `allowed_content_types`.
 
-Use `filter` for provider events that can be rejected from headers or JSON body
-fields. The API evaluates the filter before creating a workflow run, which
-keeps org-wide webhooks from spawning a sandbox for events the handler would
-immediately skip.
-
 Webhook requests do not use Centaur API keys. The API verifies the provider
-signature before creating workflow state. Use
-`{"type": "github", "secret_ref": "GITHUB_WEBHOOK_SECRET"}` for GitHub
-`X-Hub-Signature-256` webhooks, or `{"type": "hmac", ...}` for other SHA-256
-HMAC providers. During local development or for trusted internal routes, use
-`{"type": "none"}`.
+signature before creating workflow state. `HmacAuth.github(...)` verifies
+`X-Hub-Signature-256`; a plain `HmacAuth(...)` can be used for other
+SHA-256 HMAC providers. During local development or for trusted internal
+routes, `auth="none"` is allowed.
 
 The workflow receives input in this shape:
 

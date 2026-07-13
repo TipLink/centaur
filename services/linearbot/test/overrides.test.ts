@@ -76,18 +76,56 @@ describe("extractMessageOverrides", () => {
     );
   });
 
+  test("--meta selects the Meta provider and codex harness", () => {
+    expect(extractMessageOverrides("--meta fix it")).toEqual({
+      cleanedText: "fix it",
+      harnessType: "codex",
+      model: undefined,
+      provider: "responses",
+    });
+  });
+
   test("--model expands claude aliases to full model ids", () => {
     expect(extractMessageOverrides("--claude --model opus go")).toEqual({
       cleanedText: "go",
       harnessType: "claudecode",
       model: "claude-opus-4-8",
     });
-    expect(extractMessageOverrides("--model Sonnet go").model).toBe(
-      "claude-sonnet-5",
-    );
+    expect(extractMessageOverrides("--model Sonnet go")).toEqual({
+      cleanedText: "go",
+      harnessType: "claudecode",
+      model: "claude-sonnet-5",
+    });
     expect(extractMessageOverrides("--model fable go").model).toBe(
       "claude-fable-5",
     );
+  });
+
+  test("--model accepts a newline immediately after the value", () => {
+    expect(
+      extractMessageOverrides("--claude --model=fable\nwhat model are you"),
+    ).toEqual({
+      cleanedText: "what model are you",
+      harnessType: "claudecode",
+      model: "claude-fable-5",
+    });
+    expect(
+      extractMessageOverrides("@Centaur AI --claude --model=fable\r\nwhat model are you"),
+    ).toEqual({
+      cleanedText: "@Centaur AI what model are you",
+      harnessType: "claudecode",
+      model: "claude-fable-5",
+    });
+  });
+
+  test("--model accepts a rendered line break immediately after the value", () => {
+    expect(
+      extractMessageOverrides("--claude --model=fable<br>what model are you"),
+    ).toEqual({
+      cleanedText: "what model are you",
+      harnessType: "claudecode",
+      model: "claude-fable-5",
+    });
   });
 
   test("--model passes non-alias values through verbatim", () => {
@@ -95,6 +133,11 @@ describe("extractMessageOverrides", () => {
       extractMessageOverrides("--codex --model gpt-5.2-codex go").model,
     ).toBe("gpt-5.2-codex");
     expect(extractMessageOverrides("--amp --model fast go").model).toBe("fast");
+    expect(extractMessageOverrides("--model claude-sonnet-4-6 go")).toEqual({
+      cleanedText: "go",
+      harnessType: undefined,
+      model: "claude-sonnet-4-6",
+    });
   });
 
   test("explicit flags win over shortcut implications", () => {
@@ -102,6 +145,23 @@ describe("extractMessageOverrides", () => {
       cleanedText: "fix it",
       harnessType: "codex",
       model: "claude-opus-4-8",
+    });
+    expect(extractMessageOverrides("--codex --model Sonnet fix it")).toEqual({
+      cleanedText: "fix it",
+      harnessType: "codex",
+      model: "claude-sonnet-5",
+    });
+    expect(extractMessageOverrides("--meta --model Sonnet fix it")).toEqual({
+      cleanedText: "fix it",
+      harnessType: "codex",
+      model: "claude-sonnet-5",
+      provider: "responses",
+    });
+    expect(extractMessageOverrides("--meta --sonnet fix it")).toEqual({
+      cleanedText: "fix it",
+      harnessType: "codex",
+      model: "claude-sonnet-5",
+      provider: "responses",
     });
     expect(
       extractMessageOverrides("--sonnet --model claude-opus-4-8 fix it").model,
@@ -129,6 +189,11 @@ describe("extractMessageOverrides", () => {
   test("--model without a value is left untouched", () => {
     expect(extractMessageOverrides("what does --model do?")).toEqual({
       cleanedText: "what does --model do?",
+      harnessType: undefined,
+      model: undefined,
+    });
+    expect(extractMessageOverrides("--model\nwhat model are you")).toEqual({
+      cleanedText: "--model\nwhat model are you",
       harnessType: undefined,
       model: undefined,
     });

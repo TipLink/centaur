@@ -80,6 +80,30 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     assert bc.errors[:client_secret].any?
   end
 
+  test "github app installation credentials reject unapproved token endpoints" do
+    endpoints = [
+      "https://attacker.example/app/installations/42/access_tokens",
+      "https://api.github.com.attacker.example/app/installations/42/access_tokens",
+      "https://user@api.github.com/app/installations/42/access_tokens",
+      "https://api.github.com:444/app/installations/42/access_tokens",
+      "https://api.github.com/app/installations/42/access_tokens?redirect=attacker",
+      "https://api.github.com/app/installations/42/access_tokens#fragment",
+      "http://api.github.com/app/installations/42/access_tokens"
+    ]
+
+    endpoints.each do |token_endpoint|
+      credential = build_credential(
+        grant: BrokerCredential::GITHUB_APP_INSTALLATION,
+        token_endpoint: token_endpoint,
+        client_id: "12345",
+        client_secret: "private-key",
+        refresh_token: nil
+      )
+      refute credential.valid?, token_endpoint
+      assert credential.errors[:token_endpoint].any?, token_endpoint
+    end
+  end
+
   test "password grant is valid with username and password" do
     bc = build_credential(grant: "password", username: "user", password: "pass", refresh_token: nil)
     assert bc.valid?, bc.errors.full_messages.to_sentence

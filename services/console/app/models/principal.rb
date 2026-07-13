@@ -1,4 +1,7 @@
+require "uri"
+
 class Principal < ApplicationRecord
+  FEEDBACK_API_SECRET_NAME = "SLACK_FEEDBACK_API_KEY".freeze
   oid_prefix "prn"
 
   include ForeignIdCollisionGuard
@@ -11,38 +14,39 @@ class Principal < ApplicationRecord
   has_many :proxies, dependent: :nullify
   has_many :principal_roles, dependent: :destroy
   has_many :roles, through: :principal_roles
+  has_many :slack_channel_permissions, dependent: :destroy
   has_many :sync_config_snapshots, class_name: "PrincipalSyncConfigSnapshot", dependent: :destroy
+  has_many :mcp_oauth_authorization_codes, dependent: :destroy
+  has_many :mcp_oauth_refresh_tokens, dependent: :destroy
   belongs_to :created_by, class_name: "User"
 
+  accepts_nested_attributes_for :slack_channel_permissions,
+                                allow_destroy: true,
+                                reject_if: :reject_slack_channel_permission_attributes?
+
   after_commit :auto_grant_matching_oauth_credentials, on: %i[create update]
+  before_validation :apply_sandbox_repo_cache_label
   before_commit :bump_own_sync_config_cache_version, on: :update, if: :sync_config_fields_changed?
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
+  SANDBOX_REPO_CACHE_LABEL = "centaur.sandbox_repo_cache".freeze
+  SANDBOX_REPO_CACHE_VALUES = %w[none public all].freeze
 
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
   validates :foreign_id, uniqueness: { scope: :namespace, allow_nil: true },
             format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }, allow_nil: true
+  validates :sandbox_repo_cache, inclusion: { in: SANDBOX_REPO_CACHE_VALUES }
 
   # Stand-in for an inline secret value in redacted config: effective_config
   # reports that a control_plane source carries a value without revealing it.
   REDACTED = "[redacted]".freeze
-
-  # Managed proxies do not read the baked local proxy YAML; they receive their
-  # runtime config from iron-control sync. Keep this in sync with
-  # services/iron-proxy/iron-proxy.yaml and the infra fragment.
-  MANAGED_PROXY_CONFIG = {
-    "upstream_response_header_timeout" => "120s"
-  }.freeze
+  SLACK_CHANNEL_ID_LABEL = "slack_channel_id".freeze
+  SLACK_CHANNEL_ID_FORMAT = /\A[CDG][A-Z0-9]{8,}\z/
 
   # The config of a principal with no effective grants; also what an unassigned
   # proxy resolves to.
-  EMPTY_CONFIG = {
-    "proxy" => MANAGED_PROXY_CONFIG,
-    "secrets" => [].freeze,
-    "transforms" => [].freeze,
-    "postgres" => [].freeze
-  }.freeze
+  EMPTY_CONFIG = { "secrets" => [], "transforms" => [], "postgres" => [] }.freeze
 
   # Every grant this principal resolves to: its own direct grants plus the
   # grants of every role it is assigned. Secrets reachable through more than one
@@ -125,16 +129,56 @@ class Principal < ApplicationRecord
   # it passes through untouched.
   def effective_config(redact_secrets: true)
     served = served_credentials
-    config = self.class.with_managed_proxy_config(
-      "secrets" => proxy_secrets_for(served),
+    config = {
+      "secrets" => proxy_secrets_for(served) + generated_proxy_secrets,
       "transforms" => proxy_transforms_for(served),
       "postgres" => sync_postgres
-    )
+    }
     redact_secrets ? self.class.redact_live_secrets(config) : config
   end
 
-  def self.with_managed_proxy_config(config)
-    config.merge("proxy" => MANAGED_PROXY_CONFIG)
+  def apply_default_sandbox_capabilities!(supplied = {})
+    return unless new_record?
+
+    defaults = SystemSetting.current.principal_defaults
+    unless supplied_key?(supplied, :sandbox_repo_cache)
+      self.sandbox_repo_cache = defaults[:sandbox_repo_cache]
+    end
+    unless supplied_key?(supplied, :sandbox_observability_enabled)
+      self.sandbox_observability_enabled = defaults[:sandbox_observability_enabled]
+    end
+    unless supplied_key?(supplied, :sandbox_api_server_enabled)
+      self.sandbox_api_server_enabled = defaults[:sandbox_api_server_enabled]
+    end
+  end
+
+  def labels_with_sandbox_capabilities
+    labels.to_h.merge(SANDBOX_REPO_CACHE_LABEL => sandbox_repo_cache)
+  end
+
+  def slack_channel_permissions_payload
+    permissions = if association(:slack_channel_permissions).loaded?
+      slack_channel_permissions.sort_by { |permission| [ permission.channel_id, permission.id ] }
+    else
+      slack_channel_permissions.ordered
+    end
+    permissions.map(&:as_permission_json)
+  end
+
+  def slack_upload_channel_ids
+    slack_channel_ids_for(:upload_enabled)
+  end
+
+  def slack_download_channel_ids
+    slack_channel_ids_for(:download_enabled)
+  end
+
+  def slack_history_channel_ids
+    slack_channel_ids_for(:history_enabled)
+  end
+
+  def slack_jwt_channel_ids
+    (slack_upload_channel_ids + slack_download_channel_ids + slack_history_channel_ids).uniq
   end
 
   def self.bump_sync_config_cache_versions(ids)
@@ -174,6 +218,18 @@ class Principal < ApplicationRecord
     PrincipalCredentialReconciliation.new.apply_for_principal(self)
   end
 
+  def apply_sandbox_repo_cache_label
+    self[:labels] = labels.to_h.merge(SANDBOX_REPO_CACHE_LABEL => sandbox_repo_cache)
+  end
+
+  def supplied_key?(attributes, key)
+    attributes.key?(key) || attributes.key?(key.to_s)
+  end
+
+  def reject_slack_channel_permission_attributes?(attributes)
+    attributes["channel_id"].blank?
+  end
+
   # The credentials actually delivered to the proxy, grouped by type, after
   # cross-type conflict resolution. Static secrets without a deliverable source
   # are dropped first (the proxy can't resolve a value for them) so a
@@ -200,7 +256,51 @@ class Principal < ApplicationRecord
   end
 
   def proxy_secrets_for(served)
-    served[:static].map(&:to_proxy_secret)
+    served[:static].map do |secret|
+      entry = secret.to_proxy_secret
+      next entry unless secret.name == FEEDBACK_API_SECRET_NAME
+
+      # Tool manifests cannot know a Helm release-qualified Service hostname.
+      # The API accepts this credential only alongside the generated caller
+      # JWT and binds feedback-improvement:* sessions to that principal, so
+      # extend only its request rules to the JWT's canonical API hosts.
+      entry["rules"] = (entry.fetch("rules", []) + api_server_hosts.map { |host| { "host" => host } }).uniq
+      entry
+    end
+  end
+
+  def generated_proxy_secrets
+    secret = api_server_jwt_secret
+    secret ? [ secret ] : []
+  end
+
+  def api_server_jwt_secret
+    return nil unless sandbox_api_server_enabled?
+
+    token = ApiServer::Jwt.encode_for_principal(self)
+    return nil if token.blank?
+
+    rules = api_server_hosts.map { |host| { "host" => host } }
+    return nil if rules.empty?
+
+    {
+      "source" => { "type" => "control_plane", "value" => token },
+      "inject" => { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" },
+      "rules" => rules
+    }
+  end
+
+  def slack_channel_ids_for(permission)
+    slack_channel_permissions.where(permission => true).ordered.pluck(:channel_id)
+  end
+
+  def api_server_hosts
+    configured = ENV["CENTAUR_API_SERVER_PROXY_HOSTS"].to_s.split(",")
+    from_url = self.class.host_from_url(ENV["CENTAUR_API_URL"])
+    (configured + [ from_url, "centaur-api-rs", "api" ])
+      .map { |host| host.to_s.strip.downcase.delete_suffix(".") }
+      .reject(&:blank?)
+      .uniq
   end
 
   def proxy_transforms_for(served)
@@ -213,6 +313,12 @@ class Principal < ApplicationRecord
     transforms << { "name" => "oauth_token", "config" => { "tokens" => oauth_entries } } if oauth_entries.any?
 
     transforms
+  end
+
+  def self.host_from_url(value)
+    URI.parse(value.to_s).host
+  rescue URI::InvalidURIError
+    nil
   end
 
   # Cross-type conflict resolution. The wire protocol applies the `secrets` array
@@ -338,7 +444,9 @@ class Principal < ApplicationRecord
   end
 
   def sync_config_fields_changed?
-    previous_changes.key?("name") || previous_changes.key?("labels")
+    previous_changes.key?("name") ||
+      previous_changes.key?("labels") ||
+      previous_changes.key?("sandbox_api_server_enabled")
   end
 
   def bump_own_sync_config_cache_version
