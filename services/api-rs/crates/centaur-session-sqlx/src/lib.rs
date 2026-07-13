@@ -38,14 +38,6 @@ pub struct ClaimExecutionResult {
     pub claimed: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct RecordExecutionDeliveryResult {
-    pub event: SessionEvent,
-    /// True only when this call inserted the durable receipt. Replays return
-    /// the original event with `created = false`.
-    pub created: bool,
-}
-
 /// An active execution whose stdout-owner lease was released by
 /// [`PgSessionStore::release_stdout_owned_executions`].
 #[derive(Clone, Debug)]
@@ -1089,90 +1081,6 @@ impl PgSessionStore {
         .await?;
 
         row.try_into()
-    }
-
-    /// Persist one Slack delivery receipt for an exact session execution.
-    /// Locking the execution row serializes duplicate callbacks without a new
-    /// schema constraint and proves the execution belongs to `thread_key`.
-    pub async fn record_execution_delivery(
-        &self,
-        thread_key: &ThreadKey,
-        execution_id: &str,
-        event_type: &str,
-        payload: Value,
-    ) -> Result<Option<RecordExecutionDeliveryResult>, SessionStoreError> {
-        let mut tx = self.pool.begin().await?;
-        // Match the canonical release transaction's session -> execution lock
-        // order. The event insert takes a session FK lock, so locking the
-        // execution first could deadlock with a concurrent release.
-        let session_exists = sqlx::query_scalar::<_, i32>(
-            "select 1 from sessions where thread_key = $1 for key share",
-        )
-        .bind(thread_key.as_str())
-        .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
-        if !session_exists {
-            tx.commit().await?;
-            return Ok(None);
-        }
-        let execution_exists = sqlx::query_scalar::<_, i32>(
-            r#"
-            select 1
-            from session_executions
-            where thread_key = $1 and execution_id = $2
-            for update
-            "#,
-        )
-        .bind(thread_key.as_str())
-        .bind(execution_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
-        if !execution_exists {
-            tx.commit().await?;
-            return Ok(None);
-        }
-
-        if let Some(row) = sqlx::query_as::<_, SessionEventRow>(
-            r#"
-            select event_id, thread_key, execution_id, event_type, payload, created_at
-            from session_events
-            where execution_id = $1 and event_type = $2
-            order by event_id
-            limit 1
-            "#,
-        )
-        .bind(execution_id)
-        .bind(event_type)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            tx.commit().await?;
-            return Ok(Some(RecordExecutionDeliveryResult {
-                event: row.try_into()?,
-                created: false,
-            }));
-        }
-
-        let row = sqlx::query_as::<_, SessionEventRow>(
-            r#"
-            insert into session_events (thread_key, execution_id, event_type, payload)
-            values ($1, $2, $3, $4)
-            returning event_id, thread_key, execution_id, event_type, payload, created_at
-            "#,
-        )
-        .bind(thread_key.as_str())
-        .bind(execution_id)
-        .bind(event_type)
-        .bind(payload)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(Some(RecordExecutionDeliveryResult {
-            event: row.try_into()?,
-            created: true,
-        }))
     }
 
     pub async fn append_event_if_stdout_owner(
@@ -2518,103 +2426,6 @@ mod tests {
                 event_id: 42,
             }
         );
-    }
-
-    #[tokio::test]
-    async fn execution_delivery_receipt_is_thread_bound_and_idempotent() {
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let thread_key = ThreadKey::parse(format!("slack:CDELIVERY:{}", Uuid::new_v4())).unwrap();
-        let other_thread = ThreadKey::parse(format!("slack:COTHER:{}", Uuid::new_v4())).unwrap();
-        for thread in [&thread_key, &other_thread] {
-            store
-                .create_or_get_session(thread, &HarnessType::Codex, None, json!({}))
-                .await
-                .expect("create session");
-        }
-        let execution_id = store
-            .create_execution(&thread_key, None, json!({}))
-            .await
-            .expect("create execution")
-            .execution
-            .execution_id;
-
-        assert!(
-            store
-                .record_execution_delivery(
-                    &other_thread,
-                    &execution_id,
-                    "session.delivery_completed",
-                    json!({"outcome": "forged"}),
-                )
-                .await
-                .expect("cross-thread record")
-                .is_none()
-        );
-
-        let first = store
-            .record_execution_delivery(
-                &thread_key,
-                &execution_id,
-                "session.delivery_completed",
-                json!({"outcome": "primary", "message_id": "1780000000.000100"}),
-            )
-            .await
-            .expect("first receipt")
-            .expect("bound execution");
-        assert!(first.created);
-
-        let replay = store
-            .record_execution_delivery(
-                &thread_key,
-                &execution_id,
-                "session.delivery_completed",
-                json!({"outcome": "fallback", "message_id": "different"}),
-            )
-            .await
-            .expect("replayed receipt")
-            .expect("bound execution");
-        assert!(!replay.created);
-        assert_eq!(replay.event.event_id, first.event.event_id);
-        assert_eq!(replay.event.payload, first.event.payload);
-
-        let count = sqlx::query_scalar::<_, i64>(
-            "select count(*) from session_events where execution_id = $1 and event_type = 'session.delivery_completed'",
-        )
-        .bind(&execution_id)
-        .fetch_one(store.pool())
-        .await
-        .expect("count receipts");
-        assert_eq!(count, 1);
-        store
-            .complete_execution(&execution_id)
-            .await
-            .expect("complete first execution before concurrency case");
-
-        let concurrent_execution_id = store
-            .create_execution(&thread_key, None, json!({}))
-            .await
-            .expect("create concurrent execution")
-            .execution
-            .execution_id;
-        let left = store.record_execution_delivery(
-            &thread_key,
-            &concurrent_execution_id,
-            "session.delivery_completed",
-            json!({"outcome": "primary", "message_id": "1780000001.000100"}),
-        );
-        let right = store.record_execution_delivery(
-            &thread_key,
-            &concurrent_execution_id,
-            "session.delivery_completed",
-            json!({"outcome": "primary", "message_id": "1780000001.000100"}),
-        );
-        let (left, right) = tokio::join!(left, right);
-        let left = left.expect("left receipt").expect("left execution");
-        let right = right.expect("right receipt").expect("right execution");
-        assert_ne!(left.created, right.created);
-        assert_eq!(left.event.event_id, right.event.event_id);
     }
 
     #[tokio::test]

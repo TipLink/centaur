@@ -15,8 +15,6 @@ import type {
   SlackbotV2Fetch,
   SlackbotV2InterruptSessionResponse,
   SlackbotV2Options,
-  SlackbotV2RecordDeliveryRequest,
-  SlackbotV2RecordDeliveryResponse,
   SlackbotV2RendererSource,
   SlackbotV2SessionMessage
 } from './types'
@@ -570,35 +568,6 @@ export async function interruptSessionExecution(
     () => postInterruptSessionExecution(options, threadId, reason),
     sessionApiTimeoutMs(options),
     'interrupt session'
-  )
-}
-
-export async function recordSessionDelivery(
-  options: SlackbotV2Options,
-  threadId: string,
-  executionId: string,
-  receipt: SlackbotV2RecordDeliveryRequest
-): Promise<SlackbotV2RecordDeliveryResponse> {
-  return recordSessionApiOperation(
-    'record_delivery',
-    async () => {
-      const fetchFn = options.fetch ?? fetch
-      const response = await fetchWithTimeout(
-        fetchFn,
-        apiSessionDeliveryUrl(options.apiUrl, threadId, executionId),
-        {
-          method: 'POST',
-          headers: apiHeaders(options),
-          body: JSON.stringify(receipt)
-        },
-        sessionApiTimeoutMs(options),
-        'record session delivery'
-      )
-      await ensureApiOk(response, 'record session delivery')
-      return (await response.json()) as SlackbotV2RecordDeliveryResponse
-    },
-    sessionApiTimeoutMs(options),
-    'record session delivery'
   )
 }
 
@@ -1347,15 +1316,6 @@ function apiSessionUrl(
   suffix?: 'messages' | 'execute' | 'events' | 'interrupt'
 ): string {
   const path = `/api/session/${encodeURIComponent(threadId)}${suffix ? `/${suffix}` : ''}`
-  return new URL(path, ensureTrailingSlash(apiUrl)).toString()
-}
-
-function apiSessionDeliveryUrl(
-  apiUrl: string,
-  threadId: string,
-  executionId: string
-): string {
-  const path = `/api/session/${encodeURIComponent(threadId)}/executions/${encodeURIComponent(executionId)}/delivery`
   return new URL(path, ensureTrailingSlash(apiUrl)).toString()
 }
 

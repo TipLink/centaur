@@ -98,19 +98,6 @@ export type SlackbotV2InterruptSessionResponse = {
   thread_key: string
 }
 
-export type SlackbotV2RecordDeliveryRequest = {
-  message_id?: string
-  outcome: string
-}
-
-export type SlackbotV2RecordDeliveryResponse = {
-  ok: boolean
-  created: boolean
-  event_id: number
-  execution_id: string
-  thread_key: string
-}
-
 export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 export type SlackbotV2Options = {
