@@ -4504,7 +4504,7 @@ describe('slackbotv2', () => {
     expect(threadState).toEqual(expect.objectContaining({ activeExecution: false }))
   })
 
-  it('keeps v1 external org and trigger-bot allowlist behavior', async () => {
+  it('enforces external org and trigger-bot member allowlists', async () => {
     const externalMention = await postUserMessage(`<@${BOT_USER_ID}> from external org`)
     const externalWaits: Promise<unknown>[] = []
     const externalResponse = await bot.app.request(
@@ -4587,7 +4587,7 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(0)
     expect(codexApi.executes).toHaveLength(0)
 
-    bot = createTestBot({ triggerBotAllowlist: ['app:AOTHERBOT'] })
+    bot = createTestBot({ triggerBotAllowlist: ['UOTHERBOT'] })
     const allowedBotMention = await postUserMessage(`<@${BOT_USER_ID}> from allowed bot`)
     const allowedBotWaits: Promise<unknown>[] = []
     const allowedBotResponse = await bot.app.request(
@@ -4619,7 +4619,7 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.executes).toHaveLength(1)
 
-    bot = createTestBot({ triggerBotAllowlist: ['bot:BOTHERBOT'] })
+    bot = createTestBot({ triggerBotAllowlist: ['UOTHERBOT'] })
     codexApi.reset()
     const labeledBotMention = `<@${BOT_USER_ID}|centaur> from allowed bot message`
     const allowedBotChannelMessage = await postUserMessage(labeledBotMention)
