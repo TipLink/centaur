@@ -1,5 +1,3 @@
-require "zlib"
-
 module ApiServer
   module Jwt
     DEFAULT_AUDIENCE = "centaur-api".freeze
@@ -15,38 +13,32 @@ module ApiServer
       history_channels = principal.slack_history_channel_ids
       return nil if upload_channels.empty? && download_channels.empty? && history_channels.empty?
 
-      signing_secret = ENV["CENTAUR_JWT_SIGNING_SECRET"].to_s
-      return nil if signing_secret.blank?
-
-      issued_at = window_start_for(principal, now.to_i)
-      expires_at = issued_at + DEFAULT_TTL_SECONDS
-      CentaurJwt::Hs256.encode(
-        {
-          "iss" => issuer,
+      CentaurJwt::WindowedToken.encode(
+        subject_oid: principal.oid,
+        audience: audience,
+        issuer: issuer,
+        window_seconds: DEFAULT_WINDOW_SECONDS,
+        ttl_seconds: DEFAULT_TTL_SECONDS,
+        now: now,
+        claims: {
           "sub" => principal.oid,
-          "aud" => audience,
-          "iat" => issued_at,
-          "exp" => expires_at,
           "slack" => {
             "upload_channels" => upload_channels,
             "download_channels" => download_channels,
             "history_channels" => history_channels
           }
-        },
-        signing_secret: signing_secret
+        }
       )
     end
 
-    # Rotation boundaries are offset per principal (deterministically, from
-    # the oid) so the fleet's tokens don't all roll over — and force snapshot
-    # rebuilds — at the same instant.
+    # Kept for callers that reason about rotation boundaries directly
+    # (snapshot staleness checks, tests).
     def window_start_for(principal, timestamp)
-      offset = rotation_offset(principal)
-      timestamp - ((timestamp - offset) % DEFAULT_WINDOW_SECONDS)
+      CentaurJwt::WindowedToken.window_start(principal.oid, timestamp, window_seconds: DEFAULT_WINDOW_SECONDS)
     end
 
     def rotation_offset(principal)
-      Zlib.crc32(principal.oid.to_s) % DEFAULT_WINDOW_SECONDS
+      CentaurJwt::WindowedToken.rotation_offset(principal.oid, window_seconds: DEFAULT_WINDOW_SECONDS)
     end
 
     def audience

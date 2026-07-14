@@ -50,6 +50,7 @@ const PROXY_LOG_LEVEL: &str = "info";
 // DSN. These are the deploy-level env vars iron-proxy reads for that listener.
 const PG_LISTENER_PORT: u16 = 5432;
 const CENTAUR_POSTGRES_DSN_ENV: &str = "CENTAUR_POSTGRES_DSN";
+const CENTAUR_CONSOLE_URL_ENV: &str = "CENTAUR_CONSOLE_URL";
 const PG_LISTEN_ENV: &str = "IRON_PROXY_PG_LISTEN";
 const PG_CLIENT_USER_ENV: &str = "IRON_PROXY_PG_CLIENT_USER";
 const PG_CLIENT_PASSWORD_ENV: &str = "IRON_PROXY_PG_CLIENT_PASSWORD";
@@ -123,6 +124,7 @@ pub(crate) struct ResolvedIronProxy {
     proxy_host: String,
     proxy_pod_name: String,
     proxy_port: u16,
+    console_url: String,
     // iron-control principal OID this sandbox's proxy binds to.
     principal_id: String,
     // The single Postgres listener the proxy multiplexes all upstreams through,
@@ -319,6 +321,12 @@ impl AgentSandboxBackend {
             proxy_host: iron_proxy_service_name(id),
             proxy_pod_name: new_iron_proxy_pod_name(id),
             proxy_port: PROXY_TUNNEL_PORT,
+            console_url: self
+                .config
+                .iron_control
+                .as_ref()
+                .map(|settings| settings.control_url.clone())
+                .unwrap_or_default(),
             principal_id,
             pg,
             replace_placeholders,
@@ -1114,6 +1122,9 @@ pub(crate) fn apply_proxy_env(spec: &mut SandboxSpec, resolved: &ResolvedIronPro
             pg.user, pg.password, resolved.proxy_host, pg.port,
         );
         set_missing_env(spec, CENTAUR_POSTGRES_DSN_ENV, &value);
+    }
+    if !resolved.console_url.is_empty() {
+        set_missing_env(spec, CENTAUR_CONSOLE_URL_ENV, &resolved.console_url);
     }
 }
 
@@ -1939,6 +1950,7 @@ mod tests {
             proxy_host: "asbx-test-iron-proxy".to_owned(),
             proxy_pod_name: "asbx-test-iron-proxy-1".to_owned(),
             proxy_port: 8080,
+            console_url: "http://console:3000".to_owned(),
             principal_id: "principal".to_owned(),
             pg: None,
             replace_placeholders: BTreeMap::new(),
@@ -2641,5 +2653,21 @@ mod tests {
                 "{name} should contain the OTLP endpoint host: {value}"
             );
         }
+    }
+
+    #[test]
+    fn apply_proxy_env_adds_console_url() {
+        let mut spec = SandboxSpec::new("centaur-agent:latest");
+        let mut resolved = resolved();
+        resolved.console_url = "http://console:3000/".to_owned();
+
+        apply_proxy_env(&mut spec, &resolved);
+
+        let value = spec
+            .env
+            .iter()
+            .find(|env| env.name == CENTAUR_CONSOLE_URL_ENV)
+            .map(|env| env.value.as_str());
+        assert_eq!(value, Some("http://console:3000/"));
     }
 }

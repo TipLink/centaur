@@ -204,6 +204,10 @@ Rails.application.routes.draw do
 
       # Called by iron-proxy instances (proxy bearer auth, not ApiKey auth).
       post "proxy/sync", to: "proxy_sync#create"
+
+      # Called from inside sandboxes through their assigned iron-proxy. The
+      # proxy injects a short-lived sandbox entitlement JWT scoped to this path.
+      get "sandbox/permissions", to: "sandbox_permissions#show"
     end
   end
 

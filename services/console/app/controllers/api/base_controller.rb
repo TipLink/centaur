@@ -1,10 +1,10 @@
 module Api
   class BaseController < ActionController::API
+    include ApiRequestSupport
+
     before_action :authenticate_api_key!
 
     rescue_from ActiveRecord::RecordNotFound, with: :render_not_found
-    rescue_from ActionController::ParameterMissing, with: :render_bad_request
-    rescue_from ActionController::BadRequest, with: :render_bad_request
 
     attr_reader :current_api_key
 
@@ -22,24 +22,8 @@ module Api
       render_error(status: :unauthorized, message: "invalid or missing API key")
     end
 
-    def bearer_token
-      header = request.headers["Authorization"].to_s
-      return nil unless header.start_with?("Bearer ")
-      header.sub(/\ABearer\s+/, "").presence
-    end
-
-    def render_error(status:, message:, details: nil)
-      body = { error: { message: message } }
-      body[:error][:details] = details if details
-      render status: status, json: body
-    end
-
     def render_not_found(e)
       render_error(status: :not_found, message: e.message)
-    end
-
-    def render_bad_request(e)
-      render_error(status: :bad_request, message: e.message)
     end
 
     def render_validation_error(record)

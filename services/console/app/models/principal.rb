@@ -288,10 +288,7 @@ class Principal < ApplicationRecord
   def api_server_hosts
     configured = ENV["CENTAUR_API_SERVER_PROXY_HOSTS"].to_s.split(",")
     from_url = self.class.host_from_url(ENV["CENTAUR_API_URL"])
-    (configured + [ from_url, "centaur-api-rs", "api" ])
-      .map { |host| host.to_s.strip.downcase.delete_suffix(".") }
-      .reject(&:blank?)
-      .uniq
+    self.class.normalize_hosts(configured + [ from_url ])
   end
 
   def proxy_transforms_for(served)
@@ -310,6 +307,15 @@ class Principal < ApplicationRecord
     URI.parse(value.to_s).host
   rescue URI::InvalidURIError
     nil
+  end
+
+  # Canonical form for hosts used in iron-proxy injection rules, so rule
+  # matching never hinges on case, whitespace, or a trailing dot.
+  def self.normalize_hosts(hosts)
+    Array(hosts)
+      .map { |host| host.to_s.strip.downcase.delete_suffix(".") }
+      .reject(&:blank?)
+      .uniq
   end
 
   # Cross-type conflict resolution. The wire protocol applies the `secrets` array
