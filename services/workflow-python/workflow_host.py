@@ -84,6 +84,7 @@ class RegisteredWorkflow:
     input_cls: type | None
     webhooks: Any
     schedule: Any
+    agent_defaults: dict[str, Any] | None = None
 
 
 def workflow_dirs() -> list[Path]:
@@ -142,6 +143,9 @@ def load_workflow_file(path: Path) -> RegisteredWorkflow | None:
     handler = getattr(module, "handler", None)
     if not isinstance(workflow_name, str) or not callable(handler):
         return None
+    agent_defaults = getattr(module, "AGENT_DEFAULTS", None)
+    if not isinstance(agent_defaults, dict):
+        agent_defaults = None
     return RegisteredWorkflow(
         workflow_name=workflow_name,
         source_path=str(path),
@@ -149,6 +153,7 @@ def load_workflow_file(path: Path) -> RegisteredWorkflow | None:
         input_cls=getattr(module, "Input", None),
         webhooks=getattr(module, "WEBHOOKS", None),
         schedule=getattr(module, "SCHEDULE", None),
+        agent_defaults=agent_defaults,
     )
 
 
@@ -335,6 +340,7 @@ async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any
         task_id=str(message.get("task_id") or ""),
         workflow_name=workflow_name,
         pool=pool,
+        agent_defaults=registered.agent_defaults,
     )
     previous_metric_rpc = metrics.get_metric_rpc()
     metrics.set_metric_rpc(rpc)

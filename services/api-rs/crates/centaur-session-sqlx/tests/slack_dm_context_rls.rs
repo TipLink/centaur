@@ -14,17 +14,19 @@ const SLACK_DM_CONVERSATION_CONTEXT_DOCUMENTS_SQL: &str =
     include_str!("../migrations/0030_slack_dm_conversation_context_documents.sql");
 const READONLY_DM_RLS_SQL: &str =
     include_str!("../migrations/0042_centaur_readonly_slack_dm_rls.sql");
+const SLACK_PRIVATE_CONVERSATIONS_SQL: &str =
+    include_str!("../migrations/0046_slack_private_channel_oauth_sync.sql");
 
 const RLS_TABLES: &[&str] = &[
-    "slack_dm_sync_conversations",
-    "slack_dm_sync_conversation_members",
-    "slack_dm_sync_messages",
-    "slack_dm_sync_message_attachments",
-    "slack_dm_sync_checkpoints",
-    "slack_dm_sync_runs",
-    "slack_dm_sync_backfill_jobs",
-    "slack_dm_context_documents",
-    "slack_dm_conversation_context_documents",
+    "slack_private_sync_conversations",
+    "slack_private_sync_conversation_members",
+    "slack_private_sync_messages",
+    "slack_private_sync_message_attachments",
+    "slack_private_sync_checkpoints",
+    "slack_private_sync_runs",
+    "slack_private_sync_backfill_jobs",
+    "slack_private_context_documents",
+    "slack_private_conversation_context_documents",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,10 +65,12 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
     execute_migration(conn, READONLY_DM_RLS_SQL).await?;
     grant_schema_usage(conn, schema).await?;
 
-    assert_rls_enabled(conn).await?;
-    assert_expected_policies(conn).await?;
     insert_fixture_rows(conn).await?;
     assert_projected_documents(conn).await?;
+    execute_slack_private_conversations_migration(conn, schema).await?;
+    insert_private_channel_fixture(conn).await?;
+    assert_rls_enabled(conn).await?;
+    assert_expected_policies(conn).await?;
 
     let user_a = visible_rows(
         conn,
@@ -79,19 +83,30 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
     assert_eq!(
         user_a,
         VisibleDmRows {
-            conversations: vec!["T_HOME:D_A".to_owned(), "T_HOME:G_MPIM".to_owned()],
-            members: vec!["T_HOME:D_A:U_A".to_owned(), "T_HOME:G_MPIM:U_A".to_owned()],
+            conversations: vec![
+                "T_HOME:C_PRIVATE".to_owned(),
+                "T_HOME:D_A".to_owned(),
+                "T_HOME:G_MPIM".to_owned(),
+            ],
+            members: vec![
+                "T_HOME:C_PRIVATE:U_A".to_owned(),
+                "T_HOME:D_A:U_A".to_owned(),
+                "T_HOME:G_MPIM:U_A".to_owned(),
+            ],
             messages: vec![
+                "T_HOME:C_PRIVATE:1000.000005".to_owned(),
                 "T_HOME:D_A:1000.000001".to_owned(),
                 "T_HOME:G_MPIM:1000.000003".to_owned(),
             ],
             attachments: vec!["T_HOME:D_A:1000.000001:F_A".to_owned()],
             checkpoints: vec!["bcr_a:T_HOME:D_A".to_owned()],
             context_docs: vec![
+                "slack_dm:T_HOME:C_PRIVATE:1000.000005".to_owned(),
                 "slack_dm:T_HOME:D_A:1000.000001".to_owned(),
                 "slack_dm:T_HOME:G_MPIM:1000.000003".to_owned(),
             ],
             conversation_context_docs: vec![
+                "slack_dm_conversation:T_HOME:C_PRIVATE".to_owned(),
                 "slack_dm_conversation:T_HOME:D_A".to_owned(),
                 "slack_dm_conversation:T_HOME:G_MPIM".to_owned(),
             ],
@@ -286,6 +301,14 @@ async fn execute_slack_dm_conversation_context_documents_migration(
     execute_migration(conn, &sql).await
 }
 
+async fn execute_slack_private_conversations_migration(
+    conn: &mut PgConnection,
+    schema: &str,
+) -> Result<(), sqlx::Error> {
+    let sql = slack_private_conversations_for_test_schema(schema);
+    execute_migration(conn, &sql).await
+}
+
 async fn pg_search_available(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "select exists (select 1 from pg_available_extensions where name = 'pg_search')",
@@ -331,6 +354,29 @@ fn slack_dm_conversation_context_documents_without_bm25() -> String {
     )
 }
 
+fn slack_private_conversations_for_test_schema(schema: &str) -> String {
+    let (before_bm25, rest) = SLACK_PRIVATE_CONVERSATIONS_SQL
+        .split_once("-- ParadeDB ties BM25 metadata")
+        .expect("Slack private migration should contain its BM25 index block");
+    let (_, after_bm25) = rest
+        .split_once("-- PL/pgSQL function bodies retain relation names")
+        .expect("Slack private migration should recreate projection functions");
+    let sql = format!(
+        "{before_bm25}-- BM25 indexes are omitted in the portable RLS test.\n\
+         -- PL/pgSQL function bodies retain relation names{after_bm25}"
+    );
+    let quoted_schema = format!("\"{}\"", schema.replace('"', "\"\""));
+    sql.replace(
+        "n.nspname = 'public'",
+        format!("n.nspname = '{schema}'").as_str(),
+    )
+    .replace("public.", format!("{quoted_schema}.").as_str())
+    .replace(
+        "set search_path = pg_catalog, public",
+        format!("set search_path = pg_catalog, {quoted_schema}").as_str(),
+    )
+}
+
 #[test]
 fn slack_dm_context_documents_test_migration_omits_bm25_when_extension_is_unavailable() {
     let sql = slack_dm_context_documents_without_bm25();
@@ -358,6 +404,48 @@ fn slack_dm_context_documents_test_migration_omits_bm25_when_extension_is_unavai
             "create policy centaur_slack_dm_conversation_context_documents_reader_select"
         )
     );
+}
+
+#[test]
+fn slack_private_conversation_migration_renames_every_user_scoped_table() {
+    for (old_name, new_name) in [
+        (
+            "slack_dm_sync_conversations",
+            "slack_private_sync_conversations",
+        ),
+        (
+            "slack_dm_sync_conversation_members",
+            "slack_private_sync_conversation_members",
+        ),
+        ("slack_dm_sync_runs", "slack_private_sync_runs"),
+        ("slack_dm_sync_messages", "slack_private_sync_messages"),
+        (
+            "slack_dm_sync_message_attachments",
+            "slack_private_sync_message_attachments",
+        ),
+        (
+            "slack_dm_sync_checkpoints",
+            "slack_private_sync_checkpoints",
+        ),
+        (
+            "slack_dm_sync_backfill_jobs",
+            "slack_private_sync_backfill_jobs",
+        ),
+        (
+            "slack_dm_context_documents",
+            "slack_private_context_documents",
+        ),
+        (
+            "slack_dm_conversation_context_documents",
+            "slack_private_conversation_context_documents",
+        ),
+    ] {
+        assert!(
+            SLACK_PRIVATE_CONVERSATIONS_SQL
+                .contains(format!("alter table {old_name}\n    rename to {new_name};").as_str()),
+            "missing table rename from {old_name} to {new_name}"
+        );
+    }
 }
 
 async fn assert_rls_enabled(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
@@ -394,72 +482,75 @@ async fn assert_expected_policies(conn: &mut PgConnection) -> Result<(), sqlx::E
 
     for expected in [
         (
-            "slack_dm_sync_conversations",
+            "slack_private_sync_conversations",
             "centaur_slack_dm_conversations_reader_select",
         ),
         (
-            "slack_dm_sync_conversation_members",
+            "slack_private_sync_conversation_members",
             "centaur_slack_dm_members_reader_select",
         ),
         (
-            "slack_dm_sync_messages",
+            "slack_private_sync_messages",
             "centaur_slack_dm_messages_reader_select",
         ),
         (
-            "slack_dm_sync_message_attachments",
+            "slack_private_sync_message_attachments",
             "centaur_slack_dm_attachments_reader_select",
         ),
         (
-            "slack_dm_sync_checkpoints",
+            "slack_private_sync_checkpoints",
             "centaur_slack_dm_checkpoints_reader_select",
         ),
-        ("slack_dm_sync_runs", "centaur_slack_dm_runs_reader_select"),
         (
-            "slack_dm_sync_backfill_jobs",
+            "slack_private_sync_runs",
+            "centaur_slack_dm_runs_reader_select",
+        ),
+        (
+            "slack_private_sync_backfill_jobs",
             "centaur_slack_dm_backfill_jobs_reader_select",
         ),
         (
-            "slack_dm_context_documents",
+            "slack_private_context_documents",
             "centaur_slack_dm_context_documents_reader_select",
         ),
         (
-            "slack_dm_conversation_context_documents",
+            "slack_private_conversation_context_documents",
             "centaur_slack_dm_conversation_context_documents_reader_select",
         ),
         (
-            "slack_dm_sync_conversations",
+            "slack_private_sync_conversations",
             "centaur_readonly_slack_dm_sync_conversations_select",
         ),
         (
-            "slack_dm_sync_conversation_members",
+            "slack_private_sync_conversation_members",
             "centaur_readonly_slack_dm_sync_conversation_members_select",
         ),
         (
-            "slack_dm_sync_messages",
+            "slack_private_sync_messages",
             "centaur_readonly_slack_dm_sync_messages_select",
         ),
         (
-            "slack_dm_sync_message_attachments",
+            "slack_private_sync_message_attachments",
             "centaur_readonly_slack_dm_sync_message_attachments_select",
         ),
         (
-            "slack_dm_sync_checkpoints",
+            "slack_private_sync_checkpoints",
             "centaur_readonly_slack_dm_sync_checkpoints_select",
         ),
         (
-            "slack_dm_sync_runs",
+            "slack_private_sync_runs",
             "centaur_readonly_slack_dm_sync_runs_select",
         ),
         (
-            "slack_dm_sync_backfill_jobs",
+            "slack_private_sync_backfill_jobs",
             "centaur_readonly_slack_dm_sync_backfill_jobs_select",
         ),
         (
-            "slack_dm_context_documents",
+            "slack_private_context_documents",
             "centaur_readonly_slack_dm_context_documents_select",
         ),
         (
-            "slack_dm_conversation_context_documents",
+            "slack_private_conversation_context_documents",
             "centaur_readonly_slack_dm_conversation_context_documents_select",
         ),
     ] {
@@ -529,6 +620,30 @@ async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error>
             (job_key, job_type, broker_credential_id, home_team_id, conversation_id)
         values
             ('bcr_a:T_HOME:D_A', 'conversation_bootstrap', 'bcr_a', 'T_HOME', 'D_A');
+        "#,
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn insert_private_channel_fixture(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(
+        r#"
+        insert into slack_private_sync_conversations
+            (home_team_id, conversation_id, conversation_type)
+        values ('T_HOME', 'C_PRIVATE', 'private_channel');
+
+        insert into slack_private_sync_conversation_members
+            (home_team_id, conversation_id, user_id, is_current_member)
+        values
+            ('T_HOME', 'C_PRIVATE', 'U_A', true),
+            ('T_HOME', 'C_PRIVATE', 'U_C', false);
+
+        insert into slack_private_sync_messages
+            (home_team_id, conversation_id, message_ts, text, source_run_id)
+        values
+            ('T_HOME', 'C_PRIVATE', '1000.000005', 'current member only', 'run_a');
         "#,
     )
     .execute(&mut *conn)
@@ -614,41 +729,41 @@ async fn visible_rows(
     let rows = VisibleDmRows {
         conversations: text_array(
             &mut tx,
-            "select coalesce(array_agg(home_team_id || ':' || conversation_id order by home_team_id, conversation_id), '{}') from slack_dm_sync_conversations",
+            "select coalesce(array_agg(home_team_id || ':' || conversation_id order by home_team_id, conversation_id), '{}') from slack_private_sync_conversations",
         )
         .await?,
         members: text_array(
             &mut tx,
-            "select coalesce(array_agg(home_team_id || ':' || conversation_id || ':' || user_id order by home_team_id, conversation_id, user_id), '{}') from slack_dm_sync_conversation_members",
+            "select coalesce(array_agg(home_team_id || ':' || conversation_id || ':' || user_id order by home_team_id, conversation_id, user_id), '{}') from slack_private_sync_conversation_members",
         )
         .await?,
         messages: text_array(
             &mut tx,
-            "select coalesce(array_agg(home_team_id || ':' || conversation_id || ':' || message_ts order by home_team_id, conversation_id, message_ts), '{}') from slack_dm_sync_messages",
+            "select coalesce(array_agg(home_team_id || ':' || conversation_id || ':' || message_ts order by home_team_id, conversation_id, message_ts), '{}') from slack_private_sync_messages",
         )
         .await?,
         attachments: text_array(
             &mut tx,
-            "select coalesce(array_agg(home_team_id || ':' || conversation_id || ':' || message_ts || ':' || slack_file_id order by home_team_id, conversation_id, message_ts, slack_file_id), '{}') from slack_dm_sync_message_attachments",
+            "select coalesce(array_agg(home_team_id || ':' || conversation_id || ':' || message_ts || ':' || slack_file_id order by home_team_id, conversation_id, message_ts, slack_file_id), '{}') from slack_private_sync_message_attachments",
         )
         .await?,
         checkpoints: text_array(
             &mut tx,
-            "select coalesce(array_agg(broker_credential_id || ':' || home_team_id || ':' || conversation_id order by broker_credential_id, home_team_id, conversation_id), '{}') from slack_dm_sync_checkpoints",
+            "select coalesce(array_agg(broker_credential_id || ':' || home_team_id || ':' || conversation_id order by broker_credential_id, home_team_id, conversation_id), '{}') from slack_private_sync_checkpoints",
         )
         .await?,
         context_docs: text_array(
             &mut tx,
-            "select coalesce(array_agg(document_id order by document_id), '{}') from slack_dm_context_documents",
+            "select coalesce(array_agg(document_id order by document_id), '{}') from slack_private_context_documents",
         )
         .await?,
         conversation_context_docs: text_array(
             &mut tx,
-            "select coalesce(array_agg(document_id order by document_id), '{}') from slack_dm_conversation_context_documents",
+            "select coalesce(array_agg(document_id order by document_id), '{}') from slack_private_conversation_context_documents",
         )
         .await?,
-        runs: count(&mut tx, "slack_dm_sync_runs").await?,
-        backfill_jobs: count(&mut tx, "slack_dm_sync_backfill_jobs").await?,
+        runs: count(&mut tx, "slack_private_sync_runs").await?,
+        backfill_jobs: count(&mut tx, "slack_private_sync_backfill_jobs").await?,
     };
 
     tx.execute("reset role").await?;

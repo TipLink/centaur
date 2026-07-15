@@ -70,6 +70,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 | `ctx.sleep(name, duration)` | Suspend and resume later. |
 | `ctx.sleep_until(name, when)` | Resume at a specific time. |
 | `ctx.wait_for_event(name, event_type, correlation_id)` | Wait for an external event. |
+| `ctx.start_workflow(workflow_name, input, idempotency_key=...)` | Queue a child workflow and continue immediately; returns its durable task/run identifiers. |
 | `ctx.wait_for_workflow(...)` | Wait for a child workflow to finish. |
 | `ctx.run_workflow(...)` | Start and wait in one call. |
 | `ctx.start_agent(...)` | Start an agent turn. |
@@ -94,10 +95,9 @@ These primitives compose into larger automations:
 ## Run a workflow
 
 The manual control API requires the trusted `CENTAUR_CONTROL_API_KEY` (or an
-optional dedicated `WORKFLOW_API_KEY`). Agent tools use
-a separate Console JWT lane: their workflow name must be listed in
-`WORKFLOW_API_ALLOWED_NAMES`, and `input.thread_key` must belong to one of the
-JWT's Slack upload channels.
+optional dedicated `WORKFLOW_API_KEY`). Agent tools use a separate Console JWT
+lane: their workflow name must be listed in `WORKFLOW_API_ALLOWED_NAMES`, and
+`input.thread_key` must belong to one of the JWT's Slack upload channels.
 
 Create a run through the trusted operator lane:
 
@@ -130,7 +130,7 @@ WORKFLOW_NAME = "daily_market_digest"
 
 SCHEDULE = {
     "type": "cron",
-    "cron": "0 9 * * 1-5",
+    "cron": "0 9 * * MON-FRI",
     "timezone": "America/New_York",
     "input": {
         "channel": "markets",
@@ -145,11 +145,20 @@ Cron schedules use five fields:
 minute hour day-of-month month day-of-week
 ```
 
+:::warning[Day-of-week numbering is Quartz-style, not Unix crontab]
+The schedule engine parses cron expressions with the Rust
+[`cron` crate](https://github.com/zslayton/cron), which numbers days of week
+1–7 with **1 = Sunday** (`0` is rejected). A Unix-style `1-5` therefore fires
+Sunday–Thursday, not Monday–Friday. Always write day-of-week as names
+(`MON`, `MON-FRI`, `SAT,SUN`) — they mean the same thing in every dialect.
+:::
+
 Examples:
 
 | Cron | Meaning |
 |------|---------|
-| `0 9 * * 1-5` | 9:00 AM every weekday. |
+| `0 9 * * MON-FRI` | 9:00 AM every weekday. |
+| `0 9 * * 1-5` | 9:00 AM Sunday–Thursday (Quartz numbering — probably not what you meant). |
 | `*/15 * * * *` | Every 15 minutes. |
 | `30 6 * * *` | 6:30 AM every day. |
 | `0 0 1 * *` | Midnight on the first day of every month. |

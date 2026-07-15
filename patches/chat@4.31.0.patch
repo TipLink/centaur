@@ -16,9 +16,9 @@ index 6af9d7fec34adeb8a7092a3ba0077d9f327a44d7..252b031dd39e65cb6c85d3b0e5c23eb1
 +      pattern.lastIndex = lastIndex;
 +      return matches;
 +    });
-+    const hasAction = message.isMention || isDMForDedupe || isSubscribedForDedupe || matchesPatternForDedupe;
++    const hasIntrinsicAction = message.isMention || isDMForDedupe || isSubscribedForDedupe;
 +    const hasHistoryPersistence = adapter.persistThreadHistory || adapter.persistMessageHistory;
-+    const dedupeBucket = hasAction ? "action" : hasHistoryPersistence ? "history" : null;
++    const dedupeBucket = hasIntrinsicAction ? "action" : matchesPatternForDedupe || hasHistoryPersistence ? "history" : null;
 +    if (!dedupeBucket) {
 +      this.logger.debug("Skipping non-actionable message before dedupe", {
 +        adapter: adapter.name,

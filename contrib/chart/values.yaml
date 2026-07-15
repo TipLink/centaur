@@ -106,6 +106,18 @@ console:
   # When set, the slackbotv2 deployment also links the first assistant message
   # in a Slack thread to the Console session view; leave empty to omit the link.
   publicUrl: ""
+  # Break-glass email/password login. Disable when console is reachable from
+  # the public internet and SSO is configured.
+  passwordLoginEnabled: true
+  # When enabled, every authenticated Console user can browse conversations
+  # originating in public Slack channels. Private channels and DMs remain
+  # owner-only. Requires apiRs.etl.slack.enabled so channel privacy is synced;
+  # visibility fails closed without that catalog. Individual chats can still
+  # be shared by their owner from the Threads UI.
+  publicSlackThreadsEnabled: false
+  # Optional SSO admission policy. When non-empty, only identities whose email
+  # domain matches this list can sign in through Google or Slack.
+  ssoEmailDomains: []
   image:
     repository: centaur-console
     tag: latest
@@ -448,6 +460,7 @@ apiRs:
       enabled: true
       intervalSeconds: 14400
       maxWindowSeconds: 21600
+      batchSize: 50
   # Reaper: stop sandboxes older than the max lifetime, regardless of whether
   # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
@@ -511,6 +524,20 @@ slackbotv2:
   mcpPublicUrl: "http://localhost:3000"
   externalOrgAllowlist: ""
   triggerBotAllowlist: ""
+  # Per-channel default harness / model / provider / reasoning, keyed by Slack
+  # conversation id (the C…/G…/D… id). Each value is an object of optional
+  # harness / model / provider / reasoning fields, using the same vocabulary as
+  # the inline Slack flags (harness: claude|codex|amp, provider: bedrock|meta,
+  # model accepts Claude aliases like opus). A model is only meaningful within a
+  # harness, so name the harness alongside it. Applied when a message in that
+  # channel carries no explicit/sticky per-thread flag, below such a flag and
+  # above the deployment/baked harness default, and forwarded onto the harness
+  # input line so it takes effect. reasoning only affects the codex harness.
+  # Example:
+  #   channelDefaults:
+  #     C0ENG: { harness: claude, model: opus, reasoning: high }
+  #     C0TRIAGE: { reasoning: low }
+  channelDefaults: {}
   metrics:
     # slackbotv2 serves Prometheus text metrics at /metrics. This flag only
     # controls scrape annotations for Prometheus/VictoriaMetrics-style discovery.

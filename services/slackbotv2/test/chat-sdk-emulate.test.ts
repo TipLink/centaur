@@ -24,6 +24,7 @@ import {
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
 import { slackbotMetrics } from '../src/metrics'
 import claudeSettings from '../../../harness/claude/settings.json'
+import codexConfig from '../../../harness/codex/config.toml'
 
 const BOT_TOKEN = 'xoxb-slackbotv2-emulate'
 const USER_TOKEN = 'xoxp-slackbotv2-user'
@@ -173,6 +174,103 @@ describe('slackbotv2', () => {
     await Promise.all(waits)
     expect(codexApi.executes).toHaveLength(1)
     expect(codexApi.executes[0]?.threadKey).toBe(threadKey(message.ts))
+  })
+
+  it('denies an unallowlisted bot-authored message in an ambient channel', async () => {
+    bot = createTestBot({ ambientSlackChannelIds: [CHANNEL_ID] })
+    const message = await postUserMessage('Unapproved bot ambient message.')
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-ambient-bot-denied',
+        event: {
+          type: 'message',
+          bot_id: 'BOTHERBOT',
+          channel: CHANNEL_ID,
+          subtype: 'bot_message',
+          team: TEAM_ID,
+          ts: message.ts,
+          text: 'Unapproved bot ambient message.',
+          user: 'UOTHERBOT',
+          username: 'otherbot'
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.appends).toHaveLength(0)
+    expect(codexApi.executes).toHaveLength(0)
+  })
+
+  it('allows an approved bot-authored message in an ambient channel', async () => {
+    bot = createTestBot({
+      ambientSlackChannelIds: [CHANNEL_ID],
+      triggerBotAllowlist: ['UOTHERBOT']
+    })
+    const message = await postUserMessage('Approved bot ambient message.')
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-ambient-bot-allowed',
+        event: {
+          type: 'message',
+          app_id: 'AOTHERBOT',
+          bot_id: 'BOTHERBOT',
+          bot_profile: {
+            app_id: 'AOTHERBOT',
+            id: 'BOTHERBOT',
+            user_id: 'UOTHERBOT'
+          },
+          channel: CHANNEL_ID,
+          subtype: 'bot_message',
+          team: TEAM_ID,
+          ts: message.ts,
+          text: 'Approved bot ambient message.',
+          user: 'UOTHERBOT',
+          username: 'otherbot'
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(1)
+  })
+
+  it('executes a rich mention in an ambient channel exactly once', async () => {
+    bot = createTestBot({ ambientSlackChannelIds: [CHANNEL_ID] })
+    const message = await postUserMessage('')
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-ambient-rich-mention',
+        event: {
+          type: 'message',
+          attachments: [{ pretext: `<@${BOT_USER_ID}> investigate the ambient alert` }],
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: message.ts,
+          text: '',
+          user: USER_ID
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(1)
   })
 
   it('dedupes an ambient root retry after the first delivery subscribes the thread', async () => {
@@ -751,10 +849,7 @@ describe('slackbotv2', () => {
         .filter(text => text.includes('Open chat in Console'))
 
     const parent = await postUserMessage('Default model thread context.')
-    const mention = await postUserMessage(
-      `<@${BOT_USER_ID}> --claude what is your current model?`,
-      parent.ts
-    )
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> what is your current model?`, parent.ts)
     const waits: Promise<unknown>[] = []
     const response = await bot.app.request(
       '/api/webhooks/slack',
@@ -767,7 +862,7 @@ describe('slackbotv2', () => {
           team: TEAM_ID,
           ts: mention.ts,
           thread_ts: parent.ts,
-          text: `<@${BOT_USER_ID}> --claude what is your current model?`
+          text: `<@${BOT_USER_ID}> what is your current model?`
         }
       }),
       {},
@@ -778,16 +873,220 @@ describe('slackbotv2', () => {
 
     const blocks = consoleBlockTexts(slackApi.calls)
     expect(blocks).toHaveLength(1)
-    expect(blocks[0]).toContain('Claude Code')
-    expect(blocks[0]).toContain(claudeSettings.model.toUpperCase())
+    expect(blocks[0]).toContain('Codex')
+    expect(blocks[0]).toContain(codexConfig.model.toUpperCase())
+    expect(blocks[0]).toContain('Effort: Low')
+    expect(blocks[0]).toContain('Speed: Fast')
 
     // The effective (default) model is recorded in execution metadata for the
     // Console, but never forwarded to the harness — only explicit overrides
     // ride the input lines.
     expect(codexApi.executes).toHaveLength(1)
     const executeBody = codexApi.executes[0]!.body
-    expect(executeBody.metadata.model).toBe(claudeSettings.model)
+    expect(executeBody.metadata.model).toBe(codexConfig.model)
     expect(JSON.parse(executeBody.input_lines.at(-1)!).model).toBeUndefined()
+  })
+
+  it('shows a channel-default Codex reasoning effort in the Console context block', async () => {
+    bot = createTestBot({
+      channelDefaults: { [CHANNEL_ID]: { reasoning: 'high' } },
+      consolePublicUrl: 'https://console.example.dev'
+    })
+
+    const parent = await postUserMessage('Channel reasoning context.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> use the channel effort`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-console-link-channel-reasoning',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> use the channel effort`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    const blocks = slackApi.calls
+      .filter(call => call.method === 'chat.stopStream')
+      .flatMap(call => (Array.isArray(call.body.blocks) ? (call.body.blocks as unknown[]) : []))
+      .map(block => JSON.stringify(block))
+      .filter(text => text.includes('Open chat in Console'))
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]).toContain('Effort: High')
+
+    expect(codexApi.executes).toHaveLength(1)
+    expect(JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!).reasoning).toBe('high')
+  })
+
+  it('forwards a per-channel default harness + model + reasoning onto the turn', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      // The channel pins the harness and its model together (as `--claude
+      // --model opus -rsn high` would parse), so the pair can't mismatch.
+      channelDefaults: {
+        [CHANNEL_ID]: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' }
+      }
+    })
+
+    const parent = await postUserMessage('Channel default thread context.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> investigate this`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-default',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> investigate this`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    // No explicit flags, but the channel default selects the harness and rides
+    // the model/reasoning onto the input line (unlike the deployment/baked
+    // default) and is recorded for the Console.
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual(['claudecode'])
+    expect(codexApi.executes).toHaveLength(1)
+    const executeBody = codexApi.executes[0]!.body
+    const inputLine = JSON.parse(executeBody.input_lines.at(-1)!) as Record<string, unknown>
+    expect(inputLine.model).toBe('claude-opus-4-8')
+    expect(inputLine.reasoning).toBe('high')
+    expect(executeBody.metadata.model).toBe('claude-opus-4-8')
+  })
+
+  it('lets an explicit per-thread flag override the per-channel default harness + model', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      channelDefaults: {
+        [CHANNEL_ID]: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' }
+      }
+    })
+
+    const parent = await postUserMessage('Channel default override thread context.')
+    const mention = await postUserMessage(
+      `<@${BOT_USER_ID}> --codex --model gpt-5.4 -rsn low go`,
+      parent.ts
+    )
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-default-override',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> --codex --model gpt-5.4 -rsn low go`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    // Explicit --codex/--model/-rsn beat every field of the channel default.
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual(['codex'])
+    expect(codexApi.executes).toHaveLength(1)
+    const inputLine = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!) as Record<
+      string,
+      unknown
+    >
+    expect(inputLine.model).toBe('gpt-5.4')
+    expect(inputLine.reasoning).toBe('low')
+  })
+
+  it('a harness-only override does not drag the channel default model onto the new harness', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      channelDefaults: {
+        [CHANNEL_ID]: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' }
+      }
+    })
+
+    const parent = await postUserMessage('Harness-switch thread context.')
+    // Switch to codex with no model. The channel's Claude model must NOT ride
+    // onto codex; switching harness clears the previous harness's model.
+    const first = await postUserMessage(`<@${BOT_USER_ID}> --codex look into this`, parent.ts)
+    const firstWaits: Promise<unknown>[] = []
+    await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-harness-switch-1',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: first.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> --codex look into this`
+        }
+      }),
+      {},
+      waitUntilContext(firstWaits)
+    )
+    await Promise.all(firstWaits)
+
+    // A follow-up with no flags: the cleared model must stay cleared (the sticky
+    // tombstone persists), not resurface from the channel default.
+    const second = await postUserMessage(`<@${BOT_USER_ID}> keep going`, parent.ts)
+    const secondWaits: Promise<unknown>[] = []
+    await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-harness-switch-2',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: second.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> keep going`
+        }
+      }),
+      {},
+      waitUntilContext(secondWaits)
+    )
+    await Promise.all(secondWaits)
+
+    // Both turns run on codex (the second inherits the sticky harness); neither
+    // forwards a model — the channel's Claude model never leaks onto codex.
+    expect(codexApi.creates.map(c => c.body.harness_type)).toEqual(['codex', 'codex'])
+    expect(codexApi.executes).toHaveLength(2)
+    for (const execute of codexApi.executes) {
+      const line = JSON.parse(execute.body.input_lines.at(-1)!) as Record<string, unknown>
+      expect(line.model).toBeUndefined()
+    }
   })
 
   it('includes all preceding Slack thread messages for a first mid-thread mention', async () => {
@@ -4616,6 +4915,78 @@ describe('slackbotv2', () => {
         recipient_user_id: 'UOTHERBOT'
       })
     )
+
+    bot = createTestBot({ triggerBotAllowlist: ['UOTHERBOT'] })
+    codexApi.reset()
+    slackApi.reset()
+    const richBotMessage = await postUserMessage('')
+    const richBotWaits: Promise<unknown>[] = []
+    const richBotResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-bot-attachment-mention-allowed',
+        event: {
+          type: 'message',
+          app_id: 'AOTHERBOT',
+          attachments: [
+            {
+              pretext: `<@${BOT_USER_ID}> investigate`,
+              title: ':red_circle: Validator stalled',
+              text: '*Cluster:* stg-na\n*Tenant:* luganodes'
+            }
+          ],
+          bot_id: 'BOTHERBOT',
+          bot_profile: {
+            app_id: 'AOTHERBOT',
+            id: 'BOTHERBOT',
+            user_id: 'UOTHERBOT'
+          },
+          channel: CHANNEL_ID,
+          subtype: 'bot_message',
+          team: TEAM_ID,
+          text: '',
+          ts: richBotMessage.ts,
+          username: 'otherbot'
+        }
+      }),
+      {},
+      waitUntilContext(richBotWaits)
+    )
+    expect(richBotResponse.status).toBe(200)
+    await Promise.all(richBotWaits)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(sessionMessageTexts(codexApi.appends[0]!.body.messages).join('\n')).toContain(
+      'Validator stalled'
+    )
+
+    bot = createTestBot()
+    codexApi.reset()
+    const deniedRichBotMessage = await postUserMessage('')
+    const deniedRichBotWaits: Promise<unknown>[] = []
+    const deniedRichBotResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-bot-attachment-mention-denied',
+        event: {
+          type: 'message',
+          attachments: [{ pretext: `<@${BOT_USER_ID}> investigate` }],
+          bot_id: 'BOTHERBOT',
+          channel: CHANNEL_ID,
+          subtype: 'bot_message',
+          team: TEAM_ID,
+          text: '',
+          ts: deniedRichBotMessage.ts,
+          username: 'otherbot'
+        }
+      }),
+      {},
+      waitUntilContext(deniedRichBotWaits)
+    )
+    expect(deniedRichBotResponse.status).toBe(200)
+    await Promise.all(deniedRichBotWaits)
+    expect(codexApi.appends).toHaveLength(0)
+    expect(codexApi.executes).toHaveLength(0)
   })
 })
 
