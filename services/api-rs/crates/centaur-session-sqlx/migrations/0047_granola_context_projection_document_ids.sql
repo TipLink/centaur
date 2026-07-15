@@ -1,6 +1,11 @@
--- Granola's OAuth sync writes normalized source rows. Project those rows into
--- the dedicated search table in the same transaction, rather than routing
--- them through the generic company_context_documents projection.
+-- Preserve the immutable 0045 migration while adopting upstream's canonical
+-- Granola document IDs. Rename existing rows before replacing the projection
+-- function because granola_context_documents also has a unique note_id.
+
+update granola_context_documents
+set document_id = concat_ws(':', 'granola', 'note', note_id),
+    updated_at = now()
+where document_id is distinct from concat_ws(':', 'granola', 'note', note_id);
 
 create or replace function centaur_refresh_granola_context_document(
     p_note_id text
@@ -22,7 +27,7 @@ as $$
     ),
     projected as (
         select
-            concat_ws(':', 'granola', notes.note_id) as document_id,
+            concat_ws(':', 'granola', 'note', notes.note_id) as document_id,
             notes.note_id,
             coalesce(nullif(notes.title, ''), 'Granola note') as title,
             notes.content_text as body,
@@ -135,23 +140,6 @@ as $$
         updated_at = now()
     where granola_context_documents.content_hash is distinct from excluded.content_hash;
 $$;
-
-create or replace function centaur_refresh_granola_context_document_from_note()
-returns trigger
-language plpgsql
-as $$
-begin
-    perform centaur_refresh_granola_context_document(new.note_id);
-    return new;
-end;
-$$;
-
-drop trigger if exists trg_granola_sync_notes_refresh_context
-    on granola_sync_notes;
-create trigger trg_granola_sync_notes_refresh_context
-    after insert or update on granola_sync_notes
-    for each row
-    execute function centaur_refresh_granola_context_document_from_note();
 
 select centaur_refresh_granola_context_document(note_id)
 from granola_sync_notes;

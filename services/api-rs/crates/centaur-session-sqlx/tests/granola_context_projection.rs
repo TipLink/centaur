@@ -9,6 +9,8 @@ use sqlx::{Connection, Executor, PgConnection, Row};
 const GRANOLA_SYNC_SQL: &str = include_str!("../migrations/0040_granola_sync_tables.sql");
 const GRANOLA_CONTEXT_PROJECTION_SQL: &str =
     include_str!("../migrations/0045_granola_context_projection.sql");
+const GRANOLA_CONTEXT_DOCUMENT_IDS_SQL: &str =
+    include_str!("../migrations/0047_granola_context_projection_document_ids.sql");
 
 #[tokio::test]
 async fn granola_notes_project_into_their_dedicated_rls_protected_context_table()
@@ -37,18 +39,25 @@ async fn run_assertions(conn: &mut PgConnection, schema: &str) -> Result<(), Box
             'note_backfilled', 'Existing note', 'alice@example.com',
             array['alice@example.com'], 'Existing source data', '2026-07-13T09:00:00Z'
         );
-
-        insert into granola_context_documents (
-            document_id, note_id, title, body, content_hash
-        ) values (
-            'granola:note:note_backfilled', 'note_backfilled',
-            'Stale title', 'Stale body', 'stale-hash'
-        );
         "#,
     )
     .execute(&mut *conn)
     .await?;
     execute_migration(conn, GRANOLA_CONTEXT_PROJECTION_SQL).await?;
+    sqlx::query(
+        "update granola_context_documents set title = 'Stale title', body = 'Stale body', \
+         content_hash = 'stale-hash' where note_id = 'note_backfilled'",
+    )
+    .execute(&mut *conn)
+    .await?;
+    let legacy_document_id: String = sqlx::query_scalar(
+        "select document_id from granola_context_documents where note_id = 'note_backfilled'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    assert_eq!(legacy_document_id, "granola:note_backfilled");
+
+    execute_migration(conn, GRANOLA_CONTEXT_DOCUMENT_IDS_SQL).await?;
     grant_schema_usage(conn, schema).await?;
 
     let backfilled = sqlx::query(
