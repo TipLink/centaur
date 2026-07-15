@@ -21,6 +21,9 @@ that update `sandbox_id` without knowing the new nullable column.
 Upstream versions `0043` through `0045` are shifted to TipLink versions `0044`
 through `0046`: company-context projection checkpoints, Granola context
 projection, and Slack private-channel OAuth synchronization respectively.
+Fork migration `0047` adopts upstream's corrected Granola document ID namespace
+without editing the immutable TipLink `0045` migration. It renames existing
+projection rows before replacing the refresh function.
 
 Migration `0046` is not compatible with an ordinary overlapping rolling
 deployment. It renames the live `slack_dm_*` relations and rebuilds both BM25
