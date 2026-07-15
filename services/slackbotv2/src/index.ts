@@ -51,6 +51,7 @@ import {
   defaultModelForHarness,
   type SlackContextBlock
 } from './console-session-link'
+import { resolveChannelDefault } from './channel-defaults'
 import { extractMessageOverrides } from './overrides'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
@@ -189,6 +190,17 @@ function stickyOverrideValue(
 ): string | undefined {
   if (update && Object.prototype.hasOwnProperty.call(update, key)) return stringValue(update[key])
   return stringValue(state[key])
+}
+
+// Like stickyOverrideValue but keeps an explicit `null` — the tombstone a
+// harness switch writes to clear the old model/provider — so callers can tell
+// "cleared" (null) from "never set" (undefined).
+function stickyOverrideRaw(
+  state: SlackbotV2ThreadState,
+  update: StickyThreadOverrides | undefined,
+  key: keyof StickyThreadOverrides
+): string | null | undefined {
+  return update && Object.prototype.hasOwnProperty.call(update, key) ? update[key] : state[key]
 }
 
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
@@ -760,13 +772,30 @@ async function syncThreadMessageToSession(
   // (`slack:CHANNEL:THREAD_TS`) is the exact value sent to the session API as
   // `thread_key`, which the Console indexes by.
   const isFirstAssistantMessage = shouldStartExecution && executedMessageIds.size === 0
+  // Channel default: below a per-thread flag, above the deployment default, and
+  // (unlike it) ridden on the input line to take effect. harness/model/provider
+  // are sticky (effectiveOverrides); reasoning is per-turn.
+  const channelDefault = resolveChannelDefault(input.options.channelDefaults, thread.id)
+  const resolvedHarnessType = effectiveOverrides.harnessType ?? channelDefault?.harnessType
+  // A `null` sticky model/provider is a tombstone from a harness switch: honor
+  // it, don't re-pair a stale channel default with the new harness. Only
+  // `undefined` (never set) falls through to the channel default.
+  const resolvedModel =
+    stickyOverrideRaw(state, stickyOverridesUpdate, 'model') === null
+      ? undefined
+      : effectiveOverrides.model ?? channelDefault?.model
+  const resolvedProvider =
+    stickyOverrideRaw(state, stickyOverridesUpdate, 'provider') === null
+      ? undefined
+      : effectiveOverrides.provider ?? channelDefault?.provider
+  const resolvedReasoning = overrides.reasoning ?? channelDefault?.reasoning
   const effectiveHarnessType =
-    effectiveOverrides.harnessType ?? input.options.defaultHarnessType ?? 'codex'
-  // Without an explicit --model/--opus/... override the harness runs its
+    resolvedHarnessType ?? input.options.defaultHarnessType ?? 'codex'
+  // Without an explicit override or channel default the harness runs its
   // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
   // config); show and record that instead of dropping the model entirely.
   const effectiveModel =
-    effectiveOverrides.model ??
+    resolvedModel ??
     defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
   const effectiveEffort =
     effectiveHarnessType === 'codex'
@@ -848,12 +877,12 @@ async function syncThreadMessageToSession(
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     // Sticky harness changes only apply when a message starts an execution;
     // restarting the thread out from under an active execution would kill it.
-    harnessType: shouldStartExecution ? effectiveOverrides.harnessType : undefined,
+    harnessType: shouldStartExecution ? resolvedHarnessType : undefined,
     messages: messagesToAppend,
-    model: shouldStartExecution ? effectiveOverrides.model : undefined,
+    model: shouldStartExecution ? resolvedModel : undefined,
     metadataModel: shouldStartExecution ? effectiveModel : undefined,
-    provider: shouldStartExecution ? effectiveOverrides.provider : undefined,
-    reasoning: overrides.reasoning,
+    provider: shouldStartExecution ? resolvedProvider : undefined,
+    reasoning: resolvedReasoning,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },

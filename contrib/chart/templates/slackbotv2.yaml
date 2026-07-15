@@ -89,6 +89,16 @@ spec:
             - name: SLACKBOT_TRIGGER_BOT_ALLOWLIST
               value: {{ .Values.slackbotv2.triggerBotAllowlist | quote }}
 {{- end }}
+{{- if .Values.slackbotv2.channelDefaults }}
+            # Per-channel default harness / model / provider / reasoning, keyed
+            # by Slack conversation id (each value an object of harness/model/
+            # provider/reasoning fields, e.g. { harness: claude, model: opus }).
+            # Applied below an explicit/sticky per-thread flag and above the
+            # deployment/baked default, and forwarded onto the harness input line
+            # so it takes effect.
+            - name: SLACKBOTV2_CHANNEL_DEFAULTS
+              value: {{ .Values.slackbotv2.channelDefaults | toJson | quote }}
+{{- end }}
 {{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" "CODEX_MODEL_REASONING_EFFORT" }}
 {{- if and (hasKey $.Values.sandbox.extraEnv $name) (not (hasKey $.Values.slackbotv2.extraEnv $name)) }}
             # Mirror deployer harness display settings (sandbox.extraEnv) so

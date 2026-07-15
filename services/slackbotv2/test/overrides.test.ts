@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { SlackFormatConverter } from '@chat-adapter/slack'
-import { extractMessageOverrides } from '../src/overrides'
+import { extractMessageOverrides, normalizeHarnessOverrides } from '../src/overrides'
 
 describe('extractMessageOverrides', () => {
   test('returns text untouched without flags', () => {
@@ -246,6 +246,60 @@ describe('extractMessageOverrides', () => {
       provider: 'responses',
       reasoning: 'high'
     })
+  })
+})
+
+// normalizeHarnessOverrides is the object-shaped sibling of
+// extractMessageOverrides: config fields resolve through the SAME vocabulary
+// tables as the inline flags, so a channel default and a Slack flag validate
+// identically.
+describe('normalizeHarnessOverrides', () => {
+  test('resolves harness / model / provider / reasoning through the flag vocabulary', () => {
+    expect(
+      normalizeHarnessOverrides({ harness: 'claude', model: 'opus', reasoning: 'hi' })
+    ).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-opus-4-8',
+      provider: undefined,
+      reasoning: 'high'
+    })
+  })
+
+  test('a provider shortcut implies its harness, like --bedrock', () => {
+    expect(normalizeHarnessOverrides({ provider: 'bedrock', model: 'gpt-5.2' })).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-5.2',
+      provider: 'amazon-bedrock',
+      reasoning: undefined
+    })
+  })
+
+  test('expands a model alias but does not imply a harness (fields are independent)', () => {
+    // Like `--model opus` (not `--opus`): the alias expands, harness is left to
+    // the explicit `harness` field / thread / deployment default.
+    expect(normalizeHarnessOverrides({ model: 'opus' })).toEqual({
+      harnessType: undefined,
+      model: 'claude-opus-4-8',
+      provider: undefined,
+      reasoning: undefined
+    })
+  })
+
+  test('reports and drops unrecognized enum-like values', () => {
+    const errors: string[] = []
+    const result = normalizeHarnessOverrides(
+      { harness: 'gpt', provider: 'openai', reasoning: 'turbo' },
+      message => errors.push(message)
+    )
+    expect(result).toEqual({
+      harnessType: undefined,
+      model: undefined,
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(errors.some(e => e.includes('unknown harness'))).toBe(true)
+    expect(errors.some(e => e.includes('unknown provider'))).toBe(true)
+    expect(errors.some(e => e.includes('unknown reasoning effort'))).toBe(true)
   })
 })
 

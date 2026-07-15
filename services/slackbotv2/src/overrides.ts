@@ -20,12 +20,20 @@
  * shortcuts imply the codex harness.
  */
 
-export type MessageOverrides = {
-  cleanedText: string
+/**
+ * A resolved bundle of harness knobs (harness + model/provider/reasoning), all
+ * optional. Shared by the inline flag parser and per-channel defaults so both
+ * speak the same vocabulary.
+ */
+export type HarnessOverrides = {
   harnessType?: string
   model?: string
   provider?: string
   reasoning?: string
+}
+
+export type MessageOverrides = HarnessOverrides & {
+  cleanedText: string
 }
 
 // Flag name -> HarnessType wire value (serde lowercase of the Rust enum).
@@ -148,6 +156,57 @@ export function extractMessageOverrides(text: string): MessageOverrides {
     provider,
     reasoning
   }
+}
+
+/**
+ * Object-shaped counterpart to {@link extractMessageOverrides}: normalizes a
+ * `{ harness, model, provider, reasoning }` config through the same vocabulary
+ * as the flag parser (harness/provider/model aliases; a provider implies its
+ * harness, like `--bedrock`). Fields are independent; unrecognized harness /
+ * provider / reasoning values are reported via `onError` and dropped.
+ */
+export function normalizeHarnessOverrides(
+  raw: { harness?: unknown; model?: unknown; provider?: unknown; reasoning?: unknown },
+  onError?: (message: string) => void
+): HarnessOverrides {
+  let harnessType: string | undefined
+  let model: string | undefined
+  let provider: string | undefined
+  let reasoning: string | undefined
+
+  const harnessRaw = cleanString(raw.harness)
+  if (harnessRaw) {
+    harnessType = HARNESS_FLAGS[harnessRaw.toLowerCase()]
+    if (!harnessType) onError?.(`unknown harness "${harnessRaw}"`)
+  }
+
+  const providerRaw = cleanString(raw.provider)
+  if (providerRaw) {
+    const mapping = PROVIDER_FLAGS[providerRaw.toLowerCase()]
+    if (mapping) {
+      provider = mapping.provider
+      harnessType ??= mapping.harnessType // a provider implies its harness, like --bedrock
+    } else {
+      onError?.(`unknown provider "${providerRaw}"`)
+    }
+  }
+
+  const modelRaw = cleanString(raw.model)
+  if (modelRaw) model = CLAUDE_MODEL_ALIASES[modelRaw.toLowerCase()] ?? modelRaw
+
+  const reasoningRaw = cleanString(raw.reasoning)
+  if (reasoningRaw) {
+    reasoning = REASONING_EFFORTS[reasoningRaw.toLowerCase()]
+    if (!reasoning) onError?.(`unknown reasoning effort "${reasoningRaw}"`)
+  }
+
+  return { harnessType, model, provider, reasoning }
+}
+
+function cleanString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed === '' ? undefined : trimmed
 }
 
 function flagPattern(flag: string): RegExp {

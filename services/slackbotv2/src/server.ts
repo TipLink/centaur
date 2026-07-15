@@ -1,4 +1,5 @@
 import { createSlackbotV2, type SlackbotV2Options } from './index'
+import { parseChannelDefaults } from './channel-defaults'
 
 const port = numberEnv('PORT', 3002)
 const apiUrl = stringEnv('CENTAUR_API_URL', 'http://127.0.0.1:8080')
@@ -31,6 +32,9 @@ const options: SlackbotV2Options = {
   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
   botToken,
   botUserId: optionalEnv('SLACK_BOT_USER_ID'),
+  channelDefaults: parseChannelDefaults(optionalEnv('SLACKBOTV2_CHANNEL_DEFAULTS'), reason =>
+    consoleLogger.warn('slackbotv2 SLACKBOTV2_CHANNEL_DEFAULTS', { reason })
+  ),
   consolePublicUrl: optionalEnv('CENTAUR_CONSOLE_PUBLIC_URL'),
   codexDefaultReasoningEffort: optionalEnv('CODEX_MODEL_REASONING_EFFORT'),
   defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),
