@@ -9,7 +9,7 @@ class ApplicationController < ActionController::Base
   # controllers don't each hand-roll a rescue. Mirrors Api::BaseController.
   rescue_from ActiveRecord::RecordNotFound, with: :render_not_found
 
-  helper_method :current_user, :acting_admin?, :descoped?
+  helper_method :current_user, :acting_admin?, :descoped?, :password_login_enabled?
   helper_method :public_base_url, :oauth_callback_redirect_uri
 
   # The public origin the console is reached at. Derived from the request by
@@ -74,6 +74,10 @@ class ApplicationController < ActionController::Base
 
     session.delete(:descoped)
     false
+  end
+
+  def password_login_enabled?
+    ConsoleAuth.password_login_enabled?
   end
 
   # The permission check console gates use instead of current_user.admin?: a
@@ -194,6 +198,10 @@ class ApplicationController < ActionController::Base
       console_sidebar_console_thread_owner_sql,
       (console_sidebar_slack_thread_owner_sql(slack_owners) if slack_owners.any?)
     ].compact
+    if CentaurSession.public_slack_threads_enabled?
+      public_slack_sql = CentaurSession.public_slack_channel_sql
+      conditions << public_slack_sql if public_slack_sql
+    end
 
     return CentaurSession.where("1=0") if conditions.empty?
 
@@ -209,10 +217,13 @@ class ApplicationController < ActionController::Base
     thread_keys = console_sidebar_selected_thread_keys - threads.map(&:thread_key)
     return [] if thread_keys.empty?
 
-    # Resolve through the owner scope, not a raw find_by, so a directly linked
-    # thread only surfaces in the sidebar when the current user started it. This
-    # mirrors Console::ThreadsController#selected_session.
-    console_sidebar_visible_thread_scope.where(thread_key: thread_keys).to_a
+    visible = console_sidebar_visible_thread_scope.where(thread_key: thread_keys).to_a
+    missing_keys = thread_keys - visible.map(&:thread_key)
+    shared_keys = ThreadShare.where(thread_key: missing_keys).pluck(:thread_key)
+    shared = CentaurSession.where(thread_key: shared_keys).to_a
+    sessions_by_key = (visible + shared).index_by(&:thread_key)
+
+    thread_keys.filter_map { |thread_key| sessions_by_key[thread_key] }
   end
 
   # The thread param carries up to PANEL_LIMIT comma-separated keys when the

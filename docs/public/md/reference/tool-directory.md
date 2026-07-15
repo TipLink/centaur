@@ -12,13 +12,13 @@ Centaur ships with a set of tool integrations under `tools/`. Deployments can en
 The repo inventory is not the same as a live deployment. To see what an agent can use in a running sandbox, ask it to run:
 
 ```bash
-call tools
+centaur-tools list
 ```
 
-To inspect a specific tool's methods and parameters:
+To inspect a specific tool's CLI:
 
 ```bash
-call discover linear
+linear --help
 ```
 
 The `API key / credential` column uses the secret names declared by each tool's `[tool.centaur]` config. `None` means the base tool declares no required tool-specific credential; optional credentials are called out separately.
@@ -34,7 +34,7 @@ These are broadly useful across most deployments and are good candidates to conf
 | `slack` | Search Slack, read threads, inspect channels/users, and send or upload messages | `SLACK_BOT_TOKEN`; optional: `SLACK_SEARCH_TOKEN`, `SLACK_ETL_TOKEN` |
 | `gsuite` | Use Gmail, Calendar, Drive, Docs, Sheets, Slides, and Google Analytics | `GOOGLE_TOKEN_JSON` |
 | `websearch` | Free web search via Parallel and deep research | None; `PARALLEL_API_KEY` for `deep_research`; `ANTHROPIC_API_KEY` for search synthesis |
-| `company_context` | Search indexed company history, Slack DMs, and Google Docs | None |
+| `company_context` | Search indexed company history, private Slack conversations, and Google Docs | None |
 | `grafana` | Query dashboards, alerts, VictoriaMetrics, VictoriaLogs, and annotations | `GRAFANA_URL`, `GRAFANA_API_KEY` |
 | `posthog` | Query product analytics, events, pageviews, breakdowns, and user agents | `POSTHOG_API_KEY`, `POSTHOG_PROJECT_ID` |
 | `amplitude` | Query product analytics — event segmentation, funnels, retention, user activity, and taxonomy | `AMPLITUDE_API_KEY`, `AMPLITUDE_SECRET_KEY` |
@@ -60,6 +60,7 @@ These are broadly useful across most deployments and are good candidates to conf
 
 | Tool | Use | API key / credential |
 |---|---|---|
+| `centaur-console` | Inspect the current sandbox's redacted permissions and capabilities | None |
 | `chart` | Render charts as PNG images for Slack or reports | None |
 | `demo` | Test tool hot-reload and basic tool plumbing | None |
 | `grafana` | Grafana dashboards, alerts, VictoriaMetrics, VictoriaLogs, and annotations | `GRAFANA_URL`, `GRAFANA_API_KEY` |
@@ -75,8 +76,8 @@ These are broadly useful across most deployments and are good candidates to conf
 
 | Tool | Use | API key / credential |
 |---|---|---|
-| `airtable` | Bases, schemas, tables, records, views, and URL parsing | `AIRTABLE_API_KEY` |
-| `company_context` | Search indexed company history, Slack DMs, and Google Docs | None |
+| `airtable` | Bases, schemas, tables, views, record reads, record writes, and URL parsing | `AIRTABLE_API_KEY` |
+| `company_context` | Search indexed company history, private Slack conversations, and Google Docs | None |
 | `composio` | Execute tools from third-party services exposed through Composio | `COMPOSIO_API_KEY` |
 | `figma` | Extract Figma files, nodes, components, styles, and variables | `FIGMA_ACCESS_TOKEN` |
 | `granola` | Search and read Granola notes and transcripts | `GRANOLA_API_KEY` |

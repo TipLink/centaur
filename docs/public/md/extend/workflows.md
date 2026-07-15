@@ -70,6 +70,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 | `ctx.sleep(name, duration)` | Suspend and resume later. |
 | `ctx.sleep_until(name, when)` | Resume at a specific time. |
 | `ctx.wait_for_event(name, event_type, correlation_id)` | Wait for an external event. |
+| `ctx.start_workflow(workflow_name, input, idempotency_key=...)` | Queue a child workflow and continue immediately; returns its durable task/run identifiers. |
 | `ctx.wait_for_workflow(...)` | Wait for a child workflow to finish. |
 | `ctx.run_workflow(...)` | Start and wait in one call. |
 | `ctx.start_agent(...)` | Start an agent turn. |
@@ -94,10 +95,9 @@ These primitives compose into larger automations:
 ## Run a workflow
 
 The manual control API requires the trusted `CENTAUR_CONTROL_API_KEY` (or an
-optional dedicated `WORKFLOW_API_KEY`). Agent tools use
-a separate Console JWT lane: their workflow name must be listed in
-`WORKFLOW_API_ALLOWED_NAMES`, and `input.thread_key` must belong to one of the
-JWT's Slack upload channels.
+optional dedicated `WORKFLOW_API_KEY`). Agent tools use a separate Console JWT
+lane: their workflow name must be listed in `WORKFLOW_API_ALLOWED_NAMES`, and
+`input.thread_key` must belong to one of the JWT's Slack upload channels.
 
 Create a run through the trusted operator lane:
 

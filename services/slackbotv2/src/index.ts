@@ -25,7 +25,11 @@ import {
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
 import { observeSeconds, slackbotMetrics } from './metrics'
-import { renderSlackDisplayText, slackMessagePromptText } from './slack-display-text'
+import {
+  renderSlackDisplayText,
+  slackMessagePromptText,
+  slackRichTextMentionsUser
+} from './slack-display-text'
 import { slackUserIdForMessage } from './slack-user'
 import {
   collectInitialContext,
@@ -42,9 +46,12 @@ import {
 } from './session-api'
 import {
   buildConsoleSessionContextBlock,
+  defaultCodexEffort,
+  defaultCodexSpeed,
   defaultModelForHarness,
   type SlackContextBlock
 } from './console-session-link'
+import { channelIdFromThreadId, resolveChannelDefault } from './channel-defaults'
 import { extractMessageOverrides } from './overrides'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
@@ -185,6 +192,17 @@ function stickyOverrideValue(
   return stringValue(state[key])
 }
 
+// Like stickyOverrideValue but keeps an explicit `null` — the tombstone a
+// harness switch writes to clear the old model/provider — so callers can tell
+// "cleared" (null) from "never set" (undefined).
+function stickyOverrideRaw(
+  state: SlackbotV2ThreadState,
+  update: StickyThreadOverrides | undefined,
+  key: keyof StickyThreadOverrides
+): string | null | undefined {
+  return update && Object.prototype.hasOwnProperty.call(update, key) ? update[key] : state[key]
+}
+
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
   const logger = options.logger ?? noopLogger
@@ -221,8 +239,30 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   const ambientSlackChannelIds = ambientSlackChannelIdSet(options)
 
+  // Slack does not classify mentions inside Block Kit or legacy attachments as
+  // app_mention events. Alertmanager uses attachment.pretext. Ambient channels
+  // also execute root messages without mentions, so handle both cases in one
+  // callback to avoid double execution when a rich mention is ambient.
+  chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
+    const richMention = slackRichTextMentionsUser(message.raw, options.botUserId)
+    const isAmbientMessage = isAmbientSlackChannelMessage(message, ambientSlackChannelIds)
+    if (!richMention && !isAmbientMessage) return
+    if (!(await isAllowedSlackMessage(message, options, logger))) return
+    if (richMention) message.isMention = true
+    lateSlackFiles.rememberFilelessMention(thread, message)
+    await handleSlackMessageHandoff(thread, message, {
+      assistantStatusRequested: true,
+      mode: 'execute',
+      options,
+      state,
+      subscribe: true,
+      trigger: richMention ? 'new_mention' : 'ambient_channel_message'
+    })
+  })
+
   chat.onSubscribedMessage(async (thread, message) => {
     if (!(await isAllowedSlackMessage(message, options, logger))) return
+    if (slackRichTextMentionsUser(message.raw, options.botUserId)) message.isMention = true
     lateSlackFiles.rememberFilelessMention(thread, message)
     const isAmbientMessage = isAmbientSlackChannelMessage(message, ambientSlackChannelIds)
     const shouldExecute = message.isMention === true || isAmbientMessage
@@ -234,22 +274,6 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       trigger: isAmbientMessage ? 'ambient_channel_message' : 'subscribed_message'
     })
   })
-
-  if (ambientSlackChannelIds.size > 0) {
-    chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
-      if (!isAmbientSlackChannelMessage(message, ambientSlackChannelIds)) return
-      if (!isAllowedSlackMessage(message, options, logger)) return
-      lateSlackFiles.rememberFilelessMention(thread, message)
-      await handleSlackMessageHandoff(thread, message, {
-        assistantStatusRequested: true,
-        mode: 'execute',
-        options,
-        state,
-        subscribe: true,
-        trigger: 'ambient_channel_message'
-      })
-    })
-  }
 
   const app = new Hono()
   app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
@@ -352,7 +376,7 @@ function isAmbientSlackChannelMessage(
   const raw = isJsonObject(message.raw) ? message.raw : undefined
   if (raw && stringValue(raw.type) !== 'message') return false
 
-  const channelId = stringValue(raw?.channel) ?? slackChannelFromThreadId(message.threadId)
+  const channelId = stringValue(raw?.channel) ?? channelIdFromThreadId(message.threadId)
   return Boolean(channelId && allowedChannels.has(channelId))
 }
 
@@ -360,14 +384,6 @@ function ambientSlackChannelIdSet(options: SlackbotV2Options): ReadonlySet<strin
   return new Set(
     options.ambientSlackChannelIds ?? splitEnvList(process.env.SLACKBOT_AMBIENT_CHANNEL_IDS)
   )
-}
-
-function slackChannelFromThreadId(threadId: string): string | undefined {
-  const parts = threadId.split(':')
-  if (parts[0] !== 'slack') return undefined
-  if (parts.length === 4) return parts[2] || undefined
-  if (parts.length === 3) return parts[1] || undefined
-  return undefined
 }
 
 function splitEnvList(value: string | undefined): string[] {
@@ -790,20 +806,44 @@ async function syncThreadMessageToSession(
   // (`slack:CHANNEL:THREAD_TS`) is the exact value sent to the session API as
   // `thread_key`, which the Console indexes by.
   const isFirstAssistantMessage = shouldStartExecution && executedMessageIds.size === 0
+  // Channel default: below a per-thread flag, above the deployment default, and
+  // (unlike it) ridden on the input line to take effect. harness/model/provider
+  // are sticky (effectiveOverrides); reasoning is per-turn.
+  const channelDefault = resolveChannelDefault(input.options.channelDefaults, thread.id)
+  const resolvedHarnessType = effectiveOverrides.harnessType ?? channelDefault?.harnessType
+  // A `null` sticky model/provider is a tombstone from a harness switch: honor
+  // it, don't re-pair a stale channel default with the new harness. Only
+  // `undefined` (never set) falls through to the channel default.
+  const resolvedModel =
+    stickyOverrideRaw(state, stickyOverridesUpdate, 'model') === null
+      ? undefined
+      : effectiveOverrides.model ?? channelDefault?.model
+  const resolvedProvider =
+    stickyOverrideRaw(state, stickyOverridesUpdate, 'provider') === null
+      ? undefined
+      : effectiveOverrides.provider ?? channelDefault?.provider
+  const resolvedReasoning = overrides.reasoning ?? channelDefault?.reasoning
   const effectiveHarnessType =
-    effectiveOverrides.harnessType ?? input.options.defaultHarnessType ?? 'codex'
-  // Without an explicit --model/--opus/... override the harness runs its
+    resolvedHarnessType ?? input.options.defaultHarnessType ?? 'codex'
+  // Without an explicit override or channel default the harness runs its
   // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
   // config); show and record that instead of dropping the model entirely.
   const effectiveModel =
-    effectiveOverrides.model ??
+    resolvedModel ??
     defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
+  const effectiveEffort =
+    effectiveHarnessType === 'codex'
+      ? resolvedReasoning ?? defaultCodexEffort(input.options.codexDefaultReasoningEffort)
+      : undefined
+  const effectiveSpeed = effectiveHarnessType === 'codex' ? defaultCodexSpeed() : undefined
   const consoleSessionBlock = isFirstAssistantMessage
     ? buildConsoleSessionContextBlock({
         consoleBaseUrl: input.options.consolePublicUrl,
         threadKey: thread.id,
         harnessType: effectiveHarnessType,
-        model: effectiveModel
+        model: effectiveModel,
+        effort: effectiveEffort,
+        speed: effectiveSpeed
       })
     : undefined
   if (overrides.harnessType || overrides.model || overrides.provider || overrides.reasoning) {
@@ -871,12 +911,12 @@ async function syncThreadMessageToSession(
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     // Sticky harness changes only apply when a message starts an execution;
     // restarting the thread out from under an active execution would kill it.
-    harnessType: shouldStartExecution ? effectiveOverrides.harnessType : undefined,
+    harnessType: shouldStartExecution ? resolvedHarnessType : undefined,
     messages: messagesToAppend,
-    model: shouldStartExecution ? effectiveOverrides.model : undefined,
+    model: shouldStartExecution ? resolvedModel : undefined,
     metadataModel: shouldStartExecution ? effectiveModel : undefined,
-    provider: shouldStartExecution ? effectiveOverrides.provider : undefined,
-    reasoning: overrides.reasoning,
+    provider: shouldStartExecution ? resolvedProvider : undefined,
+    reasoning: resolvedReasoning,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },

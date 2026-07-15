@@ -170,7 +170,7 @@ class PrincipalTest < ActiveSupport::TestCase
 
       refute_nil entry
       assert_equal "Bearer {{ .Value }}", entry.dig("inject", "formatter")
-      assert_includes entry.fetch("rules"), { "host" => "api.internal" }
+      assert_equal [ { "host" => "api.internal" } ], entry.fetch("rules")
 
       claims = jwt_payload(entry.dig("source", "value"))
       assert_equal "centaur-console", claims.fetch("iss")
@@ -199,7 +199,11 @@ class PrincipalTest < ActiveSupport::TestCase
   end
 
   test "api-enabled non-Slack principal receives a subject-only API JWT" do
-    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+    with_env(
+      "CENTAUR_JWT_SIGNING_SECRET" => "test-secret",
+      "CENTAUR_API_URL" => "http://api.internal:8080",
+      "CENTAUR_API_SERVER_PROXY_HOSTS" => nil
+    ) do
       principal = Principal.create!(
         default_attrs(namespace: "acme", foreign_id: "github-subject-only")
       )

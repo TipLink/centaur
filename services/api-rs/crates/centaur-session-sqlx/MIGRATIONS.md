@@ -18,6 +18,9 @@ contains the forward-only reconciliation for Fineas public Slack company
 context. Fork migration `0043` appends assignment-bound sandbox content
 revision tracking; it is deliberately backward compatible with older binaries
 that update `sandbox_id` without knowing the new nullable column.
+Upstream versions `0043` through `0045` are shifted to TipLink versions `0044`
+through `0046`: company-context projection checkpoints, Granola context
+projection, and Slack private-channel OAuth synchronization respectively.
 
 The checksum manifests checked by `.github/scripts/check-migration-order.sh`
 lock the release migration tree. Append a manifest entry for a genuinely new
