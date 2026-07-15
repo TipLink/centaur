@@ -25,12 +25,17 @@ class WorkflowContext:
         task_id: str,
         workflow_name: str,
         pool: Any = None,
+        agent_defaults: dict[str, Any] | None = None,
     ) -> None:
         self._rpc = rpc
         self.run_id = run_id
         self.task_id = task_id
         self.workflow_name = workflow_name
         self._pool = pool
+        # Module-level `AGENT_DEFAULTS` (e.g. {"model": ..., "reasoning": ...})
+        # applied to every ctx.agent_turn as a per-workflow default; explicit
+        # per-call kwargs always win. See agent_turn().
+        self._agent_defaults = dict(agent_defaults or {})
         self.tools = WorkflowTools(WorkflowToolManager(self._rpc))
 
     def log(self, event: str, **fields: Any) -> None:
@@ -97,7 +102,9 @@ class WorkflowContext:
         )
 
     async def agent_turn(self, text: str | None = None, **kwargs: Any) -> Any:
-        args = dict(kwargs)
+        # Per-workflow AGENT_DEFAULTS (model / provider / reasoning / harness,
+        # ...) form the base; explicit per-call kwargs override them key by key.
+        args = {**self._agent_defaults, **kwargs}
         if text is not None:
             args.setdefault("text", text)
         return await self._rpc.request({"type": "ctx.agent_turn", "args": args})

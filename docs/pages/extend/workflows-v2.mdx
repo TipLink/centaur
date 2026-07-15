@@ -110,6 +110,8 @@ result = await ctx.agent_turn(
     "Investigate this alert and return the next action.",
     thread_key=f"workflow:{ctx.run_id}:agent",
     harness="codex",
+    model="gpt-5.2",
+    reasoning="high",
     metadata={"workflow": WORKFLOW_NAME},
 )
 ```
@@ -117,6 +119,34 @@ result = await ctx.agent_turn(
 The workflow host sandbox is separate from the agent sandbox. The workflow
 handler coordinates the run; the agent turn runs through the normal Centaur
 session runtime.
+
+#### Pick the model and reasoning effort
+
+`ctx.agent_turn(...)` accepts optional `model`, `provider`, and `reasoning`
+kwargs. They ride the turn exactly like the Slack `--model` / `--bedrock` /
+`-rsn` flags: `model` selects the model within the harness, `reasoning` sets the
+codex reasoning effort (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`),
+and `provider` selects the codex model provider. `provider` and `reasoning` only
+affect the codex harness; claude and amp ignore them. `reasoning` also accepts
+the `reasoning_effort` and `effort` aliases. When a kwarg is omitted the
+deployment/baked harness default stands — dispatched turns are no longer pinned
+to the deployment default.
+
+To set a default for **every** turn in a workflow, declare a module-level
+`AGENT_DEFAULTS` dict. Explicit per-call kwargs override it key by key:
+
+```python
+WORKFLOW_NAME = "nightly_report"
+AGENT_DEFAULTS = {"harness": "codex", "model": "gpt-5.2", "reasoning": "high"}
+
+async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
+    await ctx.agent_turn("Draft the report.")            # gpt-5.2 @ high
+    await ctx.agent_turn("Tidy formatting.", reasoning="low")  # gpt-5.2 @ low
+```
+
+Keep `harness` and `model` together — a model is only meaningful within its
+harness, and because kwargs override `AGENT_DEFAULTS` key by key, overriding one
+without the other can strand a model on the wrong harness.
 
 ### Declare webhook metadata in the workflow
 

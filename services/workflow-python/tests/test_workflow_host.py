@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -169,6 +170,42 @@ class WorkflowHostTests(unittest.TestCase):
 
         self.assertEqual(result, {"name": "draft_summary", "text": "summarize this"})
 
+    def test_agent_turn_applies_workflow_agent_defaults(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+            agent_defaults={"model": "claude-opus-4-8", "reasoning": "high"},
+        )
+
+        result = asyncio.run(ctx.agent_turn("do the thing"))
+
+        self.assertEqual(
+            result,
+            {"model": "claude-opus-4-8", "reasoning": "high", "text": "do the thing"},
+        )
+
+    def test_agent_turn_per_call_kwargs_override_agent_defaults(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+            agent_defaults={"model": "claude-opus-4-8", "reasoning": "high"},
+        )
+
+        result = asyncio.run(ctx.agent_turn("cheap step", reasoning="low"))
+
+        self.assertEqual(
+            result,
+            {"model": "claude-opus-4-8", "reasoning": "low", "text": "cheap step"},
+        )
+
     def test_start_workflow_enqueues_durable_child_with_idempotency_key(self) -> None:
         host = load_workflow_host()
         rpc = RequestRpc()
@@ -284,6 +321,70 @@ class WorkflowHostTests(unittest.TestCase):
         )
         self.assertTrue(rpc.drained)
         self.assertTrue(pool.closed)
+
+    def test_run_workflow_threads_agent_defaults_into_context(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+
+        async def handler(inp, ctx):
+            return await ctx.agent_turn("do the thing")
+
+        registered = host.RegisteredWorkflow(
+            workflow_name="sample_workflow",
+            source_path="workflows/sample.py",
+            handler=handler,
+            input_cls=None,
+            webhooks=None,
+            schedule=None,
+            agent_defaults={"model": "claude-opus-4-8", "reasoning": "high"},
+        )
+
+        async def create_pool():
+            return None
+
+        with (
+            patch.object(
+                host,
+                "discover_workflows",
+                return_value={"sample_workflow": registered},
+            ),
+            patch.object(host, "create_pool", create_pool),
+        ):
+            payload = asyncio.run(
+                host.run_workflow(
+                    {
+                        "type": "workflow.start",
+                        "workflow_name": "sample_workflow",
+                        "run_id": "run-123",
+                        "task_id": "task-456",
+                        "input": {},
+                    },
+                    rpc,
+                )
+            )
+
+        self.assertEqual(
+            payload["result"],
+            {"model": "claude-opus-4-8", "reasoning": "high", "text": "do the thing"},
+        )
+
+    def test_load_workflow_file_reads_agent_defaults(self) -> None:
+        host = load_workflow_host()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "defaults_workflow.py"
+            path.write_text(
+                "WORKFLOW_NAME = 'defaults_workflow'\n"
+                "AGENT_DEFAULTS = {'model': 'claude-opus-4-8', 'reasoning': 'high'}\n"
+                "def handler(inp, ctx):\n"
+                "    return None\n"
+            )
+            registered = host.load_workflow_file(path)
+
+        assert registered is not None
+        self.assertEqual(
+            registered.agent_defaults,
+            {"model": "claude-opus-4-8", "reasoning": "high"},
+        )
 
 
 if __name__ == "__main__":

@@ -2478,6 +2478,9 @@ async fn run_centaur_workflow_inner(
                                 workflow_owned_thread: true,
                                 idle_timeout_ms,
                                 max_duration_ms,
+                                model: None,
+                                provider: None,
+                                reasoning: None,
                             },
                         )
                         .await
@@ -3321,6 +3324,17 @@ async fn run_python_agent_turn(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("absurd-workflow-agent-turn:{client_message_id}"));
+    // Optional per-turn harness knobs, mirroring the slackbot's `--model` /
+    // `--bedrock` / `-rsn` flags. `reasoning` accepts `reasoning_effort` and
+    // `effort` aliases so Python callers can use whichever reads best.
+    let model = first_str_arg(&args, &["model"]);
+    let provider = first_str_arg(&args, &["provider"]);
+    let reasoning = first_str_arg(&args, &["reasoning", "reasoning_effort", "effort"]);
+    // Record the model on the execution like the slackbot does, so Console
+    // readers can show what a workflow-dispatched turn ran on.
+    if let Some(model) = model.as_deref() {
+        object_insert(&mut execution_metadata, "model", json!(model));
+    }
     let result = run_agent_session_turn(
         session_runtime,
         AgentTurnRequest {
@@ -3336,10 +3350,22 @@ async fn run_python_agent_turn(
             workflow_owned_thread,
             idle_timeout_ms,
             max_duration_ms,
+            model,
+            provider,
+            reasoning,
         },
     )
     .await?;
     serde_json::to_value(result).map_err(WorkflowRuntimeError::from)
+}
+
+/// Returns the first arg key that holds a non-empty (trimmed) string, owned.
+fn first_str_arg(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| args.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn parse_agent_harness(args: &Value) -> Result<Option<HarnessType>, WorkflowRuntimeError> {
@@ -3616,6 +3642,42 @@ struct AgentTurnRequest {
     workflow_owned_thread: bool,
     idle_timeout_ms: u64,
     max_duration_ms: u64,
+    // Optional per-turn model / provider / reasoning-effort overrides. When set
+    // they ride the execute input line exactly like the slackbot's per-turn
+    // `--model` / `--bedrock` / `-rsn` flags do (see slackbotv2's
+    // `toCodexInputLineWithStaged`), so the harness applies them to this turn;
+    // when `None` the deployment/baked harness default stands. `provider` and
+    // `reasoning` only affect the codex harness (claude/amp ignore them).
+    model: Option<String>,
+    provider: Option<String>,
+    reasoning: Option<String>,
+}
+
+/// Builds the single `type: "user"` execute input line for a workflow agent
+/// turn, mirroring the blocks-protocol shape the harness parses
+/// (`BlocksLine` in `harness-server`): optional top-level `model` / `provider`
+/// / `reasoning` keys, then the `message.content` parts. api-rs enriches the
+/// line with session/trace context before forwarding, so those keys are omitted
+/// here.
+fn agent_turn_input_line(
+    parts: &[Value],
+    model: Option<&str>,
+    provider: Option<&str>,
+    reasoning: Option<&str>,
+) -> Result<String, serde_json::Error> {
+    let mut line = serde_json::Map::new();
+    line.insert("type".to_owned(), json!("user"));
+    if let Some(model) = model {
+        line.insert("model".to_owned(), json!(model));
+    }
+    if let Some(provider) = provider {
+        line.insert("provider".to_owned(), json!(provider));
+    }
+    if let Some(reasoning) = reasoning {
+        line.insert("reasoning".to_owned(), json!(reasoning));
+    }
+    line.insert("message".to_owned(), json!({ "content": parts }));
+    serde_json::to_string(&Value::Object(line))
 }
 
 async fn run_agent_session_turn(
@@ -3635,6 +3697,9 @@ async fn run_agent_session_turn(
         workflow_owned_thread,
         idle_timeout_ms,
         max_duration_ms,
+        model,
+        provider,
+        reasoning,
     } = turn;
     let thread_key = ThreadKey::parse(thread_key)?;
     let mut session_metadata = session_metadata;
@@ -3667,12 +3732,12 @@ async fn run_agent_session_turn(
             ExecuteSessionInput {
                 idempotency_key: Some(execution_idempotency_key),
                 metadata: Some(execution_metadata),
-                input_lines: vec![serde_json::to_string(&json!({
-                    "type": "user",
-                    "message": {
-                        "content": parts,
-                    },
-                }))?],
+                input_lines: vec![agent_turn_input_line(
+                    &parts,
+                    model.as_deref(),
+                    provider.as_deref(),
+                    reasoning.as_deref(),
+                )?],
                 idle_timeout_ms: Some(idle_timeout_ms),
                 max_duration_ms: Some(max_duration_ms),
             },
@@ -3813,6 +3878,47 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn agent_turn_input_line_omits_unset_harness_knobs() {
+        let parts = vec![json!({"type": "text", "text": "hi"})];
+        let line = agent_turn_input_line(&parts, None, None, None).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value.get("type"), Some(&json!("user")));
+        assert_eq!(value.pointer("/message/content"), Some(&json!(parts)));
+        assert!(value.get("model").is_none());
+        assert!(value.get("provider").is_none());
+        assert!(value.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn agent_turn_input_line_forwards_model_provider_reasoning() {
+        let parts = vec![json!({"type": "text", "text": "hi"})];
+        let line = agent_turn_input_line(
+            &parts,
+            Some("claude-opus-4-8"),
+            Some("amazon-bedrock"),
+            Some("high"),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        // Keys match the blocks-protocol shape the harness parses (BlocksLine).
+        assert_eq!(value.get("model"), Some(&json!("claude-opus-4-8")));
+        assert_eq!(value.get("provider"), Some(&json!("amazon-bedrock")));
+        assert_eq!(value.get("reasoning"), Some(&json!("high")));
+        assert_eq!(value.pointer("/message/content"), Some(&json!(parts)));
+    }
+
+    #[test]
+    fn first_str_arg_picks_first_non_empty_alias() {
+        let args = json!({"reasoning": "  ", "reasoning_effort": " high ", "effort": "low"});
+        assert_eq!(
+            first_str_arg(&args, &["reasoning", "reasoning_effort", "effort"]),
+            Some("high".to_owned())
+        );
+        assert_eq!(first_str_arg(&json!({}), &["model"]), None);
+        assert_eq!(first_str_arg(&json!({"model": "   "}), &["model"]), None);
+    }
 
     #[test]
     fn parse_worker_concurrency_uses_override_or_default() {
