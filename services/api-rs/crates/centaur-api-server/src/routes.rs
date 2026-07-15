@@ -2630,6 +2630,15 @@ fn authorize_workflow_api(headers: &HeaderMap) -> Result<WorkflowApiAuthorizatio
 }
 
 fn authorize_session_api(headers: &HeaderMap) -> Result<WorkflowApiAuthorization, ApiError> {
+    authorize_session_api_with_service_token_matcher(headers, |token| {
+        token_matches_configured_env(token, SESSION_API_SERVICE_KEY_ENVS)
+    })
+}
+
+fn authorize_session_api_with_service_token_matcher(
+    headers: &HeaderMap,
+    service_token_matches: impl Fn(&str) -> bool,
+) -> Result<WorkflowApiAuthorization, ApiError> {
     if let Some(presented) = header_value(headers, "X-Centaur-Feedback-Key") {
         if !token_matches_configured_env(presented.trim(), &["SLACK_FEEDBACK_API_KEY"]) {
             return Err(ApiError::Unauthorized(
@@ -2645,18 +2654,8 @@ fn authorize_session_api(headers: &HeaderMap) -> Result<WorkflowApiAuthorization
         return Ok(WorkflowApiAuthorization::FeedbackImprovement(claims));
     }
 
-    let slackbot_key = env::var("SLACKBOT_API_KEY").unwrap_or_default();
-    let slackbot_key = slackbot_key.trim();
-    if !slackbot_key.is_empty()
-        && header_value(headers, "X-Api-Key").is_some_and(|presented| {
-            constant_time_eq(presented.trim().as_bytes(), slackbot_key.as_bytes())
-        })
-    {
-        return Ok(WorkflowApiAuthorization::Service);
-    }
-
     let token = bearer_token(headers)?;
-    if token_matches_configured_env(token, SESSION_API_SERVICE_KEY_ENVS) {
+    if service_token_matches(token) {
         return Ok(WorkflowApiAuthorization::Service);
     }
     let claims: WorkflowApiClaims = verify_console_jwt(token)?;
@@ -4068,6 +4067,32 @@ mod workflow_api_tests {
         );
         assert!(constant_time_eq(b"service-token", b"service-token"));
         assert!(!constant_time_eq(b"service-token", b"other-token"));
+    }
+
+    #[test]
+    fn session_api_uses_the_bearer_lane_for_slackbot_credentials() {
+        assert!(SESSION_API_SERVICE_KEY_ENVS.contains(&"SLACKBOT_API_KEY"));
+
+        let mut bearer_headers = HeaderMap::new();
+        bearer_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer service-token".parse().unwrap(),
+        );
+        assert!(matches!(
+            authorize_session_api_with_service_token_matcher(&bearer_headers, |token| {
+                token == "service-token"
+            }),
+            Ok(WorkflowApiAuthorization::Service)
+        ));
+
+        let mut legacy_headers = HeaderMap::new();
+        legacy_headers.insert("X-Api-Key", "service-token".parse().unwrap());
+        assert!(matches!(
+            authorize_session_api_with_service_token_matcher(&legacy_headers, |token| {
+                token == "service-token"
+            }),
+            Err(ApiError::Unauthorized(_))
+        ));
     }
 
     #[test]

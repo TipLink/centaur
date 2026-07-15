@@ -131,16 +131,10 @@
     "tokenBroker": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
         "githubApp": {
           "type": "object",
           "properties": {
             "enabled": { "type": "boolean" },
-            "credentialId": { "type": "string" },
-            "extraCredentialIds": {
-              "type": "array",
-              "items": { "type": "string" }
-            },
             "credentialNamespaces": {
               "type": "array",
               "items": { "type": "string" }
