@@ -188,23 +188,13 @@ done
 helm template test "$chart_dir" "${common[@]}" \
     --set console.enabled=true \
     --set tokenBroker.githubApp.enabled=true \
-    --set tokenBroker.githubApp.credentialId=fineas-github-app \
-    --set tokenBroker.githubApp.existingSecretName=fineas-github-app \
-    >"$scratch/github-app-alias.yaml"
-if ! grep -qF 'value: "github-app fineas-github-app"' "$scratch/github-app-alias.yaml"; then
-    echo "GitHub App compatibility alias must not replace the canonical github-app credential" >&2
-    exit 1
-fi
-
-helm template test "$chart_dir" "${common[@]}" \
-    --set console.enabled=true \
-    --set tokenBroker.githubApp.enabled=true \
     --set tokenBroker.githubApp.existingSecretName=fineas-github-app \
     >"$scratch/github-app.yaml"
 for expected in \
     'name: github-app-broker-bootstrap' \
     'grant: "github_app_installation"' \
     'name: GITHUB_APP_ID' \
+    'value: "github-app"' \
     'name: github-app-broker-secret' \
     'secretName: "fineas-github-app"'; do
     if ! grep -qF "$expected" "$scratch/github-app.yaml"; then

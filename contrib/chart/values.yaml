@@ -190,18 +190,12 @@ console:
     replicaCount: 1
     resources: {}
 
-# Managed short-lived token credentials for sandbox proxy rules. This
-# transitional bootstrap upserts the GitHub App installation credential into
-# the upstream Console credential-grant registry before api-rs starts.
+# Managed short-lived token credentials for sandbox proxy rules. The bootstrap
+# upserts the GitHub App installation credential into the upstream Console
+# credential-grant registry before api-rs starts.
 tokenBroker:
-  enabled: false
   githubApp:
     enabled: false
-    # Compatibility alias provisioned alongside the canonical `github-app`
-    # credential. The built-in infra role always consumes `github-app`; do not
-    # add a second same-scope proxy source for this alias.
-    credentialId: github-app
-    extraCredentialIds: []
     credentialNamespaces:
       - default
       - infra

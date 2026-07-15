@@ -3,7 +3,7 @@
 {{- $mcpPublicUrl := default .Values.slackbotv2.mcpPublicUrl .Values.apiRs.mcpPublicUrl -}}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
 {{- $sandboxOverlayMountPath := .Values.overlay.sandboxMountPath | default "/home/agent/overlay/org" -}}
-{{- $githubAppBrokerBootstrapEnabled := and (or .Values.tokenBroker.enabled .Values.tokenBroker.githubApp.enabled) .Values.tokenBroker.githubApp.enabled .Values.tokenBroker.githubApp.bootstrap.enabled -}}
+{{- $githubAppBrokerBootstrapEnabled := and .Values.tokenBroker.githubApp.enabled .Values.tokenBroker.githubApp.bootstrap.enabled -}}
 {{- if and $githubAppBrokerBootstrapEnabled (not $console.enabled) -}}
 {{- fail "console.enabled must be true when tokenBroker.githubApp bootstrap is enabled" -}}
 {{- end -}}
@@ -13,14 +13,6 @@
 {{- $githubAppBrokerBootstrapImageRepository := default .Values.sandbox.image.repository .Values.tokenBroker.githubApp.bootstrap.image.repository -}}
 {{- $githubAppBrokerBootstrapImageTag := default .Values.sandbox.image.tag .Values.tokenBroker.githubApp.bootstrap.image.tag -}}
 {{- $githubAppBrokerBootstrapImagePullPolicy := default .Values.sandbox.image.pullPolicy .Values.tokenBroker.githubApp.bootstrap.image.pullPolicy -}}
-{{- $githubAppBrokerCredentialIds := list "github-app" -}}
-{{- with .Values.tokenBroker.githubApp.credentialId -}}
-{{- $githubAppBrokerCredentialIds = append $githubAppBrokerCredentialIds . -}}
-{{- end -}}
-{{- range .Values.tokenBroker.githubApp.extraCredentialIds -}}
-{{- $githubAppBrokerCredentialIds = append $githubAppBrokerCredentialIds . -}}
-{{- end -}}
-{{- $githubAppBrokerCredentialIds = uniq $githubAppBrokerCredentialIds -}}
 {{- $githubAppBrokerNamespaces := default (list "default") .Values.tokenBroker.githubApp.credentialNamespaces -}}
 {{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
 {{- $repoCacheUsePvc := eq $repoCacheStorageType "persistentVolumeClaim" -}}
@@ -360,7 +352,7 @@ spec:
                   name: {{ .Values.tokenBroker.githubApp.existingSecretName | quote }}
                   key: {{ .Values.tokenBroker.githubApp.existingSecretKeys.installationId | quote }}
             - name: GITHUB_APP_BROKER_CREDENTIAL_IDS
-              value: {{ join " " $githubAppBrokerCredentialIds | quote }}
+              value: "github-app"
             - name: GITHUB_APP_BROKER_NAMESPACES
               value: {{ join " " $githubAppBrokerNamespaces | quote }}
           volumeMounts:
