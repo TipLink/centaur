@@ -151,6 +151,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Reclaim runner disk for the agent image
+        if: matrix.service == 'agent' && matrix.platform == 'linux/amd64'
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          docker system prune --all --force || true
+          df -h /
+
       - name: Derive platform slug
         run: |
           set -euo pipefail
