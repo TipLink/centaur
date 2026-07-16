@@ -16,7 +16,7 @@ thiserror.workspace = true
 urlencoding.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true
