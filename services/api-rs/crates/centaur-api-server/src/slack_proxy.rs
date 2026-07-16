@@ -753,7 +753,7 @@ async fn slack_joined_public_channels(
                 .flatten()
                 .filter(|channel| {
                     slack_channel_is_joined_local_public(channel)
-                        && !slack_channel_flag(channel, "is_archived")
+                        && slack_channel_bool(channel, "is_archived") == Some(false)
                 })
                 .cloned(),
         );
@@ -1024,7 +1024,7 @@ async fn ensure_channel_allowed(
         })?;
     if slack_channel_is_joined_local_public(&channel)
         && (!matches!(capability, SlackChannelCapability::Upload)
-            || !slack_channel_flag(&channel, "is_archived"))
+            || slack_channel_bool(&channel, "is_archived") == Some(false))
     {
         return Ok(());
     }
@@ -1046,19 +1046,23 @@ fn exact_channel_allowed(
 }
 
 fn slack_channel_is_joined_local_public(channel: &Value) -> bool {
-    channel.get("is_private") == Some(&Value::Bool(false))
-        && channel.get("is_member") == Some(&Value::Bool(true))
-        && !slack_channel_flag(channel, "is_im")
-        && !slack_channel_flag(channel, "is_mpim")
-        && !slack_channel_flag(channel, "is_ext_shared")
-        && !slack_channel_flag(channel, "is_org_shared")
+    // Fail closed when Slack omits classification metadata. In particular,
+    // Slack Connect channels can surface through several independent flags,
+    // including a pending-share state, and must never inherit the local public
+    // channel capability.
+    slack_channel_bool(channel, "is_channel") == Some(true)
+        && slack_channel_bool(channel, "is_private") == Some(false)
+        && slack_channel_bool(channel, "is_member") == Some(true)
+        && slack_channel_bool(channel, "is_im") == Some(false)
+        && slack_channel_bool(channel, "is_mpim") == Some(false)
+        && slack_channel_bool(channel, "is_shared") == Some(false)
+        && slack_channel_bool(channel, "is_pending_ext_shared") == Some(false)
+        && slack_channel_bool(channel, "is_ext_shared") == Some(false)
+        && slack_channel_bool(channel, "is_org_shared") == Some(false)
 }
 
-fn slack_channel_flag(channel: &Value, field: &str) -> bool {
-    channel
-        .get(field)
-        .and_then(Value::as_bool)
-        .unwrap_or_default()
+fn slack_channel_bool(channel: &Value, field: &str) -> Option<bool> {
+    channel.get(field).and_then(Value::as_bool)
 }
 
 fn slack_channel_ids_from_claims(claims: &SlackFileProxyClaims) -> Result<Vec<String>, ApiError> {
@@ -1120,7 +1124,7 @@ fn slack_channel_item(
             .any(|allowed| allowed == channel_id)
             || (public_channel_allowed
                 && claims.slack.public.upload
-                && !slack_channel_flag(channel, "is_archived")),
+                && slack_channel_bool(channel, "is_archived") == Some(false)),
         can_download: claims
             .slack
             .download_channels
@@ -1390,6 +1394,23 @@ mod tests {
         format!("http://{address}")
     }
 
+    fn joined_local_public_channel(channel_id: &str) -> Value {
+        json!({
+            "id": channel_id,
+            "name": "general",
+            "is_channel": true,
+            "is_private": false,
+            "is_member": true,
+            "is_im": false,
+            "is_mpim": false,
+            "is_shared": false,
+            "is_pending_ext_shared": false,
+            "is_ext_shared": false,
+            "is_org_shared": false,
+            "is_archived": false
+        })
+    }
+
     #[test]
     fn verifies_hs256_jwt_and_separate_slack_channel_claims() {
         let token = test_jwt(
@@ -1548,20 +1569,15 @@ mod tests {
 
     #[test]
     fn public_channel_classification_requires_joined_local_public_metadata() {
-        let joined_public = json!({
-            "is_private": false,
-            "is_member": true,
-            "is_im": false,
-            "is_mpim": false,
-            "is_ext_shared": false,
-            "is_org_shared": false
-        });
+        let joined_public = joined_local_public_channel("C123456789");
         assert!(slack_channel_is_joined_local_public(&joined_public));
 
         for field in [
             "is_private",
             "is_im",
             "is_mpim",
+            "is_shared",
+            "is_pending_ext_shared",
             "is_ext_shared",
             "is_org_shared",
         ] {
@@ -1579,6 +1595,25 @@ mod tests {
 
         let missing_privacy = json!({"is_member": true});
         assert!(!slack_channel_is_joined_local_public(&missing_privacy));
+
+        for field in [
+            "is_channel",
+            "is_private",
+            "is_member",
+            "is_im",
+            "is_mpim",
+            "is_shared",
+            "is_pending_ext_shared",
+            "is_ext_shared",
+            "is_org_shared",
+        ] {
+            let mut incomplete = joined_public.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                !slack_channel_is_joined_local_public(&incomplete),
+                "missing {field} must deny public capability"
+            );
+        }
     }
 
     #[test]
@@ -1599,13 +1634,8 @@ mod tests {
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             public_channels_enabled: true,
         };
-        let channel = json!({
-            "id": "C123456789",
-            "name": "general",
-            "is_private": false,
-            "is_member": true,
-            "is_archived": true
-        });
+        let mut channel = joined_local_public_channel("C123456789");
+        channel["is_archived"] = Value::Bool(true);
 
         let item = slack_channel_item(&claims, &config, "C123456789", &channel);
         assert!(item.can_read_history);
@@ -1614,12 +1644,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_channel_authorization_requires_kill_switch_and_joined_metadata() {
+    async fn public_channel_authorization_requires_capability_kill_switch_and_joined_metadata() {
         let claims = SlackFileProxyClaims {
             slack: SlackProxyClaims {
                 public: SlackPublicClaims {
                     history: true,
-                    ..SlackPublicClaims::default()
+                    download: true,
+                    upload: true,
                 },
                 ..SlackProxyClaims::default()
             },
@@ -1632,47 +1663,40 @@ mod tests {
             public_channels_enabled: false,
         };
 
-        assert!(matches!(
-            ensure_channel_allowed(
-                &client,
-                &config,
-                &claims,
-                "C123456789",
-                SlackChannelCapability::History
-            )
-            .await,
-            Err(ApiError::Forbidden(_))
-        ));
+        for capability in [
+            SlackChannelCapability::History,
+            SlackChannelCapability::Download,
+            SlackChannelCapability::Upload,
+        ] {
+            assert!(matches!(
+                ensure_channel_allowed(&client, &config, &claims, "C123456789", capability).await,
+                Err(ApiError::Forbidden(_))
+            ));
+        }
 
         config.public_channels_enabled = true;
         config.api_url = slack_metadata_server(json!({
             "ok": true,
-            "channel": {
-                "id": "C123456789",
-                "is_private": false,
-                "is_member": true
-            }
+            "channel": joined_local_public_channel("C123456789")
         }))
         .await;
-        assert!(
-            ensure_channel_allowed(
-                &client,
-                &config,
-                &claims,
-                "C123456789",
-                SlackChannelCapability::History
-            )
-            .await
-            .is_ok()
-        );
+        for capability in [
+            SlackChannelCapability::History,
+            SlackChannelCapability::Download,
+            SlackChannelCapability::Upload,
+        ] {
+            assert!(
+                ensure_channel_allowed(&client, &config, &claims, "C123456789", capability)
+                    .await
+                    .is_ok()
+            );
+        }
 
+        let mut private_channel = joined_local_public_channel("G123456789");
+        private_channel["is_private"] = Value::Bool(true);
         config.api_url = slack_metadata_server(json!({
             "ok": true,
-            "channel": {
-                "id": "C123456789",
-                "is_private": true,
-                "is_member": true
-            }
+            "channel": private_channel
         }))
         .await;
         assert!(matches!(
@@ -1686,6 +1710,42 @@ mod tests {
             .await,
             Err(ApiError::Forbidden(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn exact_private_claims_bypass_public_kill_switch_without_metadata_lookup() {
+        let claims = SlackFileProxyClaims {
+            slack: SlackProxyClaims {
+                upload_channels: vec!["G123456789".to_owned()],
+                download_channels: vec!["G123456789".to_owned()],
+                history_channels: vec!["G123456789".to_owned()],
+                ..SlackProxyClaims::default()
+            },
+        };
+        let config = SlackFileProxyConfig {
+            api_url: "http://127.0.0.1:1".to_owned(),
+            bot_token: "server-side-token".to_owned(),
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            public_channels_enabled: false,
+        };
+
+        for capability in [
+            SlackChannelCapability::History,
+            SlackChannelCapability::Download,
+            SlackChannelCapability::Upload,
+        ] {
+            assert!(
+                ensure_channel_allowed(
+                    &reqwest::Client::new(),
+                    &config,
+                    &claims,
+                    "G123456789",
+                    capability,
+                )
+                .await
+                .is_ok()
+            );
+        }
     }
 
     #[tokio::test]

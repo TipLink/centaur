@@ -43,6 +43,7 @@ class Principal < ApplicationRecord
   REDACTED = "[redacted]".freeze
   SLACK_CHANNEL_ID_LABEL = "slack_channel_id".freeze
   SLACK_CHANNEL_ID_FORMAT = /\A[CDG][A-Z0-9]{8,}\z/
+  SLACK_INTERACTIVE_KINDS = %w[slack_channel slack_dm].freeze
 
   # The config of a principal with no effective grants; also what an unassigned
   # proxy resolves to.
@@ -168,7 +169,7 @@ class Principal < ApplicationRecord
   end
 
   def slack_interactive_principal?
-    foreign_id.to_s.start_with?("slack-channel-", "slack-user-")
+    SLACK_INTERACTIVE_KINDS.include?(labels.to_h["kind"])
   end
 
   def labels_with_sandbox_capabilities

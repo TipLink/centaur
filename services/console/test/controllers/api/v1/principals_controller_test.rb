@@ -616,7 +616,13 @@ module Api
         )
 
         put api_v1_principal_url(id: "slack-channel-t123-c123"),
-            params: { data: { namespace: "acme", name: "Slack #public" } }.to_json,
+            params: {
+              data: {
+                namespace: "acme",
+                name: "Slack #public",
+                labels: { "kind" => "slack_channel" }
+              }
+            }.to_json,
             headers: auth_headers
         assert_response :created
 

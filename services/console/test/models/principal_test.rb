@@ -69,19 +69,31 @@ class PrincipalTest < ActiveSupport::TestCase
 
     slack_principal = Principal.new(default_attrs(
       namespace: "acme",
-      foreign_id: "slack-channel-t123-c123"
+      foreign_id: "slack-channel-t123-c123",
+      labels: { "kind" => "slack_channel" }
     ))
     slack_principal.apply_default_sandbox_capabilities!
 
     workflow_principal = Principal.new(default_attrs(
       namespace: "acme",
-      foreign_id: "compliance-cdd-workflow-host"
+      foreign_id: "slack-channel-forged-prefix",
+      labels: { "kind" => "workflow" }
     ))
     workflow_principal.apply_default_sandbox_capabilities!
+
+    dm_principal = Principal.new(default_attrs(
+      namespace: "acme",
+      foreign_id: "opaque-interactive-id",
+      labels: { "kind" => "slack_dm" }
+    ))
+    dm_principal.apply_default_sandbox_capabilities!
 
     assert_predicate slack_principal, :slack_public_history_enabled?
     assert_predicate slack_principal, :slack_public_download_enabled?
     assert_predicate slack_principal, :slack_public_upload_enabled?
+    assert_predicate dm_principal, :slack_public_history_enabled?
+    assert_predicate dm_principal, :slack_public_download_enabled?
+    assert_predicate dm_principal, :slack_public_upload_enabled?
     assert_not workflow_principal.slack_public_history_enabled?
     assert_not workflow_principal.slack_public_download_enabled?
     assert_not workflow_principal.slack_public_upload_enabled?
@@ -92,6 +104,7 @@ class PrincipalTest < ActiveSupport::TestCase
     principal = Principal.new(default_attrs(
       namespace: "acme",
       foreign_id: "slack-user-t123-u123",
+      labels: { "kind" => "slack_dm" },
       slack_public_upload_enabled: false
     ))
 
