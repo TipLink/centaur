@@ -100,6 +100,7 @@ reviewed_pr="$(jq -cer --arg sha "$TRIGGER_SHA" --arg repo "$TRIGGER_REPOSITORY"
   | if length == 1 then .[0] else error("expected exactly one ready or merged main PR at the trigger SHA") end
 ' <<<"$pulls_json")"
 reviewed_pr_number="$(jq -er '.number' <<<"$reviewed_pr")"
+reviewed_head_branch="$(jq -er '.head.ref' <<<"$reviewed_pr")"
 
 checks_json="$(api_get "${TRIGGER_API_URL}/repos/${TRIGGER_REPOSITORY}/commits/${TRIGGER_SHA}/check-runs?filter=latest&per_page=100")"
 
@@ -130,9 +131,8 @@ require_workflow_check() {
     "$(jq -r '.status' <<<"$run_json")" != "completed" ||
     "$(jq -r '.conclusion' <<<"$run_json")" != "success" ||
     "$(jq -r '.path' <<<"$run_json")" != "$workflow_path" ||
-    "$(jq -r --argjson pr "$reviewed_pr_number" --arg sha "$TRIGGER_SHA" '
-      any(.pull_requests[]?; .number == $pr and .head.sha == $sha)
-    ' <<<"$run_json")" != "true" ]]; then
+    "$(jq -r '.head_repository.full_name' <<<"$run_json")" != "$TRIGGER_REPOSITORY" ||
+    "$(jq -r '.head_branch' <<<"$run_json")" != "$reviewed_head_branch" ]]; then
     echo "required check is not a successful exact-head run of $workflow_path: $check_name" >&2
     exit 1
   fi
