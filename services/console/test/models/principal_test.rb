@@ -59,60 +59,6 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_predicate principal, :sandbox_api_server_enabled
   end
 
-  test "public Slack defaults apply only to interactive Slack principals" do
-    settings = system_settings(:default)
-    settings.update!(
-      default_slack_public_history_enabled: true,
-      default_slack_public_download_enabled: true,
-      default_slack_public_upload_enabled: true
-    )
-
-    slack_principal = Principal.new(default_attrs(
-      namespace: "acme",
-      foreign_id: "slack-channel-t123-c123",
-      labels: { "kind" => "slack_channel" }
-    ))
-    slack_principal.apply_default_sandbox_capabilities!
-
-    workflow_principal = Principal.new(default_attrs(
-      namespace: "acme",
-      foreign_id: "slack-channel-forged-prefix",
-      labels: { "kind" => "workflow" }
-    ))
-    workflow_principal.apply_default_sandbox_capabilities!
-
-    dm_principal = Principal.new(default_attrs(
-      namespace: "acme",
-      foreign_id: "opaque-interactive-id",
-      labels: { "kind" => "slack_dm" }
-    ))
-    dm_principal.apply_default_sandbox_capabilities!
-
-    assert_predicate slack_principal, :slack_public_history_enabled?
-    assert_predicate slack_principal, :slack_public_download_enabled?
-    assert_predicate slack_principal, :slack_public_upload_enabled?
-    assert_predicate dm_principal, :slack_public_history_enabled?
-    assert_predicate dm_principal, :slack_public_download_enabled?
-    assert_predicate dm_principal, :slack_public_upload_enabled?
-    assert_not workflow_principal.slack_public_history_enabled?
-    assert_not workflow_principal.slack_public_download_enabled?
-    assert_not workflow_principal.slack_public_upload_enabled?
-  end
-
-  test "explicit public Slack permissions override interactive defaults" do
-    system_settings(:default).update!(default_slack_public_upload_enabled: true)
-    principal = Principal.new(default_attrs(
-      namespace: "acme",
-      foreign_id: "slack-user-t123-u123",
-      labels: { "kind" => "slack_dm" },
-      slack_public_upload_enabled: false
-    ))
-
-    principal.apply_default_sandbox_capabilities!(slack_public_upload_enabled: false)
-
-    assert_not principal.slack_public_upload_enabled?
-  end
-
   test "default sandbox repo-cache overwrites explicit label assignment" do
     principal = Principal.new(default_attrs(namespace: "acme", foreign_id: "C-explicit-repo-cache-label"))
 
@@ -233,39 +179,10 @@ class PrincipalTest < ActiveSupport::TestCase
       assert_equal [ "C0123456789" ], claims.dig("slack", "upload_channels")
       assert_equal [ "G9876543210" ], claims.dig("slack", "download_channels")
       assert_equal [ "C0123456789" ], claims.dig("slack", "history_channels")
-      assert_equal false, claims.dig("slack", "public", "upload")
-      assert_equal false, claims.dig("slack", "public", "download")
-      assert_equal false, claims.dig("slack", "public", "history")
       assert_equal 1.hour.to_i, claims.fetch("exp") - claims.fetch("iat")
       assert_equal ApiServer::Jwt.rotation_offset(principal),
                    claims.fetch("iat") % ApiServer::Jwt::DEFAULT_WINDOW_SECONDS
     end
-  end
-
-  test "api server JWT emits separate public Slack capabilities" do
-    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
-      principal = principals(:acme_channel)
-      principal.update!(
-        slack_public_history_enabled: true,
-        slack_public_download_enabled: false,
-        slack_public_upload_enabled: false
-      )
-
-      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
-
-      assert_equal true, claims.dig("slack", "public", "history")
-      assert_equal false, claims.dig("slack", "public", "download")
-      assert_equal false, claims.dig("slack", "public", "upload")
-    end
-  end
-
-  test "changing a public Slack capability invalidates principal sync config" do
-    principal = principals(:acme_channel)
-    original_version = principal.sync_config_cache_version
-
-    principal.update!(slack_public_history_enabled: true)
-
-    assert_operator principal.reload.sync_config_cache_version, :>, original_version
   end
 
   test "api server JWT does not infer Slack access from a legacy channel label" do

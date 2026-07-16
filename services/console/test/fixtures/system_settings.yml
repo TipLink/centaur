@@ -3,6 +3,3 @@ default:
   default_sandbox_repo_cache: all
   default_sandbox_observability_enabled: true
   default_sandbox_api_server_enabled: true
-  default_slack_public_history_enabled: false
-  default_slack_public_download_enabled: false
-  default_slack_public_upload_enabled: false

@@ -23,12 +23,7 @@ module ApiServer
           "slack" => {
             "upload_channels" => upload_channels,
             "download_channels" => download_channels,
-            "history_channels" => history_channels,
-            "public" => {
-              "upload" => principal.slack_public_upload_enabled?,
-              "download" => principal.slack_public_download_enabled?,
-              "history" => principal.slack_public_history_enabled?
-            }
+            "history_channels" => history_channels
           }
         }
       )

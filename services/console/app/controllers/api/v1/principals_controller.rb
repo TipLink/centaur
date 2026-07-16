@@ -107,9 +107,6 @@ module Api
           name: principal.name,
           labels: principal.labels_with_sandbox_capabilities,
           slack_channel_permissions: principal.slack_channel_permissions_payload,
-          slack_public_history_enabled: principal.slack_public_history_enabled,
-          slack_public_download_enabled: principal.slack_public_download_enabled,
-          slack_public_upload_enabled: principal.slack_public_upload_enabled,
           sandbox_repo_cache: principal.sandbox_repo_cache,
           # Transitional expand/contract field for the pre-enum api-rs kept
           # live during the Console-first rollout. Remove only after every old
@@ -128,9 +125,6 @@ module Api
           :sandbox_repo_cache,
           :sandbox_observability_enabled,
           :sandbox_api_server_enabled,
-          :slack_public_history_enabled,
-          :slack_public_download_enabled,
-          :slack_public_upload_enabled,
           labels: {}
         )
       end

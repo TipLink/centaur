@@ -45,7 +45,7 @@ module Console
     end
 
     def update_slack_channel_permissions
-      @principal.update!(slack_permission_params)
+      @principal.update!(slack_channel_permission_params)
       redirect_to console_principal_path(@principal.oid), notice: "Updated Slack channel permissions."
     rescue ActiveRecord::RecordInvalid => e
       redirect_to console_principal_path(@principal.oid), alert: e.record.errors.full_messages.to_sentence
@@ -106,11 +106,8 @@ module Console
       params.fetch(:principal, ActionController::Parameters.new)
     end
 
-    def slack_permission_params
+    def slack_channel_permission_params
       params.require(:principal).permit(
-        :slack_public_history_enabled,
-        :slack_public_download_enabled,
-        :slack_public_upload_enabled,
         slack_channel_permissions_attributes: %i[
           id
           channel_id

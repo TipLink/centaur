@@ -13,9 +13,6 @@ class SystemSettingTest < ActiveSupport::TestCase
     assert_equal "all", settings.default_sandbox_repo_cache
     assert_equal true, settings.default_sandbox_observability_enabled
     assert_equal true, settings.default_sandbox_api_server_enabled
-    assert_equal false, settings.default_slack_public_history_enabled
-    assert_equal false, settings.default_slack_public_download_enabled
-    assert_equal false, settings.default_slack_public_upload_enabled
   end
 
   test "repo-cache setting is validated" do

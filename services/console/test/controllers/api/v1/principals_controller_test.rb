@@ -608,30 +608,6 @@ module Api
         assert_equal "Renamed channel", principal.reload.name
       end
 
-      test "PUT applies public Slack defaults only to a new interactive Slack principal" do
-        system_settings(:default).update!(
-          default_slack_public_history_enabled: true,
-          default_slack_public_download_enabled: true,
-          default_slack_public_upload_enabled: false
-        )
-
-        put api_v1_principal_url(id: "slack-channel-t123-c123"),
-            params: {
-              data: {
-                namespace: "acme",
-                name: "Slack #public",
-                labels: { "kind" => "slack_channel" }
-              }
-            }.to_json,
-            headers: auth_headers
-        assert_response :created
-
-        data = json_body.fetch("data")
-        assert_equal true, data.fetch("slack_public_history_enabled")
-        assert_equal true, data.fetch("slack_public_download_enabled")
-        assert_equal false, data.fetch("slack_public_upload_enabled")
-      end
-
       test "GET index rejects requests without an Authorization header" do
         get api_v1_principals_url, params: { namespace: "acme" }
         assert_response :unauthorized
