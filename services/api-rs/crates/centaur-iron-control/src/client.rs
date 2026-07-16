@@ -452,12 +452,16 @@ impl IronControlClient {
     /// checkout without a restart or token swap.
     pub async fn assign_proxy_principal(&self, id: &str, principal_id: &str) -> Result<Proxy> {
         let path = format!("{API_PREFIX}/proxies/{}", urlencoding::encode(id));
-        self.write(
-            Method::PATCH,
-            &path,
-            &json!({ "principal_id": principal_id }),
-        )
-        .await
+        let body = json!({ "principal_id": principal_id });
+        let result = self.write(Method::PATCH, &path, &body).await;
+        if !matches!(result, Err(IronControlError::Transport { .. })) {
+            return result;
+        }
+
+        // Replaying this assignment is safe: the endpoint sets a specific
+        // principal without rotating the proxy token or creating a resource.
+        // Retry once when a stale pooled connection is reset before a response.
+        self.write(Method::PATCH, &path, &body).await
     }
 
     /// Deregister a proxy by OID.
@@ -604,6 +608,153 @@ async fn ensure_success(resp: Response, method: Method, path: &str) -> Result<Re
 mod tests {
     use super::*;
     use crate::models::{InjectConfig, ReplaceConfig, RequestRule, SecretSource};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+    use tokio::time::{Duration, timeout};
+
+    async fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if request.len() >= body_start + content_length {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    async fn test_server(
+        responses: Vec<Option<(u16, &'static str)>>,
+        observe_extra: bool,
+    ) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut stream).await);
+                if let Some((status, body)) = response {
+                    let reason = if status == 200 { "OK" } else { "Bad Request" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                }
+            }
+            if observe_extra
+                && let Ok(Ok((mut stream, _))) =
+                    timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                requests.push(read_request(&mut stream).await);
+            }
+            requests
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn proxy_response() -> &'static str {
+        r#"{"data":{"id":"prx_test","name":"sandbox","principal_id":"prn_target"}}"#
+    }
+
+    #[tokio::test]
+    async fn proxy_assignment_retries_one_transport_failure() {
+        let (base_url, server) =
+            test_server(vec![None, Some((200, proxy_response()))], false).await;
+        let client = IronControlClient::new(base_url, "test-key");
+
+        let proxy = client
+            .assign_proxy_principal("prx_test", "prn_target")
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(proxy.id, "prx_test");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert!(requests[0].starts_with("PATCH /api/v1/proxies/prx_test HTTP/1.1"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-key")
+        );
+        assert!(requests[0].contains(r#"{"data":{"principal_id":"prn_target"}}"#));
+    }
+
+    #[tokio::test]
+    async fn proxy_assignment_stops_after_two_transport_failures() {
+        let (base_url, server) = test_server(vec![None, None], true).await;
+        let client = IronControlClient::new(base_url, "test-key");
+
+        let error = client
+            .assign_proxy_principal("prx_test", "prn_target")
+            .await
+            .unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(error, IronControlError::Transport { .. }));
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn proxy_assignment_does_not_retry_status_or_decode_errors() {
+        for (status, body, expected) in [
+            (400, r#"{"error":"invalid"}"#, "status"),
+            (200, "{", "decode"),
+        ] {
+            let (base_url, server) = test_server(vec![Some((status, body))], true).await;
+            let client = IronControlClient::new(base_url, "test-key");
+
+            let error = client
+                .assign_proxy_principal("prx_test", "prn_target")
+                .await
+                .unwrap_err();
+            let requests = server.await.unwrap();
+
+            match expected {
+                "status" => assert!(matches!(error, IronControlError::Status { .. })),
+                "decode" => assert!(matches!(error, IronControlError::Decode { .. })),
+                _ => unreachable!(),
+            }
+            assert_eq!(requests.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_creation_does_not_inherit_assignment_retry() {
+        let (base_url, server) = test_server(vec![None], true).await;
+        let client = IronControlClient::new(base_url, "test-key");
+
+        let error = client
+            .create_proxy("sandbox", "prn_target")
+            .await
+            .unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(error, IronControlError::Transport { .. }));
+        assert_eq!(requests.len(), 1);
+    }
 
     #[test]
     fn grant_body_principal_static() {
