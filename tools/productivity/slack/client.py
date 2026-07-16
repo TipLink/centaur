@@ -2341,7 +2341,10 @@ class SlackClient:
                 "but it is disabled for this principal."
             )
         results: list[dict] = []
-        user_cache = self._get_user_cache()
+        # File listing is principal-proxied. Resolving display names through the
+        # direct bot client would reintroduce a bot-token dependency before the
+        # scoped request even runs, so preserve user IDs here.
+        user_cache: dict[str, str] = {}
         page_limit = self._MAX_SLACK_FILES_LIST_PAGE_SIZE
         page = 1
         while len(results) < requested_limit:

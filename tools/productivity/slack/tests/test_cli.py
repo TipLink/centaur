@@ -498,7 +498,7 @@ def test_thread_calls_api_server_client(monkeypatch) -> None:
     ]
 
 
-def test_thread_falls_back_to_direct_client_when_api_server_fails(monkeypatch) -> None:
+def test_thread_fails_closed_when_api_server_fails(monkeypatch) -> None:
     proxy_calls = []
     direct_calls = []
 
@@ -508,11 +508,7 @@ def test_thread_falls_back_to_direct_client_when_api_server_fails(monkeypatch) -
 
     def fake_get_thread_replies_page(*args, **kwargs):
         direct_calls.append((args, kwargs))
-        return {
-            "messages": [{"user": "alice", "text": "root"}],
-            "has_more": False,
-            "window": {"oldest": None, "latest": None, "inclusive": True},
-        }
+        raise AssertionError("direct fallback must not be used")
 
     fake_client = types.SimpleNamespace(
         get_thread_replies_page=fake_get_thread_replies_page,
@@ -540,9 +536,10 @@ def test_thread_falls_back_to_direct_client_when_api_server_fails(monkeypatch) -
             "inclusive": True,
         },
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert proxy_calls == [expected_call]
-    assert direct_calls == [expected_call]
+    assert direct_calls == []
+    assert "proxy unavailable" in result.output
 
 
 def test_thread_direct_calls_direct_client(monkeypatch) -> None:

@@ -816,12 +816,14 @@ def test_file_proxy_methods_validate_inputs() -> None:
         client.get_channel_members_proxy(channel_id="general")
 
 
-def test_search_files_uses_proxy_with_user_cache(
+def test_search_files_uses_proxy_without_direct_user_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, _ = _make_client()
     monkeypatch.setenv("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true")
-    client._get_user_cache = lambda: {"U123456789": "alice"}  # type: ignore[method-assign]
+    client._get_user_cache = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("principal-proxied search must not use the direct bot client")
+    )
 
     def fake_list_files_proxy(**kwargs):
         assert kwargs == {"channel_id": "C123456789", "limit": 200, "page": 1}
@@ -867,7 +869,7 @@ def test_search_files_uses_proxy_with_user_cache(
             "title": "Q4 Report",
             "filetype": "pdf",
             "size": 1234,
-            "user": "alice",
+            "user": "U123456789",
             "channels": ["C123456789"],
             "permalink": "https://slack.example/files/F123456789",
             "url_private": "https://files.example/F123456789",
@@ -888,7 +890,9 @@ def test_search_files_raises_when_api_proxy_disabled(
 
 def test_search_files_paginates_proxy_until_enough_matches() -> None:
     client, _ = _make_client()
-    client._get_user_cache = lambda: {"U123456789": "alice"}  # type: ignore[method-assign]
+    client._get_user_cache = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("principal-proxied search must not use the direct bot client")
+    )
     calls: list[dict] = []
 
     def fake_list_files_proxy(**kwargs):

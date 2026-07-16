@@ -20,8 +20,18 @@ def health():
 
     client = _client()
     try:
-        details = client.list_bot_channels(limit=1)
-        payload = {"ok": True, "tool": "slack", "error": None, "details": details}
+        if client._api_server_proxy_enabled():
+            details = client.list_channels_proxy(limit=1)
+            access_path = "principal_proxy"
+        else:
+            details = client.list_bot_channels(limit=1)
+            access_path = "bot_token"
+        payload = {
+            "ok": True,
+            "tool": "slack",
+            "error": None,
+            "details": {"access_path": access_path, "channels": details},
+        }
     except Exception as exc:
         payload = {"ok": False, "tool": "slack", "error": str(exc), "details": {}}
         print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
@@ -362,7 +372,7 @@ def thread(
     """
     import sys
 
-    from .client import get_thread_replies_page, get_thread_replies_proxy
+    from .client import get_thread_replies_proxy
 
     channel_id, thread_ts = _parse_thread_ref(permalink)
 
@@ -376,20 +386,9 @@ def thread(
             latest=latest,
             inclusive=inclusive,
         )
-    except (RuntimeError, ValueError):
-        try:
-            page = get_thread_replies_page(
-                channel_id,
-                thread_ts,
-                limit=limit,
-                cursor=cursor,
-                oldest=oldest,
-                latest=latest,
-                inclusive=inclusive,
-            )
-        except (RuntimeError, ValueError) as direct_error:
-            stderr_console.print(f"[red]Error: {direct_error}[/]")
-            raise typer.Exit(1) from direct_error
+    except (RuntimeError, ValueError) as error:
+        stderr_console.print(f"[red]Error: {error}[/]")
+        raise typer.Exit(1) from error
 
     messages = page.get("messages", [])
 
