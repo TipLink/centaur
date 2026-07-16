@@ -45,10 +45,17 @@ case "$url" in
   "$base/commits/${MOCK_SHA}/pulls")
     draft=false
     if [[ "$MOCK_MODE" == "draft" ]]; then draft=true; fi
+    state=open
+    merged_at=null
+    if [[ "$MOCK_MODE" == "post-merge" ]]; then
+      state=closed
+      merged_at='"2026-07-16T15:00:49Z"'
+    fi
     head_repo='TipLink/centaur'
     if [[ "$MOCK_MODE" == "fork-pr" ]]; then head_repo='untrusted/centaur'; fi
-    jq -cn --arg sha "$MOCK_SHA" --argjson draft "$draft" --arg head_repo "$head_repo" \
-      '[{number:76,state:"open",merged_at:null,draft:$draft,base:{ref:"main",repo:{full_name:"TipLink/centaur"}},head:{sha:$sha,repo:{full_name:$head_repo}}}]'
+    jq -cn --arg sha "$MOCK_SHA" --argjson draft "$draft" --arg state "$state" \
+      --argjson merged_at "$merged_at" --arg head_repo "$head_repo" \
+      '[{number:76,state:$state,merged_at:$merged_at,draft:$draft,base:{ref:"main",repo:{full_name:"TipLink/centaur"}},head:{sha:$sha,ref:"reviewed-branch",repo:{full_name:$head_repo}}}]'
     ;;
   "$base/commits/${MOCK_SHA}/check-runs?filter=latest&per_page=100")
     ci_conclusion=success
@@ -60,17 +67,29 @@ case "$url" in
     ]}'
     ;;
   "$base/actions/runs/11")
-    pr=76
-    if [[ "$MOCK_MODE" == "wrong-pr-run" ]]; then pr=75; fi
-    jq -cn --arg sha "$MOCK_SHA" --argjson pr "$pr" '{head_sha:$sha,event:"pull_request",status:"completed",conclusion:"success",path:".github/workflows/ci.yml",pull_requests:[{number:$pr,head:{sha:$sha}}]}'
+    head_branch=reviewed-branch
+    if [[ "$MOCK_MODE" == "wrong-head-branch" ]]; then head_branch=other-branch; fi
+    head_repo='TipLink/centaur'
+    if [[ "$MOCK_MODE" == "wrong-run-repo" ]]; then head_repo='untrusted/centaur'; fi
+    pull_requests='[{"number":76}]'
+    if [[ "$MOCK_MODE" == "post-merge" ]]; then pull_requests='[]'; fi
+    jq -cn --arg sha "$MOCK_SHA" --arg head_branch "$head_branch" \
+      --arg head_repo "$head_repo" --argjson pull_requests "$pull_requests" \
+      '{head_sha:$sha,head_branch:$head_branch,head_repository:{full_name:$head_repo},event:"pull_request",status:"completed",conclusion:"success",path:".github/workflows/ci.yml",pull_requests:$pull_requests}'
     ;;
   "$base/actions/runs/12")
     path='.github/workflows/console-ci.yml'
     if [[ "$MOCK_MODE" == "wrong-workflow" ]]; then path='.github/workflows/codeql.yml'; fi
-    jq -cn --arg sha "$MOCK_SHA" --arg path "$path" '{head_sha:$sha,event:"pull_request",status:"completed",conclusion:"success",path:$path,pull_requests:[{number:76,head:{sha:$sha}}]}'
+    pull_requests='[{"number":76}]'
+    if [[ "$MOCK_MODE" == "post-merge" ]]; then pull_requests='[]'; fi
+    jq -cn --arg sha "$MOCK_SHA" --arg path "$path" --argjson pull_requests "$pull_requests" \
+      '{head_sha:$sha,head_branch:"reviewed-branch",head_repository:{full_name:"TipLink/centaur"},event:"pull_request",status:"completed",conclusion:"success",path:$path,pull_requests:$pull_requests}'
     ;;
   "$base/actions/runs/13")
-    jq -cn --arg sha "$MOCK_SHA" '{head_sha:$sha,event:"pull_request",status:"completed",conclusion:"success",path:".github/workflows/validate-images.yml",pull_requests:[{number:76,head:{sha:$sha}}]}'
+    pull_requests='[{"number":76}]'
+    if [[ "$MOCK_MODE" == "post-merge" ]]; then pull_requests='[]'; fi
+    jq -cn --arg sha "$MOCK_SHA" --argjson pull_requests "$pull_requests" \
+      '{head_sha:$sha,head_branch:"reviewed-branch",head_repository:{full_name:"TipLink/centaur"},event:"pull_request",status:"completed",conclusion:"success",path:".github/workflows/validate-images.yml",pull_requests:$pull_requests}'
     ;;
   *)
     echo "unexpected mocked curl URL: $url" >&2
@@ -111,10 +130,16 @@ export MOCK_MODE=failed-check
 expect_reject failed-check bash "$verifier"
 export MOCK_MODE=wrong-workflow
 expect_reject wrong-workflow bash "$verifier"
-export MOCK_MODE=wrong-pr-run
-expect_reject wrong-pr-run bash "$verifier"
+export MOCK_MODE=wrong-head-branch
+expect_reject wrong-head-branch bash "$verifier"
+export MOCK_MODE=wrong-run-repo
+expect_reject wrong-run-repo bash "$verifier"
 export MOCK_MODE=fork-pr
 expect_reject fork-pr bash "$verifier"
+
+export MOCK_MODE=post-merge
+bash "$verifier" >"$scratch/post-merge.out"
+grep -qF 'OK reviewed signed PR #76' "$scratch/post-merge.out"
 
 export MOCK_MODE=valid
 DISPATCH_REVIEWED_COMMIT="$(printf 'b%.0s' {1..40})"
