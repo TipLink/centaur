@@ -56,6 +56,9 @@ module Api
         assert_equal @proxy.principal.oid, data.fetch("principal_id")
         assert_equal @proxy.principal.namespace, data.dig("principal", "namespace")
         assert_equal @proxy.principal.sandbox_repo_cache, data.dig("capabilities", "sandbox_repo_cache")
+        assert_equal false, data.dig("capabilities", "slack_public_history_enabled")
+        assert_equal false, data.dig("capabilities", "slack_public_download_enabled")
+        assert_equal false, data.dig("capabilities", "slack_public_upload_enabled")
         assert_equal 1, data.fetch("slack_channel_permissions").length
         assert_equal [
           {

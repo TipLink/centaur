@@ -26,7 +26,10 @@ module Console
       params.require(:system_setting).permit(
         :default_sandbox_repo_cache,
         :default_sandbox_observability_enabled,
-        :default_sandbox_api_server_enabled
+        :default_sandbox_api_server_enabled,
+        :default_slack_public_history_enabled,
+        :default_slack_public_download_enabled,
+        :default_slack_public_upload_enabled
       )
     end
   end

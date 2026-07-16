@@ -74,7 +74,10 @@ module Api
         {
           sandbox_repo_cache: principal.sandbox_repo_cache,
           sandbox_observability_enabled: principal.sandbox_observability_enabled,
-          sandbox_api_server_enabled: principal.sandbox_api_server_enabled
+          sandbox_api_server_enabled: principal.sandbox_api_server_enabled,
+          slack_public_history_enabled: principal.slack_public_history_enabled,
+          slack_public_download_enabled: principal.slack_public_download_enabled,
+          slack_public_upload_enabled: principal.slack_public_upload_enabled
         }
       end
 

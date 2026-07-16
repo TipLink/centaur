@@ -150,6 +150,25 @@ class Principal < ApplicationRecord
     unless supplied_key?(supplied, :sandbox_api_server_enabled)
       self.sandbox_api_server_enabled = defaults[:sandbox_api_server_enabled]
     end
+    # These defaults are intentionally limited to the principals Centaur
+    # creates for interactive Slack conversations. Applying them to workflow,
+    # service, or arbitrary API-created principals would silently turn a Slack
+    # convenience policy into a broader data-access grant.
+    if slack_interactive_principal?
+      unless supplied_key?(supplied, :slack_public_history_enabled)
+        self.slack_public_history_enabled = defaults[:slack_public_history_enabled]
+      end
+      unless supplied_key?(supplied, :slack_public_download_enabled)
+        self.slack_public_download_enabled = defaults[:slack_public_download_enabled]
+      end
+      unless supplied_key?(supplied, :slack_public_upload_enabled)
+        self.slack_public_upload_enabled = defaults[:slack_public_upload_enabled]
+      end
+    end
+  end
+
+  def slack_interactive_principal?
+    foreign_id.to_s.start_with?("slack-channel-", "slack-user-")
   end
 
   def labels_with_sandbox_capabilities
@@ -452,7 +471,10 @@ class Principal < ApplicationRecord
   def sync_config_fields_changed?
     previous_changes.key?("name") ||
       previous_changes.key?("labels") ||
-      previous_changes.key?("sandbox_api_server_enabled")
+      previous_changes.key?("sandbox_api_server_enabled") ||
+      previous_changes.key?("slack_public_history_enabled") ||
+      previous_changes.key?("slack_public_download_enabled") ||
+      previous_changes.key?("slack_public_upload_enabled")
   end
 
   def bump_own_sync_config_cache_version

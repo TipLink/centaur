@@ -57,6 +57,34 @@
     </div>
   </section>
 
+  <section class="form-section">
+    <h2 class="form-section-heading">Default Slack Public-Channel Capabilities</h2>
+    <p class="mb-4 text-sm text-zinc-500">Applied only to new interactive Slack channel and DM principals. Public access also requires server-side channel membership and the deployment kill switch.</p>
+    <div class="grid gap-5 md:grid-cols-3">
+      <label class="flex items-start gap-3 rounded border border-ink-700 bg-ink-850/60 p-4">
+        <%= form.check_box :default_slack_public_history_enabled, class: checkbox_class %>
+        <span>
+          <span class="block text-sm font-medium text-zinc-100">Joined public history</span>
+          <span class="block text-xs text-zinc-500">Read messages in public channels the bot has joined.</span>
+        </span>
+      </label>
+      <label class="flex items-start gap-3 rounded border border-ink-700 bg-ink-850/60 p-4">
+        <%= form.check_box :default_slack_public_download_enabled, class: checkbox_class %>
+        <span>
+          <span class="block text-sm font-medium text-zinc-100">Joined public downloads</span>
+          <span class="block text-xs text-zinc-500">Download files from joined public channels.</span>
+        </span>
+      </label>
+      <label class="flex items-start gap-3 rounded border border-amber-500/30 bg-amber-500/[0.06] p-4">
+        <%= form.check_box :default_slack_public_upload_enabled, class: checkbox_class %>
+        <span>
+          <span class="block text-sm font-medium text-zinc-100">Joined public uploads</span>
+          <span class="block text-xs text-amber-200/80">Allows private-origin agents to publish into joined public channels.</span>
+        </span>
+      </label>
+    </div>
+  </section>
+
   <div class="flex items-center gap-3">
     <%= form.submit "Save settings", class: "btn-primary" %>
     <a href="<%= console_principals_path %>" class="btn-secondary">Cancel</a>
