@@ -677,11 +677,6 @@ fn build_agent_sandbox(
         .filter(|_| matches!(spec.capabilities.repo_cache, RepoCacheAccess::All));
 
     if repo_cache_tools.is_some() {
-        // Workflow-host specs can inherit the API deployment's transitional
-        // TOOLS_OVERLAY_PATH. Remove it, even when it arrived before this
-        // function, because entrypoint.sh appends it after TOOL_DIRS and would
-        // let stale image tools shadow the reviewed repo-cache bootstrap.
-        agent_env.retain(|(name, _)| name != "TOOLS_OVERLAY_PATH");
         for (name, value) in tools::agent_env(repo_cache_tools) {
             upsert_env(&mut agent_env, &name, value);
         }
@@ -701,17 +696,15 @@ fn build_agent_sandbox(
             "CENTAUR_OVERLAY_DIR",
             overlay_image.mount_path.clone(),
         );
-        // Repo-cache tools are published into TOOL_DIRS and are the reviewed
-        // source of truth. Keep the image path only as a fallback when no repo
-        // tool source is available; otherwise entrypoint.sh would append the
-        // stale image tree after TOOL_DIRS and let it shadow repo-backed tools.
-        if repo_cache_tools.is_none() {
-            insert_env_if_absent(
-                &mut agent_env,
-                "TOOLS_OVERLAY_PATH",
-                format!("{}/tools", overlay_image.mount_path.trim_end_matches('/')),
-            );
-        }
+        // The deployed overlay image is the reviewed runtime artifact. Append
+        // its tools after the repo-cache bootstrap so image updates can replace
+        // an older pinned copy. The RepoCacheAccess::All gate above keeps this
+        // private overlay unavailable to restricted sandboxes.
+        upsert_env(
+            &mut agent_env,
+            "TOOLS_OVERLAY_PATH",
+            format!("{}/tools", overlay_image.mount_path.trim_end_matches('/')),
+        );
     }
     insert_optional(
         &mut container,
@@ -1265,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_backed_overlay_env_wins_over_transitional_image_defaults() {
+    fn repo_backed_prompt_coexists_with_reviewed_image_tool_overlay() {
         let spec = SandboxSpec::new("centaur-agent:latest")
             .env(
                 "CENTAUR_OVERLAY_DIR",
@@ -1295,7 +1288,12 @@ mod tests {
                 .and_then(|entry| entry.value.as_deref()),
             Some("/app/tools")
         );
-        assert!(!env.iter().any(|entry| entry.name == "TOOLS_OVERLAY_PATH"));
+        assert_eq!(
+            env.iter()
+                .find(|entry| entry.name == "TOOLS_OVERLAY_PATH")
+                .and_then(|entry| entry.value.as_deref()),
+            Some("/home/agent/overlay/org/tools")
+        );
         assert!(pod_spec.init_containers.as_ref().is_some_and(|containers| {
             containers
                 .iter()
