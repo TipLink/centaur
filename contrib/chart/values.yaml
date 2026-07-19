@@ -238,6 +238,10 @@ overlay:
     tag: latest
     pullPolicy: IfNotPresent
     sourcePath: /overlay
+    # Keep false while the same workflow tree is delivered through
+    # overlays.sources. Set true when the image is the authoritative org
+    # workflow source and repo-cache carries only the base workflows.
+    includeWorkflows: false
 
 # Ordered repo-cache-backed overlays. Each source repo is synced by repo-cache;
 # api-rs reads tools/workflows from /var/lib/centaur/repos, while sandboxes read
