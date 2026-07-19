@@ -1038,6 +1038,7 @@ version = "0.1.0"
 dependencies = [
  "absurd-sdk",
  "base64",
+ "centaur-iron-control",
  "centaur-sandbox-core",
  "centaur-session-core",
  "centaur-session-runtime",
