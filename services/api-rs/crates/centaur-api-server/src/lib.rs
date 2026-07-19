@@ -21,7 +21,7 @@ pub use tool_discovery::{
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     };
 
@@ -39,11 +39,12 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::{Value, json};
     use sqlx::PgPool;
+    use tokio::sync::Mutex;
     use tower::ServiceExt;
 
     use super::{AppState, build_router_with_app_state, build_router_with_runtime};
 
-    static SESSION_API_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static SESSION_API_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[tokio::test]
     async fn router_builds() {
@@ -424,9 +425,7 @@ mod tests {
             );
         }
 
-        let _env_lock = SESSION_API_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_lock = SESSION_API_ENV_LOCK.lock().await;
         let previous_control_key = std::env::var_os("CENTAUR_CONTROL_API_KEY");
         // SAFETY: this test is the only session-context test that mutates this
         // process variable, and the mutex spans the request plus restoration.
