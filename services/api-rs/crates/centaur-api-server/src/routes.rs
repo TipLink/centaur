@@ -27,7 +27,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::ThreadKey;
+use centaur_session_core::{ChatDestination, ThreadKey};
 use centaur_session_runtime::{
     DrainReport, ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime,
     SessionRuntime, thread_trace_id, thread_trace_parent_span_id,
@@ -60,8 +60,9 @@ use crate::{
     slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
-        EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
-        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, ListWorkflowRunsQuery,
+        DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
+        ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
+        InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
         OnHarnessConflict, ReleaseThreadRequest, ReleaseThreadResponse, SessionContextResponse,
         SessionSseEvent, SlackThreadContext, stream_error_sse,
     },
@@ -503,6 +504,73 @@ async fn get_session_context(
     let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     ensure_session_resource_authorized(&runtime, &thread_key, &authorization).await?;
+    let destination = thread_key.chat_destination();
+    let platform = destination
+        .as_ref()
+        .map(ChatDestination::platform)
+        .unwrap_or("unknown")
+        .to_owned();
+    let (slack, discord, linear, github) = match destination {
+        Some(ChatDestination::Slack {
+            channel_id,
+            thread_ts,
+        }) => (
+            Some(SlackThreadContext {
+                channel_id,
+                thread_ts,
+            }),
+            None,
+            None,
+            None,
+        ),
+        Some(ChatDestination::Discord {
+            guild_id,
+            channel_id,
+            thread_id,
+        }) => (
+            None,
+            Some(DiscordThreadContext {
+                guild_id,
+                channel_id,
+                thread_id,
+            }),
+            None,
+            None,
+        ),
+        Some(ChatDestination::Linear {
+            issue_id,
+            comment_id,
+            agent_session_id,
+        }) => (
+            None,
+            None,
+            Some(LinearThreadContext {
+                issue_id,
+                comment_id,
+                agent_session_id,
+            }),
+            None,
+        ),
+        Some(ChatDestination::Github {
+            owner,
+            repo,
+            number,
+            kind,
+            review_comment_id,
+        }) => (
+            None,
+            None,
+            None,
+            Some(GithubThreadContext {
+                owner,
+                repo,
+                number,
+                kind: kind.as_str().to_owned(),
+                review_comment_id,
+            }),
+        ),
+        None => (None, None, None, None),
+    };
     let title = match runtime.session_title(&thread_key).await {
         Ok(title) => title,
         Err(error) => {
@@ -515,9 +583,13 @@ async fn get_session_context(
         }
     };
     Ok(Json(SessionContextResponse {
-        slack: slack_thread_context(&thread_key),
         title,
         thread_key,
+        platform,
+        slack,
+        discord,
+        linear,
+        github,
     }))
 }
 
@@ -525,29 +597,6 @@ async fn list_personas(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PersonaSummary>>, ApiError> {
     Ok(Json(state.runtime()?.personas()))
-}
-
-fn slack_thread_context(thread_key: &ThreadKey) -> Option<SlackThreadContext> {
-    let parts = thread_key.as_str().split(':').collect::<Vec<_>>();
-    let (channel_id, thread_ts) = match parts.as_slice() {
-        ["slack", channel_id, thread_ts] => (*channel_id, *thread_ts),
-        ["slack", _team_id, channel_id, thread_ts] => (*channel_id, *thread_ts),
-        [channel_id, thread_ts] if is_slack_conversation_id(channel_id) => {
-            (*channel_id, *thread_ts)
-        }
-        _ => return None,
-    };
-    if channel_id.is_empty() || thread_ts.is_empty() {
-        return None;
-    }
-    Some(SlackThreadContext {
-        channel_id: channel_id.to_owned(),
-        thread_ts: thread_ts.to_owned(),
-    })
-}
-
-fn is_slack_conversation_id(value: &str) -> bool {
-    matches!(value.as_bytes().first(), Some(b'C' | b'D' | b'G'))
 }
 
 async fn append_messages(
@@ -2756,9 +2805,19 @@ fn workflow_input_thread_context(input: &Value) -> Result<SlackThreadContext, Ap
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::BadRequest("workflow input.thread_key is required".to_owned()))?;
     let thread_key = ThreadKey::try_from(raw_thread_key.to_owned())?;
-    let context = slack_thread_context(&thread_key).ok_or_else(|| {
-        ApiError::BadRequest("workflow input.thread_key must identify a Slack thread".to_owned())
-    })?;
+    let Some(ChatDestination::Slack {
+        channel_id,
+        thread_ts,
+    }) = thread_key.chat_destination()
+    else {
+        return Err(ApiError::BadRequest(
+            "workflow input.thread_key must identify a Slack thread".to_owned(),
+        ));
+    };
+    let context = SlackThreadContext {
+        channel_id,
+        thread_ts,
+    };
     if let Some(input_channel) = input
         .get("channel")
         .and_then(Value::as_str)

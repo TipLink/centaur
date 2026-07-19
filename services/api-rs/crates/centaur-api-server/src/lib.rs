@@ -21,7 +21,7 @@ pub use tool_discovery::{
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     };
 
@@ -42,6 +42,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{AppState, build_router_with_app_state, build_router_with_runtime};
+
+    static SESSION_API_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[tokio::test]
     async fn router_builds() {
@@ -389,7 +391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_context_rejects_anonymous_slack_access() {
+    async fn session_context_requires_auth_and_preserves_platform_context() {
         let pool =
             PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
         let app = build_router_with_runtime(
@@ -397,39 +399,73 @@ mod tests {
             SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
         );
 
+        for thread_key in [
+            "slack%3AC123%3A123.456",
+            "discord%3A111%3A222%3A333",
+            "linear%3AISSUE%3Ac%3ACMT%3As%3ASESS",
+            "github%3A0xSplits%2Fcentaur%3A704%3Arc%3A99",
+            "cli%3Atest",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/session/{thread_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "anonymous access unexpectedly succeeded for {thread_key}"
+            );
+        }
+
+        let _env_lock = SESSION_API_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_control_key = std::env::var_os("CENTAUR_CONTROL_API_KEY");
+        // SAFETY: this test is the only session-context test that mutates this
+        // process variable, and the mutex spans the request plus restoration.
+        unsafe {
+            std::env::set_var("CENTAUR_CONTROL_API_KEY", "session-context-test-token");
+        }
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/session/slack%3AC123%3A123.456")
+                    .uri("/api/session/github%3A0xSplits%2Fcentaur%3A704%3Arc%3A99")
+                    .header(header::AUTHORIZATION, "Bearer session-context-test-token")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        // SAFETY: restore the exact prior process environment while still
+        // holding the test mutex.
+        unsafe {
+            if let Some(value) = previous_control_key {
+                std::env::set_var("CENTAUR_CONTROL_API_KEY", value);
+            } else {
+                std::env::remove_var("CENTAUR_CONTROL_API_KEY");
+            }
+        }
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn session_context_rejects_anonymous_non_slack_access() {
-        let pool =
-            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
-        let app = build_router_with_runtime(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
-        );
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/session/cli%3Atest")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["thread_key"], "github:0xSplits/centaur:704:rc:99");
+        assert_eq!(body["platform"], "github");
+        assert_eq!(body["github"]["owner"], "0xSplits");
+        assert_eq!(body["github"]["repo"], "centaur");
+        assert_eq!(body["github"]["number"], 704);
+        assert_eq!(body["github"]["kind"], "pr");
+        assert_eq!(body["github"]["review_comment_id"], 99);
+        assert!(body.get("slack").is_none());
+        assert!(body.get("discord").is_none());
+        assert!(body.get("linear").is_none());
     }
 
     #[derive(Default)]

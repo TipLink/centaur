@@ -140,6 +140,42 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
+  test "public Slack channel threads stay out of the personal chat list" do
+    skip_unless_session_table
+    skip_unless_slack_channel_table
+
+    owned_thread_key = "console:owned-list-#{SecureRandom.hex(6)}"
+    public_channel_id = "C#{SecureRandom.hex(6).upcase}"
+    public_thread_key = "slack:#{public_channel_id}:#{SecureRandom.hex(6)}"
+    insert_console_session(owned_thread_key)
+    insert_slack_sync_channel(public_channel_id, is_private: false)
+    insert_slack_session(public_thread_key, slack_user_id: "U_OTHER", slack_user_name: "someone-else")
+
+    with_env("CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED" => "true") do
+      get console_sidebar_threads_url
+      assert_response :ok
+      assert_select "a[href=?]", console_threads_path(thread: owned_thread_key), count: 1
+      assert_select "a[href=?]", console_threads_path(thread: public_thread_key), count: 0
+
+      # Even an active globally readable chat must not be injected into the
+      # user's personal sidebar.
+      get console_sidebar_threads_url(thread: public_thread_key)
+      assert_response :ok
+      assert_select "a[href=?]", console_threads_path(thread: public_thread_key), count: 0
+
+      # The default Chats landing also discovers only owned chats.
+      get console_threads_url
+      assert_redirected_to console_threads_path(thread: owned_thread_key)
+
+      # Global access itself is unchanged: a direct link remains readable, but
+      # it cannot be continued by a non-owner.
+      get console_threads_url(thread: public_thread_key)
+      assert_response :ok
+      assert_select ".console-thread-detail-header", count: 1
+      assert_select "textarea[name=prompt]", count: 0
+    end
+  end
+
   test "sharing publishes a direct read-only link from an in-page copy dialog" do
     skip_unless_session_table
 
@@ -248,6 +284,63 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Goksu Toprak", item[:label]
     assert_equal :end, item[:align]
     assert_equal "Root Slack bot post", item[:text]
+  end
+
+  test "transcript messages expose stored image attachments as bounded inline data" do
+    controller = Console::ThreadsController.new
+    controller.define_singleton_method(:current_slack_user_ids) { [] }
+    controller.instance_variable_set(:@selected_session, TranscriptSession.new(metadata_hash: {}))
+    image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    message = TranscriptMessage.new(
+      role: "user",
+      parts_array: [
+        { "type" => "text", "text" => "See attached." },
+        {
+          "type" => "attachment",
+          "attachment_type" => "image",
+          "dataBase64" => image_data,
+          "mimeType" => "image/png",
+          "name" => "screenshot.png",
+          "width" => 1440,
+          "height" => 900
+        }
+      ],
+      metadata_hash: {},
+      created_at: Time.zone.parse("2026-06-26 17:15:58 UTC")
+    )
+
+    item = controller.send(:transcript_item_for_message, message)
+
+    assert_equal "See attached.", item[:text]
+    assert_equal [
+      {
+        src: "data:image/png;base64,#{image_data}",
+        alt: "screenshot.png",
+        width: 1440,
+        height: 900
+      }
+    ], item[:images]
+  end
+
+  test "transcript images reject remote, unsafe, malformed, and oversized image data" do
+    controller = Console::ThreadsController.new
+    message = TranscriptMessage.new(
+      role: "user",
+      parts_array: [
+        { "type" => "attachment", "attachment_type" => "image", "mimeType" => "image/png",
+          "url" => "https://files.example.test/private.png" },
+        { "type" => "attachment", "attachment_type" => "image", "mimeType" => "image/svg+xml",
+          "dataBase64" => "PHN2Zz4=" },
+        { "type" => "attachment", "attachment_type" => "image", "mimeType" => "image/png",
+          "dataBase64" => "not base64" },
+        { "type" => "attachment", "attachment_type" => "image", "mimeType" => "image/png",
+          "dataBase64" => "A" * (Console::ThreadsController::MAX_INLINE_IMAGE_BASE64_CHARS + 1) }
+      ],
+      metadata_hash: {},
+      created_at: Time.zone.now
+    )
+
+    assert_empty controller.send(:transcript_message_images, message)
   end
 
   test "slack message text resolves mentions from bot identity and selected actor metadata" do
@@ -716,40 +809,32 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_includes sql, "ussoonly"
   end
 
-  test "sidebar includes public Slack threads only when the deploy setting is enabled" do
+  test "sidebar scope never expands to public Slack threads" do
     controller = threads_controller_for(@operator)
 
     with_env("CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED" => "true") do
       sql = controller.send(:console_sidebar_visible_thread_scope).to_sql
 
-      if slack_channel_privacy_catalog_available?
-        assert_includes sql, "slack_sync_channels"
-      end
+      refute_includes sql, "slack_sync_channels"
     end
   end
 
-  test "selected session resolves a directly linked thread only within the owner scope" do
-    controller = Console::ThreadsController.new
-    owned_thread = SelectedSession.new(thread_key: "slack:C123:1782339173.755169")
-    scoped_relation = Object.new
-    scoped_relation.define_singleton_method(:where) do |thread_key:|
-      thread_key == owned_thread.thread_key ? [ owned_thread ] : []
+  test "opening a direct thread skips recent chat discovery" do
+    skip_unless_session_table
+    thread_key = "console:direct-load-#{SecureRandom.hex(6)}"
+    insert_console_session(thread_key)
+
+    without_session_list_query do
+      get console_threads_url(thread: thread_key)
     end
-    controller.instance_variable_set(:@starting_new_thread, false)
-    controller.instance_variable_set(:@sessions, [])
 
-    # An owned key outside the base window is recovered through the scope.
-    controller.instance_variable_set(:@selected_thread_key, owned_thread.thread_key)
-    assert_equal owned_thread, controller.send(:selected_session, scoped_relation, [])
-
-    # A key the scope does not own has no unscoped fallback, so it stays hidden.
-    controller.instance_variable_set(:@selected_thread_key, "slack:C999:1782339173.999999")
-    assert_nil controller.send(:selected_session, scoped_relation, [])
+    assert_response :ok
+    assert_select ".console-thread-detail-header", count: 1
   end
 
-  test "renders the sidebar New chat link and the full-page composer" do
-    with_composer do
-      with_recent_first_error do
+  test "renders the full-page composer without loading sessions" do
+    without_session_list_query do
+      with_composer do
         get console_threads_url(new: 1)
       end
     end
@@ -879,8 +964,8 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "the new sentinel alone renders the full-page new chat screen" do
-    with_composer do
-      with_recent_first_error do
+    without_session_list_query do
+      with_composer do
         get console_threads_url(thread: "new")
       end
     end
@@ -951,6 +1036,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "console", create[:metadata][:platform]
     assert_equal "console", create[:metadata][:source]
     assert_equal @operator.email, create[:metadata][:actor_email]
+    assert_equal "@ada", create[:metadata][:github_handle]
     assert_equal "claude-opus-4-8", create[:metadata][:model]
 
     append = client.calls[1].last
@@ -959,11 +1045,13 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "user", message[:role]
     assert_equal "Reply with PONG.", message[:parts].first[:text]
     assert_equal @operator.email, message[:metadata][:user_email]
+    assert_equal "@ada", message[:metadata][:github_handle]
 
     execute = client.calls[2].last
     assert_equal create[:thread_key], execute[:thread_key]
     assert execute[:idempotency_key].present?
     assert_equal "claude-opus-4-8", execute[:metadata][:model]
+    assert_equal "@ada", execute[:metadata][:github_handle]
     line = JSON.parse(execute[:input_lines].first)
     assert_equal "user", line["type"]
     assert_equal create[:thread_key], line["thread_key"]
@@ -977,6 +1065,34 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Reply with PONG.", line.dig("message", "content", 1, "text")
 
     assert_redirected_to console_threads_path(thread: create[:thread_key])
+  end
+
+  test "starting a chat prefers the Console user's connected GitHub login" do
+    @operator.update!(name: "Goksu Toprak")
+    client = RecordingApiClient.new
+    identity = GithubRequesterIdentity::Result.new(
+      handle: "@goksu", source: "connected GitHub account", reason: nil
+    )
+    test_case = self
+    operator = @operator
+    with_singleton_method(GithubRequesterIdentity, :resolve, ->(user:) {
+      test_case.assert_equal operator, user
+      identity
+    }) do
+      with_singleton_method(SlackRequesterIdentity, :resolve, ->(**) {
+        flunk("Slack fallback should not run when GitHub is connected")
+      }) do
+        with_composer(client: client) do
+          post console_threads_url, params: { prompt: "Open the PR.", model: "gpt-5.5" }
+        end
+      end
+    end
+
+    line = JSON.parse(client.calls[2].last[:input_lines].first)
+    requester_context = line.dig("message", "content", 0, "text")
+    assert_includes requester_context, "Prompted by: @goksu"
+    assert_includes requester_context, "GitHub handle source: connected GitHub account"
+    refute_includes requester_context, "Prompted by: Goksu Toprak"
   end
 
   test "picking Amp starts an amp chat and sends no model" do
@@ -1077,7 +1193,49 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to console_threads_path(thread: "console:composer-reply,console:other")
   end
 
-  test "replying into a chat outside the owner scope is rejected" do
+  test "replying to a deployment-public non-owned chat is rejected" do
+    skip_unless_session_table
+    skip_unless_slack_channel_table
+
+    channel_id = "C#{SecureRandom.hex(6).upcase}"
+    thread_key = "slack:#{channel_id}:#{SecureRandom.hex(6)}"
+    insert_slack_sync_channel(channel_id, is_private: false)
+    insert_slack_session(thread_key, slack_user_id: "U_OTHER", slack_user_name: "someone-else")
+
+    client = RecordingApiClient.new
+    with_env("CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED" => "true") do
+      with_composer(client: client) do
+        post console_threads_url,
+             params: { prompt: "Continue from here.", thread_key: thread_key }
+      end
+    end
+
+    assert_empty client.calls
+    assert_redirected_to console_threads_path
+    assert_equal "Chat not found.", flash[:alert]
+  end
+
+  test "replying to an explicitly shared non-owned chat is rejected" do
+    skip_unless_session_table
+
+    thread_key = "console:shared-reply-#{SecureRandom.hex(6)}"
+    insert_console_session(thread_key)
+    ThreadShare.create!(thread_key: thread_key, created_by: @operator)
+    delete logout_url
+    post login_url, params: { email: users(:member_user).email, password: "password123456" }
+
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url,
+           params: { prompt: "Continue from here.", thread_key: thread_key }
+    end
+
+    assert_empty client.calls
+    assert_redirected_to console_threads_path
+    assert_equal "Chat not found.", flash[:alert]
+  end
+
+  test "replying into a chat outside the readable scope is rejected" do
     skip_unless_session_table
 
     client = RecordingApiClient.new
@@ -1252,6 +1410,23 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_includes item[:text], "```sh\npnpm test\n```"
     assert_includes item[:text], "Output:"
     assert_includes item[:text], "```text\nok\n```"
+  end
+
+  test "thinking extraction omits file change status events" do
+    controller = Console::ThreadsController.new
+    line = {
+      method: "item/completed",
+      params: {
+        item: {
+          type: "fileChange",
+          status: "completed",
+          changes: [ { path: "app/models/thread.rb", kind: "update" } ]
+        }
+      }
+    }.to_json
+    event = OutputLineEvent.new(payload: line, created_at: Time.zone.now)
+
+    assert_nil controller.send(:thinking_transcript_item, event)
   end
 
   test "compact trace grouping combines adjacent command executions for one run" do
@@ -1654,12 +1829,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
   end
 
   def with_recent_first_error
-    singleton = class << CentaurSession; self; end
-    original = CentaurSession.method(:recent_first)
-    singleton.define_method(:recent_first) { raise ActiveRecord::ConnectionNotEstablished }
-    yield
-  ensure
-    singleton.define_method(:recent_first, original)
+    replacement = -> { raise ActiveRecord::ConnectionNotEstablished }
+    with_singleton_method(CentaurSession, :recent_first, replacement) { yield }
+  end
+
+  def without_session_list_query
+    calls = 0
+    replacement = -> {
+      calls += 1
+      raise ActiveRecord::ConnectionNotEstablished
+    }
+    with_singleton_method(CentaurSession, :recent_first, replacement) { yield }
+    assert_equal 0, calls, "explicit chat loads must not query the recent session list"
   end
 
   def threads_controller_for(user)

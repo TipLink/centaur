@@ -506,6 +506,7 @@
       }
 
       .console-thinking-preview {
+        flex: 1 1 auto;
         min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -517,6 +518,7 @@
         flex: 0 0 auto;
         color: #d4d4d8;
         font-weight: 500;
+        white-space: nowrap;
       }
 
       .console-thinking-failed,
@@ -527,7 +529,9 @@
       /* The comma hugs the group title: pull the label back across the flex
          gap so it reads "Ran 2 commands, 1 failed". */
       .console-thinking-failed {
+        flex: 0 0 auto;
         margin-left: -0.4rem;
+        white-space: nowrap;
       }
 
       .console-thinking-failed::before {
@@ -888,6 +892,25 @@
 
       .console-message-stack {
         min-width: 0;
+      }
+
+      .console-message-images {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.75rem;
+        max-width: 100%;
+      }
+
+      .console-message-image {
+        display: block;
+        width: auto;
+        height: auto;
+        max-width: 100%;
+        max-height: min(28rem, 60vh);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 0.75rem;
+        object-fit: contain;
       }
 
       .console-message-timestamp {
