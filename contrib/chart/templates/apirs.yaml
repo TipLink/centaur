@@ -81,11 +81,14 @@
 {{- if and .Values.repoCache.enabled (gt (len $sandboxWorkflowDirList) 0) -}}
 {{- $sandboxWorkflowDirs = join ":" $sandboxWorkflowDirList -}}
 {{- end -}}
-{{- if and .Values.overlay.image.repository (not (and .Values.repoCache.enabled (gt (len $apiWorkflowDirList) 0))) -}}
+{{- if and .Values.overlay.image.repository (or .Values.overlay.image.includeWorkflows (not (and .Values.repoCache.enabled (gt (len $apiWorkflowDirList) 0)))) -}}
 {{- $workflowDirs = printf "%s:%s" $workflowDirs (printf "%s/workflows" .Values.overlay.mountPath) -}}
 {{- end -}}
-{{- if and .Values.overlay.image.repository (not (and .Values.repoCache.enabled (gt (len $sandboxWorkflowDirList) 0))) -}}
+{{- if and .Values.overlay.image.repository (or .Values.overlay.image.includeWorkflows (not (and .Values.repoCache.enabled (gt (len $sandboxWorkflowDirList) 0)))) -}}
 {{- $sandboxWorkflowDirs = printf "%s/workflows" $sandboxOverlayMountPath -}}
+{{- if and .Values.repoCache.enabled (gt (len $sandboxWorkflowDirList) 0) -}}
+{{- $sandboxWorkflowDirs = printf "%s:%s" (join ":" $sandboxWorkflowDirList) $sandboxWorkflowDirs -}}
+{{- end -}}
 {{- end -}}
 {{- $apiRsMetricsAnnotations := dict -}}
 {{- if .Values.apiRs.metrics.scrapeAnnotations -}}
