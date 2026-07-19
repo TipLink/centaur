@@ -119,6 +119,29 @@ if grep -F 'value: "/home/agent/github/' "$scratch/repo-and-image-overlay.yaml" 
     exit 1
 fi
 
+helm template test "$chart_dir" "${common[@]}" \
+    --set repoCache.enabled=true \
+    --set overlay.image.repository=ghcr.io/tiplink/overlay \
+    --set overlay.image.tag=sha-test \
+    --set overlay.image.includeWorkflows=true \
+    --set-string 'overlays.sources[0].repo=paradigmxyz/centaur' \
+    --set-string 'overlays.sources[1].repo=TipLink/fineas-centaur-overlay' \
+    --set-string 'overlays.sources[1].workflowsSubdir=' \
+    >"$scratch/image-workflows.yaml"
+
+if ! grep -qF 'value: "/var/lib/centaur/repos/paradigmxyz/centaur/workflows:/app/overlay/org/workflows"' "$scratch/image-workflows.yaml"; then
+    echo "enabled image workflows must follow the base repo-cache workflow source" >&2
+    exit 1
+fi
+if ! grep -qF 'value: "/home/agent/github/paradigmxyz/centaur/workflows:/home/agent/overlay/org/workflows"' "$scratch/image-workflows.yaml"; then
+    echo "enabled sandbox image workflows must follow the base repo-cache workflow source" >&2
+    exit 1
+fi
+if grep -F 'name: WORKFLOW_DIRS' -A1 "$scratch/image-workflows.yaml" | grep -qF '/TipLink/fineas-centaur-overlay/workflows'; then
+    echo "disabled repo-cache workflow trees must not duplicate image workflows" >&2
+    exit 1
+fi
+
 # A skills-only source never enters KUBERNETES_TOOLS_*, but its immutable ref
 # must still rotate the sandbox content revision and therefore the warm key.
 for revision in 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222; do
