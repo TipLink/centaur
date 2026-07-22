@@ -505,7 +505,11 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         self.patch_sandbox_merge(id, sandbox_pause_patch(jiff::Timestamp::now()))
-            .await
+            .await?;
+        // The workload and its state volume are retained while paused, but the
+        // companion proxy has no work to serve. Resume recreates and re-adopts
+        // these resources before scaling the workload back up.
+        self.delete_iron_proxy_resources(id).await
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -997,10 +1001,84 @@ fn map_kube_error(operation: &str, err: Error) -> SandboxError {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::sync::Mutex as StdMutex;
+
     use centaur_sandbox_core::{RepoCacheAccess, ResourceLimits, SandboxCapabilities, SandboxSpec};
+    use http::{Method, Request, Response};
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+    use kube::client::Body;
 
     use super::*;
+
+    #[tokio::test]
+    async fn pause_scales_down_before_deleting_proxy_resources() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let observed_requests = requests.clone();
+        let sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("centaur-agent:latest"),
+            &AgentSandboxConfig::new("test"),
+        )
+        .unwrap();
+        let sandbox_response = serde_json::to_vec(&sandbox).unwrap();
+
+        let service = tower::service_fn(move |request: Request<Body>| {
+            let observed_requests = observed_requests.clone();
+            let sandbox_response = sandbox_response.clone();
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_owned();
+                observed_requests
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), path));
+
+                let body = if method == Method::PATCH {
+                    sandbox_response
+                } else if method == Method::GET {
+                    serde_json::to_vec(&json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [],
+                    }))
+                    .unwrap()
+                } else {
+                    serde_json::to_vec(&json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "metadata": {},
+                        "status": "Success",
+                        "code": 200,
+                    }))
+                    .unwrap()
+                };
+                Ok::<_, Infallible>(Response::new(Body::from(body)))
+            }
+        });
+        let backend = AgentSandboxBackend::new(
+            Client::new(service, "test"),
+            AgentSandboxConfig::new("test"),
+        );
+
+        backend.pause(&SandboxId::new("asbx-test")).await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0].0, Method::PATCH);
+        assert!(requests[0].1.ends_with("/sandboxes/asbx-test"));
+        assert_eq!(requests[1].0, Method::GET);
+        assert!(requests[1].1.ends_with("/pods"));
+        assert_eq!(requests[2].0, Method::DELETE);
+        assert!(
+            requests[2].1.ends_with("/services/asbx-test-proxy"),
+            "{requests:#?}"
+        );
+        assert!(requests[3..].iter().all(|(method, path)| {
+            *method == Method::DELETE && path.contains("/networkpolicies/")
+        }));
+    }
 
     #[test]
     fn builds_agent_sandbox_spec_with_state_volume_and_limits() {

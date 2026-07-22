@@ -56,8 +56,9 @@ stdin/stdout/stderr handles.
 
 The Agent Sandbox CRD backend implements pause/resume by patching:
 
-- pause: `spec.replicas = 0`
-- resume: `spec.replicas = 1`, then wait for the workload to become ready
+- pause: `spec.replicas = 0`, then delete ephemeral per-sandbox proxy resources
+- resume: recreate and adopt proxy resources, set `spec.replicas = 1`, then wait
+  for the workload to become ready
 - stop: delete the Sandbox CRD, state PVC, prompt Secret, and proxy resources
 
 The Rust version should keep those lifecycle semantics while stripping away
@@ -114,7 +115,8 @@ Agent Sandbox CRD backend:
 
 - translate `SandboxSpec` into `agents.x-k8s.io/v1alpha1` Sandbox resources
 - configure state volume claim templates
-- implement pause/resume through replica patches
+- implement pause/resume through replica patches while releasing and recreating
+  ephemeral companion resources around the suspended workload
 - delete CRD-owned state on stop
 - resolve the backing Pod for private I/O transport and status
 - list observed Sandbox CRD objects and backing Pods for reconciliation
@@ -449,8 +451,9 @@ The first usable slice should prove:
    local backend's observed state.
 5. `centaur-sandbox-agent-k8s` can create a real Agent Sandbox CRD and open
    stdio handles through the backing Pod.
-6. `centaur-sandbox-agent-k8s` can pause and resume by patching replicas, then
-   observe the resulting state.
+6. `centaur-sandbox-agent-k8s` can pause and resume by patching replicas,
+   releasing and recreating ephemeral companion resources, then observing the
+   resulting state.
 
 Suggested local proof shape:
 
