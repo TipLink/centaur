@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -321,6 +323,63 @@ class WorkflowHostTests(unittest.TestCase):
         )
         self.assertTrue(rpc.drained)
         self.assertTrue(pool.closed)
+
+    def test_main_exits_after_workflow_error_while_stdin_read_blocks(self) -> None:
+        host = load_workflow_host()
+        unblock_stdin = threading.Event()
+        second_read_started = threading.Event()
+
+        class BlockingStdin:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def readline(self) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    return (
+                        '{"type":"workflow.start","workflow_name":"sample_workflow",'
+                        '"run_id":"run-123","task_id":"task-456","input":{}}\n'
+                    )
+                second_read_started.set()
+                unblock_stdin.wait(timeout=5)
+                return ""
+
+        async def handler(_inp, _ctx):
+            raise RuntimeError("workflow failed fast")
+
+        registered = host.RegisteredWorkflow(
+            workflow_name="sample_workflow",
+            source_path="workflows/sample.py",
+            handler=handler,
+            input_cls=None,
+            webhooks=None,
+            schedule=None,
+        )
+
+        async def create_pool():
+            return None
+
+        fake_stdin = BlockingStdin()
+        fake_stdout = io.StringIO()
+        try:
+            with (
+                patch.object(sys, "stdin", fake_stdin),
+                patch.object(sys, "stdout", fake_stdout),
+                patch.object(
+                    host,
+                    "discover_workflows",
+                    return_value={"sample_workflow": registered},
+                ),
+                patch.object(host, "create_pool", create_pool),
+            ):
+                result = asyncio.run(asyncio.wait_for(host.main(), timeout=1.0))
+        finally:
+            unblock_stdin.set()
+
+        self.assertEqual(result, 0)
+        self.assertTrue(second_read_started.wait(timeout=1))
+        self.assertIn('"type":"workflow.error"', fake_stdout.getvalue())
+        self.assertIn("workflow failed fast", fake_stdout.getvalue())
 
     def test_run_workflow_threads_agent_defaults_into_context(self) -> None:
         host = load_workflow_host()
