@@ -16,6 +16,7 @@ import inspect
 import json
 import os
 import sys
+import threading
 import traceback
 import typing
 from pathlib import Path
@@ -389,6 +390,40 @@ def discovery_payload() -> dict[str, Any]:
     }
 
 
+async def _read_stdin_line() -> str:
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[str] = loop.create_future()
+
+    def set_result(line: str) -> None:
+        if not fut.done():
+            fut.set_result(line)
+
+    def set_exception(exc: Exception) -> None:
+        if not fut.done():
+            fut.set_exception(exc)
+
+    def read_line() -> None:
+        try:
+            line = sys.stdin.readline()
+        except Exception as exc:
+            try:
+                loop.call_soon_threadsafe(set_exception, exc)
+            except RuntimeError:
+                pass
+            return
+        try:
+            loop.call_soon_threadsafe(set_result, line)
+        except RuntimeError:
+            pass
+
+    threading.Thread(
+        target=read_line,
+        name="workflow-host-stdin",
+        daemon=True,
+    ).start()
+    return await fut
+
+
 async def main() -> int:
     rpc = RpcClient()
     stdin_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
@@ -397,7 +432,7 @@ async def main() -> int:
 
     async def read_stdin() -> None:
         while True:
-            line = await asyncio.to_thread(sys.stdin.readline)
+            line = await _read_stdin_line()
             if line == "":
                 await stdin_queue.put(None)
                 return
