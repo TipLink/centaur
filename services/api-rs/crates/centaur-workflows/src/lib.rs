@@ -4266,6 +4266,7 @@ async fn run_agent_session_turn(
                 parts: parts.clone(),
                 metadata: message_metadata,
             }],
+            true,
         )
         .await?;
     let execution = session_runtime

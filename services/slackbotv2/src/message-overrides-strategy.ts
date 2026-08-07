@@ -16,6 +16,7 @@ const SYSTEM_PROMPT = [
   'Allowed harness values: codex, claudecode, amp.',
   'Allowed provider values: responses, amazon-bedrock, openrouter.',
   'Allowed reasoning values: none, minimal, low, medium, high, xhigh, max.',
+  'Set queue to true only when the message contains the literal --queue flag; otherwise false.',
   'Map fuzzy effort words to the nearest reasoning value by magnitude. Examples: tiny/cheap/fast -> low or minimal; normal/default -> medium; deep/strong/intense -> high or xhigh; maximum/superduper/biggest -> max.',
   'Return reasoning even when the requested model is not Codex; validation will ignore reasoning that cannot apply.',
   'Map OpenAI model aliases to canonical IDs: sol -> gpt-5.6-sol, terra -> gpt-5.6-terra, luna -> gpt-5.6-luna, 5.5 -> gpt-5.5, 5.5 pro -> gpt-5.5-pro, 5.4 -> gpt-5.4, 5.4 pro -> gpt-5.4-pro, 5.4 mini -> gpt-5.4-mini, 5.4 nano -> gpt-5.4-nano.',
@@ -60,12 +61,15 @@ const MESSAGE_OVERRIDES_SCHEMA = {
       enum: ['responses', 'amazon-bedrock', 'openrouter', null],
       type: ['string', 'null']
     },
+    queue: {
+      type: 'boolean'
+    },
     reasoning: {
       enum: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', null],
       type: ['string', 'null']
     }
   },
-  required: ['harness', 'model', 'provider', 'reasoning'],
+  required: ['harness', 'model', 'provider', 'queue', 'reasoning'],
   type: 'object'
 }
 
@@ -83,6 +87,7 @@ type OpenAiMessageOverridesStrategyOutput = {
   harness?: unknown
   model?: unknown
   provider?: unknown
+  queue?: unknown
   reasoning?: unknown
 }
 
