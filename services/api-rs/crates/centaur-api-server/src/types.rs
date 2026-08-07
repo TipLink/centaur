@@ -88,6 +88,33 @@ pub struct GithubThreadContext {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppendMessagesRequest {
     pub messages: Vec<SessionMessageInput>,
+    /// Whether user messages should be delivered to an active harness turn as steering.
+    /// Existing clients default to steering; callers can disable it to queue a later turn.
+    #[serde(default = "default_true")]
+    pub steer_active_execution: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod append_messages_request_tests {
+    use super::AppendMessagesRequest;
+
+    #[test]
+    fn append_messages_steers_by_default_but_can_be_queued() {
+        let default_request: AppendMessagesRequest =
+            serde_json::from_value(serde_json::json!({ "messages": [] })).unwrap();
+        assert!(default_request.steer_active_execution);
+
+        let queued_request: AppendMessagesRequest = serde_json::from_value(serde_json::json!({
+            "messages": [],
+            "steer_active_execution": false
+        }))
+        .unwrap();
+        assert!(!queued_request.steer_active_execution);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

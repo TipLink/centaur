@@ -609,7 +609,11 @@ async fn append_messages(
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     ensure_session_resource_authorized(&runtime, &thread_key, &authorization).await?;
     let message_ids = runtime
-        .append_messages(&thread_key, &request.messages)
+        .append_messages(
+            &thread_key,
+            &request.messages,
+            request.steer_active_execution,
+        )
         .await?;
     Ok(Json(AppendMessagesResponse {
         ok: true,

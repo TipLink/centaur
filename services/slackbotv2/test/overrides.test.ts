@@ -173,6 +173,20 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('--ampere hi').harnessType).toBeUndefined()
   })
 
+  test('parses --queue as a non-sticky delivery flag and strips it', () => {
+    expect(extractMessageOverrides('--queue do this next')).toEqual({
+      cleanedText: 'do this next',
+      harnessType: undefined,
+      model: undefined,
+      provider: undefined,
+      queue: true,
+      reasoning: undefined
+    })
+    expect(extractMessageOverrides('do this --queue next').cleanedText).toBe('do this next')
+    expect(extractMessageOverrides('document the --queue flag').queue).toBe(true)
+    expect(extractMessageOverrides('pre--queue remains literal').queue).toBeUndefined()
+  })
+
   test('flag-only message cleans to empty text', () => {
     expect(extractMessageOverrides('--claude')).toEqual({
       cleanedText: '',

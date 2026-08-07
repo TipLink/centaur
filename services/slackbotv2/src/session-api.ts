@@ -492,7 +492,14 @@ export async function forwardToSessionApi(
     const appendStartedAtMs = nowMs()
     await recordSessionApiOperation(
       'append_messages',
-      () => appendSessionMessages(options, input.threadId, input.messages, !input.executeMessage),
+      () =>
+        appendSessionMessages(
+          options,
+          input.threadId,
+          input.messages,
+          !input.executeMessage,
+          input.steerActiveExecution
+        ),
       sessionApiTimeoutMs(options),
       'append session messages'
     )
@@ -1205,13 +1212,15 @@ async function appendSessionMessages(
   options: SlackbotV2Options,
   threadId: string,
   messages: SlackbotV2ApiMessage[],
-  includeRequesterContext = false
+  includeRequesterContext = false,
+  steerActiveExecution = true
 ): Promise<void> {
   const fetchFn = options.fetch ?? fetch
   const body: SlackbotV2AppendMessagesRequest = {
     messages: await Promise.all(
       messages.map(message => toSessionMessage(options, message, includeRequesterContext))
-    )
+    ),
+    steer_active_execution: steerActiveExecution
   }
   const response = await fetchWithTimeout(
     fetchFn,
