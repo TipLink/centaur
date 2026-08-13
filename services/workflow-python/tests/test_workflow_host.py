@@ -150,6 +150,33 @@ class WorkflowHostTests(unittest.TestCase):
         self.assertEqual(error.to_dict()["status_code"], 422)
         self.assertIn("INVALID", str(error))
 
+    def test_call_tool_shim_sends_payload_over_stdin(self) -> None:
+        load_workflow_host()
+        from api.app import call_tool_shim
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = Path(tmp) / "centaur-tools"
+            shim.write_text(
+                f"#!{sys.executable}\n"
+                "import json\n"
+                "import sys\n"
+                "payload = json.load(sys.stdin)\n"
+                "print(json.dumps({'argv': sys.argv[1:], 'payload': payload}))\n"
+            )
+            shim.chmod(0o755)
+            payload = {
+                "customer": "example@example.com",
+                "sensitive": "must-not-appear-in-argv",
+            }
+
+            result = asyncio.run(
+                call_tool_shim(str(shim), "demo", "lookup", payload)
+            )
+
+        self.assertEqual(result["argv"], ["call", "demo", "lookup", "--stdin"])
+        self.assertEqual(result["payload"], payload)
+        self.assertNotIn("must-not-appear-in-argv", " ".join(result["argv"]))
+
     def test_step_accepts_step_kind_and_binds_tool_manager_rpc(self) -> None:
         host = load_workflow_host()
         from api import app as workflow_app

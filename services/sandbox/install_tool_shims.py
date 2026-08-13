@@ -520,7 +520,7 @@ def load():
 
 
 def usage():
-    print("usage: centaur-tools [list|json|refresh|which <name>|run <name> [args...]|call <name> <method> [json]]", file=sys.stderr)
+    print("usage: centaur-tools [list|json|refresh|which <name>|run <name> [args...]|call <name> <method> [json|--stdin]]", file=sys.stderr)
     return 2
 
 
@@ -551,7 +551,7 @@ from centaur_sdk.tool_sdk import ToolContext, reset_tool_context, set_tool_conte
 project_dir = Path(sys.argv[1])
 client_module = sys.argv[2]
 method = sys.argv[3]
-payload = json.loads(sys.argv[4])
+payload = json.load(sys.stdin)
 
 module_path = project_dir / client_module
 package_name = project_dir.name.replace("-", "_")
@@ -740,9 +740,9 @@ def call_tool(tool, method, payload):
                 str(project_dir),
                 client_module,
                 method,
-                json.dumps(payload, separators=(",", ":")),
             ],
             check=False,
+            input=json.dumps(payload, separators=(",", ":")),
             text=True,
             capture_output=True,
             env=tool_env(),
@@ -802,7 +802,16 @@ def main(argv):
                 print(f"unknown tool: {{name}}", file=sys.stderr)
                 return 1
             try:
-                payload = json.loads(argv[4]) if len(argv) >= 5 else {{}}
+                if len(argv) >= 5 and argv[4] == "--stdin":
+                    raw_payload = sys.stdin.read()
+                elif len(argv) >= 5:
+                    # Keep the original CLI form working for interactive and
+                    # older callers. Workflow callers use stdin so payloads do
+                    # not appear in process listings.
+                    raw_payload = argv[4]
+                else:
+                    raw_payload = ""
+                payload = json.loads(raw_payload) if raw_payload.strip() else {{}}
                 result = call_tool(by_name[name], method, payload)
                 if result.stdout:
                     print(result.stdout, end="")

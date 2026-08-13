@@ -420,6 +420,136 @@ class GeneratedShimTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("usage: centaur-tools", result.stderr)
 
+    def test_centaur_tools_call_keeps_payload_off_child_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            fake_bin = root / "fake-bin"
+            project_dir = root / "tools" / "demo"
+            sdk_dir = root / "sdk"
+            bin_dir.mkdir()
+            fake_bin.mkdir()
+            project_dir.mkdir(parents=True)
+            (sdk_dir / "centaur_sdk").mkdir(parents=True)
+
+            (sdk_dir / "centaur_sdk" / "__init__.py").write_text("")
+            (sdk_dir / "centaur_sdk" / "tool_sdk.py").write_text(
+                "class ToolContext:\n"
+                "    def __init__(self, **kwargs):\n"
+                "        self.kwargs = kwargs\n"
+                "def set_tool_context(ctx):\n"
+                "    return ctx\n"
+                "def reset_tool_context(token):\n"
+                "    return None\n"
+            )
+            (project_dir / "client.py").write_text(
+                "def lookup(customer, sensitive):\n"
+                "    return {'customer': customer, 'sensitive': sensitive}\n"
+                "def defaults():\n"
+                "    return {'ok': True}\n"
+            )
+
+            index_path = bin_dir / ".centaur-tools.json"
+            index_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "name": "demo",
+                            "project_dir": str(project_dir),
+                            "package": "demo",
+                            "entrypoint": "client:main",
+                            "client_module": "client.py",
+                        }
+                    ]
+                )
+                + "\n"
+            )
+            install_tool_shims._write_catalog(
+                bin_dir / "centaur-tools",
+                index_path,
+                str(sdk_dir),
+            )
+
+            uvx_argv_log = root / "uvx-argv.json"
+            fake_uvx = fake_bin / "uvx"
+            fake_uvx.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "Path(os.environ['UVX_ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))\n"
+                "args = sys.argv[1:]\n"
+                "os.execvp(args[2], args[2:])\n"
+            )
+            fake_uvx.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            env["UVX_ARGV_LOG"] = str(uvx_argv_log)
+            payload = {
+                "customer": "example@example.com",
+                "sensitive": "must-not-appear-in-child-argv",
+            }
+
+            result = subprocess.run(
+                [
+                    str(bin_dir / "centaur-tools"),
+                    "call",
+                    "demo",
+                    "lookup",
+                    "--stdin",
+                ],
+                input=json.dumps(payload),
+                check=False,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), payload)
+            child_argv = json.loads(uvx_argv_log.read_text())
+            self.assertNotIn(payload["sensitive"], json.dumps(child_argv))
+            self.assertEqual(
+                child_argv[-3:],
+                [str(project_dir), "client.py", "lookup"],
+            )
+
+            legacy_payload = {
+                "customer": "legacy@example.com",
+                "sensitive": "legacy-argv-compatible",
+            }
+            result = subprocess.run(
+                [
+                    str(bin_dir / "centaur-tools"),
+                    "call",
+                    "demo",
+                    "lookup",
+                    json.dumps(legacy_payload),
+                ],
+                check=False,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), legacy_payload)
+            child_argv = json.loads(uvx_argv_log.read_text())
+            self.assertNotIn(legacy_payload["sensitive"], json.dumps(child_argv))
+
+            result = subprocess.run(
+                [str(bin_dir / "centaur-tools"), "call", "demo", "defaults"],
+                check=False,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"ok": True})
+
 
 class RefreshInstallTest(unittest.TestCase):
     def test_install_removes_stale_generated_shims(self) -> None:
