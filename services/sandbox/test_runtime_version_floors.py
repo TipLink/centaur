@@ -49,6 +49,15 @@ def test_sandbox_keeps_cross_architecture_development_tools() -> None:
         assert required in source
 
 
+def test_harness_server_build_uses_stable_rust() -> None:
+    source = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert (
+        "cargo +stable install --locked --path /opt/centaur/harness-server-src "
+        "--root /home/agent/.local"
+    ) in source
+
+
 def test_node_tools_opt_in_to_the_sandbox_proxy_without_dropping_options() -> None:
     source = ENTRYPOINT.read_text(encoding="utf-8")
 
