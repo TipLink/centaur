@@ -668,6 +668,15 @@ struct SandboxArgs {
         value_delimiter = ','
     )]
     passthrough_env: Vec<String>,
+    /// Comma-delimited API process variables copied only into workflow-host
+    /// sandboxes. Unlike SESSION_SANDBOX_PASSTHROUGH_ENV, these values are not
+    /// exposed to interactive session sandboxes.
+    #[arg(
+        long = "workflow-host-passthrough-env",
+        env = "WORKFLOW_HOST_PASSTHROUGH_ENV",
+        value_delimiter = ','
+    )]
+    workflow_host_passthrough_env: Vec<String>,
     /// Operator-supplied sandbox env as a JSON list of `{"name","value"}`
     /// objects — the chart renders `sandbox.extraEnv` into this (the same
     /// contract as the Python control plane's `KUBERNETES_SANDBOX_EXTRA_ENV`).
@@ -1255,7 +1264,13 @@ impl SandboxArgs {
             envs.push(("TOOLS_OVERLAY_PATH".to_owned(), value));
         }
 
-        for name in self.passthrough_env_names() {
+        // Keep SESSION_SANDBOX_PASSTHROUGH_ENV available here for backwards
+        // compatibility, then layer workflow-host-only names on top. Upserting
+        // ensures duplicate and overlapping allowlist entries produce one env.
+        for name in self
+            .passthrough_env_names()
+            .chain(self.workflow_host_passthrough_env_names())
+        {
             if let Ok(value) = env::var(name) {
                 if let Some((_, existing_value)) = envs
                     .iter_mut()
@@ -1281,6 +1296,14 @@ impl SandboxArgs {
 
     fn passthrough_env_names(&self) -> impl Iterator<Item = &str> {
         self.passthrough_env
+            .iter()
+            .flat_map(|entry| entry.split(','))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    fn workflow_host_passthrough_env_names(&self) -> impl Iterator<Item = &str> {
+        self.workflow_host_passthrough_env
             .iter()
             .flat_map(|entry| entry.split(','))
             .map(str::trim)
@@ -2933,6 +2956,78 @@ mod tests {
                 .map(|env| env.value.as_str()),
             Some(SLACK_BOT_TOKEN_ENV)
         );
+    }
+
+    #[test]
+    fn workflow_host_passthrough_env_is_workflow_only_and_deduplicated() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("SESSION_SHARED", "session-value"),
+            ("WORKFLOW_ONLY", "workflow-value"),
+            ("OVERLAPPING_ENV", "shared-value"),
+        ]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--session-sandbox-passthrough-env",
+            "SESSION_SHARED,OVERLAPPING_ENV",
+            "--workflow-host-passthrough-env",
+            "WORKFLOW_ONLY,WORKFLOW_ONLY,OVERLAPPING_ENV",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+        ])
+        .unwrap();
+
+        let workflow_spec = args.sandbox.workflow_host_spec(None).unwrap();
+        let session_env = args.sandbox.codex_app_server_env_template().unwrap();
+
+        let workflow_value = |key: &str| {
+            workflow_spec
+                .env
+                .iter()
+                .find(|env| env.name == key)
+                .map(|env| env.value.as_str())
+        };
+        let session_value = |key: &str| {
+            session_env
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+        };
+
+        // Preserve the existing shared passthrough behavior.
+        assert_eq!(workflow_value("SESSION_SHARED"), Some("session-value"));
+        assert_eq!(session_value("SESSION_SHARED"), Some("session-value"));
+        assert_eq!(session_value("OVERLAPPING_ENV"), Some("shared-value"));
+
+        // The new allowlist is workflow-host-only.
+        assert_eq!(workflow_value("WORKFLOW_ONLY"), Some("workflow-value"));
+        assert_eq!(session_value("WORKFLOW_ONLY"), None);
+
+        // Duplicate entries within the new list and overlaps with the shared
+        // list are collapsed without changing the API process value.
+        assert_eq!(
+            workflow_spec
+                .env
+                .iter()
+                .filter(|env| env.name == "WORKFLOW_ONLY")
+                .count(),
+            1
+        );
+        assert_eq!(
+            workflow_spec
+                .env
+                .iter()
+                .filter(|env| env.name == "OVERLAPPING_ENV")
+                .count(),
+            1
+        );
+        assert_eq!(workflow_value("OVERLAPPING_ENV"), Some("shared-value"));
     }
 
     #[test]
