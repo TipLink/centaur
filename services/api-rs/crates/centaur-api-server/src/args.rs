@@ -2965,6 +2965,7 @@ mod tests {
             ("SESSION_SHARED", "session-value"),
             ("WORKFLOW_ONLY", "workflow-value"),
             ("OVERLAPPING_ENV", "shared-value"),
+            (GITHUB_TOKEN_ENV, "workflow-token-value"),
         ]);
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2977,7 +2978,7 @@ mod tests {
             "--session-sandbox-passthrough-env",
             "SESSION_SHARED,OVERLAPPING_ENV",
             "--workflow-host-passthrough-env",
-            "WORKFLOW_ONLY,WORKFLOW_ONLY,OVERLAPPING_ENV",
+            "WORKFLOW_ONLY,WORKFLOW_ONLY,OVERLAPPING_ENV,GITHUB_TOKEN",
             "--kubernetes-sandbox-iron-proxy-mode",
             "disabled",
         ])
@@ -3008,6 +3009,14 @@ mod tests {
         // The new allowlist is workflow-host-only.
         assert_eq!(workflow_value("WORKFLOW_ONLY"), Some("workflow-value"));
         assert_eq!(session_value("WORKFLOW_ONLY"), None);
+
+        // Workflow-only passthrough is applied after the workflow template,
+        // while the interactive template retains its proxy placeholder.
+        assert_eq!(
+            workflow_value(GITHUB_TOKEN_ENV),
+            Some("workflow-token-value")
+        );
+        assert_eq!(session_value(GITHUB_TOKEN_ENV), Some(GITHUB_TOKEN_ENV));
 
         // Duplicate entries within the new list and overlaps with the shared
         // list are collapsed without changing the API process value.
