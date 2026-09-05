@@ -882,8 +882,8 @@ describe('slackbotv2', () => {
       string,
       unknown
     >
-    expect(firstInput.model).toBe('claude-fable-5')
-    expect(secondInput.model).toBe('claude-fable-5')
+    expect(firstInput.model).toBe('claude-fable-5-1')
+    expect(secondInput.model).toBe('claude-fable-5-1')
     expect(JSON.stringify(firstInput)).not.toContain('--claude')
     expect(JSON.stringify(firstInput)).not.toContain('--model')
     expect(JSON.stringify(firstInput)).toContain('first pass')
@@ -895,7 +895,7 @@ describe('slackbotv2', () => {
     expect(state).toEqual(
       expect.objectContaining({
         harnessType: 'claudecode',
-        model: 'claude-fable-5'
+        model: 'claude-fable-5-1'
       })
     )
   })

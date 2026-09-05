@@ -57,7 +57,7 @@ const PROVIDER_FLAGS: Record<string, { provider: string; harnessType: string }> 
 // values (--model opus). Either form implies claude-code unless an explicit
 // harness or provider flag selects something else.
 const CLAUDE_MODEL_ALIASES: Record<string, string> = {
-  fable: 'claude-fable-5',
+  fable: 'claude-fable-5-1',
   haiku: 'claude-haiku-4-5',
   opus: 'claude-opus-4-8',
   sonnet: 'claude-sonnet-5'
@@ -84,6 +84,7 @@ const STRATEGY_REASONING_EFFORTS = new Set([
 ])
 
 const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
+  'claude-fable-5-1': 'claudecode',
   'claude-fable-5': 'claudecode',
   'claude-haiku-4-5': 'claudecode',
   'claude-opus-4-8': 'claudecode',
@@ -99,7 +100,8 @@ const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
   'gpt-5.5-pro': 'codex',
   'gpt-5.6-luna': 'codex',
   'gpt-5.6-sol': 'codex',
-  'gpt-5.6-terra': 'codex'
+  'gpt-5.6-terra': 'codex',
+  'gpt-6-astra': 'codex'
 }
 
 // Values are one horizontal-whitespace-delimited token; a newline after the

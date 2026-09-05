@@ -69,7 +69,7 @@ describe('extractMessageOverrides', () => {
     })
     expect(extractMessageOverrides('--sonnet fix it').model).toBe('claude-sonnet-5')
     expect(extractMessageOverrides('--haiku fix it').model).toBe('claude-haiku-4-5')
-    expect(extractMessageOverrides('--fable fix it').model).toBe('claude-fable-5')
+    expect(extractMessageOverrides('--fable fix it').model).toBe('claude-fable-5-1')
   })
 
   test('--meta selects the Meta provider and codex harness', () => {
@@ -93,14 +93,14 @@ describe('extractMessageOverrides', () => {
       harnessType: 'claudecode',
       model: 'claude-sonnet-5'
     })
-    expect(extractMessageOverrides('--model fable go').model).toBe('claude-fable-5')
+    expect(extractMessageOverrides('--model fable go').model).toBe('claude-fable-5-1')
   })
 
   test('--model accepts a newline immediately after the value', () => {
     expect(extractMessageOverrides('--claude --model=fable\nwhat model are you')).toEqual({
       cleanedText: 'what model are you',
       harnessType: 'claudecode',
-      model: 'claude-fable-5',
+      model: 'claude-fable-5-1',
       reasoning: undefined
     })
     expect(
@@ -108,7 +108,7 @@ describe('extractMessageOverrides', () => {
     ).toEqual({
       cleanedText: '@Centaur AI what model are you',
       harnessType: 'claudecode',
-      model: 'claude-fable-5',
+      model: 'claude-fable-5-1',
       reasoning: undefined
     })
   })
@@ -117,7 +117,7 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('--claude --model=fable<br>what model are you')).toEqual({
       cleanedText: 'what model are you',
       harnessType: 'claudecode',
-      model: 'claude-fable-5',
+      model: 'claude-fable-5-1',
       reasoning: undefined
     })
   })
@@ -401,6 +401,18 @@ describe('validateStrategyOverrides', () => {
       provider: undefined,
       reasoning: undefined
     })
+    expect(validateStrategyOverrides({ model: 'claude-fable-5-1' })).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-fable-5-1',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'gpt-6-astra' })).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-6-astra',
+      provider: undefined,
+      reasoning: undefined
+    })
   })
 
   test('rejects aliases and arbitrary model ids from the strategy path', () => {
@@ -554,7 +566,7 @@ describe('SlackFormatConverter.extractPlainText + extractMessageOverrides', () =
     expect(extractMessageOverrides(text)).toEqual({
       cleanedText: 'examine github.com/paradigmxyz/centaur/pull/921. cross reference that PR.',
       harnessType: 'claudecode',
-      model: 'claude-fable-5',
+      model: 'claude-fable-5-1',
       reasoning: undefined
     })
   })
