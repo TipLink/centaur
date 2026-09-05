@@ -8,11 +8,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 VALIDATE_IMAGES_WORKFLOW = REPO_ROOT / ".github/workflows/validate-images.yml"
 PACKAGED_HARNESS_PROBE = REPO_ROOT / "scripts/probe-agent-harness-image.sh"
 REVIEWED_VERSION_BASELINES = {
-    # These are TipLink's tested pins. Codex 0.144.0 already supports GPT-5.6;
-    # 0.144.1 is retained for its later installer/code-mode fixes. Claude Code
-    # 2.1.197 is the Sonnet 5 floor, and 2.1.198 is TipLink's tested patch.
-    "CLAUDE_CODE_VERSION": (2, 1, 198),
-    "CODEX_VERSION": (0, 144, 1),
+    # These are TipLink's tested pins for GPT-6 Astra and Claude Fable 5.1.
+    # Keep the baselines at the exact reviewed versions so an older CLI cannot
+    # silently restore a model configuration that the upstream rejects.
+    "CLAUDE_CODE_VERSION": (2, 1, 261),
+    "CODEX_VERSION": (0, 153, 4),
     "PLAYWRIGHT_VERSION": (1, 58, 0),
 }
 
