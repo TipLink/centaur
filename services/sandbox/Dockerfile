@@ -85,6 +85,7 @@ ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
 ARG PLAYWRIGHT_VERSION=1.58.0
 ARG KACHE_VERSION=v0.7.0
+ARG SKILLS_CLI_VERSION=1.5.25
 # Bootstrap pnpm for agents working in JS monorepos. The exact baked version
 # doesn't constrain repos: when a repo's `packageManager` field declares a
 # different version, pnpm downloads and runs that one (v11 `pmOnFail=download`
@@ -218,11 +219,12 @@ RUN set -eux; \
     "$AGENT_BROWSER_EXECUTABLE_PATH" --version
 
 # ── Agent skills + workspace setup (rarely changes) ─────────────────────────
-RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked \
-    npx -y skills add vercel-labs/agent-browser
 # git-branch configures each writable clone with the publishing GitHub account.
 # A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
-RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
+RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked \
+    mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
+    && npx -y "skills@${SKILLS_CLI_VERSION}" add vercel-labs/agent-browser \
+      --agent amp claude-code codex pi --yes \
     && git config --global init.defaultBranch main \
     && git config --global push.autoSetupRemote true \
     && git config --global core.hooksPath /opt/centaur/git-hooks \
