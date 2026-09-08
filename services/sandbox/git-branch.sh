@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # git-branch — create a writable working copy from a read-only mounted repo.
 #
 # Usage:  git-branch <org/repo> <branch slug>
@@ -9,6 +9,7 @@
 # and supports commit, push, and PR workflows.
 
 set -euo pipefail
+IFS=$'\n\t'
 
 usage() {
     echo "Usage: git-branch <org/repo> <branch slug>" >&2
@@ -36,9 +37,6 @@ DEST="$HOME/branches/$REPO"
 configure_git_identity() {
     local name="${CENTAUR_GIT_USER_NAME:-}"
     local email="${CENTAUR_GIT_USER_EMAIL:-}"
-    local github_identity_query='[.name // .login,
-        .email // ((.id | tostring) + "+" + .login + "@users.noreply.github.com")
-    ] | @tsv'
 
     if [ -n "$name" ] || [ -n "$email" ]; then
         if [ -z "$name" ] || [ -z "$email" ]; then
@@ -46,12 +44,6 @@ configure_git_identity() {
                 "must be set together" >&2
             return 1
         fi
-    elif command -v gh >/dev/null 2>&1 && [ -n "${GITHUB_TOKEN:-}" ]; then
-        local identity
-        identity="$({
-            GH_PROMPT_DISABLED=1 gh api user --jq "$github_identity_query"
-        } 2>/dev/null || true)"
-        IFS=$'\t' read -r name email <<< "$identity"
     fi
 
     if [ -n "$name" ] && [ -n "$email" ]; then
@@ -61,6 +53,29 @@ configure_git_identity() {
         echo "Warning: no Git author identity is configured; set" \
             "CENTAUR_GIT_USER_NAME and CENTAUR_GIT_USER_EMAIL before committing" >&2
     fi
+}
+
+# Sign commits locally when the runner provides a dedicated private key. Push
+# authentication remains independent and continues to use GITHUB_TOKEN.
+configure_git_signing() {
+    local signing_key="${CENTAUR_GIT_SIGNING_KEY:-}"
+
+    if [ -z "$signing_key" ]; then
+        return
+    fi
+    if [ ! -f "$signing_key" ] || [ ! -r "$signing_key" ]; then
+        echo "Error: CENTAUR_GIT_SIGNING_KEY must name a readable private key file" >&2
+        return 1
+    fi
+
+    git -C "$DEST" config gpg.format ssh
+    git -C "$DEST" config user.signingkey "$signing_key"
+    git -C "$DEST" config commit.gpgsign true
+}
+
+configure_git() {
+    configure_git_identity
+    configure_git_signing
 }
 
 if [[ ! "$SLUG" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$ ]]; then
@@ -76,7 +91,7 @@ fi
 
 if [ -d "$DEST/.git" ]; then
     echo "$DEST already exists — reusing" >&2
-    configure_git_identity
+    configure_git
     echo "$DEST"
     exit 0
 fi
@@ -99,6 +114,6 @@ fi
 BRANCH="centaur/$SLUG-$(date +%s)"
 git -C "$DEST" checkout -q -b "$BRANCH"
 
-configure_git_identity
+configure_git
 
 echo "$DEST"
