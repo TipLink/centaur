@@ -199,7 +199,12 @@ jobs:
           # per-arch release builds are pushed by digest only.
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
           provenance: true
-          sbom: true
+          # BuildKit 0.32.2 rejects attestations larger than 40 MiB. The agent
+          # image's package-owned file inventory exceeds that limit on both
+          # architectures; retain SBOMs for every other image and provenance
+          # for all images until the scanner supports package-only output.
+          # https://github.com/moby/buildkit/issues/7044
+          sbom: ${{ matrix.service != 'agent' }}
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
           cache-from: |
