@@ -7,7 +7,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 SANDBOX_DIR = Path(__file__).parent
 GIT_BRANCH = SANDBOX_DIR / "git-branch.sh"
 COMMIT_MSG_HOOK = SANDBOX_DIR / "git-hooks" / "commit-msg"
@@ -54,11 +53,12 @@ class GitBranchTest(unittest.TestCase):
         )
         return Path(result.stdout.strip())
 
-    def test_uses_authenticated_github_identity(self) -> None:
+    def test_does_not_query_github_for_identity(self) -> None:
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         gh = bin_dir / "gh"
-        gh.write_text("#!/bin/sh\nprintf 'Perry Dime\\tsvc_ai@paradigm.xyz\\n'\n")
+        marker = self.root / "gh-called"
+        gh.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
         gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
 
         destination = self._run_git_branch(
@@ -68,27 +68,15 @@ class GitBranchTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(
-            self._git("-C", str(destination), "config", "user.name").stdout.strip(),
-            "Perry Dime",
+        self.assertFalse(marker.exists())
+        result = subprocess.run(
+            ["git", "-C", str(destination), "config", "--local", "--get", "user.name"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
         )
-        self.assertEqual(
-            self._git("-C", str(destination), "config", "user.email").stdout.strip(),
-            "svc_ai@paradigm.xyz",
-        )
-        (destination / "CHANGELOG.md").write_text("fixed\n")
-        self._git("-C", str(destination), "add", "CHANGELOG.md")
-        self._git("-C", str(destination), "commit", "-m", "fix: test attribution")
-        commit = self._git(
-            "-C",
-            str(destination),
-            "show",
-            "-s",
-            "--format=%an <%ae>%n%B",
-            "HEAD",
-        ).stdout
-        self.assertTrue(commit.startswith("Perry Dime <svc_ai@paradigm.xyz>\n"))
-        self.assertNotIn("Co-authored-by:", commit)
+        self.assertEqual(result.returncode, 1)
 
     def test_explicit_identity_does_not_require_github(self) -> None:
         destination = self._run_git_branch(
@@ -152,6 +140,50 @@ class GitBranchTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must be set together", result.stderr)
+
+    def test_configures_ssh_commit_signing(self) -> None:
+        signing_key = self.root / "centaur_commit_signing"
+        signing_key.write_text("private key placeholder\n")
+        destination = self._run_git_branch(
+            {
+                "CENTAUR_GIT_USER_NAME": "Release Bot",
+                "CENTAUR_GIT_USER_EMAIL": "release@example.com",
+                "CENTAUR_GIT_SIGNING_KEY": str(signing_key),
+                "GITHUB_TOKEN": "push-token-placeholder",
+            }
+        )
+
+        expected = {
+            "gpg.format": "ssh",
+            "user.signingkey": str(signing_key),
+            "commit.gpgsign": "true",
+        }
+        for key, value in expected.items():
+            self.assertEqual(
+                self._git(
+                    "-C", str(destination), "config", "--local", key
+                ).stdout.strip(),
+                value,
+            )
+
+    def test_rejects_missing_signing_key(self) -> None:
+        result = subprocess.run(
+            [str(GIT_BRANCH), "acme/centaur", "fix-attribution"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "HOME": str(self.home),
+                "CENTAUR_GIT_USER_NAME": "Release Bot",
+                "CENTAUR_GIT_USER_EMAIL": "release@example.com",
+                "CENTAUR_GIT_SIGNING_KEY": str(self.root / "missing-key"),
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must name a readable private key file", result.stderr)
 
 
 class CommitMessageHookTest(unittest.TestCase):

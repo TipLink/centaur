@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-    git curl wget ca-certificates gnupg lsb-release sudo \
+    git openssh-client curl wget ca-certificates gnupg lsb-release sudo \
     build-essential pkg-config cmake ninja-build \
     ffmpeg ghostscript dvisvgm file \
     libssl-dev libclang-dev protobuf-compiler \
