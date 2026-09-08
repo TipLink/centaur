@@ -86,6 +86,7 @@ ARG KUBECTL_VERSION=v1.34.2
 ARG PLAYWRIGHT_VERSION=1.58.0
 ARG KACHE_VERSION=v0.7.0
 ARG SKILLS_CLI_VERSION=1.5.25
+ARG AGENT_BROWSER_SKILL_REVISION=021d9255e543d2f1ab66b87f338d85c3d7a910be
 # Bootstrap pnpm for agents working in JS monorepos. The exact baked version
 # doesn't constrain repos: when a repo's `packageManager` field declares a
 # different version, pnpm downloads and runs that one (v11 `pmOnFail=download`
@@ -223,8 +224,11 @@ RUN set -eux; \
 # A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
 RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked \
     mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
-    && npx -y "skills@${SKILLS_CLI_VERSION}" add vercel-labs/agent-browser \
-      --agent amp claude-code codex pi --yes \
+    && npx -y "skills@${SKILLS_CLI_VERSION}" add \
+      "https://github.com/vercel-labs/agent-browser/tree/${AGENT_BROWSER_SKILL_REVISION}/skills/agent-browser" \
+      --skill agent-browser --agent amp claude-code codex pi --yes \
+    && jq -e --arg ref "${AGENT_BROWSER_SKILL_REVISION}" \
+      '.skills["agent-browser"].ref == $ref' skills-lock.json >/dev/null \
     && git config --global init.defaultBranch main \
     && git config --global push.autoSetupRemote true \
     && git config --global core.hooksPath /opt/centaur/git-hooks \
