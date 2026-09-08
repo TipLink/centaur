@@ -2237,6 +2237,80 @@ describe('slackbotv2', () => {
     await Promise.all(firstWaits)
   })
 
+  it('queues a --queue mention as the next turn without steering the active turn', async () => {
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before queued execution.')
+    const firstMention = await postUserMessage(`<@${BOT_USER_ID}> start a long run`, parent.ts)
+    const firstWaits: Promise<unknown>[] = []
+    const firstResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-queue-first',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: firstMention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> start a long run`
+        }
+      }),
+      {},
+      waitUntilContext(firstWaits)
+    )
+    expect(firstResponse.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+
+    const queuedText = `<@${BOT_USER_ID}> --queue run this after the current turn`
+    const queuedMention = await postUserMessage(queuedText, parent.ts)
+    const queuedWaits: Promise<unknown>[] = []
+    const queuedResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-queue-second',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: queuedMention.ts,
+          thread_ts: parent.ts,
+          text: queuedText
+        }
+      }),
+      {},
+      waitUntilContext(queuedWaits)
+    )
+    expect(queuedResponse.status).toBe(200)
+    await waitFor(() => codexApi.appends.length === 2)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.appends[1]!.body.steer_active_execution).toBe(false)
+    expect(sessionMessageTexts(codexApi.appends[1]!.body.messages).at(-1)).toBe(
+      `@${BOT_USER_ID} run this after the current turn`
+    )
+
+    const firstExecutionId = codexApi.eventRequests[0]!.executionId
+    codexApi.emitOutputLines(
+      threadKey(parent.ts),
+      sampleCodexOutputLines('First turn complete.'),
+      firstExecutionId
+    )
+    await waitFor(() => codexApi.executes.length === 2)
+    await waitFor(() => codexApi.eventRequests.length === 2)
+
+    const secondExecutionId = codexApi.eventRequests[1]!.executionId
+    codexApi.emitOutputLines(
+      threadKey(parent.ts),
+      sampleCodexOutputLines('Queued turn complete.'),
+      secondExecutionId
+    )
+    await Promise.all([...firstWaits, ...queuedWaits])
+    expect(await threadText(parent.ts)).toContain('Queued turn complete.')
+  })
+
   it('renders raw turn.failed session output as visible final text', async () => {
     codexApi.autoRespond = false
 

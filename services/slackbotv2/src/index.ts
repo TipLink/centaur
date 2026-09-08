@@ -145,6 +145,8 @@ const LATE_SLACK_FILE_PENDING_TTL_MS = 60_000
 const LATE_SLACK_FILE_CONSUMED_TTL_MS = 5 * 60_000
 const LATE_SLACK_FILE_IDLE_WAIT_MS = 90_000
 const LATE_SLACK_FILE_IDLE_POLL_MS = 500
+const QUEUED_EXECUTION_WAIT_MS = 4 * 60 * 60 * 1000
+const QUEUED_EXECUTION_POLL_MS = 500
 const LATE_SLACK_FILE_MESSAGE_TEXT = 'Late Slack file attachment for the previous message.'
 const SLACK_BLOCK_ACTION_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000
 const SLACK_BLOCK_ACTION_LEASE_TTL_MS = 60 * 1000
@@ -160,6 +162,7 @@ type PendingLateSlackFileMention = {
 
 type StickyThreadOverrides = Pick<SlackbotV2ThreadState, 'harnessType' | 'model' | 'provider'>
 const DEFAULT_MESSAGE_OVERRIDES_STRATEGY = createFlagMessageOverridesStrategy()
+const queuedExecutionChains = new Map<string, Promise<void>>()
 
 export async function messageOverridesForText(
   options: SlackbotV2Options,
@@ -821,6 +824,8 @@ type SyncThreadMessageInput = {
   retryAttempt?: number
   /** Resolved once per local handoff chain so retryable failures stay idempotent. */
   resolvedMessageOverrides?: Awaited<ReturnType<typeof messageOverridesForText>>
+  /** True for the detached worker that is waiting to start a --queue message. */
+  queueWorker?: boolean
   state: StateAdapter
 }
 
@@ -945,6 +950,8 @@ async function syncThreadMessageToSession(
     setMessageText(serializedMessage, messageOverrides.cleanedText)
   }
   const overrides = messageOverrides.overrides
+  const shouldQueueBehindActiveExecution =
+    input.mode === 'execute' && overrides.queue === true && state.activeExecution === true
   const stickyOverridesUpdate = stickyThreadOverrideUpdate(overrides)
   const effectiveOverrides = resolveStickyThreadOverrides(state, stickyOverridesUpdate)
   // Slack-only "Open chat in Console" link on the FIRST assistant message in
@@ -986,11 +993,18 @@ async function syncThreadMessageToSession(
         model: effectiveModel
       })
     : undefined
-  if (overrides.harnessType || overrides.model || overrides.provider || overrides.reasoning) {
+  if (
+    overrides.harnessType ||
+    overrides.model ||
+    overrides.provider ||
+    overrides.queue ||
+    overrides.reasoning
+  ) {
     traceLog(input.options, 'slackbotv2_forward_overrides_parsed', trace, {
       harness_type: overrides.harnessType,
       model: overrides.model,
       provider: overrides.provider,
+      queue: overrides.queue,
       reasoning: overrides.reasoning
     })
   }
@@ -1057,6 +1071,7 @@ async function syncThreadMessageToSession(
     metadataModel: shouldStartExecution ? effectiveModel : undefined,
     provider: shouldStartExecution ? resolvedProvider : undefined,
     reasoning: resolvedReasoning,
+    steerActiveExecution: !shouldQueueBehindActiveExecution,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },
@@ -1174,6 +1189,9 @@ async function syncThreadMessageToSession(
     traceLog(input.options, 'slackbotv2_forward_complete', trace)
     recordForward(input.mode, 'complete', traceStartedAtMs)
     if (input.retryAttempt) slackbotMetrics.handoffRetries.inc({ outcome: 'succeeded' })
+    if (shouldQueueBehindActiveExecution && !input.queueWorker) {
+      scheduleQueuedExecution(thread, message, input, messageOverrides, trace)
+    }
     return
   }
 
@@ -1252,6 +1270,67 @@ async function syncThreadMessageToSession(
     })
     recordForward(input.mode, 'error_notice_rendered', traceStartedAtMs)
   }
+}
+
+function scheduleQueuedExecution(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  input: SyncThreadMessageInput,
+  resolvedMessageOverrides: Awaited<ReturnType<typeof messageOverridesForText>>,
+  trace: SlackbotV2Trace
+): void {
+  traceLog(input.options, 'slackbotv2_queued_execution_scheduled', trace)
+  const previous = queuedExecutionChains.get(thread.id) ?? Promise.resolve()
+  const promise = previous.catch(() => undefined).then(async () => {
+    const startedAtMs = nowMs()
+    while (elapsedMs(startedAtMs) < QUEUED_EXECUTION_WAIT_MS) {
+      const latest = (await thread.state) ?? {}
+      if (latest.executedMessageIds?.includes(message.id)) {
+        traceLog(input.options, 'slackbotv2_queued_execution_already_started', trace)
+        return
+      }
+      if (latest.activeExecution === true) {
+        await sleep(QUEUED_EXECUTION_POLL_MS)
+        continue
+      }
+
+      const assistantStatusVisible = await setInitialAssistantStatus(
+        thread,
+        input.options,
+        trace
+      ).catch(() => false)
+      await syncThreadMessageToSession(thread, message, {
+        initialAssistantStatusRequested: true,
+        initialAssistantStatusVisible: assistantStatusVisible,
+        mode: 'execute',
+        options: input.options,
+        queueWorker: true,
+        resolvedMessageOverrides,
+        state: input.state
+      })
+
+      const afterAttempt = (await thread.state) ?? {}
+      if (afterAttempt.executedMessageIds?.includes(message.id)) {
+        traceLog(input.options, 'slackbotv2_queued_execution_started', trace, {
+          waited_ms: elapsedMs(startedAtMs)
+        })
+        return
+      }
+      await sleep(QUEUED_EXECUTION_POLL_MS)
+    }
+    traceWarn(input.options, 'slackbotv2_queued_execution_wait_timeout', trace, {
+      waited_ms: elapsedMs(startedAtMs)
+    })
+  }).catch(error => {
+    traceWarn(input.options, 'slackbotv2_queued_execution_failed', trace, {
+      error: errorMessage(error)
+    })
+  })
+  queuedExecutionChains.set(thread.id, promise)
+  void promise.finally(() => {
+    if (queuedExecutionChains.get(thread.id) === promise) queuedExecutionChains.delete(thread.id)
+  })
+  backgroundWaitUntil(promise)
 }
 
 function scheduleExecutionRender(

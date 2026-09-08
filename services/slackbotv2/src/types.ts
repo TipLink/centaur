@@ -69,6 +69,8 @@ export type SlackbotV2SessionMessage = {
 
 export type SlackbotV2AppendMessagesRequest = {
   messages: SlackbotV2SessionMessage[]
+  /** Defaults to true. False persists the messages without steering an active turn. */
+  steer_active_execution?: boolean
 }
 
 export type SlackbotV2CreateSessionRequest = {
@@ -270,6 +272,8 @@ export type ForwardSessionInput = {
   metadataModel?: string
   /** Effective model provider selected by sticky thread flags (--bedrock); codex only. */
   provider?: string
+  /** Whether appending these messages may steer the currently active execution. */
+  steerActiveExecution?: boolean
   /** Per-turn reasoning effort parsed from the `-rsn` flag (codex only). */
   reasoning?: string
   onEventId(eventId: number): void

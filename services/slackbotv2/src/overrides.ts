@@ -6,6 +6,7 @@
  *   --model <name> (or --model=<name>)           pick the model within that harness
  *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex)
  *   --fable | --opus | --sonnet | --haiku        model shortcuts (imply claude-code)
+ *   --queue                                       run after the active turn instead of steering it
  *
  * Flags are stripped from the text before it reaches the agent. The harness
  * applies at session creation — an explicit harness flag on a thread pinned to
@@ -29,6 +30,8 @@ export type HarnessOverrides = {
   harnessType?: string
   model?: string
   provider?: string
+  /** Per-message delivery behavior; never persisted as a sticky thread override. */
+  queue?: boolean
   reasoning?: string
 }
 
@@ -143,7 +146,14 @@ export function extractMessageOverrides(text: string): MessageOverrides {
   let model: string | undefined
   let modelAliasHarness: string | undefined
   let provider: string | undefined
+  let queue: boolean | undefined
   let reasoning: string | undefined
+
+  const queueMatch = flagPattern('queue').exec(cleaned)
+  if (queueMatch) {
+    queue = true
+    cleaned = stripMatch(cleaned, queueMatch)
+  }
 
   const modelMatch = MODEL_FLAG_PATTERN.exec(cleaned)
   if (modelMatch) {
@@ -195,6 +205,7 @@ export function extractMessageOverrides(text: string): MessageOverrides {
     harnessType,
     model,
     provider,
+    ...(queue ? { queue } : {}),
     reasoning
   }
 }
@@ -204,6 +215,7 @@ export function validateStrategyOverrides(
     harness?: unknown
     model?: unknown
     provider?: unknown
+    queue?: unknown
     reasoning?: unknown
   } | null | undefined
 ): HarnessOverrides {
@@ -211,6 +223,7 @@ export function validateStrategyOverrides(
   let harnessType: string | undefined
   let model: string | undefined
   let provider: string | undefined
+  const queue = raw.queue === true ? true : undefined
   let reasoning: string | undefined
 
   const harnessRaw = cleanString(raw.harness)
@@ -245,7 +258,7 @@ export function validateStrategyOverrides(
     reasoning = harnessType === undefined || harnessType === 'codex' ? normalized : undefined
   }
 
-  return { harnessType, model, provider, reasoning }
+  return { harnessType, model, provider, ...(queue ? { queue } : {}), reasoning }
 }
 
 /**

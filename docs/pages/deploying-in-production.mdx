@@ -347,6 +347,8 @@ reply with exactly PONG
 
 Slack messages without a harness flag use Codex. Use `--amp`, `--claude`,
 `--codex`, or `--pi` only when you want to select a specific harness.
+While a turn is running, add `--queue` to a message to run it as the next turn
+instead of steering the active turn.
 
 Inspect sandbox pods with the labels Centaur actually sets:
 
