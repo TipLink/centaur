@@ -38,9 +38,9 @@ use centaur_telemetry::{
     record_http_request_started, set_span_parent_trace,
 };
 use centaur_workflows::{
-    CreateWorkflowRunRequest, WebhookFilter, WorkflowRun, WorkflowRuntime, WorkflowWebhookAuth,
-    WorkflowWebhookSpec, WorkflowWebhookTriggerKey, decode_workflow_task_token,
-    workflow_task_signing_key_from_env,
+    CreateWorkflowRunRequest, WebhookFilter, WorkflowRun, WorkflowRuntime,
+    WorkflowTaskTokenIdentity, WorkflowWebhookAuth, WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
+    decode_workflow_task_token, workflow_task_signing_key_from_env,
 };
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
@@ -2607,6 +2607,36 @@ enum WorkflowApiAuthorization {
     Principal(WorkflowApiClaims),
 }
 
+#[derive(Debug)]
+enum WorkflowRunCreateAuthorization {
+    WorkflowApi(WorkflowApiAuthorization),
+    WorkflowTask(WorkflowTaskTokenIdentity),
+}
+
+impl FromRequestParts<AppState> for WorkflowRunCreateAuthorization {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if header_value(&parts.headers, "X-Centaur-Workflow-Task-Token")
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            let signing_key = workflow_task_signing_key_from_env()
+                .map_err(|error| ApiError::Internal(error.to_string()))?;
+            let identity = workflow_task_identity_from_headers(
+                &parts.headers,
+                &signing_key,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            )?
+            .expect("non-empty task token header was checked above");
+            return Ok(Self::WorkflowTask(identity));
+        }
+        authorize_workflow_api(&parts.headers).map(Self::WorkflowApi)
+    }
+}
+
 impl FromRequestParts<AppState> for WorkflowApiAuthorization {
     type Rejection = ApiError;
 
@@ -2676,6 +2706,23 @@ fn authorize_workflow_api(headers: &HeaderMap) -> Result<WorkflowApiAuthorizatio
         ));
     }
     Ok(WorkflowApiAuthorization::Principal(claims))
+}
+
+fn workflow_task_identity_from_headers(
+    headers: &HeaderMap,
+    signing_key: &[u8],
+    now_unix: i64,
+) -> Result<Option<WorkflowTaskTokenIdentity>, ApiError> {
+    let token = header_value(headers, "X-Centaur-Workflow-Task-Token").unwrap_or_default();
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    decode_workflow_task_token(signing_key, token, now_unix)
+        .map(Some)
+        .ok_or_else(|| {
+            ApiError::Unauthorized("invalid or expired workflow-task authorization".to_owned())
+        })
 }
 
 fn authorize_session_api(headers: &HeaderMap) -> Result<WorkflowApiAuthorization, ApiError> {
@@ -2860,6 +2907,26 @@ fn ensure_workflow_run_authorized(
     Ok(())
 }
 
+fn ensure_workflow_run_create_authorized(
+    authorization: &WorkflowRunCreateAuthorization,
+    workflow_name: &str,
+    input: &Value,
+    allowed_names: &BTreeSet<String>,
+) -> Result<Option<SlackThreadContext>, ApiError> {
+    match authorization {
+        WorkflowRunCreateAuthorization::WorkflowApi(workflow_api) => {
+            if matches!(workflow_api, WorkflowApiAuthorization::Principal(_)) {
+                ensure_workflow_api_name_allowed(workflow_name, allowed_names)?;
+            }
+            ensure_workflow_input_authorized(workflow_api, input)
+        }
+        WorkflowRunCreateAuthorization::WorkflowTask(_) => {
+            ensure_workflow_api_name_allowed(workflow_name, allowed_names)?;
+            Ok(None)
+        }
+    }
+}
+
 fn ensure_workflow_service_authorized(
     authorization: &WorkflowApiAuthorization,
     operation: &str,
@@ -2874,17 +2941,24 @@ fn ensure_workflow_service_authorized(
 
 async fn create_workflow_run(
     State(state): State<AppState>,
-    authorization: WorkflowApiAuthorization,
+    authorization: WorkflowRunCreateAuthorization,
     Json(request): Json<CreateWorkflowRunRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
-    if matches!(authorization, WorkflowApiAuthorization::Principal(_)) {
-        ensure_workflow_api_name_allowed(
-            &request.workflow_name,
-            &configured_workflow_api_names("WORKFLOW_API_ALLOWED_NAMES"),
-        )?;
+    ensure_workflow_run_create_authorized(
+        &authorization,
+        &request.workflow_name,
+        &request.input,
+        &configured_workflow_api_names("WORKFLOW_API_ALLOWED_NAMES"),
+    )?;
+    if let WorkflowRunCreateAuthorization::WorkflowTask(identity) = &authorization {
+        tracing::info!(
+            parent_workflow_run_id = %identity.run_id,
+            parent_workflow_task_id = %identity.task_id,
+            child_workflow_name = %request.workflow_name,
+            "authorized child workflow creation with signed task capability"
+        );
     }
-    ensure_workflow_input_authorized(&authorization, &request.input)?;
     let run = workflows.create_run(request).await?;
     Ok(Json(serde_json::to_value(run)?))
 }
@@ -4126,6 +4200,67 @@ mod workflow_api_tests {
         );
         assert!(constant_time_eq(b"service-token", b"service-token"));
         assert!(!constant_time_eq(b"service-token", b"other-token"));
+    }
+
+    #[test]
+    fn workflow_task_capability_can_create_only_allowlisted_children() {
+        let authorization =
+            WorkflowRunCreateAuthorization::WorkflowTask(WorkflowTaskTokenIdentity {
+                run_id: "parent-run".to_owned(),
+                task_id: "parent-task".to_owned(),
+            });
+        let allowed = BTreeSet::from(["compliance_cdd_research".to_owned()]);
+
+        assert!(
+            ensure_workflow_run_create_authorized(
+                &authorization,
+                "compliance_cdd_research",
+                &json!({"metadata": {"source": "scheduled-parent"}}),
+                &allowed,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(matches!(
+            ensure_workflow_run_create_authorized(
+                &authorization,
+                "unreviewed_workflow",
+                &json!({}),
+                &allowed,
+            ),
+            Err(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn workflow_task_create_header_is_signed_scoped_and_expiring() {
+        let signing_key = b"workflow-signing-key";
+        let now = 1_700_000_000;
+        let task_token = centaur_workflows::mint_workflow_task_token(
+            signing_key,
+            "parent-run",
+            "parent-task",
+            now + 300,
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer proxy-injected-principal-jwt".parse().unwrap(),
+        );
+        headers.insert("x-centaur-workflow-task-token", task_token.parse().unwrap());
+
+        assert_eq!(
+            workflow_task_identity_from_headers(&headers, signing_key, now).unwrap(),
+            Some(WorkflowTaskTokenIdentity {
+                run_id: "parent-run".to_owned(),
+                task_id: "parent-task".to_owned(),
+            })
+        );
+        assert!(matches!(
+            workflow_task_identity_from_headers(&headers, signing_key, now + 301),
+            Err(ApiError::Unauthorized(_))
+        ));
     }
 
     #[test]
