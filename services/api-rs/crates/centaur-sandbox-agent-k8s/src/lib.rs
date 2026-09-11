@@ -505,7 +505,11 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         self.patch_sandbox_merge(id, sandbox_pause_patch(jiff::Timestamp::now()))
-            .await
+            .await?;
+        // A paused sandbox has no agent pod, so its egress proxy is idle.
+        // Release that pod slot during the retention window; resume()
+        // recreates the proxy from the principal recorded at create.
+        self.delete_iron_proxy_resources(id).await
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
