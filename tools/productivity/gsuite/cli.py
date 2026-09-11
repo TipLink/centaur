@@ -124,9 +124,53 @@ def gmail_read(
             console.print(f"[green]CC:[/] {msg['cc']}")
         console.print(f"[green]Date:[/] {msg['date']}")
         console.print(f"\n{msg['body']}")
+        if msg["attachments"]:
+            console.print("\n[bold]Attachments:[/]")
+            for attachment in msg["attachments"]:
+                name = attachment["filename"] or "(unnamed)"
+                console.print(
+                    f"- {name} ({attachment['mime_type']}, {attachment['size']} bytes) "
+                    f"[dim]part_id={attachment['part_id']} "
+                    f"attachment_id={attachment['attachment_id'] or '-'}[/]"
+                )
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
+
+
+@gmail_app.command("download-attachment")
+def gmail_download_attachment(
+    message_id: str = typer.Argument(..., help="Message ID"),
+    part_id: str | None = typer.Option(None, "--part-id", help="MIME part ID from gmail read"),
+    attachment_id: str | None = typer.Option(
+        None, "--attachment-id", help="Gmail attachment ID from gmail read"
+    ),
+    output: str = typer.Option(".", "--output", "-o", help="Output directory or path"),
+) -> None:
+    """Download an attachment from a Gmail message.
+
+    Examples:
+        gsuite gmail download-attachment "18d1234567890abc" --part-id "1"
+        gsuite gmail download-attachment "18d1234567890abc" --attachment-id "ANGjdJ..." -o file.pdf
+    """
+    from .client import _gmail_attachment_filename, _gmail_download_attachment_bytes
+
+    try:
+        metadata, data = _gmail_download_attachment_bytes(
+            message_id,
+            part_id=part_id,
+            attachment_id=attachment_id,
+        )
+        filename = _gmail_attachment_filename(metadata, message_id)
+        output_path = Path(output)
+        if output_path.is_dir():
+            output_path = output_path / filename
+        output_path.write_bytes(data)
+        console.print(f"[green]✓ Downloaded {filename}[/]")
+        console.print(f"[dim]{output_path.absolute()}[/]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
 
 
 @gmail_app.command("send")
