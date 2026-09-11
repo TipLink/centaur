@@ -47,9 +47,10 @@ class _FakeDriveService:
 
 
 class _FakeGmailMessagesApi:
-    def __init__(self, full_result: dict, raw_result: dict):
+    def __init__(self, full_result: dict, raw_result: dict, attachment_result: dict | None = None):
         self.full_result = full_result
         self.raw_result = raw_result
+        self.attachments_api = _FakeGmailAttachmentsApi(attachment_result or {})
         self.get_calls: list[dict] = []
 
     def get(self, **kwargs):
@@ -59,6 +60,19 @@ class _FakeGmailMessagesApi:
         if kwargs.get("format") == "raw":
             return _CreateRequest(self.raw_result)
         raise AssertionError(f"Unexpected Gmail format: {kwargs.get('format')}")
+
+    def attachments(self):
+        return self.attachments_api
+
+
+class _FakeGmailAttachmentsApi:
+    def __init__(self, result: dict):
+        self.result = result
+        self.get_calls: list[dict] = []
+
+    def get(self, **kwargs):
+        self.get_calls.append(kwargs)
+        return _CreateRequest(self.result)
 
 
 class _FakeGmailUsersApi:
@@ -70,8 +84,17 @@ class _FakeGmailUsersApi:
 
 
 class _FakeGmailService:
-    def __init__(self, full_result: dict, raw_result: dict):
-        self.messages_api = _FakeGmailMessagesApi(full_result, raw_result)
+    def __init__(
+        self,
+        full_result: dict,
+        raw_result: dict,
+        attachment_result: dict | None = None,
+    ):
+        self.messages_api = _FakeGmailMessagesApi(
+            full_result,
+            raw_result,
+            attachment_result,
+        )
         self.users_api = _FakeGmailUsersApi(self.messages_api)
 
     def users(self):
@@ -233,6 +256,189 @@ def test_gmail_read_returns_plain_html_and_raw_content(monkeypatch):
         {"userId": "me", "id": "msg-1", "format": "full"},
         {"userId": "me", "id": "msg-1", "format": "raw"},
     ]
+
+
+def test_gmail_read_recursively_lists_inline_and_external_attachments(monkeypatch):
+    inline_data = base64.urlsafe_b64encode(b"small").decode().rstrip("=")
+    full_result = {
+        "id": "msg-1",
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [],
+            "parts": [
+                {
+                    "partId": "0",
+                    "mimeType": "text/plain",
+                    "body": {"data": base64.urlsafe_b64encode(b"Body").decode(), "size": 4},
+                },
+                {
+                    "partId": "1",
+                    "mimeType": "multipart/related",
+                    "body": {"size": 0},
+                    "parts": [
+                        {
+                            "partId": "1.0",
+                            "mimeType": "image/png",
+                            "filename": "logo.png",
+                            "headers": [{"name": "Content-Disposition", "value": "inline"}],
+                            "body": {"data": inline_data, "size": 5},
+                        },
+                        {
+                            "partId": "1.1",
+                            "mimeType": "application/pdf",
+                            "filename": "report.pdf",
+                            "headers": [
+                                {
+                                    "name": "Content-Disposition",
+                                    "value": 'attachment; filename="report.pdf"',
+                                }
+                            ],
+                            "body": {"attachmentId": "att-123", "size": 7},
+                        },
+                    ],
+                },
+            ],
+        },
+    }
+    fake_service = _FakeGmailService(full_result, {"raw": ""})
+    monkeypatch.setattr(client, "get_gmail_service", lambda: fake_service)
+
+    result = client.gmail_read("msg-1")
+
+    assert result["attachments"] == [
+        {
+            "part_id": "1.0",
+            "attachment_id": "",
+            "filename": "logo.png",
+            "mime_type": "image/png",
+            "size": 5,
+            "content_disposition": "inline",
+        },
+        {
+            "part_id": "1.1",
+            "attachment_id": "att-123",
+            "filename": "report.pdf",
+            "mime_type": "application/pdf",
+            "size": 7,
+            "content_disposition": 'attachment; filename="report.pdf"',
+        },
+    ]
+
+
+def test_gmail_download_attachment_fetches_external_data(monkeypatch):
+    attachment_bytes = b"pdfdata"
+    encoded = base64.urlsafe_b64encode(attachment_bytes).decode().rstrip("=")
+    full_result = {
+        "id": "msg-1",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "mimeType": "application/pdf",
+                    "filename": "report.pdf",
+                    "body": {"attachmentId": "att-123", "size": len(attachment_bytes)},
+                }
+            ]
+        },
+    }
+    fake_service = _FakeGmailService(
+        full_result,
+        {},
+        {"data": encoded, "size": len(attachment_bytes)},
+    )
+    monkeypatch.setattr(client, "get_gmail_service", lambda: fake_service)
+    saved: dict = {}
+
+    def fake_save_attachment(**kwargs):
+        saved.update(kwargs)
+        return {"attachment_id": "thread-att-1", "filename": kwargs["name"]}
+
+    monkeypatch.setattr(client, "save_attachment", fake_save_attachment)
+
+    result = client.gmail_download_attachment("msg-1", attachment_id="att-123")
+
+    assert result == {"attachment_id": "thread-att-1", "filename": "report.pdf"}
+    assert saved == {
+        "name": "report.pdf",
+        "mime_type": "application/pdf",
+        "data": attachment_bytes,
+    }
+    assert fake_service.messages_api.attachments_api.get_calls == [
+        {"userId": "me", "messageId": "msg-1", "id": "att-123"}
+    ]
+
+
+def test_gmail_download_attachment_decodes_inline_data(monkeypatch):
+    attachment_bytes = b"hello"
+    encoded = base64.urlsafe_b64encode(attachment_bytes).decode().rstrip("=")
+    full_result = {
+        "id": "msg-1",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "1",
+                    "mimeType": "text/plain",
+                    "filename": "notes.txt",
+                    "body": {"data": encoded, "size": len(attachment_bytes)},
+                }
+            ]
+        },
+    }
+    fake_service = _FakeGmailService(full_result, {})
+    monkeypatch.setattr(client, "get_gmail_service", lambda: fake_service)
+
+    metadata, data = client._gmail_download_attachment_bytes("msg-1", part_id="1")
+
+    assert metadata["filename"] == "notes.txt"
+    assert data == attachment_bytes
+    assert fake_service.messages_api.attachments_api.get_calls == []
+
+
+def test_gmail_download_attachment_accepts_empty_inline_file(monkeypatch):
+    full_result = {
+        "id": "msg-1",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "1",
+                    "mimeType": "text/plain",
+                    "filename": "empty.txt",
+                    "body": {"data": "", "size": 0},
+                }
+            ]
+        },
+    }
+    monkeypatch.setattr(
+        client,
+        "get_gmail_service",
+        lambda: _FakeGmailService(full_result, {}),
+    )
+
+    _metadata, data = client._gmail_download_attachment_bytes("msg-1", part_id="1")
+
+    assert data == b""
+
+
+def test_gmail_attachment_filename_drops_untrusted_path_components():
+    metadata = {
+        "filename": "../../report.pdf",
+        "mime_type": "application/pdf",
+        "part_id": "1",
+        "attachment_id": "",
+    }
+
+    assert client._gmail_attachment_filename(metadata, "msg-1") == "report.pdf"
+
+
+def test_gmail_download_attachment_requires_one_selector():
+    with pytest.raises(ValueError, match="Exactly one"):
+        client._gmail_download_attachment_bytes("msg-1")
+    with pytest.raises(ValueError, match="Exactly one"):
+        client._gmail_download_attachment_bytes(
+            "msg-1",
+            part_id="1",
+            attachment_id="att-123",
+        )
 
 
 def test_drive_upload_sets_supports_all_drives(tmp_path, monkeypatch):
