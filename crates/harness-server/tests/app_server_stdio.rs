@@ -84,6 +84,53 @@ impl Harness {
 }
 
 #[test]
+fn fable_blocks_turn_overrides_inherited_high_effort_in_the_claude_child() {
+    let fake_claude = temp_path("fake-fable-effort.sh");
+    std::fs::write(
+        &fake_claude,
+        r##"#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+test "${CLAUDE_CODE_EFFORT_LEVEL:-}" = max
+model=''
+settings=''
+while (($#)); do
+  case "$1" in
+    --model) model="$2"; shift ;;
+    --settings) settings="$2"; shift ;;
+  esac
+  shift
+done
+test "$model" = claude-fable-5-1
+test "$settings" = '{"alwaysThinkingEnabled":true}'
+read -r input
+printf '%s\n' \
+  '{"type":"system","subtype":"init","session_id":"fable-session"}' \
+  '{"type":"assistant","message":{"id":"msg_fable","content":[{"type":"text","text":"fable max"}]}}' \
+  '{"type":"result","subtype":"success","result":"fable max"}'
+"##,
+    )
+    .expect("write fake Claude executable");
+    std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake Claude executable");
+    let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
+        Harness::ClaudeCode,
+        None,
+        Some(("CLAUDE_BIN", fake_claude.to_str().unwrap())),
+        &[("CLAUDE_CODE_EFFORT_LEVEL", "high")],
+    );
+    let turn = bridge.run_blocks_user_turn_with_model(
+        "Check the requested reasoning mode",
+        Some("claude-fable-5-1"),
+        Duration::from_secs(10),
+    );
+    bridge.finish_successfully();
+    let _ = std::fs::remove_file(fake_claude);
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "fable max");
+}
+
+#[test]
 fn fake_claude_app_server_streams_codex_v2_notifications() {
     let fake_claude = concat!(
         "printf '%s\\n' ",
