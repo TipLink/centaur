@@ -1509,7 +1509,7 @@ function slackStreamErrorCode(error: unknown): string {
   return typeof record.message === 'string' ? record.message : ''
 }
 
-const FALLBACK_OPEN_MAX_ATTEMPTS = 4
+const FALLBACK_REPLAY_MAX_ATTEMPTS = 4
 
 /**
  * Delivers the durable final answer as a plain thread post after the live
@@ -1531,10 +1531,14 @@ async function renderFallbackFinalAnswer(
   let outcome = 'error'
   let lastEventId = source.afterEventId
   try {
-    let stream: AsyncIterable<SlackbotV2RendererSource> | undefined
+    let fallback: SlackRenderFallback
     for (let attempt = 0; ; attempt++) {
+      // Rebuild from the execution's original cursor after a disconnected
+      // body as well as a failed open. Reusing a partial collector would
+      // concatenate replayed deltas and can duplicate the final answer.
+      fallback = new SlackRenderFallback()
       try {
-        stream = await openSessionEventStream(options, {
+        const stream = await openSessionEventStream(options, {
           afterEventId: source.afterEventId,
           executionId: source.executionId,
           onEventId: eventId => {
@@ -1543,25 +1547,24 @@ async function renderFallbackFinalAnswer(
           threadId: source.threadId,
           trace
         })
+        const chatStream = fallback.collectChatSdk(
+          slackSafeChatSdkStream(
+            codexAppServerToChatSdkStream(
+              fallback.collectSource(stream),
+              fallbackRendererOptions(options)
+            )
+          )
+        )
+        for await (const _chunk of chatStream) {
+          void _chunk
+        }
         break
       } catch (error) {
-        if (!isRetryableSessionApiError(error) || attempt + 1 >= FALLBACK_OPEN_MAX_ATTEMPTS) {
+        if (!isRetryableSessionApiError(error) || attempt + 1 >= FALLBACK_REPLAY_MAX_ATTEMPTS) {
           throw error
         }
         await sleep(renderRetryDelayMs(attempt))
       }
-    }
-    const fallback = new SlackRenderFallback()
-    const chatStream = fallback.collectChatSdk(
-      slackSafeChatSdkStream(
-        codexAppServerToChatSdkStream(
-          fallback.collectSource(stream),
-          fallbackRendererOptions(options)
-        )
-      )
-    )
-    for await (const _chunk of chatStream) {
-      void _chunk
     }
     const capturedText = fallback.text()
     if (!capturedText && !fallback.isInterrupted()) {

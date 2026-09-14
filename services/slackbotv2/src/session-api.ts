@@ -61,7 +61,7 @@ export class SessionApiError extends Error {
 export function isRetryableSessionApiError(error: unknown): boolean {
   if (error instanceof SessionApiError) return error.retryable
   if (!(error instanceof Error)) return false
-  return error.name === 'AbortError' || error.name === 'TypeError'
+  return error.name === 'AbortError' || error.name === 'TimeoutError' || error.name === 'TypeError'
 }
 
 export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 3 * 60 * 60 * 1000
