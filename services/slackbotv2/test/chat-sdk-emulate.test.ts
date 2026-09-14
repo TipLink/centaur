@@ -2833,6 +2833,102 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('reconnects a timed-out fallback body without rerunning or duplicating the answer', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    let eventOpens = 0
+    bot = createTestBot({
+      state: sharedState,
+      fetch: async (input, init) => {
+        if (String(input).includes('/events?') && ++eventOpens === 2) {
+          // Headers and a partial SSE body arrive, then the connection times
+          // out during an API rollout. Opening the stream itself succeeded.
+          let reads = 0
+          return new Response(new ReadableStream({
+            pull(controller) {
+              if (reads++ === 0) {
+                controller.enqueue(new TextEncoder().encode('event: session.output.line\ndata: "incomplete'))
+              } else {
+                controller.error(new DOMException('The operation timed out.', 'TimeoutError'))
+              }
+            }
+          }), { headers: { 'content-type': 'text/event-stream' } })
+        }
+        return fetch(input, init)
+      }
+    })
+    codexApi.autoRespond = false
+    // The first append succeeds, then Slack expires the streaming message
+    // (production: ~300s after chat.startStream) and every further append
+    // fails. The final answer has not reached Slack at that point.
+    slackApi.failStreamAppendsAfter(1, 'message_not_in_streaming_state')
+    const durableFinalAnswer = `RECONNECTED_FALLBACK_VISIBLE ${'detail '.repeat(64)}`.trimEnd()
+
+    const parent = await postUserMessage('Context before a stream expiry.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> run something long`, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-stream-expired-fallback',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> run something long`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'cmd-long',
+          type: 'commandExecution',
+          command: 'sleep 600',
+          status: 'completed',
+          aggregatedOutput: 'done'
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-stream-expired',
+      status: 'completed',
+      // Exceed the adapter's 256-character stream buffer so this answer uses
+      // chat.appendStream and exercises the configured expiry above.
+      result_text: durableFinalAnswer
+    })
+
+    await Promise.all(waits)
+    expect(eventOpens).toBe(3)
+    expect(codexApi.executes).toHaveLength(1)
+    const texts = await threadTexts(parent.ts)
+    const visibleFinalReplies = texts.filter(text =>
+      text.includes(durableFinalAnswer)
+    )
+    expect(visibleFinalReplies).toHaveLength(1)
+    const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+    expect(threadState).toEqual(
+      expect.objectContaining({
+        activeExecution: false,
+        renderObligation: null
+      })
+    )
+  })
+
   it('rotates Slack stream segments before they reach the streaming age limit', async () => {
     process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS = '120'
     try {
