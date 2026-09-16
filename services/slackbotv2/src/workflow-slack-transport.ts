@@ -17,15 +17,27 @@ export function mountWorkflowSlackTransport(
     method: string,
     args: Record<string, unknown>
   ): Promise<Record<string, any>> => {
+    const body = new URLSearchParams()
+    for (const [key, value] of Object.entries(args)) {
+      if (value === undefined) continue
+      body.set(
+        key,
+        typeof value === 'string'
+          ? value
+          : typeof value === 'number' || typeof value === 'boolean'
+            ? String(value)
+            : JSON.stringify(value)
+      )
+    }
     const response = await fetchFn(
       new URL(method, options.slackApiUrl ?? 'https://slack.com/api/'),
       {
         method: 'POST',
         headers: {
           authorization: `Bearer ${options.botToken}`,
-          'content-type': 'application/json'
+          'content-type': 'application/x-www-form-urlencoded'
         },
-        body: JSON.stringify(args),
+        body,
         signal: AbortSignal.timeout(10_000)
       }
     )

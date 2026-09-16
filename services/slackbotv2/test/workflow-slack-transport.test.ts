@@ -9,7 +9,7 @@ function harness(
   member = true,
   getThread?: Parameters<typeof mountWorkflowSlackTransport>[3]
 ) {
-  const calls: Array<{ url: string; body: any }> = []
+  const calls: Array<{ url: string; body: any; contentType: string | null }> = []
   const state = createMemoryState()
   const app = new Hono()
   const options: SlackbotV2Options = {
@@ -21,8 +21,13 @@ function harness(
     slackApiUrl: 'http://slack.test/api/',
     fetch: async (input, init) => {
       const url = String(input)
-      const body = init?.body ? JSON.parse(String(init.body)) : undefined
-      calls.push({ url, body })
+      const contentType = new Headers(init?.headers).get('content-type')
+      const body = init?.body
+        ? contentType === 'application/x-www-form-urlencoded'
+          ? Object.fromEntries(new URLSearchParams(String(init.body)))
+          : JSON.parse(String(init.body))
+        : undefined
+      calls.push({ url, body, contentType })
       if (url.endsWith('/auth.test'))
         return Response.json({ ok: true, team_id: 'T1' })
       if (url.endsWith('/conversations.info'))
@@ -137,11 +142,27 @@ describe('workflow Slack transport', () => {
     const { app, calls } = harness()
     const response = await app.request(
       '/internal/workflow/slack',
-      request('post', { team_id: 'T1', channel: 'C1', text: 'hello' })
+      request('post', {
+        team_id: 'T1',
+        channel: 'C1',
+        text: 'hello',
+        blocks: [{ type: 'section' }],
+        unfurl_links: false
+      })
     )
     expect(response.status).toBe(200)
-    expect(calls.some((call) => call.url.endsWith('/chat.postMessage'))).toBe(
-      true
+    const membership = calls.find((call) =>
+      call.url.endsWith('/conversations.info')
     )
+    expect(membership?.contentType).toBe('application/x-www-form-urlencoded')
+    expect(membership?.body).toEqual({ channel: 'C1' })
+    const post = calls.find((call) => call.url.endsWith('/chat.postMessage'))
+    expect(post?.contentType).toBe('application/x-www-form-urlencoded')
+    expect(post?.body).toEqual({
+      channel: 'C1',
+      text: 'hello',
+      blocks: JSON.stringify([{ type: 'section' }]),
+      unfurl_links: 'false'
+    })
   })
 })

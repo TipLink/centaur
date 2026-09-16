@@ -29,7 +29,8 @@ function signed(body: string) {
 }
 function harness(
   definitions = sampleCommands(true),
-  state: StateAdapter = createMemoryState()
+  state: StateAdapter = createMemoryState(),
+  beforeMount?: (app: Hono) => void
 ) {
   const calls: Recorded[] = []
   const failures = { open: false, handoff: false }
@@ -52,6 +53,7 @@ function harness(
     }
   }
   const app = new Hono()
+  beforeMount?.(app)
   mountSlashCommands(app, options, state)
   const request = async (path: string, body: string, verified = true) =>
     app.request(path, {
@@ -214,6 +216,23 @@ function custom(name: string, enabled = true): SlackCommandDefinition {
 }
 
 describe('Slack command picker and forms', () => {
+  test('overlay routes can handle commands before the workflow registry', async () => {
+    const h = harness(sampleCommands(true), createMemoryState(), (app) =>
+      app.post('/api/slack/commands', async (c, next) => {
+        const form = new URLSearchParams(await c.req.raw.clone().text())
+        if (form.get('text') !== 'help') return next()
+        return c.json({ response_type: 'ephemeral', text: 'Overlay help' })
+      })
+    )
+    const handled = await (await h.slash('help')).json()
+    expect(handled).toEqual({
+      response_type: 'ephemeral',
+      text: 'Overlay help'
+    })
+    const unknown = await (await h.slash('missing')).json()
+    expect(unknown.text).toContain('Unknown command')
+  })
+
   test('empty command opens searchable picker and bare command opens required form', async () => {
     const h = harness()
     const picker = await h.open('')

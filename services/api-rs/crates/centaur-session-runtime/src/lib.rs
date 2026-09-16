@@ -2551,6 +2551,15 @@ impl SessionRuntime {
         })
     }
 
+    /// Return the active execution so authenticated API surfaces can bind
+    /// request context to server-recorded execution metadata.
+    pub async fn active_execution(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<SessionExecution>, SessionRuntimeError> {
+        Ok(self.store.active_execution_for_thread(thread_key).await?)
+    }
+
     async fn wait_for_active_steering_pipe(
         &self,
         thread_key: &ThreadKey,

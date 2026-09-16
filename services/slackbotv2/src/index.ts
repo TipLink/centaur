@@ -366,10 +366,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
 
   const app = new Hono()
-  mountSlashCommands(app, options, state)
-  mountWorkflowSlackTransport(app, options, state, threadId => chat.thread(threadId))
   for (const extension of options.commandExtensions ?? [])
     extension.mount?.({ app, options, state, verifySlackSignature })
+  mountSlashCommands(app, options, state)
+  mountWorkflowSlackTransport(app, options, state, threadId => chat.thread(threadId))
   app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
   app.get('/metrics', c =>
     c.text(slackbotMetrics.expose(), 200, {
