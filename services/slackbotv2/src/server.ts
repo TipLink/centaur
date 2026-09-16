@@ -1,6 +1,6 @@
 import { createSlackbotV2, type SlackbotV2Options } from './index'
 import { parseChannelDefaults } from './channel-defaults'
-import { workItemCommands } from './work-item-commands'
+import { loadSlackCommandExtensions } from './slack-command-extensions'
 import {
   createFlagMessageOverridesStrategy,
   createOpenAiMessageOverridesStrategy
@@ -10,6 +10,9 @@ const port = numberEnv('PORT', 3002)
 const apiUrl = stringEnv('CENTAUR_API_URL', 'http://127.0.0.1:8080')
 const botToken = requiredEnv('SLACK_BOT_TOKEN')
 const signingSecret = requiredEnv('SLACK_SIGNING_SECRET')
+const commandExtensions = await loadSlackCommandExtensions(
+  pathList('SLACK_COMMAND_EXTENSION_MODULES')
+)
 const messageOverridesStrategyMode = messageOverridesStrategyModeEnv(
   'SLACKBOTV2_MESSAGE_OVERRIDES_STRATEGY'
 )
@@ -37,11 +40,16 @@ const consoleLogger = {
 
 const options: SlackbotV2Options = {
   apiUrl,
-  slashCommands: {
-    name: stringEnv('SLACK_COMMAND_NAME', '/centaur'),
-    teamId: optionalEnv('SLACK_COMMAND_TEAM_ID'),
-    definitions: workItemCommands(booleanEnv('WORK_ITEMS_ENABLED', false))
-  },
+  slashCommands: commandExtensions.length
+    ? {
+        name: stringEnv('SLACK_COMMAND_NAME', '/centaur'),
+        teamId: optionalEnv('SLACK_COMMAND_TEAM_ID'),
+        definitions: commandExtensions.flatMap((extension) => [
+          ...extension.commands
+        ])
+      }
+    : undefined,
+  commandExtensions,
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
   ambientSlackChannelIds: envList('SLACKBOT_AMBIENT_CHANNEL_IDS'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
@@ -112,6 +120,16 @@ function envList(name: string): string[] | undefined {
     .split(/[\s,]+/)
     .map(part => part.trim())
     .filter(Boolean)
+}
+
+function pathList(name: string): string[] {
+  const value = optionalEnv(name)
+  return value
+    ? value
+        .split(':')
+        .map((part) => part.trim())
+        .filter(Boolean)
+    : []
 }
 
 function requiredEnv(name: string): string {

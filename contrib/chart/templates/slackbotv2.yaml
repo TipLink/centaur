@@ -21,6 +21,9 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+{{- if .Values.overlay.image.repository }}
+        checksum/overlay: {{ .Values.overlay | toJson | sha256sum }}
+{{- end }}
 {{- with $slackbotV2MetricsAnnotations }}
 {{ toYaml . | nindent 8 }}
 {{- end }}
@@ -33,6 +36,25 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
+{{- if .Values.overlay.image.repository }}
+      initContainers:
+        - name: overlay-bootstrap
+          image: {{ printf "%s:%s" .Values.overlay.image.repository .Values.overlay.image.tag | quote }}
+          imagePullPolicy: {{ .Values.overlay.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              src={{ .Values.overlay.image.sourcePath | quote }}
+              target={{ .Values.overlay.mountPath | quote }}
+              mkdir -p "$target"
+              cp -R "$src"/. "$target"/
+          volumeMounts:
+            - name: overlay-root
+              mountPath: {{ .Values.overlay.mountPath | quote }}
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+{{- end }}
       containers:
         - name: slackbotv2
           image: {{ printf "%s:%s" .Values.slackbotv2.image.repository .Values.slackbotv2.image.tag | quote }}
@@ -149,6 +171,17 @@ spec:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.slackbotv2.resources | nindent 12 }}
+{{- if .Values.overlay.image.repository }}
+          volumeMounts:
+            - name: overlay-root
+              mountPath: {{ .Values.overlay.mountPath | quote }}
+              readOnly: true
+{{- end }}
+{{- if .Values.overlay.image.repository }}
+      volumes:
+        - name: overlay-root
+          emptyDir: {}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service

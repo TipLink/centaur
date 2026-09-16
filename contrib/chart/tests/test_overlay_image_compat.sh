@@ -84,6 +84,29 @@ if ! grep -qF 'value: "/home/agent/overlay/org/workflows"' "$scratch/overlay.yam
     exit 1
 fi
 
+helm template test "$chart_dir" \
+    --set apiRs.enabled=false \
+    --set console.enabled=false \
+    --set slackbotv2.enabled=true \
+    --set ironProxy.enabled=false \
+    --set overlay.image.repository=ghcr.io/tiplink/overlay \
+    --set overlay.image.tag=sha-test >"$scratch/slackbot-overlay.yaml"
+
+if [[ "$(grep -cF 'name: overlay-root' "$scratch/slackbot-overlay.yaml")" -lt 2 ]]; then
+    echo "Slackbot must receive the deployment overlay volume" >&2
+    exit 1
+fi
+for expected in \
+    'name: overlay-bootstrap' \
+    'image: "ghcr.io/tiplink/overlay:sha-test"' \
+    'mountPath: "/app/overlay/org"' \
+    'readOnly: true'; do
+    if ! grep -qF "$expected" "$scratch/slackbot-overlay.yaml"; then
+        echo "Slackbot overlay render is missing: $expected" >&2
+        exit 1
+    fi
+done
+
 helm template test "$chart_dir" "${common[@]}" \
     --set repoCache.enabled=true \
     --set-string 'apiRs.workflowApiAllowedNames=reminder\,compliance_cdd_research' \

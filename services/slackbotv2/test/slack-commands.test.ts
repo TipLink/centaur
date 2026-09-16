@@ -4,12 +4,12 @@ import { createMemoryState } from '@chat-adapter/state-memory'
 import { Hono } from 'hono'
 import type { StateAdapter } from 'chat'
 import { mountSlashCommands } from '../src/slack-commands'
-import { workItemCommands } from '../src/work-item-commands'
 import {
   COMMAND_FORM,
   COMMAND_PICKER,
   COMMAND_RETRY,
   COMMAND_SEARCH,
+  CommandFieldError,
   type SlackCommandDefinition
 } from '../src/slack-command-registry'
 import type { SlackbotV2Options } from '../src/types'
@@ -28,7 +28,7 @@ function signed(body: string) {
   }
 }
 function harness(
-  definitions = workItemCommands(true),
+  definitions = sampleCommands(true),
   state: StateAdapter = createMemoryState()
 ) {
   const calls: Recorded[] = []
@@ -97,6 +97,79 @@ function harness(
       return calls.filter((c) => c.url.endsWith('/api/workflows/runs'))
     }
   }
+}
+
+function sampleCommands(enabled: boolean): SlackCommandDefinition[] {
+  const create = (kind: 'incident' | 'chore'): SlackCommandDefinition => ({
+    name: kind,
+    title: kind === 'incident' ? 'Create incident' : 'Create chore',
+    description: `Create a ${kind} with an owner and deadline.`,
+    keywords: ['create', kind],
+    enabled,
+    workflowName: 'sample_command',
+    example: `${kind} "Investigate" owner:@alex deadline:30m`,
+    submitLabel: 'Create',
+    fields: [
+      { id: 'title', label: 'Description', type: 'text' },
+      { id: 'owner', label: 'Owner', type: 'user' },
+      { id: 'deadline', label: 'Deadline', type: 'text' }
+    ],
+    parseText: () => ({ kind }),
+    parseForm(values) {
+      if (!/^[UW][A-Z0-9]+$/.test(values.owner ?? ''))
+        throw new CommandFieldError('owner', 'Choose a Slack workspace member.')
+      if (!/^[1-9][0-9]*[mhd]$/.test(values.deadline ?? ''))
+        throw new CommandFieldError('deadline', 'Use a duration.')
+      return { kind, ...values }
+    }
+  })
+  const actions = [
+    'acknowledge',
+    'resolve',
+    'snooze',
+    'reschedule',
+    'status'
+  ] as const
+  return [
+    create('incident'),
+    create('chore'),
+    ...actions.map(
+      (name): SlackCommandDefinition => ({
+        name,
+        title: `${name[0]!.toUpperCase()}${name.slice(1)} request`,
+        description: `Apply the ${name} operation to an existing request.`,
+        keywords: [name],
+        enabled: true,
+        workflowName: 'sample_command',
+        example: `${name} REQ-42`,
+        submitLabel: 'Submit',
+        fields: [
+          { id: 'key', label: 'Request ID', type: 'text' },
+          ...(name === 'snooze' || name === 'reschedule'
+            ? [{ id: 'duration', label: 'Duration', type: 'text' as const }]
+            : [])
+        ],
+        parseText: () => ({ operation: name }),
+        parseForm(values) {
+          const result: Record<string, unknown> = {
+            operation: name,
+            key: values.key
+          }
+          if (name === 'snooze' || name === 'reschedule') {
+            const duration = /^(\d+)([mhd])$/.exec(values.duration ?? '')
+            const scale = { m: 60, h: 3600, d: 86400 }
+            const seconds = duration
+              ? Number(duration[1]) * scale[duration[2] as keyof typeof scale]
+              : 0
+            if (!seconds || (name === 'snooze' && seconds > 86400))
+              throw new CommandFieldError('duration', 'Use a valid duration.')
+            result.duration_seconds = seconds
+          }
+          return result
+        }
+      })
+    )
+  ]
 }
 function submission(
   view: any,
@@ -274,7 +347,7 @@ describe('Slack command picker and forms', () => {
     expect(h.queued()).toHaveLength(0)
   })
   test('creation disabled removes create forms but retains status forms', async () => {
-    const h = harness(workItemCommands(false))
+    const h = harness(sampleCommands(false))
     expect((await (await h.slash('incident')).json()).text).toContain(
       'disabled'
     )
@@ -365,7 +438,7 @@ describe('Slack command authentication and state recovery', () => {
     const first = await (await h.payload(submission(view, fields()))).json()
     expect(first.view.callback_id).toBe(COMMAND_RETRY)
     const original = structuredClone(h.queued()[0]!.body)
-    const restarted = harness(workItemCommands(true), h.state)
+    const restarted = harness(sampleCommands(true), h.state)
     const response = await (
       await restarted.payload(
         submission(
