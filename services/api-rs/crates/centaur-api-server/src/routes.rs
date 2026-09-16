@@ -2846,14 +2846,18 @@ fn claims_owns_session(claims: &WorkflowApiClaims, bound_principal: Option<&str>
     })
 }
 
-fn workflow_input_thread_context(input: &Value) -> Result<SlackThreadContext, ApiError> {
+fn workflow_input_thread_key(input: &Value) -> Result<ThreadKey, ApiError> {
     let raw_thread_key = input
         .get("thread_key")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::BadRequest("workflow input.thread_key is required".to_owned()))?;
-    let thread_key = ThreadKey::try_from(raw_thread_key.to_owned())?;
+    Ok(ThreadKey::try_from(raw_thread_key.to_owned())?)
+}
+
+fn workflow_input_thread_context(input: &Value) -> Result<SlackThreadContext, ApiError> {
+    let thread_key = workflow_input_thread_key(input)?;
     let Some(ChatDestination::Slack {
         channel_id,
         thread_ts,
@@ -2879,6 +2883,51 @@ fn workflow_input_thread_context(input: &Value) -> Result<SlackThreadContext, Ap
         ));
     }
     Ok(context)
+}
+
+fn valid_slack_user_id(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(characters.next(), Some('U' | 'W'))
+        && characters.clone().next().is_some()
+        && characters.all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
+}
+
+fn set_authenticated_workflow_context(
+    input: &mut Value,
+    slack_user_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let object = input
+        .as_object_mut()
+        .ok_or_else(|| ApiError::BadRequest("workflow input must be a JSON object".to_owned()))?;
+    let actor = slack_user_id
+        .map(str::trim)
+        .filter(|value| valid_slack_user_id(value));
+    object.insert(
+        "_centaur".to_owned(),
+        actor
+            .map(|value| json!({ "slack_user_id": value }))
+            .unwrap_or_else(|| json!({})),
+    );
+    Ok(())
+}
+
+async fn bind_authenticated_workflow_context(
+    state: &AppState,
+    authorization: &WorkflowApiAuthorization,
+    input: &mut Value,
+) -> Result<(), ApiError> {
+    if !matches!(authorization, WorkflowApiAuthorization::Principal(_)) {
+        return Ok(());
+    }
+    let thread_key = workflow_input_thread_key(input)?;
+    let execution = state.runtime()?.active_execution(&thread_key).await?;
+    let actor = execution.as_ref().and_then(|execution| {
+        execution
+            .metadata
+            .get("slack_user_id")
+            .and_then(Value::as_str)
+    });
+    set_authenticated_workflow_context(input, actor)
 }
 
 fn ensure_workflow_input_authorized(
@@ -2924,7 +2973,7 @@ fn ensure_workflow_service_authorized(
 async fn create_workflow_run(
     State(state): State<AppState>,
     authorization: WorkflowCreateAuthorization,
-    Json(request): Json<CreateWorkflowRunRequest>,
+    Json(mut request): Json<CreateWorkflowRunRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let authorization = authorization.for_workflow(
         &request.workflow_name,
@@ -2938,6 +2987,7 @@ async fn create_workflow_run(
         )?;
     }
     ensure_workflow_input_authorized(&authorization, &request.input)?;
+    bind_authenticated_workflow_context(&state, &authorization, &mut request.input).await?;
     let run = workflows.create_run(request).await?;
     Ok(Json(serde_json::to_value(run)?))
 }
@@ -4203,6 +4253,21 @@ mod workflow_api_tests {
             ),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn workflow_context_overwrites_caller_supplied_actor() {
+        let mut input = json!({
+            "thread_key": "slack:T123:C123:1780000000.000100",
+            "_centaur": { "slack_user_id": "UFORGED" }
+        });
+        set_authenticated_workflow_context(&mut input, Some("UVERIFIED1")).unwrap();
+        assert_eq!(input["_centaur"]["slack_user_id"], "UVERIFIED1");
+
+        set_authenticated_workflow_context(&mut input, None).unwrap();
+        assert_eq!(input["_centaur"], json!({}));
+        set_authenticated_workflow_context(&mut input, Some("not-a-slack-user")).unwrap();
+        assert_eq!(input["_centaur"], json!({}));
     }
 
     #[test]
