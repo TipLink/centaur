@@ -139,6 +139,10 @@ class WorkflowContext:
     async def call_tool(self, tool: str, method: str, args: dict[str, Any] | None = None) -> Any:
         return await WorkflowToolManager(self._rpc).call_tool_raw(tool, method, args or {})
 
+    async def slack_transport(self, operation: str, args: dict[str, Any]) -> Any:
+        """Use the configured trusted Slack transport without exposing its key."""
+        return await self._rpc.request({"type": "ctx.slack_transport", "operation": operation, "args": args})
+
     async def post_to_slack(self, channel: str, text: str, **kwargs: Any) -> Any:
         return await self._rpc.request(
             {

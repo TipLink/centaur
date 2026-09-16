@@ -1,3 +1,5 @@
+import { mountWorkItems } from './work-items'
+import { mountSlashCommands } from './slack-commands'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { Hono, type Context } from 'hono'
@@ -364,6 +366,8 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
 
   const app = new Hono()
+  mountSlashCommands(app, options, state)
+  mountWorkItems(app, options, state, threadId => chat.thread(threadId))
   app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
   app.get('/metrics', c =>
     c.text(slackbotMetrics.expose(), 200, {

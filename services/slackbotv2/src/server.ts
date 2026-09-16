@@ -1,5 +1,6 @@
 import { createSlackbotV2, type SlackbotV2Options } from './index'
 import { parseChannelDefaults } from './channel-defaults'
+import { workItemCommands } from './work-item-commands'
 import {
   createFlagMessageOverridesStrategy,
   createOpenAiMessageOverridesStrategy
@@ -36,6 +37,11 @@ const consoleLogger = {
 
 const options: SlackbotV2Options = {
   apiUrl,
+  slashCommands: {
+    name: stringEnv('SLACK_COMMAND_NAME', '/centaur'),
+    teamId: optionalEnv('SLACK_COMMAND_TEAM_ID'),
+    definitions: workItemCommands(booleanEnv('WORK_ITEMS_ENABLED', false))
+  },
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
   ambientSlackChannelIds: envList('SLACKBOT_AMBIENT_CHANNEL_IDS'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),

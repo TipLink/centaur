@@ -119,6 +119,7 @@ export type SlackbotV2BlockActionPayload = {
 }
 
 export type SlackbotV2Options = {
+  slashCommands?: import('./slack-command-registry').SlashCommandConfig
   allowedExternalTeamIds?: readonly string[]
   /** Slack channel ids where messages should start sessions without an @mention. */
   ambientSlackChannelIds?: readonly string[]

@@ -296,3 +296,60 @@ curl -s "$CENTAUR_API_URL/api/workflows/runs" \
 Inspect the run, checkpoints, and sandbox state. A migrated workflow is not done
 until it has completed through the `api-rs` runtime in the same sandbox image
 and database configuration used by the deployment.
+
+## Trusted Slack transport for work-item workflows
+
+Deployments can enable an incident/chore slash-command ingress with
+`WORK_ITEMS_ENABLED=true` and `SLACK_COMMAND_NAME=/centaur` on Slackbot v2.
+The signed request queues the deployment-provided `work_item_command` workflow;
+malformed commands receive a private example without creating a run. Commands
+require a quoted description, Slack owner mention, and a duration or explicit
+ISO timestamp. The creator/channel identity comes only from the signed payload.
+
+The root slash command opens a searchable modal command picker. A bare command
+name opens its form directly; complete text commands remain available. Configure
+the Slack app's Interactivity Request URL as `/api/slack/actions` and its Select
+Menus Options Load URL as `/api/slack/options`. `SLACK_COMMAND_TEAM_ID` optionally
+restricts the entry points to one workspace. The public ingress must admit signed
+POST requests to all three command, action, and options routes.
+
+To add commands, supply another `SlackCommandDefinition` in the `slashCommands`
+configuration assembled by `services/slackbotv2/src/server.ts`. Each definition
+declares a unique name, title, description, search keywords, enablement, form
+fields, text/form parsers, and trusted workflow name. `work-item-commands.ts`
+contains the incident/chore definitions; `slack-command-registry.ts` owns the
+shared UI schema and search. The router in `slack-commands.ts` requires no new
+route or feature-specific branches. Keep business authorization and durable
+effects in the target workflow; registry entries are trusted deployment code,
+not sandbox-provided definitions.
+
+Required form errors attach to individual input blocks. Picker search returns
+at most 100 matches per query, so larger catalogs remain searchable. Signed modal
+metadata binds the creator, workspace, channel, command, and one-hour expiry.
+The Postgres-backed state adapter freezes input before handoff and serializes
+submissions; retries reuse both relative deadlines and workflow idempotency keys.
+Modal receipts confirm acceptance only. The workflow reports final validation or
+results in the originating channel. No workflow starts merely by browsing forms.
+
+The Python host exposes `ctx.slack_transport(operation, args)` to explicitly
+allowlisted workflows. Configure `WORKFLOW_SLACK_TRANSPORT_ALLOWED_NAMES` on
+api-rs and point `WORKFLOW_SLACK_TRANSPORT_URL` at the internal Slackbot v2
+`/internal/workflow/slack` endpoint. The API supplies `SLACKBOT_API_KEY` itself;
+that key and the bot token never cross the workflow-host RPC boundary.
+The transport checks bot workspace identity and live channel membership.
+It supports bounded Slack posting, root-message updates, private responses,
+user/channel reads, history, and session context registration. `context`
+subscribes the thread before collecting existing messages, then appends the
+structured work-item context through the ordinary session API. It does not
+execute an agent turn.
+
+Keep these state-changing workflows outside sandbox workflow API grants.
+The deployment overlay owns its state schema, transition rules, outbox, Linear
+mapping, and workflow code. Both the API-to-Slackbot egress policy and the
+Slackbot ingress policy must allow the authenticated internal callback.
+
+Slackbot v2 can forward `/api/webhooks/work-items-linear` unchanged to api-rs,
+where the configured workflow webhook verifies the provider HMAC before enqueue.
+Configure the public edge to expose only that exact POST route. External webhook
+payloads must be reconciled against current provider state before applying a
+transition.

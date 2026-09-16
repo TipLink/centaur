@@ -3674,6 +3674,10 @@ async fn handle_python_context_request(
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
         },
+        Some("ctx.slack_transport") => match python_slack_transport(message, input).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
         Some("ctx.post_to_slack") => {
             match post_python_slack_message(message, ctx, &request_id).await {
                 Ok(value) => Ok(value),
@@ -4065,6 +4069,43 @@ async fn post_tool_result_to_slack(
     )
     .await?;
     Ok(slack_post_result_from_response(channel, response))
+}
+
+// Fixed server-configured destination and workflow allowlist; no credentials
+// cross the workflow host RPC boundary.
+async fn python_slack_transport(
+    message: &Value,
+    input: &WorkflowTaskInput,
+) -> Result<Value, WorkflowRuntimeError> {
+    let allowed = env::var("WORKFLOW_SLACK_TRANSPORT_ALLOWED_NAMES").unwrap_or_default();
+    if !allowed
+        .split(',')
+        .any(|name| name.trim() == input.workflow_name)
+    {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "workflow has no Slack transport grant".to_owned(),
+        ));
+    }
+    let url = env::var("WORKFLOW_SLACK_TRANSPORT_URL").map_err(|_| {
+        WorkflowRuntimeError::BadRequest("Slack transport is not configured".to_owned())
+    })?;
+    let token = env::var("SLACKBOT_API_KEY").map_err(|_| {
+        WorkflowRuntimeError::BadRequest("Slack transport credential is not configured".to_owned())
+    })?;
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(20))
+        .json(&json!({"operation": message.get("operation"), "args": message.get("args")}))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(WorkflowRuntimeError::Upstream(format!(
+            "Slack transport failed: {}",
+            response.status()
+        )));
+    }
+    Ok(response.json().await?)
 }
 
 async fn post_python_slack_message(
@@ -5212,3 +5253,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod slack_transport_tests;
