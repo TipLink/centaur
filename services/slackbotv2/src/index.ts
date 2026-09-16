@@ -1,3 +1,5 @@
+import { mountSlashCommands, verifySlackSignature } from './slack-commands'
+import { mountWorkflowSlackTransport } from './workflow-slack-transport'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { Hono, type Context } from 'hono'
@@ -364,6 +366,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
 
   const app = new Hono()
+  mountSlashCommands(app, options, state)
+  mountWorkflowSlackTransport(app, options, state, threadId => chat.thread(threadId))
+  for (const extension of options.commandExtensions ?? [])
+    extension.mount?.({ app, options, state, verifySlackSignature })
   app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
   app.get('/metrics', c =>
     c.text(slackbotMetrics.expose(), 200, {

@@ -362,6 +362,16 @@ spec:
         - protocol: TCP
           port: 5432
 {{- end }}
+{{- if .Values.slackbotv2.enabled }}
+    # Authenticated workflow Slack transport callback.
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbotv2") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3001
+{{- end }}
     # Per-sandbox iron-proxy listeners (HTTP proxy + postgres + management API).
     - to:
         - podSelector:
@@ -411,6 +421,12 @@ spec:
     - Egress
   ingress:
     - from:
+{{- if .Values.apiRs.enabled }}
+        # Workflow Slack transport is authenticated by the service key.
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+{{- end }}
 {{- range $ingressSourceNamespaces }}
         - namespaceSelector:
             matchLabels:
