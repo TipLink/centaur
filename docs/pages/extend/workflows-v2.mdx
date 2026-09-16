@@ -331,6 +331,13 @@ submissions; retries reuse both relative deadlines and workflow idempotency keys
 Modal receipts confirm acceptance only. The workflow reports final validation or
 results in the originating channel. No workflow starts merely by browsing forms.
 
+On api-rs, set `WORKFLOW_API_SLACKBOT_ALLOWED_NAMES` to the exact workflow names
+the command registry may enqueue, such as `work_item_command`. The existing
+`SLACKBOT_API_KEY` authenticates these submissions. This grant defaults to empty,
+does not accept wildcards, and applies only to creating runs; it does not grant
+workflow listing, cancellation, scheduling, or global event access. Keep it
+separate from the sandbox-facing `WORKFLOW_API_ALLOWED_NAMES` grant.
+
 The Python host exposes `ctx.slack_transport(operation, args)` to explicitly
 allowlisted workflows. Configure `WORKFLOW_SLACK_TRANSPORT_ALLOWED_NAMES` on
 api-rs and point `WORKFLOW_SLACK_TRANSPORT_URL` at the internal Slackbot v2

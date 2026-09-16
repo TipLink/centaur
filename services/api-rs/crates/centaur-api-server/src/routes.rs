@@ -2678,6 +2678,55 @@ fn authorize_workflow_api(headers: &HeaderMap) -> Result<WorkflowApiAuthorizatio
     Ok(WorkflowApiAuthorization::Principal(claims))
 }
 
+// Slack ingress may enqueue only explicitly granted command workflows. This
+// grant does not authorize listing, cancelling, or emitting workflow events.
+#[derive(Debug)]
+enum WorkflowCreateAuthorization {
+    Standard(WorkflowApiAuthorization),
+    Slackbot,
+}
+
+impl FromRequestParts<AppState> for WorkflowCreateAuthorization {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        authorize_workflow_create_with_slackbot_matcher(&parts.headers, |token| {
+            token_matches_configured_env(token, &["SLACKBOT_API_KEY"])
+        })
+    }
+}
+
+impl WorkflowCreateAuthorization {
+    fn for_workflow(
+        self,
+        workflow_name: &str,
+        allowed_names: &BTreeSet<String>,
+    ) -> Result<WorkflowApiAuthorization, ApiError> {
+        match self {
+            Self::Standard(authorization) => Ok(authorization),
+            Self::Slackbot if allowed_names.contains(workflow_name) => {
+                Ok(WorkflowApiAuthorization::Service)
+            }
+            Self::Slackbot => Err(ApiError::Forbidden(
+                "workflow is not allowed for Slack command service".to_owned(),
+            )),
+        }
+    }
+}
+
+fn authorize_workflow_create_with_slackbot_matcher(
+    headers: &HeaderMap,
+    slackbot_token_matches: impl Fn(&str) -> bool,
+) -> Result<WorkflowCreateAuthorization, ApiError> {
+    if slackbot_token_matches(bearer_token(headers)?) {
+        return Ok(WorkflowCreateAuthorization::Slackbot);
+    }
+    authorize_workflow_api(headers).map(WorkflowCreateAuthorization::Standard)
+}
+
 fn authorize_session_api(headers: &HeaderMap) -> Result<WorkflowApiAuthorization, ApiError> {
     authorize_session_api_with_service_token_matcher(headers, |token| {
         token_matches_configured_env(token, SESSION_API_SERVICE_KEY_ENVS)
@@ -2874,9 +2923,13 @@ fn ensure_workflow_service_authorized(
 
 async fn create_workflow_run(
     State(state): State<AppState>,
-    authorization: WorkflowApiAuthorization,
+    authorization: WorkflowCreateAuthorization,
     Json(request): Json<CreateWorkflowRunRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let authorization = authorization.for_workflow(
+        &request.workflow_name,
+        &configured_workflow_api_names("WORKFLOW_API_SLACKBOT_ALLOWED_NAMES"),
+    )?;
     let workflows = workflow_runtime(&state)?;
     if matches!(authorization, WorkflowApiAuthorization::Principal(_)) {
         ensure_workflow_api_name_allowed(
@@ -4055,6 +4108,44 @@ mod drain_response_tests {
 #[cfg(test)]
 mod workflow_api_tests {
     use super::*;
+
+    #[test]
+    fn slackbot_workflow_creation_requires_an_exact_explicit_grant() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer slack-command-test-key".parse().unwrap(),
+        );
+        let allowed = BTreeSet::from(["command_handler".to_owned()]);
+        let authorize = |name, names: &BTreeSet<String>| {
+            authorize_workflow_create_with_slackbot_matcher(&headers, |token| {
+                token == "slack-command-test-key"
+            })
+            .and_then(|authorization| authorization.for_workflow(name, names))
+        };
+        assert!(matches!(
+            authorize("command_handler", &allowed),
+            Ok(WorkflowApiAuthorization::Service)
+        ));
+        for (name, names) in [
+            ("another_workflow", allowed.clone()),
+            ("command_handler_extra", allowed.clone()),
+            ("command_handler", BTreeSet::new()),
+            ("command_handler", BTreeSet::from(["*".to_owned()])),
+        ] {
+            assert!(matches!(
+                authorize(name, &names),
+                Err(ApiError::Forbidden(_))
+            ));
+        }
+        assert!(matches!(
+            authorize_workflow_create_with_slackbot_matcher(&HeaderMap::new(), |_| true),
+            Err(ApiError::Unauthorized(_))
+        ));
+        // The generic API continues to require its separate service key or JWT.
+        assert!(!WORKFLOW_API_SERVICE_KEY_ENVS.contains(&"SLACKBOT_API_KEY"));
+        assert!(!ADMIN_API_SERVICE_KEY_ENVS.contains(&"SLACKBOT_API_KEY"));
+    }
 
     fn principal(channel_id: &str) -> WorkflowApiAuthorization {
         WorkflowApiAuthorization::Principal(WorkflowApiClaims {

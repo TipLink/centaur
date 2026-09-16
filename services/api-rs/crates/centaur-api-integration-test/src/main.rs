@@ -708,6 +708,7 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         bail!("workflow run filters returned unexpected rows: {filtered}");
     }
 
+    let started_marker = workflow_path.with_extension("started");
     let removed_run_id = create_workflow_run(
         http,
         base_url,
@@ -715,6 +716,7 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         json!({
             "case": "removed-workflow-run",
             "sleep_ms": 60_000,
+            "started_marker": started_marker,
         }),
     )
     .await
@@ -723,6 +725,16 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         .await
         .context("wait for long-running workflow run to start")?;
 
+    // A run becomes running before the Python host imports its module. Wait
+    // until the handler has entered before removing the source under test.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !started_marker.try_exists()? {
+        if Instant::now() >= deadline {
+            bail!("workflow handler did not write its start marker before timeout");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    fs::remove_file(&started_marker)?;
     fs::remove_file(&workflow_path)
         .with_context(|| format!("remove workflow file {}", workflow_path.display()))?;
 
@@ -764,6 +776,7 @@ fn write_test_workflow(path: &Path, workflow_name: &str) -> Result<()> {
     let source = format!(
         r#"
 import asyncio
+from pathlib import Path
 
 WORKFLOW_NAME = "{workflow_name}"
 SCHEDULE = {{
@@ -776,6 +789,8 @@ SCHEDULE = {{
 
 
 async def handler(params, ctx):
+    if params.get("started_marker"):
+        Path(params["started_marker"]).write_text("started")
     sleep_ms = int(params.get("sleep_ms") or 0)
     if sleep_ms:
         await asyncio.sleep(sleep_ms / 1000)
