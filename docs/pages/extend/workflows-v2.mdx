@@ -337,6 +337,14 @@ does not accept wildcards, and applies only to creating runs; it does not grant
 workflow listing, cancellation, scheduling, or global event access. Keep it
 separate from the sandbox-facing `WORKFLOW_API_ALLOWED_NAMES` grant.
 
+For principal-authenticated workflow creation, api-rs reserves the `_centaur`
+input object. It replaces any caller-supplied value with context from the active
+execution for `input.thread_key`. Slack-started executions include the verified
+requester's user ID as `_centaur.slack_user_id`. A state-changing overlay
+workflow can authorize that server-bound identity without accepting an actor ID
+from an agent tool or another caller. Reject the operation when the required
+identity is absent.
+
 The Python host exposes `ctx.slack_transport(operation, args)` to explicitly
 allowlisted workflows. Configure `WORKFLOW_SLACK_TRANSPORT_ALLOWED_NAMES` on
 api-rs and point `WORKFLOW_SLACK_TRANSPORT_URL` at the internal Slackbot v2
@@ -349,7 +357,8 @@ subscribes the thread before collecting existing messages, then appends the
 structured workflow context through the ordinary session API. It does not
 execute an agent turn.
 
-Keep state-changing workflows outside sandbox workflow API grants. Deployment
-overlays own their domain schemas, transition rules, provider mappings, and
-workflow code. Both the API-to-Slackbot egress policy and the Slackbot ingress
-policy must allow the authenticated internal callback.
+Expose state-changing workflows through sandbox workflow API grants only when
+they authorize server-bound principal context and the exact thread-scoped
+resource. Deployment overlays own their domain schemas, transition rules,
+provider mappings, and workflow code. Both the API-to-Slackbot egress policy and
+the Slackbot ingress policy must allow the authenticated internal callback.
