@@ -81,12 +81,26 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
 {{- define "centaur.overlaySources" -}}
+{{- $root := . -}}
 {{- $sources := list -}}
 {{- with .Values.overlays.sources -}}
 {{- range . -}}
 {{- if .repo -}}
 {{- $source := dict "repo" .repo -}}
-{{- with .ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
+{{- $configuredRef := default "" .ref | toString -}}
+{{- $refFromOverlayImage := default false .refFromOverlayImage -}}
+{{- if and $configuredRef $refFromOverlayImage -}}
+{{- fail (printf "overlay source %s cannot set both ref and refFromOverlayImage" .repo) -}}
+{{- end -}}
+{{- if $refFromOverlayImage -}}
+{{- $overlayTag := default "" $root.Values.overlay.image.tag | toString -}}
+{{- if not (regexMatch "^(reviewed|auto-deploy)-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$" $overlayTag) -}}
+{{- fail (printf "overlay source %s uses refFromOverlayImage, but overlay.image.tag must be reviewed-<40-hex-sha> or auto-deploy-<40-hex-sha>, optionally with an immutable digest" .repo) -}}
+{{- end -}}
+{{- $_ := set $source "ref" (regexFind "[0-9a-f]{40}" $overlayTag) -}}
+{{- else -}}
+{{- with $configuredRef }}{{- $_ := set $source "ref" . -}}{{- end -}}
+{{- end -}}
 {{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .visibility) -}}
 {{- /*
 Subdir defaults: an omitted key falls back to the conventional layout

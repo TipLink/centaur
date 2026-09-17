@@ -252,7 +252,9 @@ overlay:
 # Subdirs default to the conventional layout — toolsSubdir: tools,
 # workflowsSubdir: workflows, skillsSubdir: .agents/skills — so most sources
 # only need `repo`; set `ref` to a branch, tag, or commit when you do not want
-# the repo's default branch. Directories missing from a repo are skipped at
+# the repo's default branch. A source built into overlay.image may instead set
+# `refFromOverlayImage: true`; the chart derives its immutable commit from a
+# `reviewed-<sha>` or `auto-deploy-<sha>` image tag. Directories missing from a repo are skipped at
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
 # Repo visibility defaults to private; set visibility: public only for repos
 # safe to expose to principals with sandbox_repo_cache=public.
@@ -262,7 +264,7 @@ overlays:
   #   ref: ""
   #   visibility: public
   # - repo: your-org/centaur-overlay
-  #   ref: main
+  #   refFromOverlayImage: true
   #   visibility: private
   # - repo: your-org/workflows-only
   #   ref: main
