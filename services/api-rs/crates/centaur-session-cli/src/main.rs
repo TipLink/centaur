@@ -227,6 +227,7 @@ pub(crate) async fn append_user_message(
                         "source": "centaur-session-cli",
                     }),
                 }],
+                steer_active_execution: true,
             },
         )
         .await?;

@@ -515,6 +515,22 @@ describe('Slack attachment serialization', () => {
 })
 
 describe('forwardToSessionApi overrides', () => {
+  test('can append a queued message without steering an active execution', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage('do this next'), {
+        executeMessage: undefined,
+        steerActiveExecution: false
+      })
+    )
+    const append = requests.find(request => request.url.endsWith('/messages'))
+    expect((append?.body as { steer_active_execution?: boolean }).steer_active_execution).toBe(
+      false
+    )
+    expect(requests.some(request => request.url.endsWith('/execute'))).toBe(false)
+  })
+
   test('creates session with default codex harness', async () => {
     const { fetchFn, requests } = fakeApi()
     await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hi')))

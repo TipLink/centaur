@@ -1692,6 +1692,7 @@ impl SessionRuntime {
         &self,
         thread_key: &ThreadKey,
         messages: &[SessionMessageInput],
+        steer_active_execution: bool,
     ) -> Result<Vec<String>, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.session.messages.append",
@@ -1757,8 +1758,10 @@ impl SessionRuntime {
                 return Err(error);
             }
         };
-        self.forward_messages_to_active_execution(thread_key, messages, &message_ids)
-            .await;
+        if steer_active_execution {
+            self.forward_messages_to_active_execution(thread_key, messages, &message_ids)
+                .await;
+        }
         self.spawn_session_title_generation(thread_key);
         Ok(message_ids)
     }
@@ -9385,6 +9388,7 @@ mod adoption_tests {
                     ],
                     metadata: json!({}),
                 }],
+                true,
             ),
         )
         .await
@@ -9410,6 +9414,7 @@ mod adoption_tests {
                     parts: vec![json!({"type": "text", "text": "add more logging"})],
                     metadata: json!({}),
                 }],
+                true,
             )
             .await
             .expect("append burst message");
@@ -9429,6 +9434,7 @@ mod adoption_tests {
                     parts: vec![json!({"type": "text", "text": "add more logging"})],
                     metadata: json!({}),
                 }],
+                true,
             )
             .await
             .expect("append second message");
