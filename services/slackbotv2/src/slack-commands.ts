@@ -150,6 +150,7 @@ export function mountSlashCommands(
         },
         body: JSON.stringify({
           workflow_name: prepared.workflow,
+          eager_start: true,
           input: prepared.input,
           idempotency_key: `slack-command:${origin.requestId}`
         }),

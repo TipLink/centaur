@@ -319,6 +319,7 @@ describe('Slack command picker and forms', () => {
       )
     )
     expect(h.queued()[0]!.body.workflow_name).toBe('workflow_deploy')
+    expect(h.queued()[0]!.body.eager_start).toBe(true)
     expect(h.queued()[0]!.body.input).toMatchObject({
       detail: 'staging',
       actor_id: 'U1',

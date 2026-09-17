@@ -1852,6 +1852,7 @@ async fn start_slack_archive_import(
         .create_run(CreateWorkflowRunRequest {
             workflow_name: "slack_archive_import".to_owned(),
             input: json!({ "import_id": import.import_id }),
+            eager_start: false,
             idempotency_key: Some(format!("slack_archive_import:{}", import.import_id)),
             harness_type: None,
             max_attempts: Some(1),
@@ -1897,6 +1898,7 @@ async fn retry_slack_archive_import(
         .create_run(CreateWorkflowRunRequest {
             workflow_name: "slack_archive_import".to_owned(),
             input: json!({ "import_id": import.import_id }),
+            eager_start: false,
             idempotency_key: Some(format!(
                 "slack_archive_import:{}:retry:{}",
                 import.import_id,
@@ -3149,6 +3151,7 @@ async fn invoke_workflow_webhook(
                 "raw_body_sha256": raw_body_sha256,
             }
         }),
+        eager_start: false,
         idempotency_key: Some(trigger_key),
         harness_type: None,
         max_attempts: None,
