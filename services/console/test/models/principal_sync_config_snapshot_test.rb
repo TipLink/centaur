@@ -476,11 +476,15 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     end
   end
 
-  test "proxy sync renders proxy labels from the snapshot without recomputing postgres" do
+  test "proxy sync renders proxy-specific settings from the snapshot without recomputing postgres" do
     pg = pg_dsn_secrets(:acme_analytics_pg)
     pg.update!(settings: [
       { "name" => "centaur.principal", "value_from" => { "principal_field" => "foreign_id" } },
-      { "name" => "centaur.slack_user_id", "value_from" => { "proxy_label" => "centaur.slack_user_id" } }
+      { "name" => "centaur.slack_user_id", "value_from" => { "proxy_label" => "centaur.slack_user_id" } },
+      {
+        "name" => "centaur.requester_slack_user_id",
+        "value_from" => { "requester_principal_field" => "slack_user_id" }
+      }
     ])
     proxy = proxies(:acme_proxy)
     proxy.update!(labels: { "centaur.slack_user_id" => "U0123456789" })
@@ -495,11 +499,47 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
       assert_equal(
         [
           { "name" => "centaur.principal", "value" => @principal.foreign_id },
-          { "name" => "centaur.slack_user_id", "value" => "U0123456789" }
+          { "name" => "centaur.slack_user_id", "value" => "U0123456789" },
+          { "name" => "centaur.requester_slack_user_id", "value" => "" }
         ],
         entry.fetch("settings")
       )
     end
+  end
+
+  test "requester-derived postgres settings follow requester swaps and fail closed when cleared" do
+    conversation = @principal
+    conversation.update!(slack_user_id: "U9999999999")
+    requester_a = principals(:acme_user_alice)
+    requester_a.update!(slack_user_id: "U1111111111")
+    requester_b = principals(:acme_user_bob)
+    requester_b.update!(slack_user_id: "U2222222222")
+    pg = pg_dsn_secrets(:acme_analytics_pg)
+    pg.update!(settings: [
+      {
+        "name" => "centaur.slack_user_id",
+        "value_from" => { "requester_principal_field" => "slack_user_id" }
+      }
+    ])
+    proxy = proxies(:acme_proxy)
+
+    baseline_hash = proxy.config_hash
+    assert_equal "", proxy.sync_config_snapshot.dig(:config, "postgres", 0, "settings", 0, "value")
+
+    proxy.update!(requester_principal: requester_a)
+    hash_a = proxy.config_hash
+    assert_equal "U1111111111", proxy.sync_config_snapshot.dig(:config, "postgres", 0, "settings", 0, "value")
+    refute_equal baseline_hash, hash_a
+
+    proxy.update!(requester_principal: requester_b)
+    hash_b = proxy.config_hash
+    assert_equal "U2222222222", proxy.sync_config_snapshot.dig(:config, "postgres", 0, "settings", 0, "value")
+    refute_equal baseline_hash, hash_b
+    refute_equal hash_a, hash_b
+
+    proxy.update!(requester_principal: nil)
+    assert_equal "", proxy.sync_config_snapshot.dig(:config, "postgres", 0, "settings", 0, "value")
+    assert_equal baseline_hash, proxy.config_hash
   end
 
   test "snapshot accessors read flat payloads created before the snapshot envelope" do

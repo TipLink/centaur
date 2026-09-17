@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'bun:test'
 import type { Logger, Message } from 'chat'
-import { isAllowedSlackMessage } from '../src/slack-events'
+import {
+  isAllowedSlackMessage,
+  isAllowedSlackPayload,
+  parseSlackWebhookPayload
+} from '../src/slack-events'
 import type { SlackbotV2Options } from '../src/types'
 
 const logger: Logger = {
@@ -30,6 +34,48 @@ function options(fetchImpl: SlackbotV2Options['fetch']): SlackbotV2Options {
     triggerBotAllowlist: ['UALLOWED']
   }
 }
+
+describe('Slack webhook payload parsing', () => {
+  it('parses URL-encoded slash commands without labeling them invalid', () => {
+    expect(parseSlackWebhookPayload(new URLSearchParams({
+      channel_id: 'C123',
+      command: '/fineas',
+      team_id: 'T123',
+      text: 'help',
+      user_id: 'U123'
+    }).toString())).toEqual({
+      channel_id: 'C123',
+      command: '/fineas',
+      team_id: 'T123',
+      text: 'help',
+      user_id: 'U123'
+    })
+  })
+
+  it('does not treat an arbitrary form body as a Slack payload', () => {
+    expect(parseSlackWebhookPayload('command=fineas&text=help')).toBeNull()
+  })
+})
+
+describe('Slack extension interaction policy', () => {
+  for (const type of ['block_actions', 'block_suggestion', 'view_submission']) {
+    it(`rejects an unallowlisted external team for ${type}`, () => {
+      const payload = {
+        type,
+        team: { id: 'THOME' },
+        user: { id: 'UEXTERNAL', team_id: 'TEXTERNAL' }
+      }
+      const config = { ...options(globalThis.fetch), allowedExternalTeamIds: [] }
+
+      expect(isAllowedSlackPayload(payload, config, logger)).toBe(false)
+      expect(isAllowedSlackPayload(
+        payload,
+        { ...config, allowedExternalTeamIds: ['TEXTERNAL'] },
+        logger
+      )).toBe(true)
+    })
+  }
+})
 
 describe('Slack trigger bot allowlist', () => {
   it('resolves a bot-only event to its allowlisted bot user and caches the mapping', async () => {

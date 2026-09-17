@@ -250,7 +250,8 @@ module Console
         settings: {
           "0" => { name: "centaur.slack_channel_id", kind: "principal_field", value: "slack_channel_id" },
           "1" => { name: "centaur.principal", kind: "principal_field", value: "foreign_id" },
-          "2" => { name: "app.tenant", kind: "literal", value: "centaur" }
+          "2" => { name: "centaur.requester", kind: "requester_principal_field", value: "slack_user_id" },
+          "3" => { name: "app.tenant", kind: "literal", value: "centaur" }
         },
         source: { source_type: "env", reference: "VALUE_FROM_DSN" }
       }
@@ -260,6 +261,7 @@ module Console
         [
           { "name" => "centaur.slack_channel_id", "value_from" => { "principal_field" => "slack_channel_id" } },
           { "name" => "centaur.principal", "value_from" => { "principal_field" => "foreign_id" } },
+          { "name" => "centaur.requester", "value_from" => { "requester_principal_field" => "slack_user_id" } },
           { "name" => "app.tenant", "value" => "centaur" }
         ],
         secret.settings

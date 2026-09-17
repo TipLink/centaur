@@ -437,6 +437,357 @@ describe('slackbotv2', () => {
     expect(JSON.stringify(codexApi.workflowEvents)).not.toContain('sensitive-response-token')
   })
 
+  it('routes an extension-owned action without invoking the workflow catch-all', async () => {
+    const handled: Array<{ actionId: string; userId: string; value?: string }> = []
+    await bot.registerExtension(
+      { id: 'work-items-test', actionIds: ['work_item.resolve'] },
+      ({ chat }) => {
+        chat.onAction('work_item.resolve', async event => {
+          handled.push({
+            actionId: event.actionId,
+            userId: event.user.userId,
+            value: event.value
+          })
+        })
+      }
+    )
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/slack/actions',
+      signedSlackInteraction({
+        type: 'block_actions',
+        team: { id: TEAM_ID },
+        user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+        channel: { id: CHANNEL_ID },
+        message: { ts: '1700000002.000400', thread_ts: '1700000002.000100' },
+        actions: [{
+          action_id: 'work_item.resolve',
+          action_ts: '1700000002.000500',
+          type: 'button',
+          value: '{"item_id":"INC-42","version":3}'
+        }]
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(handled).toEqual([{
+      actionId: 'work_item.resolve',
+      userId: USER_ID,
+      value: '{"item_id":"INC-42","version":3}'
+    }])
+    expect(codexApi.workflowEvents).toHaveLength(0)
+  })
+
+  it('acknowledges an extension-owned action only after its durable handler finishes', async () => {
+    let release: (() => void) | undefined
+    const held = new Promise<void>(resolve => { release = resolve })
+    let started = false
+    await bot.registerExtension(
+      { id: 'durable-action-test', actionIds: ['work_item.durable'] },
+      ({ chat }) => {
+        chat.onAction('work_item.durable', async () => {
+          started = true
+          await held
+        })
+      }
+    )
+
+    let settled = false
+    const responsePromise = Promise.resolve(bot.app.request(
+      '/api/slack/actions',
+      signedSlackInteraction(extensionActionPayload('work_item.durable')),
+      {},
+      waitUntilContext([])
+    )).then(response => {
+      settled = true
+      return response
+    })
+
+    await waitFor(() => started)
+    await sleep(20)
+    expect(settled).toBe(false)
+    release?.()
+    expect((await responsePromise).status).toBe(200)
+  })
+
+  it('returns retryable failure when an extension action fails before acknowledgement', async () => {
+    bot = createTestBot({ logger: captureLogger([]) })
+    await bot.registerExtension(
+      { id: 'failed-action-test', actionIds: ['work_item.failed'] },
+      ({ chat }) => {
+        chat.onAction('work_item.failed', async () => {
+          throw new Error('durable write failed')
+        })
+      }
+    )
+
+    const response = await bot.app.request(
+      '/api/slack/actions',
+      signedSlackInteraction(extensionActionPayload('work_item.failed')),
+      {},
+      waitUntilContext([])
+    )
+    expect(response.status).toBe(503)
+    expect(await response.text()).toBe('Slack extension request could not be recorded. Please retry.')
+  })
+
+  it('acknowledges an extension-owned slash command only after its durable handler finishes', async () => {
+    let release: (() => void) | undefined
+    const held = new Promise<void>(resolve => { release = resolve })
+    let started = false
+    await bot.registerExtension(
+      { id: 'durable-slash-test', slashCommands: ['/durable-slash'] },
+      ({ chat }) => {
+        chat.onSlashCommand('/durable-slash', async () => {
+          started = true
+          await held
+        })
+      }
+    )
+
+    let settled = false
+    const responsePromise = Promise.resolve(bot.app.request(
+      '/api/slack/commands',
+      signedSlackCommand('/durable-slash'),
+      {},
+      waitUntilContext([])
+    )).then(response => {
+      settled = true
+      return response
+    })
+
+    await waitFor(() => started)
+    await sleep(20)
+    expect(settled).toBe(false)
+    release?.()
+    expect((await responsePromise).status).toBe(200)
+  })
+
+  it('returns retryable failure when an extension slash command fails before acknowledgement', async () => {
+    bot = createTestBot({ logger: captureLogger([]) })
+    await bot.registerExtension(
+      { id: 'failed-slash-test', slashCommands: ['/failed-slash'] },
+      ({ chat }) => {
+        chat.onSlashCommand('/failed-slash', async () => {
+          throw new Error('durable write failed')
+        })
+      }
+    )
+
+    const response = await bot.app.request(
+      '/api/slack/commands',
+      signedSlackCommand('/failed-slash'),
+      {},
+      waitUntilContext([])
+    )
+    expect(response.status).toBe(503)
+    expect(await response.text()).toBe('Slack extension request could not be recorded. Please retry.')
+  })
+
+  it('acknowledges an extension modal only after its durable handler finishes', async () => {
+    let release: (() => void) | undefined
+    const held = new Promise<void>(resolve => { release = resolve })
+    let started = false
+    await bot.registerExtension(
+      { id: 'durable-modal-test', modalCallbackIds: ['work_item.modal'] },
+      ({ chat }) => {
+        chat.onModalSubmit('work_item.modal', async () => {
+          started = true
+          await held
+          return { action: 'close' }
+        })
+      }
+    )
+
+    let settled = false
+    const responsePromise = Promise.resolve(bot.app.request(
+      '/api/slack/actions',
+      signedSlackInteraction(extensionModalPayload('work_item.modal')),
+      {},
+      waitUntilContext([])
+    )).then(response => {
+      settled = true
+      return response
+    })
+
+    await waitFor(() => started)
+    await sleep(20)
+    expect(settled).toBe(false)
+    release?.()
+    expect((await responsePromise).status).toBe(200)
+  })
+
+  it('returns retryable failure when an extension modal fails before acknowledgement', async () => {
+    bot = createTestBot({ logger: captureLogger([]) })
+    await bot.registerExtension(
+      { id: 'failed-modal-test', modalCallbackIds: ['work_item.failed_modal'] },
+      ({ chat }) => {
+        chat.onModalSubmit('work_item.failed_modal', async () => {
+          throw new Error('durable create failed')
+        })
+      }
+    )
+
+    const response = await bot.app.request(
+      '/api/slack/actions',
+      signedSlackInteraction(extensionModalPayload('work_item.failed_modal')),
+      {},
+      waitUntilContext([])
+    )
+    expect(response.status).toBe(503)
+    expect(await response.text()).toBe('Slack extension request could not be recorded. Please retry.')
+  })
+
+  it('preserves the forwarded Socket Mode secret from the adapter environment', () => {
+    const previous = process.env.SLACK_SOCKET_FORWARDING_SECRET
+    process.env.SLACK_SOCKET_FORWARDING_SECRET = 'forwarding-secret'
+    try {
+      const adapter = createTestBot().chat.getAdapter('slack') as unknown as {
+        socketForwardingSecret?: string
+      }
+      expect(adapter.socketForwardingSecret).toBe('forwarding-secret')
+    } finally {
+      if (previous === undefined) delete process.env.SLACK_SOCKET_FORWARDING_SECRET
+      else process.env.SLACK_SOCKET_FORWARDING_SECRET = previous
+    }
+  })
+
+  it('keeps webhook mode by default when an app token exists in the environment', () => {
+    const previous = process.env.SLACK_APP_TOKEN
+    process.env.SLACK_APP_TOKEN = 'xapp-environment-token'
+    try {
+      const adapter = createTestBot().chat.getAdapter('slack') as unknown as {
+        appToken?: string
+        mode?: string
+      }
+      expect(adapter.appToken).toBe('xapp-environment-token')
+      expect(adapter.mode).toBe('webhook')
+    } finally {
+      if (previous === undefined) delete process.env.SLACK_APP_TOKEN
+      else process.env.SLACK_APP_TOKEN = previous
+    }
+  })
+
+  it('holds Socket Mode acknowledgements for extension actions and slash commands', async () => {
+    const feedback: unknown[] = []
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/api/workflows/actions/invoke')) {
+          return Response.json({ error: 'invalid or untrusted workflow button' }, { status: 403 })
+        }
+        if (String(input).endsWith('/chat.postEphemeral')) {
+          feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
+          return Response.json({ ok: true })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    let releaseAction: (() => void) | undefined
+    let releaseSlash: (() => void) | undefined
+    const heldAction = new Promise<void>(resolve => { releaseAction = resolve })
+    const heldSlash = new Promise<void>(resolve => { releaseSlash = resolve })
+    let actionStarted = false
+    let slashStarted = false
+    await bot.registerExtension(
+      {
+        id: 'socket-durability-test',
+        actionIds: ['work_item.socket'],
+        modalCallbackIds: ['work_item.socket_modal'],
+        slashCommands: ['/work-item-socket']
+      },
+      ({ chat }) => {
+        chat.onAction('work_item.socket', async () => {
+          actionStarted = true
+          await heldAction
+        })
+        chat.onSlashCommand('/work-item-socket', async () => {
+          slashStarted = true
+          await heldSlash
+        })
+        chat.onModalSubmit('work_item.socket_modal', async () => {
+          throw new Error('socket durable create failed')
+        })
+      }
+    )
+    await bot.initialize()
+    const adapter = bot.chat.getAdapter('slack') as unknown as {
+      routeSocketEvent(
+        body: Record<string, unknown>,
+        eventType: string,
+        ack: () => Promise<void>
+      ): Promise<void>
+    }
+
+    let actionAcknowledged = false
+    const actionRoute = adapter.routeSocketEvent(
+      extensionActionPayload('work_item.socket'),
+      'interactive',
+      async () => { actionAcknowledged = true }
+    )
+    await waitFor(() => actionStarted)
+    await sleep(20)
+    expect(actionAcknowledged).toBe(false)
+    releaseAction?.()
+    await actionRoute
+    expect(actionAcknowledged).toBe(true)
+
+    let slashAcknowledged = false
+    const slashRoute = adapter.routeSocketEvent(
+      {
+        command: '/work-item-socket',
+        text: 'incident',
+        user_id: USER_ID,
+        channel_id: CHANNEL_ID,
+        team_id: TEAM_ID,
+        trigger_id: 'socket-trigger'
+      },
+      'slash_commands',
+      async () => { slashAcknowledged = true }
+    )
+    await waitFor(() => slashStarted)
+    await sleep(20)
+    expect(slashAcknowledged).toBe(false)
+    releaseSlash?.()
+    await slashRoute
+    expect(slashAcknowledged).toBe(true)
+
+    let mixedAcknowledged = false
+    await adapter.routeSocketEvent(
+      {
+        ...extensionActionPayload('work_item.socket'),
+        actions: [
+          ...(extensionActionPayload('work_item.socket').actions as unknown[]),
+          {
+            action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+            action_ts: '1700000002.000800',
+            type: 'button',
+            value: 'unsigned'
+          }
+        ]
+      },
+      'interactive',
+      async () => { mixedAcknowledged = true }
+    )
+    expect(mixedAcknowledged).toBe(true)
+    await waitFor(() => feedback.length === 1)
+    expect(feedback[0]).toMatchObject({
+      channel: CHANNEL_ID,
+      text: 'This request is no longer available.',
+      user: USER_ID
+    })
+
+    let failedModalAcknowledged = false
+    await adapter.routeSocketEvent(
+      extensionModalPayload('work_item.socket_modal'),
+      'interactive',
+      async () => { failedModalAcknowledged = true }
+    )
+    expect(failedModalAcknowledged).toBe(false)
+  })
+
   it('durably hands off workflow buttons before acknowledging and retries failed acceptance', async () => {
     const requests: Record<string, unknown>[] = []
     const feedback: unknown[] = []
@@ -6253,6 +6604,62 @@ function signedSlackInteraction(payload: Record<string, unknown>): RequestInit {
       'x-slack-signature': `v0=${signature}`
     },
     body
+  }
+}
+
+function signedSlackCommand(command: string): RequestInit {
+  const timestamp = Math.floor(Date.now() / 1000)
+  const body = new URLSearchParams({
+    channel_id: CHANNEL_ID,
+    command,
+    team_id: TEAM_ID,
+    text: 'incident',
+    trigger_id: 'webhook-trigger',
+    user_id: USER_ID
+  }).toString()
+  const signature = createHmac('sha256', SIGNING_SECRET)
+    .update(`v0:${timestamp}:${body}`)
+    .digest('hex')
+  return {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'x-slack-request-timestamp': String(timestamp),
+      'x-slack-signature': `v0=${signature}`
+    },
+    body
+  }
+}
+
+function extensionActionPayload(actionId: string): Record<string, unknown> {
+  return {
+    type: 'block_actions',
+    team: { id: TEAM_ID },
+    user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+    channel: { id: CHANNEL_ID },
+    message: { ts: '1700000002.000600', thread_ts: '1700000002.000100' },
+    actions: [{
+      action_id: actionId,
+      action_ts: '1700000002.000700',
+      type: 'button',
+      value: '{"item_id":"INC-42","version":3}'
+    }]
+  }
+}
+
+function extensionModalPayload(callbackId: string): Record<string, unknown> {
+  return {
+    type: 'view_submission',
+    team: { id: TEAM_ID },
+    user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+    trigger_id: 'modal-trigger',
+    view: {
+      id: 'VMODAL',
+      type: 'modal',
+      callback_id: callbackId,
+      private_metadata: '',
+      state: { values: {} }
+    }
   }
 }
 

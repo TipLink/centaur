@@ -23,7 +23,7 @@ Use these as the main extension points:
 | `console.sqlExporter.*` | SQL Exporter configuration and scrape metadata for Console database metrics. |
 | `slackbot.extraEnv` | Slackbot HTTP, Slack, feedback, and cross-org behavior. |
 | `sandbox.extraEnv` | Extra variables copied into every sandbox pod through `KUBERNETES_SANDBOX_EXTRA_ENV`. |
-| `overlays.sources` | Ordered repo-cache-backed overlay repos for tools, workflows, and skills; subdirs default to `tools`, `workflows`, and `.agents/skills`. |
+| `overlays.sources` | Ordered repo-cache-backed overlay repos for tools, workflows, skills, and opt-in Slackbot extensions; `slackbotSubdir` points to a directory containing `index.mjs` and requires `ref` to be a full commit SHA. |
 | `overlay.systemPrompt` | Small inline prompt overlay escape hatch. |
 
 Tool credentials are not listed here. Tool plugins declare their own secrets in
@@ -38,7 +38,6 @@ These must exist for the normal Helm deployment. For local development,
 | Env var | Set from | Controls |
 | --- | --- | --- |
 | `DATABASE_URL` | `secretManager.existingSecretName`; local bootstrap generates it. | API and Slackbot Postgres connection. |
-| `SLACK_SIGNING_SECRET` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack request signature verification. |
 | `SLACKBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Dedicated Slackbot key accepted by api-rs for the Slack session namespace and workflow events. |
 | `SLACK_BOT_TOKEN` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack Web API access for Slackbot and api-rs Slack helpers. |
 | `IRON_MANAGEMENT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it. | Management key for API-created iron-proxy pods. |
@@ -49,6 +48,8 @@ Optional required-by-mode variables:
 
 | Env var | Set from | Controls |
 | --- | --- | --- |
+| `SLACK_SIGNING_SECRET` | `secretManager.existingSecretName` when `slackbotv2.mode=webhook`; local bootstrap reads shell env. | Required in webhook mode for Slack request signature verification. Not required for native Socket Mode. |
+| `SLACK_APP_TOKEN` | `secretManager.existingSecretName` when `slackbotv2.mode=socket`. | Required in Socket Mode for the Chat SDK connection. |
 | `OP_CONNECT_CREDENTIALS_FILE` | Local shell before `just deploy`. | Enables the 1Password Connect subchart and creates its credentials Secret. |
 | `OP_CONNECT_TOKEN` | Secret or local bootstrap shell env. | Token used by iron-proxy when `ironProxy.secretSource=onepassword-connect`. |
 | `TEAMS_BOT_APP_ID`, `TEAMS_BOT_APP_PASSWORD`, `TEAMS_BOT_APP_TENANT_ID` | Local shell before `just bootstrap-secrets`; production Secret. | Required by Teamsbot when `teamsbot.enabled=true`. |
@@ -179,12 +180,14 @@ Execution tuning:
 | `SLACK_FEEDBACK_LINEAR_TEAM_ID`, `SLACK_FEEDBACK_LINEAR_PROJECT_ID` | `slackbot.extraEnv`. | Linear destination for feedback issues. |
 | `SLACKBOT_EXTERNAL_ORG_ALLOWLIST` | `slackbot.extraEnv`. | Slack team ids allowed for external org handoff. |
 | `SLACKBOTV2_AGENT_VIEW_ENABLED` | `slackbotv2.agentViewEnabled`. | Enables Slack agent view, threaded DM sessions, and native status and titles. Defaults to `false`. Requires the Slack app migration described in [Quickstart](/quickstart). Native Stop support is deferred. |
+| `SLACKBOTV2_MODE` | `slackbotv2.mode`. | Selects `webhook` (default) or Chat SDK `socket` event transport. Socket mode requires `SLACK_APP_TOKEN`; extensions register before the adapter connects. |
 | `SLACKBOTV2_AUTO_JOIN_CREATED_CHANNELS` | `slackbotv2.autoJoinCreatedChannels`. | Joins newly-created public channels after subscribed `channel_created` events. Requires `channels:read` and `channels:join`. Defaults to `false`. |
 | `SLACKBOTV2_STEERING_REACTION_ENABLED` | `slackbotv2.steeringReactionEnabled`. | Reacts to mentioned follow-up messages while an execution is active, then removes their reactions after the assistant response is posted. Requires `reactions:write`. Defaults to `false` and disables itself for the running process if Slack reports the scope is missing. |
 | `SLACKBOTV2_STEERING_REACTION` | `slackbotv2.steeringReaction`. | Slack emoji name used for steering acknowledgements. Defaults to `hourglass_flowing_sand`. |
 | `SLACKBOTV2_DEFAULT_HARNESS` | `sandbox.harnessEngine`. | Base harness for new Slack threads without an explicit flag or channel default. |
 | `SLACKBOTV2_CODEX_NANOCODEX_ROLLOUT_PERCENT` | `slackbotv2.codexNanocodexRolloutPercent`. | Percentage of otherwise-default Codex Slack threads assigned to Nanocodex. Assignment is deterministic by thread key and recorded in session and execution metadata. Selecting a non-default model bypasses the rollout. When response metadata is enabled, Slack shows the resolved harness name. Defaults to `0`; increase it to enroll new Codex Slack threads. |
 | `SLACKBOTV2_CHANNEL_DEFAULTS` | `slackbotv2.channelDefaults`. | Per-channel default harness / model / provider / reasoning as a JSON object keyed by Slack conversation id, where each value is an object of optional `harness`/`model`/`provider`/`reasoning` fields (same vocabulary as the inline flags, so `harness: claude`, `provider: bedrock`, and Claude model aliases like `opus` all work), e.g. `{"C0ENG":{"harness":"claude","model":"opus","reasoning":"high"},"C0TRIAGE":{"reasoning":"low"}}`. A model is only meaningful within a harness, so name the harness alongside it. Applied when a message in that channel carries no explicit/sticky per-thread flag (below such a flag, above the deployment/baked default) and forwarded onto the harness input line so it takes effect; setting the harness restarts a thread onto it like a `--claude`/`--codex` flag. `reasoning` affects the Codex and Nanocodex harnesses. Malformed JSON and unrecognized field values are logged and ignored. |
+| `SLACKBOTV2_EXTENSION_MODULES` | Chart-rendered from `overlays.sources[*].slackbotSubdir`. | Ordered JSON descriptors containing each trusted ESM module path, repo path, and immutable revision. Slackbot verifies repo-cache `HEAD`, then loads modules before listening. Each module exports an `extension` manifest and `register(context)`. |
 | `SLACK_TEAM_ID` | `slackbot.extraEnv`. | Workspace team ID (e.g. `T01ABCD2EFG`) used to rewrite `https://*.slack.com/archives/...` URLs in final-delivery messages into native `slack://channel?team=...` deep links that open in the Slack app. Leave unset to keep archive URLs unchanged. |
 | `COMMIT_SHA` | Build/deploy env. | Commit shown in Slackbot metadata. |
 

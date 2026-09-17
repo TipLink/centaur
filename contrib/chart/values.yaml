@@ -290,6 +290,9 @@ overlay:
 # only need `repo`; set `ref` to a branch, tag, or commit when you do not want
 # the repo's default branch. Directories missing from a repo are skipped at
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
+# Slackbot extensions execute inside the Slack ingress, so they are opt-in:
+# set slackbotSubdir to a directory containing index.mjs and pin ref to a full
+# 40-character commit SHA.
 # Repo visibility defaults to private; set visibility: public only for repos
 # safe to expose to principals with sandbox_repo_cache=public.
 overlays:
@@ -305,6 +308,7 @@ overlays:
   #   visibility: private
   #   toolsSubdir: ""
   #   skillsSubdir: ""
+  #   slackbotSubdir: slackbot
 
 codex:
   # Operator-defined OpenAI-compatible Responses providers. Each provider is
@@ -639,6 +643,10 @@ apiRs:
 slackbotv2:
   enabled: true
   replicaCount: 1
+  # Use webhook for public Slack request URLs, or socket with an
+  # SLACK_APP_TOKEN in the deployment Secret. Socket handlers are registered
+  # before the adapter connects.
+  mode: webhook
   image:
     repository: centaur-slackbotv2
     tag: latest

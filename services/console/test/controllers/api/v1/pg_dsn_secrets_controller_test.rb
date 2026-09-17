@@ -196,7 +196,8 @@ module Api
             database: "value-from-db",
             settings: [
               { name: "centaur.slack_channel_id", value_from: { principal_field: "slack_channel_id" } },
-              { name: "centaur.principal", value_from: { principal_field: "foreign_id" } }
+              { name: "centaur.principal", value_from: { principal_field: "foreign_id" } },
+              { name: "centaur.requester", value_from: { requester_principal_field: "slack_user_id" } }
             ],
             dsn: { source_type: "env", config: { var: "VALUE_FROM_DSN" } }
           }
@@ -208,7 +209,8 @@ module Api
         assert_equal(
           [
             { "name" => "centaur.slack_channel_id", "value_from" => { "principal_field" => "slack_channel_id" } },
-            { "name" => "centaur.principal", "value_from" => { "principal_field" => "foreign_id" } }
+            { "name" => "centaur.principal", "value_from" => { "principal_field" => "foreign_id" } },
+            { "name" => "centaur.requester", "value_from" => { "requester_principal_field" => "slack_user_id" } }
           ],
           json_body.dig("data", "settings")
         )

@@ -297,7 +297,8 @@ pub struct AwsAuthSecretInput {
 /// issues ``SET ROLE`` for. ``settings`` are optional Postgres GUCs the proxy
 /// sets after connecting. A setting can carry either a literal ``value`` or a
 /// structured ``value_from`` reference that iron-control resolves against the
-/// proxy's assigned principal at sync time.
+/// proxy's assigned principal, verified per-turn requester principal, or proxy
+/// labels at sync time.
 // Not `Eq`: holds a `SecretSource` (arbitrary `Value` config).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PgDsnSecretInput {
@@ -330,6 +331,8 @@ pub struct PgDsnSettingValueFromInput {
     pub principal_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requester_principal_field: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_label: Option<String>,
 }

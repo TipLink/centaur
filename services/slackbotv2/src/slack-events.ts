@@ -55,8 +55,22 @@ export function isAllowedSlackWebhookBody(
   logger: Logger
 ): boolean {
   const payload = parseSlackWebhookPayload(rawBody)
+  return isAllowedSlackPayload(payload, options, logger)
+}
+
+/** Apply Centaur's workspace policy to a parsed webhook or Socket Mode payload. */
+export function isAllowedSlackPayload(
+  payload: unknown,
+  options: SlackbotV2Options,
+  logger: Logger
+): boolean {
   if (!payload) return true
-  if (isRawSlackInteraction(payload) && payload.type === 'block_actions') {
+  if (
+    isRawSlackInteraction(payload)
+    && ['block_actions', 'block_suggestion', 'view_submission'].includes(
+      stringValue(payload.type) ?? ''
+    )
+  ) {
     return isAllowedSlackInteraction(payload, options, logger)
   }
   if (!isRawSlackEnvelope(payload) || payload.type !== 'event_callback') return true
@@ -80,8 +94,11 @@ export function isAllowedSlackWebhookBody(
 export function parseSlackWebhookPayload(rawBody: string): Record<string, unknown> | null {
   const parsed = parseJsonObject(rawBody)
   if (parsed) return parsed
-  const formPayload = new URLSearchParams(rawBody).get('payload')
-  return formPayload ? parseJsonObject(formPayload) : null
+  const form = new URLSearchParams(rawBody)
+  const formPayload = form.get('payload')
+  if (formPayload) return parseJsonObject(formPayload)
+  const command = form.get('command')
+  return command?.startsWith('/') ? Object.fromEntries(form) : null
 }
 
 function parseJsonObject(value: string): Record<string, unknown> | null {

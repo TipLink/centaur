@@ -28,10 +28,11 @@ class PgDsnSecret < ApplicationRecord
   RESERVED_SETTING_NAMES = %w[role session_authorization].freeze
 
   # A setting's `value_from` reference takes exactly one of these keys.
-  VALUE_FROM_KEYS = %w[principal_label principal_field proxy_label].freeze
-  # Principal attributes a `principal_field` reference may name. `id` resolves
-  # to the principal oid and `console_user_id` to the associated user oid; raw
-  # database primary keys are never exposed as setting values.
+  VALUE_FROM_KEYS = %w[principal_label principal_field requester_principal_field proxy_label].freeze
+  # Principal attributes a `principal_field` or `requester_principal_field`
+  # reference may name. `id` resolves to the principal oid and
+  # `console_user_id` to the associated user oid; raw database primary keys are
+  # never exposed as setting values.
   PRINCIPAL_FIELDS = %w[
     id foreign_id name kind slack_user_id slack_channel_id slack_team_id slack_email
     console_user_id console_user_email slack_history_channel_ids
@@ -71,14 +72,37 @@ class PgDsnSecret < ApplicationRecord
     end
   end
 
-  def proxy_label_settings?
+  def proxy_specific_settings?
     Array(settings).any? do |setting|
       next false unless setting.is_a?(Hash)
 
       ref = setting.with_indifferent_access[:value_from]
       next false unless ref.is_a?(Hash)
 
-      ref[:proxy_label].present?
+      ref.with_indifferent_access.key?(:proxy_label) ||
+        ref.with_indifferent_access.key?(:requester_principal_field)
+    end
+  end
+
+  # Resolve only explicitly allowlisted principal attributes. This method is
+  # shared by normal principal fields and requester principal fields so neither
+  # selector can turn persisted input into an arbitrary method call.
+  def self.principal_field_value(principal, field)
+    return "" unless principal && PRINCIPAL_FIELDS.include?(field.to_s)
+
+    case field.to_s
+    when "id" then principal.oid
+    when "foreign_id" then principal.foreign_id.to_s
+    when "name" then principal.name.to_s
+    when "kind" then principal.kind.to_s
+    when "slack_user_id" then principal.slack_user_id.to_s
+    when "slack_channel_id" then principal.slack_channel_id.to_s
+    when "slack_team_id" then principal.slack_team_id.to_s
+    when "slack_email" then principal.slack_email.to_s
+    when "console_user_id" then principal.console_user&.oid.to_s
+    when "console_user_email" then principal.console_user&.email.to_s
+    when "slack_history_channel_ids" then JSON.generate(principal.slack_history_channel_ids)
+    else ""
     end
   end
 
@@ -97,38 +121,37 @@ class PgDsnSecret < ApplicationRecord
   end
 
   # The concrete value the proxy should pin: the stored literal, or the
-  # principal/proxy attribute or label a `value_from` reference names. References
-  # resolve to "" when no principal/proxy is given or the label is absent, so
-  # RLS-style policies fail closed rather than seeing a literal placeholder.
+  # principal/requester/proxy attribute or label a `value_from` reference names.
+  # References resolve to "" when their exact source is absent, so RLS-style
+  # policies fail closed rather than falling back to another identity.
   def setting_value(setting, principal, proxy)
     setting = setting.with_indifferent_access
     ref = setting[:value_from]
     return setting[:value].to_s unless ref.is_a?(Hash)
+    ref = ref.with_indifferent_access
 
-    label = ref[:principal_label]
-    if label.present?
+    # If malformed persisted data contains another selector alongside this
+    # one, requester identity still fails closed instead of falling through to
+    # a conversation principal or proxy label.
+    if ref.key?(:requester_principal_field)
+      return self.class.principal_field_value(proxy&.requester_principal, ref[:requester_principal_field])
+    end
+
+    if ref.key?(:principal_label)
+      label = ref[:principal_label]
+      return "" if label.blank?
       return principal&.labels&.fetch(label.to_s, "").to_s
     end
 
-    proxy_label = ref[:proxy_label]
-    return proxy&.labels&.fetch(proxy_label.to_s, "").to_s if proxy_label.present?
-
-    return "" unless principal
-
-    case ref[:principal_field].to_s
-    when "id" then principal.oid
-    when "foreign_id" then principal.foreign_id.to_s
-    when "name" then principal.name.to_s
-    when "kind" then principal.kind.to_s
-    when "slack_user_id" then principal.slack_user_id.to_s
-    when "slack_channel_id" then principal.slack_channel_id.to_s
-    when "slack_team_id" then principal.slack_team_id.to_s
-    when "slack_email" then principal.slack_email.to_s
-    when "console_user_id" then principal.console_user&.oid.to_s
-    when "console_user_email" then principal.console_user&.email.to_s
-    when "slack_history_channel_ids" then JSON.generate(principal.slack_history_channel_ids)
-    else "" # Invalid persisted or unsaved settings fail closed.
+    if ref.key?(:proxy_label)
+      proxy_label = ref[:proxy_label]
+      return "" if proxy_label.blank?
+      return proxy&.labels&.fetch(proxy_label.to_s, "").to_s
     end
+
+    return self.class.principal_field_value(principal, ref[:principal_field]) if ref.key?(:principal_field)
+
+    "" # Invalid persisted or unsaved settings fail closed.
   end
 
   # Settings must be an array of { name, value } or { name, value_from }
@@ -185,6 +208,10 @@ class PgDsnSecret < ApplicationRecord
     return "proxy_label can't be blank" if keys.first == "proxy_label" && proxy_label.to_s.blank?
     if keys.first == "principal_field" && !PRINCIPAL_FIELDS.include?(field.to_s)
       return "unknown principal_field #{field.to_s.inspect} (one of: #{PRINCIPAL_FIELDS.join(", ")})"
+    end
+    requester_field = ref[:requester_principal_field]
+    if keys.first == "requester_principal_field" && !PRINCIPAL_FIELDS.include?(requester_field.to_s)
+      return "unknown requester_principal_field #{requester_field.to_s.inspect} (one of: #{PRINCIPAL_FIELDS.join(", ")})"
     end
 
     nil

@@ -1,6 +1,55 @@
 {{- if .Values.slackbotv2.enabled }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
+{{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
+{{- $repoCacheUsePvc := eq $repoCacheStorageType "persistentVolumeClaim" -}}
+{{- $repoCachePvcName := include "centaur.repoCachePvcName" . -}}
+{{- $overlaySources := include "centaur.overlaySources" . | fromJsonArray -}}
+{{- $effectiveRepoRefs := dict -}}
+{{- range $repo, $ref := .Values.repoCache.repositoryRefs -}}
+{{- $_ := set $effectiveRepoRefs $repo $ref -}}
+{{- end -}}
+{{- range .Values.repoCache.repositories -}}
+{{- if not (kindIs "string" .) -}}
+{{- $repo := get . "repo" | default "" -}}
+{{- $ref := get . "ref" | default "" -}}
+{{- if and $repo $ref (not (hasKey $effectiveRepoRefs $repo)) -}}
+{{- $_ := set $effectiveRepoRefs $repo $ref -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $source := $overlaySources -}}
+{{- $repo := get $source "repo" | default "" -}}
+{{- $ref := get $source "ref" | default "" -}}
+{{- if and $repo $ref (not (hasKey $effectiveRepoRefs $repo)) -}}
+{{- $_ := set $effectiveRepoRefs $repo $ref -}}
+{{- end -}}
+{{- end -}}
+{{- $extensionModules := list -}}
+{{- $extensionSources := list -}}
+{{- range $source := $overlaySources -}}
+{{- $repo := get $source "repo" | default "" -}}
+{{- with (get $source "slackbotSubdir") -}}
+{{- $ref := get $source "ref" | default "" -}}
+{{- if not (regexMatch "^[0-9a-fA-F]{40}$" $ref) -}}
+{{- fail (printf "overlays source %s: slackbotSubdir requires ref to be a full 40-character commit SHA" $repo) -}}
+{{- end -}}
+{{- $effectiveRef := get $effectiveRepoRefs $repo | default "" -}}
+{{- if ne (lower $effectiveRef) (lower $ref) -}}
+{{- fail (printf "overlays source %s: slackbotSubdir ref %s conflicts with effective repo-cache ref %s" $repo $ref ($effectiveRef | default "<default branch>")) -}}
+{{- end -}}
+{{- $repositoryPath := printf "%s/%s" $.Values.repoCache.hostPath $repo -}}
+{{- $modulePath := printf "%s/%s/index.mjs" $repositoryPath . -}}
+{{- $extensionModule := dict "modulePath" $modulePath "repositoryPath" $repositoryPath "revision" (lower $ref) -}}
+{{- $extensionModules = append $extensionModules $extensionModule -}}
+{{- $extensionSource := dict "repo" $repo "ref" (lower $ref) "slackbotSubdir" . -}}
+{{- $extensionSources = append $extensionSources $extensionSource -}}
+{{- end -}}
+{{- end -}}
+{{- if and (gt (len $extensionModules) 0) (not .Values.repoCache.enabled) -}}
+{{- fail "overlays.sources[].slackbotSubdir requires repoCache.enabled=true" -}}
+{{- end -}}
+{{- $useExtensionRepoCache := gt (len $extensionModules) 0 -}}
 {{- $slackbotV2MetricsAnnotations := dict -}}
 {{- if .Values.slackbotv2.metrics.scrapeAnnotations -}}
 {{- $slackbotV2MetricsAnnotations = dict "prometheus.io/scrape" "true" "prometheus.io/path" .Values.slackbotv2.metrics.path "prometheus.io/port" "3001" -}}
@@ -21,6 +70,9 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+{{- if $extensionSources }}
+        checksum/slackbot-extensions: {{ toJson $extensionSources | sha256sum }}
+{{- end }}
 {{- with $slackbotV2MetricsAnnotations }}
 {{ toYaml . | nindent 8 }}
 {{- end }}
@@ -42,6 +94,8 @@ spec:
               value: "3001"
             - name: CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+            - name: SLACKBOTV2_MODE
+              value: {{ .Values.slackbotv2.mode | quote }}
             # New threads without an explicit --claude/--amp/--codex/
             # --nanocodex flag run the deployment's default harness.
             - name: SLACKBOTV2_DEFAULT_HARNESS
@@ -53,11 +107,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sSLACK_BOT_TOKEN" .Values.secretManager.envPrefix }}
+{{- if eq .Values.slackbotv2.mode "webhook" }}
             - name: SLACK_SIGNING_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sSLACK_SIGNING_SECRET" .Values.secretManager.envPrefix }}
+{{- end }}
+{{- if eq .Values.slackbotv2.mode "socket" }}
+            - name: SLACK_APP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sSLACK_APP_TOKEN" .Values.secretManager.envPrefix }}
+{{- end }}
             - name: SLACKBOT_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -100,6 +163,10 @@ spec:
               value: {{ .Values.slackbotv2.messageOverridesStrategy.timeoutMs | quote }}
             - name: SLACKBOTV2_MESSAGE_OVERRIDES_MAX_OUTPUT_TOKENS
               value: {{ .Values.slackbotv2.messageOverridesStrategy.maxOutputTokens | quote }}
+{{- if $extensionModules }}
+            - name: SLACKBOTV2_EXTENSION_MODULES
+              value: {{ toJson $extensionModules | quote }}
+{{- end }}
 {{- if and $console.chat.enabled $console.publicUrl }}
             # Public origin of the Console UI (matches the Console's own
             # CENTAUR_CONSOLE_PUBLIC_URL). When chat is enabled, the first
@@ -161,13 +228,32 @@ spec:
             timeoutSeconds: 5
           livenessProbe:
             httpGet:
-              path: /health
+              path: /live
               port: 3001
             timeoutSeconds: 5
           securityContext:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.slackbotv2.resources | nindent 12 }}
+{{- if $useExtensionRepoCache }}
+          volumeMounts:
+            - name: repo-cache
+              mountPath: {{ .Values.repoCache.hostPath | quote }}
+              readOnly: true
+{{- end }}
+{{- if $useExtensionRepoCache }}
+      volumes:
+        - name: repo-cache
+{{- if $repoCacheUsePvc }}
+          persistentVolumeClaim:
+            claimName: {{ $repoCachePvcName | quote }}
+            readOnly: true
+{{- else }}
+          hostPath:
+            path: {{ .Values.repoCache.hostPath | quote }}
+            type: DirectoryOrCreate
+{{- end }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service

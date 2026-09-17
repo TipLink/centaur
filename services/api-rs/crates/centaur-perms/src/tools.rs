@@ -740,10 +740,12 @@ fn parse_pg_dsn_setting_value_from(value: Option<&Value>) -> Result<Option<PgDsn
         .ok_or_else(|| eyre!("pg_dsn setting value_from must be a table"))?;
     let principal_label = opt_str(table, "principal_label");
     let principal_field = opt_str(table, "principal_field");
+    let requester_principal_field = opt_str(table, "requester_principal_field");
     let proxy_label = opt_str(table, "proxy_label");
     let declared = [
         principal_label.as_ref(),
         principal_field.as_ref(),
+        requester_principal_field.as_ref(),
         proxy_label.as_ref(),
     ]
     .into_iter()
@@ -751,12 +753,13 @@ fn parse_pg_dsn_setting_value_from(value: Option<&Value>) -> Result<Option<PgDsn
     .count();
     if declared != 1 {
         bail!(
-            "pg_dsn setting value_from must declare exactly one of principal_label, principal_field, or proxy_label"
+            "pg_dsn setting value_from must declare exactly one of principal_label, principal_field, requester_principal_field, or proxy_label"
         );
     }
     Ok(Some(PgDsnSettingValueFrom {
         principal_label,
         principal_field,
+        requester_principal_field,
         proxy_label,
     }))
 }

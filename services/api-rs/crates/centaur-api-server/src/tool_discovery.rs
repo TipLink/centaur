@@ -984,10 +984,13 @@ fn parse_pg_dsn_setting_value_from(
     })?;
     let principal_label = optional_str(table, "principal_label").map(ToOwned::to_owned);
     let principal_field = optional_str(table, "principal_field").map(ToOwned::to_owned);
+    let requester_principal_field =
+        optional_str(table, "requester_principal_field").map(ToOwned::to_owned);
     let proxy_label = optional_str(table, "proxy_label").map(ToOwned::to_owned);
     let declared = [
         principal_label.as_ref(),
         principal_field.as_ref(),
+        requester_principal_field.as_ref(),
         proxy_label.as_ref(),
     ]
     .into_iter()
@@ -995,12 +998,13 @@ fn parse_pg_dsn_setting_value_from(
     .count();
     if declared != 1 {
         return Err(ToolDiscoveryError::Invalid(
-            "pg_dsn setting value_from must declare exactly one of principal_label, principal_field, or proxy_label".to_owned(),
+            "pg_dsn setting value_from must declare exactly one of principal_label, principal_field, requester_principal_field, or proxy_label".to_owned(),
         ));
     }
     Ok(Some(PgDsnSettingValueFrom {
         principal_label,
         principal_field,
+        requester_principal_field,
         proxy_label,
     }))
 }
@@ -1637,6 +1641,7 @@ mod tests {
                     value_from: Some(PgDsnSettingValueFrom {
                         principal_label: None,
                         principal_field: Some("slack_channel_id".to_owned()),
+                        requester_principal_field: None,
                         proxy_label: None,
                     }),
                 },
@@ -1646,6 +1651,7 @@ mod tests {
                     value_from: Some(PgDsnSettingValueFrom {
                         principal_label: None,
                         principal_field: None,
+                        requester_principal_field: None,
                         proxy_label: Some("centaur.slack_user_id".to_owned()),
                     }),
                 },
@@ -1655,6 +1661,17 @@ mod tests {
                     value_from: Some(PgDsnSettingValueFrom {
                         principal_label: None,
                         principal_field: Some("slack_history_channel_ids".to_owned()),
+                        requester_principal_field: None,
+                        proxy_label: None,
+                    }),
+                },
+                PgDsnSetting {
+                    name: "centaur.requester_slack_user_id".to_owned(),
+                    value: None,
+                    value_from: Some(PgDsnSettingValueFrom {
+                        principal_label: None,
+                        principal_field: None,
+                        requester_principal_field: Some("slack_user_id".to_owned()),
                         proxy_label: None,
                     }),
                 },
@@ -1674,7 +1691,7 @@ mod tests {
             listeners[0].extra.get("role").and_then(YamlValue::as_str),
             Some("centaur_company_context_reader")
         );
-        assert_eq!(listeners[0].settings.len(), 4);
+        assert_eq!(listeners[0].settings.len(), 5);
         assert_eq!(listeners[0].settings[0].name, "centaur.slack_channel_id");
         assert_eq!(listeners[0].settings[1].name, "centaur.slack_user_id");
         assert_eq!(
@@ -1695,7 +1712,14 @@ mod tests {
                 .and_then(|value_from| value_from.principal_field.as_deref()),
             Some("slack_history_channel_ids")
         );
-        assert_eq!(listeners[0].settings[3].value.as_deref(), Some("true"));
+        assert_eq!(
+            listeners[0].settings[3]
+                .value_from
+                .as_ref()
+                .and_then(|value_from| value_from.requester_principal_field.as_deref()),
+            Some("slack_user_id")
+        );
+        assert_eq!(listeners[0].settings[4].value.as_deref(), Some("true"));
     }
 
     #[test]
@@ -1704,7 +1728,7 @@ mod tests {
             r#"
 database = "warehouse"
 settings = [
-  { name = "centaur.slack_user_id", value_from = { principal_label = "slack_user_id", proxy_label = "centaur.slack_user_id" } }
+  { name = "centaur.slack_user_id", value_from = { principal_field = "slack_user_id", requester_principal_field = "slack_user_id" } }
 ]
 "#,
         )

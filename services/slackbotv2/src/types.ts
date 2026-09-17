@@ -1,6 +1,11 @@
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { CodexAppServerToChatStreamOptions } from '@centaur/rendering'
 import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
+import type {
+  SlackbotExtensionManifest,
+  SlackbotExtensionModuleConfig,
+  SlackbotExtensionRegister
+} from './extensions'
 import type { Hono } from 'hono'
 import type { ChannelDefaults } from './channel-defaults'
 import type { HarnessOverrides } from './overrides'
@@ -130,6 +135,8 @@ export type SlackbotV2BlockActionPayload = {
 
 export type SlackbotV2Options = {
   allowedExternalTeamIds?: readonly string[]
+  /** Slack app-level token used when slackMode is socket. */
+  appToken?: string
   apiKey?: string
   apiUrl: string
   /** Enable Slack's Agent messaging experience. Must match the app manifest. */
@@ -206,8 +213,11 @@ export type SlackbotV2Options = {
   renderRecoveryThreadTimeoutMs?: number
   /** Deadline for Centaur session API HTTP calls made during Slack handoff. */
   sessionApiTimeoutMs?: number
-  signingSecret: string
+  /** Slack request signing secret. Required only when slackMode is webhook. */
+  signingSecret?: string
   slackApiUrl?: string
+  /** Slack event transport. Webhook remains the default. */
+  slackMode?: 'socket' | 'webhook'
   /** Bot workspace team ID resolved once from Slack's auth.test response. */
   slackHomeTeamId?: string
   /** Deadline for optional Slack Web API metadata lookups. */
@@ -238,6 +248,12 @@ export type MessageOverridesStrategy = (
 export type SlackbotV2 = {
   app: Hono
   chat: Chat
+  initialize(): Promise<void>
+  loadExtensions(modules: readonly SlackbotExtensionModuleConfig[]): Promise<void>
+  registerExtension(
+    manifest: SlackbotExtensionManifest,
+    register: SlackbotExtensionRegister
+  ): Promise<void>
 }
 
 export type SlackbotV2ThreadState = {

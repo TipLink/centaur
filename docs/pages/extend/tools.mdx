@@ -85,7 +85,13 @@ Each entry in `secrets` declares one credential the tool can request with
   `*.googleapis.com` and scopes default to `cloud-platform`.
 - `type = "pg_dsn"` is for Postgres. iron-proxy resolves the real upstream DSN,
   while the sandbox gets a local proxy DSN in an environment variable named by
-  `name`; `database` must match the upstream database name.
+  `name`; `database` must match the upstream database name. Optional `settings`
+  pin Postgres session variables. Use
+  `value_from = { requester_principal_field = "slack_user_id" }` when a policy
+  needs the verified requester for the current turn. The selector resolves to
+  an empty string when no requester is bound and never falls back to the
+  conversation principal. Open a new database connection for each turn because
+  pinned settings are installed when the Postgres session starts.
 - `name` is the placeholder string the sandbox sees and what
   `secret("...")` looks up for replace-mode HTTP secrets.
 - `match_headers`, `match_query`, or `match_path` tell iron-proxy where in the
