@@ -1,6 +1,7 @@
 """GSuite API client for Gmail, Calendar, and Drive."""
 
 import base64
+import binascii
 import io
 import mimetypes
 import os
@@ -139,6 +140,73 @@ def gmail_search(query: str, max_results: int = 20) -> list[dict]:
     return messages
 
 
+def _decode_gmail_data(data: str) -> bytes:
+    """Decode Gmail's unpadded base64url message-part data."""
+    try:
+        padded = data + "=" * (-len(data) % 4)
+        return base64.b64decode(padded, altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise RuntimeError("Gmail returned invalid base64url attachment data") from exc
+
+
+def _gmail_attachment_metadata(part: dict) -> dict | None:
+    """Return normalized metadata when a MIME part is downloadable."""
+    body = part.get("body") or {}
+    headers = {
+        header.get("name", "").lower(): header.get("value", "")
+        for header in part.get("headers") or []
+    }
+    disposition = headers.get("content-disposition", "")
+    filename = part.get("filename") or ""
+    attachment_id = body.get("attachmentId") or ""
+    if not filename and not attachment_id and not disposition.lower().startswith("attachment"):
+        return None
+
+    try:
+        size = int(body.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+
+    return {
+        "part_id": part.get("partId", ""),
+        "attachment_id": attachment_id,
+        "filename": filename,
+        "mime_type": part.get("mimeType") or "application/octet-stream",
+        "size": size,
+        "content_disposition": disposition,
+    }
+
+
+def _gmail_attachment_parts(payload: dict) -> list[tuple[dict, dict]]:
+    """Recursively collect downloadable attachment parts and their metadata."""
+    attachments: list[tuple[dict, dict]] = []
+
+    def visit(part: dict) -> None:
+        metadata = _gmail_attachment_metadata(part)
+        if metadata is not None:
+            attachments.append((part, metadata))
+        for child in part.get("parts") or []:
+            if isinstance(child, dict):
+                visit(child)
+
+    if isinstance(payload, dict):
+        visit(payload)
+    return attachments
+
+
+def _gmail_attachment_filename(metadata: dict, message_id: str) -> str:
+    """Return a safe local filename for Gmail-provided attachment metadata."""
+    filename = str(metadata.get("filename") or "").replace("\\", "/").rsplit("/", 1)[-1]
+    filename = filename.replace("\x00", "")
+    if filename not in {"", ".", ".."}:
+        return filename
+
+    suffix = mimetypes.guess_extension(metadata.get("mime_type") or "") or ""
+    selector = metadata.get("part_id") or metadata.get("attachment_id") or "attachment"
+    safe_selector = re.sub(r"[^A-Za-z0-9._-]+", "_", str(selector)).strip("._")
+    return f"gmail-{message_id}-{safe_selector or 'attachment'}{suffix}"
+
+
 def gmail_read(message_id: str) -> dict:
     """Read a Gmail message.
 
@@ -146,7 +214,7 @@ def gmail_read(message_id: str) -> dict:
         message_id: The message ID
 
     Returns:
-        Dict with id, subject, from, to, date, body, html, and raw RFC822 content
+        Dict with id, headers, body, html, raw RFC822 content, and attachment metadata
     """
     service = get_gmail_service()
 
@@ -155,15 +223,11 @@ def gmail_read(message_id: str) -> dict:
 
     headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
 
-    def decode_body(data):
-        padded = data + "=" * (-len(data) % 4)
-        return base64.urlsafe_b64decode(padded.encode()).decode("utf-8", errors="replace")
-
     def get_body(payload, mime_type):
         if not isinstance(payload, dict):
             return ""
         if payload.get("mimeType") == mime_type and payload.get("body", {}).get("data"):
-            return decode_body(payload["body"]["data"])
+            return _decode_gmail_data(payload["body"]["data"]).decode("utf-8", errors="replace")
         for part in payload.get("parts") or []:
             body = get_body(part, mime_type)
             if body:
@@ -182,7 +246,98 @@ def gmail_read(message_id: str) -> dict:
         "html": get_body(msg.get("payload", {}), "text/html"),
         "raw": raw_msg.get("raw", ""),
         "label_ids": msg.get("labelIds", []),
+        "attachments": [
+            metadata for _part, metadata in _gmail_attachment_parts(msg.get("payload", {}))
+        ],
     }
+
+
+def _gmail_download_attachment_bytes(
+    message_id: str,
+    *,
+    part_id: str | None = None,
+    attachment_id: str | None = None,
+) -> tuple[dict, bytes]:
+    """Fetch one Gmail attachment by its message-part or attachment ID."""
+    if (part_id is None) == (attachment_id is None):
+        raise ValueError("Exactly one of part_id or attachment_id is required")
+
+    service = get_gmail_service()
+    msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    candidates = _gmail_attachment_parts(msg.get("payload", {}))
+
+    selected: tuple[dict, dict] | None = None
+    for part, metadata in candidates:
+        if part_id is not None and metadata["part_id"] == part_id:
+            selected = (part, metadata)
+            break
+        if attachment_id is not None and metadata["attachment_id"] == attachment_id:
+            selected = (part, metadata)
+            break
+    if selected is None:
+        selector = (
+            f"part_id={part_id!r}" if part_id is not None else f"attachment_id={attachment_id!r}"
+        )
+        raise ValueError(f"Attachment {selector} was not found in Gmail message {message_id!r}")
+
+    part, metadata = selected
+    body = part.get("body") or {}
+    data = body.get("data")
+    if data is None:
+        gmail_attachment_id = body.get("attachmentId")
+        if not gmail_attachment_id:
+            raise RuntimeError("Gmail attachment has neither inline data nor an attachment ID")
+        attachment_body = (
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=gmail_attachment_id)
+            .execute()
+        )
+        data = attachment_body.get("data")
+        if data is None:
+            raise RuntimeError("Gmail returned an attachment without data")
+        expected_size = int(attachment_body.get("size") or metadata["size"] or 0)
+    else:
+        expected_size = metadata["size"]
+
+    decoded = _decode_gmail_data(data)
+    if expected_size and len(decoded) != expected_size:
+        raise RuntimeError(
+            f"Gmail attachment size mismatch: expected {expected_size} bytes, got {len(decoded)}"
+        )
+    return metadata, decoded
+
+
+def gmail_download_attachment(
+    message_id: str,
+    part_id: str | None = None,
+    attachment_id: str | None = None,
+) -> dict:
+    """Download a Gmail attachment into the current thread.
+
+    Use ``part_id`` from ``gmail_get`` for both inline and separately stored
+    attachment data. ``attachment_id`` is also accepted for separately stored
+    attachments.
+
+    Args:
+        message_id: Gmail message ID containing the attachment
+        part_id: MIME part ID returned by gmail_get
+        attachment_id: Gmail attachment ID returned by gmail_get
+
+    Returns:
+        Thread-scoped attachment metadata
+    """
+    metadata, data = _gmail_download_attachment_bytes(
+        message_id,
+        part_id=part_id,
+        attachment_id=attachment_id,
+    )
+    return save_attachment(
+        name=_gmail_attachment_filename(metadata, message_id),
+        mime_type=metadata["mime_type"],
+        data=data,
+    )
 
 
 def gmail_send(to: str, subject: str, body: str, cc: str | None = None) -> dict:
@@ -2478,9 +2633,31 @@ class GSuiteClient:
             message_id: The message ID
 
         Returns:
-            Dict with id, subject, from, to, date, body (plain text)
+            Dict with message content and downloadable attachment metadata
         """
         return gmail_read(message_id)
+
+    def gmail_download_attachment(
+        self,
+        message_id: str,
+        part_id: str | None = None,
+        attachment_id: str | None = None,
+    ) -> dict:
+        """Download a Gmail attachment into the current thread.
+
+        Args:
+            message_id: Gmail message ID containing the attachment
+            part_id: MIME part ID returned by gmail_get
+            attachment_id: Gmail attachment ID returned by gmail_get
+
+        Returns:
+            Thread-scoped attachment metadata
+        """
+        return gmail_download_attachment(
+            message_id,
+            part_id=part_id,
+            attachment_id=attachment_id,
+        )
 
     def gmail_send(
         self, to: str, subject: str, body: str, cc: str | None = None

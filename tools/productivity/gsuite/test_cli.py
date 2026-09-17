@@ -6,6 +6,39 @@ from gsuite.cli import app
 runner = CliRunner()
 
 
+def test_gmail_download_attachment_writes_selected_part(tmp_path, monkeypatch):
+    output_path = tmp_path / "downloaded.pdf"
+    monkeypatch.setattr(
+        client,
+        "_gmail_download_attachment_bytes",
+        lambda message_id, part_id, attachment_id: (
+            {
+                "filename": "report.pdf",
+                "part_id": part_id,
+                "attachment_id": attachment_id or "",
+            },
+            b"pdfdata",
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "gmail",
+            "download-attachment",
+            "msg-1",
+            "--part-id",
+            "2",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert output_path.read_bytes() == b"pdfdata"
+    assert "Downloaded report.pdf" in result.output
+
+
 def test_docs_bullets_command_prints_verification_summary(monkeypatch):
     monkeypatch.setattr(
         client,
