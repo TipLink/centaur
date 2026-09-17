@@ -142,6 +142,42 @@ if grep -F 'value: "/home/agent/github/' "$scratch/repo-and-image-overlay.yaml" 
     exit 1
 fi
 
+overlay_revision=1234567890abcdef1234567890abcdef12345678
+overlay_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+helm template test "$chart_dir" "${common[@]}" \
+    --set repoCache.enabled=true \
+    --set overlay.image.repository=ghcr.io/example/overlay \
+    --set-string "overlay.image.tag=auto-deploy-${overlay_revision}@sha256:${overlay_digest}" \
+    --set-string 'overlays.sources[0].repo=example/overlay' \
+    --set overlays.sources[0].refFromOverlayImage=true \
+    >"$scratch/derived-overlay-ref.yaml"
+
+if ! grep -qF "example/overlay=${overlay_revision}" "$scratch/derived-overlay-ref.yaml"; then
+    echo "repo-cache ref was not derived from the effective overlay image tag" >&2
+    exit 1
+fi
+
+if helm template test "$chart_dir" "${common[@]}" \
+    --set overlay.image.repository=ghcr.io/example/overlay \
+    --set overlay.image.tag=latest \
+    --set-string 'overlays.sources[0].repo=example/overlay' \
+    --set overlays.sources[0].refFromOverlayImage=true \
+    >"$scratch/invalid-derived-ref.yaml" 2>&1; then
+    echo "refFromOverlayImage accepted a mutable overlay image tag" >&2
+    exit 1
+fi
+
+if helm template test "$chart_dir" "${common[@]}" \
+    --set overlay.image.repository=ghcr.io/example/overlay \
+    --set-string "overlay.image.tag=reviewed-${overlay_revision}" \
+    --set-string 'overlays.sources[0].repo=example/overlay' \
+    --set-string "overlays.sources[0].ref=${overlay_revision}" \
+    --set overlays.sources[0].refFromOverlayImage=true \
+    >"$scratch/conflicting-derived-ref.yaml" 2>&1; then
+    echo "overlay source accepted both ref and refFromOverlayImage" >&2
+    exit 1
+fi
+
 helm template test "$chart_dir" "${common[@]}" \
     --set repoCache.enabled=true \
     --set overlay.image.repository=ghcr.io/tiplink/overlay \
