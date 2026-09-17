@@ -109,8 +109,12 @@ curl -s "$CENTAUR_API_URL/api/workflows/runs" \
     "workflow_name": "nightly_report",
     "input": {"channel": "ops", "topic": "open incidents"},
     "eager_start": true
-  }' | jq
+}' | jq
 ```
+
+Set `eager_start` for short interactive work. The run remains durable and the
+create call still returns immediately, but Centaur routes it to the isolated
+low-latency queue instead of waiting behind standard background workflows.
 
 Inspect it:
 

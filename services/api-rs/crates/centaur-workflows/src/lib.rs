@@ -497,6 +497,8 @@ pub struct CreateWorkflowRunRequest {
     #[serde(default)]
     pub input: Value,
     #[serde(default)]
+    pub eager_start: bool,
+    #[serde(default)]
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub harness_type: Option<HarnessType>,
@@ -1007,7 +1009,10 @@ impl WorkflowRuntime {
             ));
         }
         WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
-        let client = self.client_for_workflow(workflow_name);
+        let client = self.client_for_class(workflow_queue_class_for_request(
+            workflow_name,
+            request.eager_start,
+        ));
         let spawn = client
             .spawn(
                 WORKFLOW_TASK,
@@ -1285,13 +1290,21 @@ impl WorkflowRuntime {
             .collect()
     }
 
-    fn client_for_workflow(&self, workflow_name: &str) -> &Client {
-        match workflow_queue_class(workflow_name) {
+    fn client_for_class(&self, class: WorkflowQueueClass) -> &Client {
+        match class {
             WorkflowQueueClass::Standard => &self.inner.client,
             WorkflowQueueClass::SlackLive => &self.inner.slack_live_client,
             WorkflowQueueClass::Etl => &self.inner.etl_client,
             WorkflowQueueClass::EtlBackfill => &self.inner.etl_backfill_client,
         }
+    }
+}
+
+fn workflow_queue_class_for_request(workflow_name: &str, eager_start: bool) -> WorkflowQueueClass {
+    if eager_start {
+        WorkflowQueueClass::SlackLive
+    } else {
+        workflow_queue_class(workflow_name)
     }
 }
 
@@ -4730,6 +4743,22 @@ mod tests {
         assert_eq!(
             workflow_queue_class("github_issue_triage"),
             WorkflowQueueClass::Standard
+        );
+    }
+
+    #[test]
+    fn eager_runs_use_the_low_latency_slack_queue() {
+        assert_eq!(
+            workflow_queue_class_for_request("interactive_action", true),
+            WorkflowQueueClass::SlackLive
+        );
+        assert_eq!(
+            workflow_queue_class_for_request("interactive_action", false),
+            WorkflowQueueClass::Standard
+        );
+        assert_eq!(
+            workflow_queue_class_for_request("google_drive_sync", false),
+            WorkflowQueueClass::Etl
         );
     }
 
