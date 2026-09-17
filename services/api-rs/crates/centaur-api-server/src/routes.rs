@@ -4261,7 +4261,7 @@ mod workflow_api_tests {
             "thread_key": "slack:T123:C123:1780000000.000100",
             "_centaur": { "slack_user_id": "UFORGED" }
         });
-        set_authenticated_workflow_context(&mut input, Some("UVERIFIED1")).unwrap();
+        set_authenticated_workflow_context(&mut input, Some(" UVERIFIED1 ")).unwrap();
         assert_eq!(input["_centaur"]["slack_user_id"], "UVERIFIED1");
 
         set_authenticated_workflow_context(&mut input, None).unwrap();
