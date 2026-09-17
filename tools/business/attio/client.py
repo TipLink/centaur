@@ -1,6 +1,8 @@
 """Attio API client."""
 
 from typing import Any
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 
@@ -139,10 +141,58 @@ class AttioClient:
         data = self._request("POST", f"/objects/{object_slug}/records/query", json=body)
         return data.get("data", [])
 
+    def query_all_records(
+        self,
+        object_slug: str,
+        filter_obj: dict | None = None,
+        sorts: list[dict] | None = None,
+        page_size: int = 200,
+        max_records: int = 1000,
+    ) -> list[dict]:
+        """Query records with offset pagination up to max_records."""
+        records: list[dict] = []
+        offset = 0
+        while len(records) < max_records:
+            limit = min(page_size, max_records - len(records))
+            page = self.query_records(
+                object_slug,
+                filter_obj=filter_obj,
+                sorts=sorts,
+                limit=limit,
+                offset=offset,
+            )
+            records.extend(page)
+            if len(page) < limit:
+                break
+            offset += limit
+        return records
+
     def get_record(self, object_slug: str, record_id: str) -> dict:
         """Get a specific record by ID."""
         data = self._request("GET", f"/objects/{object_slug}/records/{record_id}")
         return data.get("data", {})
+
+    def get_records(
+        self,
+        object_slug: str,
+        record_ids: Iterable[str],
+        max_workers: int = 8,
+    ) -> dict[str, dict]:
+        """Fetch multiple records concurrently, keyed by record_id."""
+        unique_ids = [record_id for record_id in dict.fromkeys(record_ids) if record_id]
+        if not unique_ids:
+            return {}
+
+        def fetch(record_id: str) -> tuple[str, dict]:
+            return record_id, self.get_record(object_slug, record_id)
+
+        results: dict[str, dict] = {}
+        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+            futures = [executor.submit(fetch, record_id) for record_id in unique_ids]
+            for future in as_completed(futures):
+                record_id, record = future.result()
+                results[record_id] = record
+        return results
 
     def create_record(self, object_slug: str, values: dict) -> dict:
         """Create a new record.
