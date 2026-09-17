@@ -286,6 +286,33 @@ class PgDsnSecretTest < ActiveSupport::TestCase
     assert_equal "", value
   end
 
+  test "to_proxy_dsn resolves requester fields only from the proxy requester" do
+    conversation = principals(:acme_channel)
+    conversation.update!(slack_user_id: "U9999999999")
+    requester = principals(:acme_user_alice)
+    requester.update!(slack_user_id: "U1111111111")
+    proxy = Proxy.create!(name: "requester-fields", principal: conversation, requester_principal: requester)
+    secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [
+      {
+        "name" => "centaur.slack_user_id",
+        "value_from" => { "requester_principal_field" => "slack_user_id" }
+      }
+    ])))
+
+    assert secret.valid?
+    assert_equal(
+      "U1111111111",
+      secret.to_proxy_dsn(principal: conversation, proxy: proxy).dig("settings", 0, "value")
+    )
+
+    proxy.update!(requester_principal: nil)
+    assert_equal(
+      "",
+      secret.to_proxy_dsn(principal: conversation, proxy: proxy.reload).dig("settings", 0, "value"),
+      "a missing requester must not fall back to the conversation principal"
+    )
+  end
+
   test "to_proxy_dsn resolves a label the principal does not carry as an empty string" do
     secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [
       { "name" => "centaur.slack_admin", "value_from" => { "principal_label" => "centaur_slack_admin" } }
@@ -328,7 +355,7 @@ class PgDsnSecretTest < ActiveSupport::TestCase
       secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [ { "name" => "app.tenant", "value_from" => ref } ])))
       assert_not secret.valid?
       assert_includes secret.errors[:settings],
-        "[0] value_from must have exactly one of principal_label or principal_field or proxy_label"
+        "[0] value_from must have exactly one of principal_label or principal_field or requester_principal_field or proxy_label"
     end
   end
 
@@ -355,6 +382,49 @@ class PgDsnSecretTest < ActiveSupport::TestCase
     assert_not secret.valid?
     assert_includes secret.errors[:settings],
       %([0] unknown principal_field "labels" (one of: #{PgDsnSecret::PRINCIPAL_FIELDS.join(", ")}))
+  end
+
+  test "a value_from with an unknown requester_principal_field is rejected" do
+    secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [
+      { "name" => "app.tenant", "value_from" => { "requester_principal_field" => "labels" } }
+    ])))
+    assert_not secret.valid?
+    assert_includes secret.errors[:settings],
+      %([0] unknown requester_principal_field "labels" (one of: #{PgDsnSecret::PRINCIPAL_FIELDS.join(", ")}))
+  end
+
+  test "an unknown requester_principal_field cannot invoke a requester method while rendering" do
+    requester = principals(:acme_user_alice)
+    proxy = Proxy.create!(name: "invalid-requester-field", principal: principals(:acme_channel),
+                          requester_principal: requester)
+    secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [
+      { "name" => "app.tenant", "value_from" => { "requester_principal_field" => "destroy" } }
+    ])))
+
+    assert_equal "", secret.to_proxy_dsn(principal: principals(:acme_channel), proxy: proxy).dig("settings", 0, "value")
+    assert Principal.exists?(requester.id)
+  end
+
+  test "a requester field in malformed persisted data cannot fall back to another selector" do
+    conversation = principals(:acme_channel)
+    conversation.update!(slack_user_id: "U9999999999")
+    proxy = Proxy.create!(
+      name: "invalid-requester-fallback",
+      principal: conversation,
+      labels: { "centaur.slack_user_id" => "U3333333333" }
+    )
+    secret = with_dsn(PgDsnSecret.new(base_attrs(settings: [
+      {
+        "name" => "centaur.slack_user_id",
+        "value_from" => {
+          "requester_principal_field" => "slack_user_id",
+          "principal_field" => "slack_user_id",
+          "proxy_label" => "centaur.slack_user_id"
+        }
+      }
+    ])))
+
+    assert_equal "", secret.to_proxy_dsn(principal: conversation, proxy: proxy).dig("settings", 0, "value")
   end
 
   test "an unknown principal_field cannot invoke a principal method while rendering" do

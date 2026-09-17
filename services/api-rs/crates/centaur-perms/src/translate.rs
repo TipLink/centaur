@@ -289,11 +289,13 @@ fn pg_setting_input(setting: &PgDsnSetting) -> PgDsnSettingInput {
             |PgDsnSettingValueFrom {
                  principal_label,
                  principal_field,
+                 requester_principal_field,
                  proxy_label,
              }| {
                 PgDsnSettingValueFromInput {
                     principal_label: principal_label.clone(),
                     principal_field: principal_field.clone(),
+                    requester_principal_field: requester_principal_field.clone(),
                     proxy_label: proxy_label.clone(),
                 }
             },

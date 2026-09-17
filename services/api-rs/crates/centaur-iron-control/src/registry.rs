@@ -551,11 +551,13 @@ fn pg_setting_from_listener(setting: &PgDsnSetting) -> PgDsnSettingInput {
             |PgDsnSettingValueFrom {
                  principal_label,
                  principal_field,
+                 requester_principal_field,
                  proxy_label,
              }| {
                 PgDsnSettingValueFromInput {
                     principal_label: principal_label.clone(),
                     principal_field: principal_field.clone(),
+                    requester_principal_field: requester_principal_field.clone(),
                     proxy_label: proxy_label.clone(),
                 }
             },
@@ -1099,6 +1101,9 @@ postgres:
       - name: centaur.slack_user_id
         value_from:
           proxy_label: centaur.slack_user_id
+      - name: centaur.requester_slack_user_id
+        value_from:
+          requester_principal_field: slack_user_id
 "#,
         )
         .unwrap();
@@ -1111,7 +1116,7 @@ postgres:
         assert_eq!(input.name, "analytics");
         assert_eq!(input.database, "analytics_db");
         assert_eq!(input.role.as_deref(), Some("readonly"));
-        assert_eq!(input.settings.len(), 2);
+        assert_eq!(input.settings.len(), 3);
         assert_eq!(input.settings[0].name, "centaur.slack_channel_id");
         assert_eq!(
             input.settings[0]
@@ -1127,6 +1132,14 @@ postgres:
                 .as_ref()
                 .and_then(|value_from| value_from.proxy_label.as_deref()),
             Some("centaur.slack_user_id")
+        );
+        assert_eq!(input.settings[2].name, "centaur.requester_slack_user_id");
+        assert_eq!(
+            input.settings[2]
+                .value_from
+                .as_ref()
+                .and_then(|value_from| value_from.requester_principal_field.as_deref()),
+            Some("slack_user_id")
         );
         assert_eq!(input.dsn.source_type, "env");
         assert_eq!(input.dsn.config, json!({ "var": "PG_ANALYTICS_DSN" }));

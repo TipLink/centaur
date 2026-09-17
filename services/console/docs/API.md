@@ -621,7 +621,7 @@ Listener and client knobs (bind address, client auth) are deliberately not model
 | `labels`      | optional    | Object; defaults to `{}`. |
 | `database`    | required    | Database name clients connect to through the proxy. Must match the upstream DSN's database. If several granted secrets use the same database, grant priority selects the effective route. |
 | `role`        | optional    | Upstream `SET ROLE` applied to the session. |
-| `settings`    | optional    | Ordered array of session variables (GUCs) the proxy SETs at session start, before the `SET ROLE`, and pins so clients cannot override them. Each entry is `{ "name", "value" }` for a literal value, or `{ "name", "value_from" }` to resolve the value from the assigned proxy principal or proxy labels at sync time (see [derived setting values](#derived-setting-values)). Names must be a bare or dotted identifier; `role` and `session_authorization` are reserved. Replaced wholesale on update. |
+| `settings`    | optional    | Ordered array of session variables (GUCs) the proxy SETs at session start, before the `SET ROLE`, and pins so clients cannot override them. Each entry is `{ "name", "value" }` for a literal value, or `{ "name", "value_from" }` to resolve the value from the assigned proxy principal, the verified per-turn requester principal, or proxy labels at sync time (see [derived setting values](#derived-setting-values)). Names must be a bare or dotted identifier; `role` and `session_authorization` are reserved. Replaced wholesale on update. |
 | `dsn`         | required    | A [secret source](#secret-sources) resolving to the connection string. Replaced wholesale on update. |
 
 ### Create
@@ -667,8 +667,9 @@ The `dsn` in responses never includes a `control_plane` `secret` value.
 
 ### Derived setting values
 
-A setting may take its value from the proxy's assigned principal or proxy
-labels instead of storing a literal, by replacing `value` with `value_from`:
+A setting may take its value from the proxy's assigned principal, its verified
+per-turn requester principal, or proxy labels instead of storing a literal, by
+replacing `value` with `value_from`:
 
 ```json
 { "name": "centaur.slack_channel_id", "value_from": { "principal_field": "slack_channel_id" } }
@@ -676,17 +677,24 @@ labels instead of storing a literal, by replacing `value` with `value_from`:
 
 `value_from` contains exactly one of:
 
-| Key               | Resolves to |
-| ----------------- | ----------- |
-| `principal_label` | The named label on the assigned principal. A label the principal does not carry resolves to an empty string, so RLS-style policies fail closed. |
-| `principal_field` | One of the principal's fields: `id` (the opaque `prn_...` id), `foreign_id`, `name`, `kind`, `slack_user_id`, `slack_channel_id`, `slack_team_id`, `slack_email`, `console_user_id`, `console_user_email` (the associated Console user's current email), or `slack_history_channel_ids` (JSON array of Slack channel IDs with history permission). |
-| `proxy_label`     | The named label on the proxy. A label the proxy does not carry resolves to an empty string, so RLS-style policies fail closed. |
+| Key                         | Resolves to |
+| --------------------------- | ----------- |
+| `principal_label`           | The named label on the assigned principal. A label the principal does not carry resolves to an empty string, so RLS-style policies fail closed. |
+| `principal_field`           | One of the assigned principal's allowlisted fields: `id` (the opaque `prn_...` id), `foreign_id`, `name`, `kind`, `slack_user_id`, `slack_channel_id`, `slack_team_id`, `slack_email`, `console_user_id`, `console_user_email` (the associated Console user's current email), or `slack_history_channel_ids` (JSON array of Slack channel IDs with history permission). |
+| `requester_principal_field` | One of the same allowlisted fields on the verified requester bound to the current turn. If no requester is bound or the field is absent, this resolves to an empty string. It never falls back to the assigned conversation principal. |
+| `proxy_label`               | The named label on the proxy. A label the proxy does not carry resolves to an empty string, so RLS-style policies fail closed. |
 
 A setting has either `value` or `value_from`, never both; unknown
-`principal_field` names and blank label keys are rejected at create
-and update time. References are resolved only in the proxy sync and
-effective-config payloads; create, update, show, and list responses echo the
-stored reference.
+`principal_field` and `requester_principal_field` names and blank label keys
+are rejected at create and update time. References are resolved only in the
+proxy sync and effective-config payloads; create, update, show, and list
+responses echo the stored reference.
+
+Requester assignments participate in the proxy config hash, and the runtime's
+assignment barrier waits for that exact hash before running the turn. Pinned
+settings are installed when a Postgres session starts, so a client using
+`requester_principal_field` must open a new database connection for each turn;
+it must not reuse a connection created for a previous requester.
 
 ### Other operations
 
@@ -1654,7 +1662,7 @@ Response when the hash differs (full payload):
 Notes on the proxy-sync payload, which differs from the REST representation:
 
 - `status` is `assigned` or `unassigned`, and `principal_id` is the assigned principal (or `null`). An unassigned proxy gets a valid response with `status: "unassigned"` and empty `secrets`/`transforms`, which is distinct from an assigned proxy whose config is genuinely empty. These fields appear only in the full payload (not the hash-only response).
-- The config hash incorporates the principal assignment, so assigning, swapping, or clearing the principal always changes the hash and the proxy refetches. A swap is a full replacement: the proxy should drop the previously delivered config rather than merge.
+- The config hash incorporates the principal and requester assignments, so assigning, swapping, or clearing either identity changes the hash and the proxy refetches. A swap is a full replacement: the proxy should drop the previously delivered config rather than merge.
 - The delivered config covers the proxy's principal's **effective grants**: secrets granted to the principal directly plus those granted to any [role](#roles) it holds. A secret reachable through more than one path appears once.
 - `secrets` carries one entry per granted static secret that has a source (sourceless static secrets are skipped). `transforms` carries one `gcp_auth` transform per granted GCP auth secret, one `aws_auth` transform per granted AWS auth secret, one `hmac_sign` transform per granted HMAC secret, and a single bundled `oauth_token` transform whose `config.tokens` lists every granted OAuth token secret. An `hmac_sign` transform omits `allow_chunked_body` when it is `false`.
 - `postgres` carries one entry per granted PG DSN secret, with the opaque `id` and `foreign_id` alongside it for sandbox env-var derivation and operator lookup. The proxy routes Postgres sessions by `database`; `role` is omitted when blank, as is `settings` when no session variables are configured.

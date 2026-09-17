@@ -362,6 +362,37 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     )
   end
 
+  test "postgres requester settings track requester A to B to nil without conversation fallback" do
+    @proxy.principal.update!(slack_user_id: "U9999999999")
+    requester_a = principals(:acme_user_alice)
+    requester_a.update!(slack_user_id: "U1111111111")
+    requester_b = principals(:acme_user_bob)
+    requester_b.update!(slack_user_id: "U2222222222")
+    pg = pg_dsn_secrets(:acme_analytics_pg)
+    pg.update!(settings: [
+      {
+        "name" => "centaur.slack_user_id",
+        "value_from" => { "requester_principal_field" => "slack_user_id" }
+      }
+    ])
+
+    baseline_hash = @proxy.config_hash
+    previous_hash = baseline_hash
+    [ [ requester_a, "U1111111111" ], [ requester_b, "U2222222222" ], [ nil, "" ] ].each do |requester, expected|
+      @proxy.update!(requester_principal: requester)
+      post api_v1_proxy_sync_url, params: { config_hash: previous_hash }.to_json, headers: auth_headers
+      assert_response :ok
+      assert json_body.key?("postgres"), "a requester swap must cross the config-hash sync barrier"
+      refute_equal previous_hash, json_body.fetch("config_hash")
+      entry = json_body.fetch("postgres").find { |item| item["foreign_id"] == pg.foreign_id }
+      assert_equal expected, entry.dig("settings", 0, "value")
+      refute_equal "U9999999999", entry.dig("settings", 0, "value")
+      previous_hash = json_body.fetch("config_hash")
+    end
+    assert_equal baseline_hash, previous_hash
+    assert_equal baseline_hash, @proxy.reload.config_hash
+  end
+
   test "directly-granted secrets are emitted after role-granted ones" do
     # acme_channel holds github_token_inject and db_password_replace directly
     # (priority 100) and resolves acme_prod_api_key through the acme_infra role

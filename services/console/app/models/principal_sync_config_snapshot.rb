@@ -168,8 +168,9 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   # direct wrapper grants. Assembled live from grant rows instead of merging
   # cached snapshots because a snapshot's rendered form drops grant
   # priorities, so conflict suppression could not compose across principals
-  # (RFC 0005). Postgres, setting templates, and the api-server JWT stay
-  # derived from the conversation principal only.
+  # (RFC 0005). Postgres routes and the api-server JWT stay derived from the
+  # conversation principal; only an explicit requester_principal_field setting
+  # reads the verified requester bound to this proxy.
   def self.live_union_config_for_proxy(proxy)
     principal = proxy.principal
     # A requester on an unassigned proxy is an invalid transient state; fail
@@ -236,23 +237,34 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
       name = setting["name"].presence || setting[:name].presence
       next if name.blank?
 
-      value = proxy_label_setting_value(proxy, setting)
+      value = proxy_specific_setting_value(proxy, setting)
       value = rendered_by_name.fetch(name, "") if value.nil?
       { "name" => name, "value" => value }
     end
   end
   private_class_method :proxy_specific_postgres_settings
 
-  def self.proxy_label_setting_value(proxy, setting)
+  def self.proxy_specific_setting_value(proxy, setting)
     ref = setting["value_from"] || setting[:value_from]
     return nil unless ref.is_a?(Hash)
+    ref = ref.with_indifferent_access
 
-    proxy_label = ref["proxy_label"] || ref[:proxy_label]
-    return nil if proxy_label.blank?
+    if ref.key?(:requester_principal_field)
+      return PgDsnSecret.principal_field_value(
+        proxy.requester_principal,
+        ref[:requester_principal_field]
+      )
+    end
 
-    proxy.labels&.fetch(proxy_label.to_s, "").to_s
+    if ref.key?(:proxy_label)
+      proxy_label = ref[:proxy_label]
+      return "" if proxy_label.blank?
+      return proxy.labels&.fetch(proxy_label.to_s, "").to_s
+    end
+
+    nil
   end
-  private_class_method :proxy_label_setting_value
+  private_class_method :proxy_specific_setting_value
 
   def self.with_sandbox_entitlements_secret_for_proxy(proxy, config, hosts:)
     secret = sandbox_entitlements_secret_for_proxy(proxy, hosts: hosts)
@@ -308,7 +320,7 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   def self.sync_postgres_entries_with_templates_for(principal)
     templates = {}
     entries = effective_pg_dsn_secrets_for(principal).map do |pg|
-      templates[pg.oid] = pg.settings if pg.proxy_label_settings?
+      templates[pg.oid] = pg.settings if pg.proxy_specific_settings?
       pg.to_proxy_dsn(principal: principal)
     end
     [ entries, templates ]

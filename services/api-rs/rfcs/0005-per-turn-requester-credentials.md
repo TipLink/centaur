@@ -167,6 +167,10 @@ shared PAT. On everyone else's turns the PAT serves alone.
 `config_hash` must include the requester principal oid and its cache
 version, so the sync poll and the barrier observe requester swaps. Postgres
 DSN entries and the api-server JWT stay keyed on the conversation principal.
+A PG DSN setting may explicitly select an allowlisted requester principal field;
+that value is rendered from the verified per-turn requester only and is empty
+when no requester is bound. Tools using that setting must open a new Postgres
+connection per turn because pinned settings are installed at session start.
 
 One open implementation choice: config snapshots are cached per principal
 and their rendered form drops grant priorities, so the union cannot be built

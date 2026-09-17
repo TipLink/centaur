@@ -65,6 +65,8 @@ pub struct PgDsnSettingValueFrom {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal_field: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_principal_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_label: Option<String>,
 }
 
