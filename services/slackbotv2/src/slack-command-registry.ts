@@ -6,7 +6,10 @@ export type SlackModalView = ViewsOpenArguments['view']
 export type CommandField = {
   id: string
   label: string
-  type: 'text' | 'user'
+  type: 'text' | 'user' | 'users'
+  optional?: boolean
+  multiline?: boolean
+  maxSelectedItems?: number
   hint?: string
   placeholder?: string
   maxLength?: number
@@ -160,22 +163,31 @@ export function commandView(
         type: 'input' as const,
         block_id: field.id,
         label: plain(field.label),
+        optional: field.optional ?? false,
         hint: field.hint ? plain(field.hint) : undefined,
         element:
-          field.type === 'user'
+          field.type === 'users'
             ? {
-                type: 'users_select' as const,
+                type: 'multi_users_select' as const,
                 action_id: 'value',
-                placeholder: plain('Choose an owner')
+                max_selected_items: field.maxSelectedItems ?? 10,
+                placeholder: plain('Choose owners')
               }
-            : {
-                type: 'plain_text_input' as const,
-                action_id: 'value',
-                max_length: field.maxLength ?? 500,
-                placeholder: field.placeholder
-                  ? plain(field.placeholder)
-                  : undefined
-              }
+            : field.type === 'user'
+              ? {
+                  type: 'users_select' as const,
+                  action_id: 'value',
+                  placeholder: plain('Choose an owner')
+                }
+              : {
+                  type: 'plain_text_input' as const,
+                  action_id: 'value',
+                  max_length: field.maxLength ?? 500,
+                  multiline: field.multiline ?? false,
+                  placeholder: field.placeholder
+                    ? plain(field.placeholder)
+                    : undefined
+                }
       }))
     ]
   }
@@ -188,7 +200,31 @@ export function formValues(
   return Object.fromEntries(
     command.fields.map((field) => {
       const input = state?.[field.id]?.value
+      if (field.type === 'users') {
+        const users = input?.selected_users ?? []
+        if (
+          !Array.isArray(users) ||
+          users.some(
+            (user) => typeof user !== 'string' || !/^[UW][A-Z0-9]+$/.test(user)
+          )
+        )
+          throw new CommandFieldError(
+            field.id,
+            `${field.label} contains invalid users.`
+          )
+        if (!users.length && !field.optional)
+          throw new CommandFieldError(field.id, `${field.label} is required.`)
+        if (users.length > (field.maxSelectedItems ?? 10))
+          throw new CommandFieldError(
+            field.id,
+            `${field.label} has too many users.`
+          )
+        // Keep the extension form contract string-valued, like text/user fields.
+        return [field.id, [...new Set(users)].join(',')]
+      }
       const value = field.type === 'user' ? input?.selected_user : input?.value
+      if (field.optional && (value == null || (typeof value === 'string' && !value.trim())))
+        return [field.id, '']
       if (typeof value !== 'string' || !value.trim())
         throw new CommandFieldError(field.id, `${field.label} is required.`)
       if (field.type === 'text' && value.length > (field.maxLength ?? 500))

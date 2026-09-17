@@ -650,3 +650,44 @@ describe('Slack command authentication and state recovery', () => {
     }
   })
 })
+
+test('signed form carries optional multiline details and multiple owners to the workflow', async () => {
+  const command = sampleCommands(true)[0]!
+  command.fields = [
+    ...command.fields,
+    {
+      id: 'description',
+      label: 'Description',
+      type: 'text',
+      multiline: true,
+      optional: true,
+      maxLength: 2000
+    },
+    {
+      id: 'additional_owners',
+      label: 'Additional owners',
+      type: 'users',
+      optional: true,
+      maxSelectedItems: 9
+    }
+  ]
+  const h = harness([command])
+  const view = await h.open('incident')
+  const result = await h.payload(
+    submission(
+      view,
+      fields({
+        description: { value: { value: 'First line\nSecond line' } },
+        additional_owners: { value: { selected_users: ['U3', 'U4'] } }
+      })
+    )
+  )
+  expect(result.status).toBe(200)
+  expect(h.queued()).toHaveLength(1)
+  expect(h.queued()[0]!.body.input).toMatchObject({
+    description: 'First line\nSecond line',
+    additional_owners: 'U3,U4',
+    actor_id: 'U1',
+    channel_id: 'C1'
+  })
+})
