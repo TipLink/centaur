@@ -237,6 +237,7 @@ class RepoCacheSync:
                         str(target),
                         "checkout",
                         "-q",
+                        "-f",
                         "--detach",
                         f"origin/{requested_ref}",
                     ],
@@ -250,7 +251,15 @@ class RepoCacheSync:
                 f"{requested_ref}^{{commit}}",
             ):
                 self._run_git(
-                    ["-C", str(target), "checkout", "-q", "--detach", requested_ref],
+                    [
+                        "-C",
+                        str(target),
+                        "checkout",
+                        "-q",
+                        "-f",
+                        "--detach",
+                        requested_ref,
+                    ],
                     f"checkout {repo}@{requested_ref}",
                 )
             else:
@@ -269,7 +278,15 @@ class RepoCacheSync:
                     f"fetch {repo}@{requested_ref}",
                 )
                 self._run_git(
-                    ["-C", str(target), "checkout", "-q", "--detach", "FETCH_HEAD"],
+                    [
+                        "-C",
+                        str(target),
+                        "checkout",
+                        "-q",
+                        "-f",
+                        "--detach",
+                        "FETCH_HEAD",
+                    ],
                     f"checkout {repo}@FETCH_HEAD",
                 )
             return
@@ -290,12 +307,26 @@ class RepoCacheSync:
                 str(target),
                 "checkout",
                 "-q",
+                "-f",
                 "-B",
                 default_branch,
                 f"origin/{default_branch}",
             ],
             f"checkout {repo}@{default_branch}",
         )
+
+    def clean_checkout(self, repo: str, target: Path) -> None:
+        # `git checkout` leaves modified tracked files alone when the requested
+        # commit is already checked out. Repo-cache consumers treat a pinned
+        # checkout as immutable deployment input, so restore the committed tree
+        # before removing untracked files and advertising readiness.
+        self._run_git(
+            ["-C", str(target), "reset", "--hard", "HEAD"],
+            f"reset {repo}",
+        )
+        # Include ignored paths so stale dependency trees cannot shadow modules
+        # from the reviewed commit. Double force also removes nested repositories.
+        self._run_git(["-C", str(target), "clean", "-ffdx"], f"clean {repo}")
 
     def sync_repo(self, repo: str) -> None:
         repo_url = f"https://github.com/{repo}.git"
@@ -327,7 +358,7 @@ class RepoCacheSync:
             )
             self._git_ok(target, "remote", "set-head", "origin", "-a")
             self.checkout_repo(repo, target)
-            self._run_git(["-C", str(target), "clean", "-fd"], f"clean {repo}")
+            self.clean_checkout(repo, target)
             self.remove_stale_visibility_target(repo)
             self.update_legacy_link(repo, target)
             return
@@ -344,7 +375,7 @@ class RepoCacheSync:
         )
         self._git_ok(tmp, "remote", "set-head", "origin", "-a")
         self.checkout_repo(repo, tmp)
-        self._run_git(["-C", str(tmp), "clean", "-fd"], f"clean {repo}")
+        self.clean_checkout(repo, tmp)
         tmp.replace(target)
         self.remove_stale_visibility_target(repo)
         self.update_legacy_link(repo, target)

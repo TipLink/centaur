@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -159,6 +160,103 @@ class RepoCacheSyncTest(unittest.TestCase):
 
             self.assertTrue((target / ".git").is_dir())
             self.assertFalse(old.exists())
+
+    def test_clean_checkout_restores_tracked_files_and_removes_untracked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "repo"
+            target.mkdir()
+            subprocess.run(["git", "init", "-q", str(target)], check=True)
+            subprocess.run(
+                ["git", "-C", str(target), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(target), "config", "user.name", "Repo Cache Test"],
+                check=True,
+            )
+            tracked = target / "index.mjs"
+            tracked.write_text("reviewed\n")
+            subprocess.run(["git", "-C", str(target), "add", "index.mjs"], check=True)
+            subprocess.run(
+                ["git", "-C", str(target), "commit", "-q", "-m", "fixture"],
+                check=True,
+            )
+            tracked.write_text("tampered\n")
+            untracked = target / "untracked.mjs"
+            untracked.write_text("tampered\n")
+            ignored = target / "node_modules" / "pg" / "index.mjs"
+            ignored.parent.mkdir(parents=True)
+            ignored.write_text("tampered\n")
+            (target / ".git" / "info" / "exclude").write_text("node_modules/\n")
+            sync = repo_cache_sync.RepoCacheSync(
+                cache_dir=root / "cache",
+                repositories=["acme/centaur"],
+                repository_refs={},
+                repository_visibilities={},
+                sync_interval_seconds=30,
+                github_token_file=root / "missing-token",
+            )
+
+            sync.clean_checkout("acme/centaur", target)
+
+            self.assertEqual(tracked.read_text(), "reviewed\n")
+            self.assertFalse(untracked.exists())
+            self.assertFalse(ignored.exists())
+
+    def test_checkout_pinned_ref_discards_dirty_tracked_file_while_advancing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "repo"
+            target.mkdir()
+            subprocess.run(["git", "init", "-q", str(target)], check=True)
+            subprocess.run(
+                ["git", "-C", str(target), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(target), "config", "user.name", "Repo Cache Test"],
+                check=True,
+            )
+            tracked = target / "index.mjs"
+            tracked.write_text("first\n")
+            subprocess.run(["git", "-C", str(target), "add", "index.mjs"], check=True)
+            subprocess.run(
+                ["git", "-C", str(target), "commit", "-q", "-m", "first"],
+                check=True,
+            )
+            first = subprocess.run(
+                ["git", "-C", str(target), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            tracked.write_text("second\n")
+            subprocess.run(["git", "-C", str(target), "commit", "-qam", "second"], check=True)
+            second = subprocess.run(
+                ["git", "-C", str(target), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "-C", str(target), "checkout", "-q", "--detach", first],
+                check=True,
+            )
+            tracked.write_text("tampered\n")
+            sync = repo_cache_sync.RepoCacheSync(
+                cache_dir=root / "cache",
+                repositories=["acme/centaur"],
+                repository_refs={"acme/centaur": second},
+                repository_visibilities={},
+                sync_interval_seconds=30,
+                github_token_file=root / "missing-token",
+            )
+
+            sync.checkout_repo("acme/centaur", target)
+
+            self.assertEqual(tracked.read_text(), "second\n")
+            self.assertEqual(sync._git_output(target, "rev-parse", "HEAD"), second)
 
     def test_run_forever_restores_repo_cache_umask(self) -> None:
         class StopAfterUmask(repo_cache_sync.RepoCacheSync):

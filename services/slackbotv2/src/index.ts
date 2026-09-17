@@ -12,9 +12,10 @@ import {
   type Logger,
   type Message as ChatMessage,
   type StateAdapter,
-  type Thread
+  type Thread,
+  type WebhookOptions
 } from 'chat'
-import { createSlackAdapter } from '@chat-adapter/slack'
+import { SlackAdapter, type SlackAdapterConfig } from '@chat-adapter/slack'
 import {
   assertSlackOk,
   callSlackApi,
@@ -72,7 +73,17 @@ import {
 } from './overrides'
 import { createFlagMessageOverridesStrategy } from './message-overrides-strategy'
 import {
+  createSlackbotExtensionClaims,
+  loadSlackbotExtensions,
+  registerSlackbotExtension,
+  type SlackbotExtensionClaims,
+  type SlackbotExtensionContext,
+  type SlackbotExtensionManifest,
+  type SlackbotExtensionRegister
+} from './extensions'
+import {
   isAllowedSlackMessage,
+  isAllowedSlackPayload,
   isAllowedSlackWebhookBody,
   parseSlackWebhookPayload
 } from './slack-events'
@@ -125,6 +136,12 @@ export type {
   SlackbotV2SessionMessage,
   SlackbotV2SessionMessageRole
 } from './types'
+export type {
+  SlackbotExtensionContext,
+  SlackbotExtensionManifest,
+  SlackbotExtensionModuleConfig,
+  SlackbotExtensionRegister
+} from './extensions'
 
 type WaitUntilContext = {
   waitUntil(promise: Promise<unknown>): void
@@ -145,12 +162,19 @@ const MAX_SLACK_MESSAGE_ATTACHMENTS = 20
 type SlackbotV2RequestContext = {
   waitUntil(promise: Promise<unknown>): void
   actionError?: unknown
+  extensionError?: unknown
 }
 
 type StateConnectionStatus = {
   attempts: number
   connected: boolean
   lastError?: string
+}
+
+type SocketInitializationStatus = {
+  error?: string
+  initialized: boolean
+  required: boolean
 }
 
 const requestContext = new AsyncLocalStorage<SlackbotV2RequestContext>()
@@ -303,21 +327,153 @@ function stickyOverrideRaw(
   return update && Object.prototype.hasOwnProperty.call(update, key) ? update[key] : state[key]
 }
 
+function isExtensionInteraction(
+  payload: unknown,
+  claims: SlackbotExtensionClaims
+): boolean {
+  if (!isJsonObject(payload)) return false
+  if (payload.type === 'block_actions') {
+    return Array.isArray(payload.actions) && payload.actions.some(action =>
+      isJsonObject(action)
+      && typeof action.action_id === 'string'
+      && claims.ownsAction(action.action_id)
+    )
+  }
+  if (payload.type === 'view_submission') {
+    const view = isJsonObject(payload.view) ? payload.view : undefined
+    return typeof view?.callback_id === 'string'
+      && claims.ownsModalCallback(view.callback_id)
+  }
+  return payload.type === 'block_suggestion'
+    && typeof payload.action_id === 'string'
+    && claims.ownsOptionsLoad(payload.action_id)
+}
+
+/**
+ * Chat SDK normally acknowledges Slack interactive and Socket Mode slash events
+ * before async handlers finish. Extension-owned actions, modals, option loads,
+ * and slash commands may need a short durable write first, so await only their tasks.
+ */
+class SlackbotExtensionAdapter extends SlackAdapter {
+  constructor(
+    config: SlackAdapterConfig,
+    private readonly extensionClaims: SlackbotExtensionClaims
+  ) {
+    super(config)
+  }
+
+  protected override async dispatchInteractivePayload(
+    payload: unknown,
+    options?: WebhookOptions
+  ): Promise<Response> {
+    if (!isExtensionInteraction(payload, this.extensionClaims)) {
+      return super.dispatchInteractivePayload(payload as never, options)
+    }
+    return this.awaitExtensionTasks(
+      trackedOptions => super.dispatchInteractivePayload(payload as never, trackedOptions),
+      options
+    )
+  }
+
+  protected override async runSlashCommand(
+    params: URLSearchParams,
+    options?: WebhookOptions
+  ): Promise<Response> {
+    if (!this.extensionClaims.ownsSlashCommand(params.get('command') ?? '')) {
+      return super.runSlashCommand(params, options)
+    }
+    return this.awaitExtensionTasks(
+      trackedOptions => super.runSlashCommand(params, trackedOptions),
+      options
+    )
+  }
+
+  protected override async routeSocketEvent(
+    body: Record<string, unknown>,
+    eventType: string,
+    ack: (response?: Record<string, unknown>) => Promise<void>,
+    options?: WebhookOptions,
+    retryNum?: number
+  ): Promise<void> {
+    const command = typeof body.command === 'string' ? body.command : ''
+    if (eventType === 'slash_commands' && this.extensionClaims.ownsSlashCommand(command)) {
+      const params = new URLSearchParams()
+      for (const [key, value] of Object.entries(body)) {
+        if (typeof value === 'string' || typeof value === 'boolean') {
+          params.set(key, String(value))
+        }
+      }
+      try {
+        await this.runSlashCommand(params, options)
+        await ack()
+      } catch (error) {
+        this.logger.error('Slack extension slash command failed before acknowledgement', {
+          command,
+          error
+        })
+      }
+      return
+    }
+
+    if (eventType === 'interactive' && isExtensionInteraction(body, this.extensionClaims)) {
+      try {
+        await super.routeSocketEvent(body, eventType, ack, options, retryNum)
+      } catch (error) {
+        this.logger.error('Slack extension interaction failed before acknowledgement', { error })
+      }
+      return
+    }
+    return super.routeSocketEvent(body, eventType, ack, options, retryNum)
+  }
+
+  private async awaitExtensionTasks<T>(
+    operation: (options: WebhookOptions) => T | Promise<T>,
+    options?: WebhookOptions
+  ): Promise<T> {
+    const tasks: Promise<unknown>[] = []
+    const trackedOptions: WebhookOptions = {
+      ...options,
+      waitUntil: task => {
+        tasks.push(task)
+        options?.waitUntil?.(task)
+      }
+    }
+    const execute = async (): Promise<T> => {
+      const result = await operation(trackedOptions)
+      await Promise.all(tasks)
+      return result
+    }
+    if (requestContext.getStore()) return execute()
+
+    const context: SlackbotV2RequestContext = { waitUntil: detachedWaitUntil }
+    return requestContext.run(context, async () => {
+      const result = await execute()
+      if (context.extensionError) throw context.extensionError
+      return result
+    })
+  }
+}
+
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
   const logger = options.logger ?? noopLogger
-  const slack = createSlackAdapter({
+  const extensionClaims = createSlackbotExtensionClaims(WORKFLOW_ACTION_PREFIX)
+  const appToken = options.appToken ?? process.env.SLACK_APP_TOKEN
+  const slack = new SlackbotExtensionAdapter({
     agentView: options.agentViewEnabled === true,
+    appToken,
     // Titles come from durable session events, including recovery.
     sessionTitle: false,
     apiUrl: options.slackApiUrl,
     botToken: options.botToken,
     botUserId: options.botUserId,
     signingSecret: options.signingSecret,
+    socketForwardingSecret: process.env.SLACK_SOCKET_FORWARDING_SECRET,
     streamSegmentMaxAgeMs: Number(process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS) || undefined,
     userName,
-    logger
-  })
+    logger,
+    mode: options.slackMode ?? 'webhook'
+  }, extensionClaims)
   const state = options.state ?? createDefaultState(options, logger)
   const chat = new Chat<{ slack: typeof slack }, SlackbotV2ThreadState>({
     userName,
@@ -326,13 +482,26 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     onLockConflict: 'force',
     logger
   })
+  const extensionContext: SlackbotExtensionContext = { chat, logger }
+  const allowExtensionEvent = (raw: unknown): boolean =>
+    isAllowedSlackPayload(raw, options, logger)
+  const reportExtensionError = (error: unknown): void => {
+    const context = requestContext.getStore()
+    if (context) context.extensionError = error
+  }
   const steeringReactions = createSteeringReactionController(options)
   const lateSlackFiles = createLateSlackFileRepair(options, state, steeringReactions)
   const stateConnectionStatus: StateConnectionStatus = { attempts: 0, connected: false }
+  const socketInitializationStatus: SocketInitializationStatus = {
+    initialized: false,
+    required: options.slackMode === 'socket'
+  }
   const stateConnected = ensureStateConnected(state, options, stateConnectionStatus)
   backgroundWaitUntil(stateConnected)
 
   chat.onAction(async event => {
+    if (!isAllowedSlackPayload(event.raw, options, logger)) return
+    if (extensionClaims.ownsAction(event.actionId)) return
     const payload = slackBlockActionPayload(event)
     const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
     // Workflow starts deduplicate durably using the Slack click identity.
@@ -515,7 +684,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   })
 
   const app = new Hono()
-  app.get('/health', c => healthResponse(c, stateConnectionStatus))
+  app.get('/live', c => c.json({ ok: true, service: 'slackbotv2' }))
+  app.get('/health', c =>
+    healthResponse(c, stateConnectionStatus, socketInitializationStatus)
+  )
   app.get('/metrics', c =>
     c.text(slackbotMetrics.expose(), 200, {
       'Content-Type': 'text/plain; version=0.0.4; charset=utf-8'
@@ -548,7 +720,16 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         && interaction.actions.some(action => isJsonObject(action)
           && typeof action.action_id === 'string'
           && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
-      const awaitHandoff = workflowAction || shouldAwaitSlackHandoff(rawBody)
+      const extensionInteraction = isExtensionInteraction(interaction, extensionClaims)
+      const slashCommand = typeof interaction?.command === 'string'
+        ? interaction.command
+        : undefined
+      const extensionSlashCommand = typeof slashCommand === 'string'
+        && extensionClaims.ownsSlashCommand(slashCommand)
+      const awaitHandoff = workflowAction
+        || extensionInteraction
+        || extensionSlashCommand
+        || shouldAwaitSlackHandoff(rawBody)
       const handoffTasks: Promise<unknown>[] = []
       const context: SlackbotV2RequestContext = {
         waitUntil: promise => waitUntil(c, promise)
@@ -600,6 +781,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
           outcome = 'error'
           return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
         }
+        if ((extensionInteraction || extensionSlashCommand) && (waitError || context.extensionError)) {
+          outcome = 'error'
+          return new globalThis.Response('Slack extension request could not be recorded. Please retry.', { status: 503 })
+        }
       }
       const lateFileTask = lateSlackFiles.repairFromWebhook(rawBody)
       if (lateFileTask) waitUntil(c, lateFileTask)
@@ -625,11 +810,61 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   app.post('/api/slack/options', handleSlackWebhook)
   app.post('/api/slack/commands', handleSlackWebhook)
 
-  if (options.recoverRenderObligationsOnStart !== false) {
+  let recoveryScheduled = false
+  const scheduleRecovery = (): void => {
+    if (recoveryScheduled || options.recoverRenderObligationsOnStart === false) return
+    recoveryScheduled = true
     scheduleRenderObligationRecovery(chat, state, options, stateConnected)
   }
+  const initialize = async (): Promise<void> => {
+    try {
+      await stateConnected
+      await chat.initialize()
+      socketInitializationStatus.initialized = true
+      socketInitializationStatus.error = undefined
+      if (options.slackMode === 'socket') scheduleRecovery()
+    } catch (error) {
+      socketInitializationStatus.initialized = false
+      socketInitializationStatus.error = errorMessage(error)
+      throw error
+    }
+  }
 
-  return { app, chat }
+  // Preserve webhook startup semantics: serve health while the state adapter
+  // connects and let Chat initialize lazily on the first webhook. Socket Mode
+  // has no webhook to trigger initialization, so the executable starts it
+  // after registering deployment extensions and opening the health server.
+  if (options.slackMode !== 'socket') scheduleRecovery()
+
+  const registerExtension = async (
+    manifest: SlackbotExtensionManifest,
+    register: SlackbotExtensionRegister
+  ): Promise<void> => {
+    await registerSlackbotExtension(
+      manifest,
+      register,
+      extensionContext,
+      extensionClaims,
+      `<inline:${manifest.id}>`,
+      allowExtensionEvent,
+      reportExtensionError
+    )
+  }
+
+  return {
+    app,
+    chat,
+    initialize,
+    loadExtensions: modules =>
+      loadSlackbotExtensions(
+        modules,
+        extensionContext,
+        extensionClaims,
+        allowExtensionEvent,
+        reportExtensionError
+      ),
+    registerExtension
+  }
 }
 
 async function handleSlackMessageHandoff(
@@ -1026,13 +1261,32 @@ function createDefaultState(options: SlackbotV2Options, logger: Logger): StateAd
   })
 }
 
-function healthResponse(c: Context, stateConnectionStatus: StateConnectionStatus): Response {
-  if (stateConnectionStatus.connected) {
+function healthResponse(
+  c: Context,
+  stateConnectionStatus: StateConnectionStatus,
+  socketInitializationStatus: SocketInitializationStatus
+): Response {
+  if (
+    stateConnectionStatus.connected
+    && (!socketInitializationStatus.required || socketInitializationStatus.initialized)
+  ) {
     return c.json({
       ok: true,
       service: 'slackbotv2',
       database_connected: true
     })
+  }
+  if (stateConnectionStatus.connected && socketInitializationStatus.required) {
+    return c.json(
+      {
+        ok: false,
+        service: 'slackbotv2',
+        database_connected: true,
+        database_status: 'connected',
+        slack_transport_status: socketInitializationStatus.error ? 'failed' : 'connecting'
+      },
+      503
+    )
   }
   return c.json(
     {
@@ -2987,6 +3241,10 @@ function backgroundWaitUntil(promise: Promise<unknown>): void {
     context.waitUntil(promise)
     return
   }
+  detachedWaitUntil(promise)
+}
+
+function detachedWaitUntil(promise: Promise<unknown>): void {
   void promise.catch(() => undefined)
 }
 
@@ -3338,12 +3596,21 @@ function slackWebhookLogFields(rawBody: string): JsonObject {
   const action = Array.isArray(payload.actions) ? payload.actions.find(isJsonObject) : undefined
   const fields: JsonObject = {}
   setStringField(fields, 'slack_event_id', payload.event_id)
-  setStringField(fields, 'slack_event_type', event.type ?? payload.type)
+  setStringField(
+    fields,
+    'slack_event_type',
+    event.type ?? payload.type ?? (payload.command ? 'slash_command' : undefined)
+  )
+  setStringField(fields, 'slack_command', payload.command)
   setStringField(fields, 'slack_action_id', action?.action_id)
   setStringField(
     fields,
     'slack_channel',
-    stringValue(event.channel) ?? eventChannel.id ?? channel.id ?? container.channel_id
+    stringValue(event.channel)
+      ?? eventChannel.id
+      ?? channel.id
+      ?? container.channel_id
+      ?? payload.channel_id
   )
   setStringField(fields, 'slack_message_ts', event.ts ?? message.ts ?? container.message_ts)
   setStringField(

@@ -7,11 +7,13 @@ describe('slackbotv2 metrics', () => {
   test('withholds health until state connects', async () => {
     const state = createMemoryState()
     const originalConnect = state.connect.bind(state)
+    let connectCalls = 0
     let releaseConnect!: () => void
     const connectGate = new Promise<void>(resolve => {
       releaseConnect = resolve
     })
     state.connect = async () => {
+      connectCalls += 1
       await connectGate
       await originalConnect()
     }
@@ -31,6 +33,12 @@ describe('slackbotv2 metrics', () => {
       database_connected: false,
       database_status: 'connecting'
     })
+    const liveResponse = await bot.app.request('/live')
+    expect(liveResponse.status).toBe(200)
+    await expect(liveResponse.json()).resolves.toEqual({
+      ok: true,
+      service: 'slackbotv2'
+    })
 
     releaseConnect()
     const readyResponse = await waitForHealthy(bot)
@@ -40,6 +48,7 @@ describe('slackbotv2 metrics', () => {
       service: 'slackbotv2',
       database_connected: true
     })
+    expect(connectCalls).toBe(1)
   })
 
   test('serves Prometheus text metrics', async () => {
@@ -75,12 +84,44 @@ describe('slackbotv2 metrics', () => {
       'centaur_session_delivery_total{delivery_status="streamed"} 1'
     )
   })
+
+  test('keeps Socket Mode unready until its listener initializes', async () => {
+    const bot = createSlackbotV2({
+      apiUrl: 'http://api.test',
+      appToken: 'xapp-test',
+      botToken: 'xoxb-test',
+      recoverRenderObligationsOnStart: false,
+      slackMode: 'socket',
+      state: createMemoryState()
+    })
+
+    const response = await waitForDatabaseConnected(bot)
+    expect(response.status).toBe(503)
+    await expect(response.json()).resolves.toMatchObject({
+      ok: false,
+      database_connected: true,
+      database_status: 'connected',
+      slack_transport_status: 'connecting'
+    })
+  })
 })
 
 async function waitForHealthy(bot: ReturnType<typeof createSlackbotV2>): Promise<Response> {
   for (let attempt = 0; attempt < 20; attempt++) {
     const response = await bot.app.request('/health')
     if (response.status === 200) return response
+    await sleep(5)
+  }
+  return bot.app.request('/health')
+}
+
+async function waitForDatabaseConnected(
+  bot: ReturnType<typeof createSlackbotV2>
+): Promise<Response> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const response = await bot.app.request('/health')
+    const body = await response.clone().json() as { database_connected?: boolean }
+    if (body.database_connected) return response
     await sleep(5)
   }
   return bot.app.request('/health')

@@ -223,6 +223,7 @@
               "toolsSubdir": { "type": "string" },
               "workflowsSubdir": { "type": "string" },
               "skillsSubdir": { "type": "string" },
+              "slackbotSubdir": { "type": "string" },
               "promptPath": { "type": "string" },
               "personasSubdir": { "type": "string" }
             },
@@ -477,6 +478,10 @@
       "type": "object",
       "properties": {
         "agentViewEnabled": { "type": "boolean" },
+        "mode": {
+          "type": "string",
+          "enum": ["webhook", "socket"]
+        },
         "mcpPublicUrl": { "type": "string" },
         "codexNanocodexRolloutPercent": {
           "type": "integer",

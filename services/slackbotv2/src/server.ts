@@ -2,6 +2,7 @@ import { createSlackbotV2, type SlackbotV2Options } from './index'
 import { parseChannelDefaults } from './channel-defaults'
 import { resolveSlackHomeTeamId } from './session-api'
 import { resolveSlackBotUserId } from './slack-user'
+import { parseSlackbotExtensionModules } from './extensions'
 import {
   createFlagMessageOverridesStrategy,
   createOpenAiMessageOverridesStrategy
@@ -10,7 +11,11 @@ import {
 const port = numberEnv('PORT', 3002)
 const apiUrl = stringEnv('CENTAUR_API_URL', 'http://127.0.0.1:8080')
 const botToken = requiredEnv('SLACK_BOT_TOKEN')
-const signingSecret = requiredEnv('SLACK_SIGNING_SECRET')
+const slackMode = slackModeEnv('SLACKBOTV2_MODE')
+const signingSecret = slackMode === 'webhook'
+  ? requiredEnv('SLACK_SIGNING_SECRET')
+  : optionalEnv('SLACK_SIGNING_SECRET')
+const appToken = slackMode === 'socket' ? requiredEnv('SLACK_APP_TOKEN') : undefined
 const slackApiUrl = optionalEnv('SLACK_API_URL')
 const slackApiTimeoutMs = optionalNumberEnv('SLACKBOTV2_SLACK_API_TIMEOUT_MS')
 const botUserId = await resolveSlackBotUserId({
@@ -46,6 +51,7 @@ const consoleLogger = {
 
 const options: SlackbotV2Options = {
   apiUrl,
+  appToken,
   agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
@@ -92,6 +98,7 @@ const options: SlackbotV2Options = {
   sessionApiTimeoutMs: optionalNumberEnv('SLACKBOTV2_SESSION_API_TIMEOUT_MS'),
   signingSecret,
   slackApiUrl,
+  slackMode,
   slackApiTimeoutMs,
   stateKeyPrefix: optionalEnv('SLACKBOTV2_STATE_KEY_PREFIX'),
   steeringReactionEnabled: booleanEnv('SLACKBOTV2_STEERING_REACTION_ENABLED', false),
@@ -104,11 +111,24 @@ const options: SlackbotV2Options = {
 }
 options.slackHomeTeamId = await resolveSlackHomeTeamId(options)
 
-const { app } = createSlackbotV2(options)
+const { app, initialize, loadExtensions } = createSlackbotV2(options)
+const extensionModules = parseSlackbotExtensionModules(
+  optionalEnv('SLACKBOTV2_EXTENSION_MODULES')
+)
+await loadExtensions(extensionModules)
 const server = Bun.serve({
   port,
   fetch: app.fetch
 })
+if (slackMode === 'socket') {
+  void initialize().catch(error => {
+    consoleLogger.error('slackbotv2_socket_initialization_failed', {
+      error: error instanceof Error ? error.message : String(error)
+    })
+    server.stop(true)
+    process.exit(1)
+  })
+}
 
 console.log(
   JSON.stringify({
@@ -126,6 +146,8 @@ console.log(
     response_service_tier_enabled: options.responseServiceTierEnabled,
     steering_reaction_enabled: options.steeringReactionEnabled,
     steering_reaction_name: options.steeringReactionName,
+    slack_mode: slackMode,
+    extension_module_count: extensionModules.length,
     port: server.port,
     api_url: apiUrl
   })
@@ -172,6 +194,13 @@ function responseMetadataModeEnv(name: string): 'first' | 'always' | 'never' {
   if (!value) return 'first'
   if (value === 'first' || value === 'always' || value === 'never') return value
   throw new Error(`${name} must be "first", "always", or "never"`)
+}
+
+function slackModeEnv(name: string): 'socket' | 'webhook' {
+  const value = optionalEnv(name)?.toLowerCase()
+  if (!value) return 'webhook'
+  if (value === 'socket' || value === 'webhook') return value
+  throw new Error(`${name} must be "socket" or "webhook"`)
 }
 
 function percentEnv(name: string, fallback: number): number {

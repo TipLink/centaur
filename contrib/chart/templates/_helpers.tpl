@@ -93,6 +93,8 @@ Subdir defaults: an omitted key falls back to the conventional layout
 (tools, workflows, .agents/skills); a key explicitly set to "" disables
 that surface for the source. Missing directories are skipped at runtime,
 so the defaults are safe for repos that only carry some surfaces.
+Slackbot extensions are executable deployment code, so slackbotSubdir has no
+default and must be enabled explicitly.
 */ -}}
 {{- if hasKey . "toolsSubdir" -}}
 {{- with .toolsSubdir }}{{- $_ := set $source "toolsSubdir" . -}}{{- end -}}
@@ -109,6 +111,7 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- else -}}
 {{- $_ := set $source "skillsSubdir" ".agents/skills" -}}
 {{- end -}}
+{{- with .slackbotSubdir }}{{- $_ := set $source "slackbotSubdir" . -}}{{- end -}}
 {{- with .promptPath }}{{- $_ := set $source "promptPath" . -}}{{- end -}}
 {{- with .personasSubdir }}{{- $_ := set $source "personasSubdir" . -}}{{- end -}}
 {{- $sources = append $sources $source -}}
