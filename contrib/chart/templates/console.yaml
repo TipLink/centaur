@@ -112,6 +112,8 @@ spec:
                 secretKeyRef:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sIRON_CONTROL_DATABASE_URL" $prefix }}
+            - name: CENTAUR_CONSOLE_DATABASE_NAME
+              value: {{ $console.database.name | quote }}
             # Thread browsing reads api-rs session rows from its logical DB.
             # Keep this under a Console-specific name so Rails' primary
             # DATABASE_URL remains pointed at the console database.

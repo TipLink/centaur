@@ -86,6 +86,8 @@ spec:
                 secretKeyRef:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sIRON_CONTROL_DATABASE_URL" $prefix }}
+            - name: CENTAUR_CONSOLE_DATABASE_NAME
+              value: {{ $console.database.name | quote }}
             - name: CENTAUR_CONSOLE_CENTAUR_DATABASE_URL
               valueFrom:
                 secretKeyRef:

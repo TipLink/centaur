@@ -148,9 +148,9 @@ console:
   railsEnv: production
   database:
     # Logical DB created on the bundled Postgres by the create-db init
-    # container. Must match the primary connection's `database:` in the image's
-    # database.yml — the connection URL carries no database path, so Rails
-    # resolves the name from there.
+    # container and passed to the Console web and worker processes. The
+    # connection URL carries no database path, so Rails uses this name for the
+    # primary database and appends the cache, queue, and cable suffixes.
     name: iron_control_production
   # Google as an OAuth identity provider for console sign-in (and the
   # broker-credential refresh loop). Off by default — not every deployment uses

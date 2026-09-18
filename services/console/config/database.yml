@@ -1,3 +1,5 @@
+<% production_database = ConsoleEnv.fetch("DATABASE_NAME", "iron_control_production") %>
+
 default: &default
   adapter: postgresql
   encoding: unicode
@@ -28,24 +30,24 @@ test:
 production:
   primary:
     <<: *default
-    database: iron_control_production
+    database: <%= production_database %>
     username: iron_control
     password: <%= ConsoleEnv["DATABASE_PASSWORD"] %>
   cache:
     <<: *default
-    database: iron_control_production_cache
+    database: <%= "#{production_database}_cache" %>
     username: iron_control
     password: <%= ConsoleEnv["DATABASE_PASSWORD"] %>
     migrations_paths: db/cache_migrate
   queue:
     <<: *default
-    database: iron_control_production_queue
+    database: <%= "#{production_database}_queue" %>
     username: iron_control
     password: <%= ConsoleEnv["DATABASE_PASSWORD"] %>
     migrations_paths: db/queue_migrate
   cable:
     <<: *default
-    database: iron_control_production_cable
+    database: <%= "#{production_database}_cable" %>
     username: iron_control
     password: <%= ConsoleEnv["DATABASE_PASSWORD"] %>
     migrations_paths: db/cable_migrate
