@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use centaur_sandbox_core::{
     DesiredSandboxState, ObservedSandbox, SandboxBackend, SandboxHandle, SandboxId, SandboxIo,
@@ -172,6 +172,13 @@ where
         self.backend.list_observed().await
     }
 
+    pub async fn reap_orphan_iron_proxy_resources(
+        &self,
+        grace: Duration,
+    ) -> SandboxResult<BTreeMap<String, u32>> {
+        self.backend.reap_orphan_iron_proxy_resources(grace).await
+    }
+
     pub async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         let backend = self.backend.name();
         match self.backend.pause(id).await {
@@ -243,9 +250,11 @@ where
         &self,
         id: &SandboxId,
         principal_id: &str,
+        requester_principal_id: Option<&str>,
+        labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         self.backend
-            .assign_iron_control_proxy_principal(id, principal_id)
+            .assign_iron_control_proxy_principal(id, principal_id, requester_principal_id, labels)
             .await
     }
 
@@ -253,9 +262,11 @@ where
         &self,
         id: &SandboxId,
         principal_id: &str,
+        requester_principal_id: Option<&str>,
+        labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         self.backend
-            .ensure_iron_control_proxy_resources(id, principal_id)
+            .ensure_iron_control_proxy_resources(id, principal_id, requester_principal_id, labels)
             .await
     }
 

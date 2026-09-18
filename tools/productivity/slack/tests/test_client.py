@@ -3,6 +3,7 @@ import email.message
 import json
 
 import pytest
+import slack.client as slack_client
 from slack.client import SlackAuthError, SlackClient, SlackRateLimitError
 from slack_sdk.errors import SlackApiError
 
@@ -35,6 +36,7 @@ class _FakeWebClient:
         self.user_info_response: dict | None = None
         self.user_profile_response: dict | None = None
         self.user_profile_calls: list[dict] = []
+        self.permalink_calls: list[dict] = []
         self.upload_exception: Exception | None = None
         self.upload_count = 0
         # Per-upload-attempt share outcomes consumed by files_upload_v2.
@@ -49,7 +51,21 @@ class _FakeWebClient:
 
     def chat_postMessage(self, **kwargs):
         self.last_kwargs = kwargs
-        return {"ts": "123.456"}
+        channel = "D123" if kwargs["channel"].startswith("U") else kwargs["channel"]
+        return {"channel": channel, "ts": "123.456"}
+
+    def reactions_add(self, **kwargs):
+        self.last_kwargs = kwargs
+        return {"ok": True}
+
+    def chat_getPermalink(self, **kwargs):
+        self.permalink_calls.append(kwargs)
+        channel = kwargs["channel"]
+        ts = kwargs["message_ts"]
+        return {
+            "ok": True,
+            "permalink": f"https://acme.slack.com/archives/{channel}/p{ts.replace('.', '')}",
+        }
 
     def conversations_history(self, **kwargs):
         self.history_calls.append(kwargs)
@@ -137,6 +153,68 @@ def _make_client() -> tuple[SlackClient, _FakeWebClient]:
     return client, fake_web_client
 
 
+@pytest.mark.parametrize("emoji", ["pencil2", ":pencil2:", " :pencil2: "])
+def test_add_reaction_preserves_target_and_normalizes_emoji(emoji) -> None:
+    client, web_client = _make_client()
+
+    result = client.add_reaction("C1234567890", "1789546423.000001", emoji)
+
+    assert web_client.last_kwargs == {
+        "channel": "C1234567890",
+        "timestamp": "1789546423.000001",
+        "name": "pencil2",
+    }
+    assert result == {
+        "ok": True,
+        "channel": "C1234567890",
+        "ts": "1789546423.000001",
+        "name": "pencil2",
+        "added": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("channel", "timestamp", "emoji"),
+    [
+        ("general", "123.456", "pencil2"),
+        ("U1234567890", "123.456", "pencil2"),
+        ("C1234567890", "not-a-timestamp", "pencil2"),
+        ("C1234567890", "123.456", "::"),
+        ("C1234567890", "123.456", "two words"),
+    ],
+)
+def test_add_reaction_rejects_invalid_input_before_request(channel, timestamp, emoji) -> None:
+    client, web_client = _make_client()
+    with pytest.raises(ValueError):
+        client.add_reaction(channel, timestamp, emoji)
+    assert web_client.last_kwargs is None
+
+
+@pytest.mark.parametrize(
+    "error", ["already_reacted", "missing_scope", "message_not_found", "ratelimited"]
+)
+def test_add_reaction_handles_slack_errors(monkeypatch, error) -> None:
+    client, web_client = _make_client()
+    calls = []
+
+    def fail(**kwargs):
+        calls.append(kwargs)
+        raise _make_slack_error(error=error, status_code=429 if error == "ratelimited" else 200)
+
+    monkeypatch.setattr(web_client, "reactions_add", fail)
+    if error == "already_reacted":
+        assert client.add_reaction("C1234567890", "123.456", "pencil2")["added"] is False
+    else:
+        expected = {
+            "missing_scope": SlackAuthError,
+            "message_not_found": RuntimeError,
+            "ratelimited": SlackRateLimitError,
+        }[error]
+        with pytest.raises(expected):
+            client.add_reaction("C1234567890", "123.456", "pencil2")
+    assert len(calls) == 1
+
+
 def _make_slack_error(
     *, error: str, status_code: int, message: str = "Slack request failed"
 ) -> SlackApiError:
@@ -180,27 +258,42 @@ def test_send_message_normalizes_escaped_line_breaks() -> None:
     assert fake_web_client.last_kwargs["text"] == "*Title*\n- one\n- two"
 
 
-def test_send_message_opens_dm_for_user_id_destination() -> None:
+def test_send_message_posts_directly_to_user_id_without_im_write_scope() -> None:
     client, fake_web_client = _make_client()
 
     result = client.send_message("<@U123ABC>", "hello", no_attribution=True)
 
-    assert fake_web_client.open_calls == [{"users": "U123ABC"}]
+    assert fake_web_client.open_calls == []
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channel"] == "D123"
+    assert fake_web_client.last_kwargs["channel"] == "U123ABC"
     assert fake_web_client.last_kwargs["text"] == "hello"
     assert result["channel"] == "D123"
-    assert result["permalink"] == "https://slack.com/archives/D123/p123456"
+    assert result["permalink"] == "https://acme.slack.com/archives/D123/p123456"
+    assert fake_web_client.permalink_calls == [{"channel": "D123", "message_ts": "123.456"}]
 
 
-def test_send_dm_opens_dm_and_posts_message() -> None:
+def test_canonical_message_permalink_falls_back_when_slack_rejects_lookup() -> None:
+    client, fake_web_client = _make_client()
+
+    def fail_permalink(**kwargs):
+        raise _make_slack_error(error="message_not_found", status_code=200)
+
+    fake_web_client.chat_getPermalink = fail_permalink  # type: ignore[method-assign]
+
+    assert (
+        client._canonical_message_permalink("C123", "123.456")
+        == "https://slack.com/archives/C123/p123456"
+    )
+
+
+def test_send_dm_posts_directly_to_user_id() -> None:
     client, fake_web_client = _make_client()
 
     client.send_dm("U234ABC", "hello", no_attribution=True, unfurl_links=False)
 
-    assert fake_web_client.open_calls == [{"users": "U234ABC"}]
+    assert fake_web_client.open_calls == []
     assert fake_web_client.last_kwargs is not None
-    assert fake_web_client.last_kwargs["channel"] == "D123"
+    assert fake_web_client.last_kwargs["channel"] == "U234ABC"
     assert fake_web_client.last_kwargs["unfurl_links"] is False
 
 
@@ -234,12 +327,13 @@ def test_resolve_channel_rejects_unknown_at_username() -> None:
         client._resolve_channel("@nobody")
 
 
-def test_resolve_channel_still_resolves_channel_names() -> None:
+def test_resolve_channel_still_resolves_channel_names(monkeypatch: pytest.MonkeyPatch) -> None:
     client, fake_web_client = _make_client()
     _restore_real_resolve_channel(client)
 
-    assert client._resolve_channel("paradigm-pulse") == "C123"
-    assert client._resolve_channel("C456DEF") == "C456DEF"
+    monkeypatch.setattr(slack_client, "_client", lambda: client)
+    assert slack_client.resolve_channel("paradigm-pulse") == "C123"
+    assert slack_client.resolve_channel("C456DEF") == "C456DEF"
     assert fake_web_client.open_calls == []
 
 
@@ -340,6 +434,44 @@ def test_get_channel_history_page_paginates_with_date_window() -> None:
     assert result["count"] == 3
     assert result["has_more"] is False
     assert result["messages"][1]["text"] == "hi @alice"
+
+
+def test_get_channel_history_page_preserves_reactions() -> None:
+    """Reactions ride along on the history payload; the serializer must keep them.
+
+    In channels where people answer by reacting rather than replying, the
+    reaction list is the signal and reply_count is close to noise. Dropping
+    reactions during serialization left callers with no way to tell the
+    difference between "nobody responded" and "everybody responded with an
+    emoji".
+    """
+    client, fake_web_client = _make_client()
+    client._get_user_cache = lambda: {"U1": "alice", "U2": "bob"}  # type: ignore[method-assign]
+    fake_web_client.history_pages = [
+        {
+            "messages": [
+                {
+                    "user": "U1",
+                    "text": "ship it?",
+                    "ts": "200.000000",
+                    "reactions": [
+                        {"name": "white_check_mark", "users": ["U1", "U2"], "count": 2},
+                    ],
+                },
+                {"user": "U2", "text": "no reactions here", "ts": "190.000000"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        },
+    ]
+
+    result = client.get_channel_history_page("paradigm-pulse", limit=2)
+
+    assert result["messages"][0]["reactions"] == [
+        {"name": "white_check_mark", "users": ["U1", "U2"], "count": 2},
+    ]
+    # A message with no reactions gets an empty list, matching how reply_users
+    # defaults, so callers can index without a guard.
+    assert result["messages"][1]["reactions"] == []
 
 
 def test_get_channel_history_page_surfaces_structured_auth_failure() -> None:
@@ -482,24 +614,15 @@ def test_get_channel_history_proxy_validates_inputs() -> None:
 def test_list_channels_proxy_calls_centaur_api() -> None:
     client, _ = _make_client()
 
+    calls = []
+
     def fake_get_json(path, params):
         assert path == "/api/slack/channels"
-        assert params == {}
+        calls.append(params)
+        history_only = params["history_only"]
         return {
             "ok": True,
             "channels": [
-                {
-                    "id": "C222222222",
-                    "name": "random",
-                    "purpose": "",
-                    "topic": "Chat",
-                    "member_count": 3,
-                    "is_private": False,
-                    "is_member": True,
-                    "can_upload": True,
-                    "can_download": False,
-                    "can_read_history": False,
-                },
                 {
                     "id": "C111111111",
                     "name": "general",
@@ -512,7 +635,20 @@ def test_list_channels_proxy_calls_centaur_api() -> None:
                     "can_download": True,
                     "can_read_history": True,
                 },
+                *([] if history_only else [{
+                    "id": "C222222222",
+                    "name": "random",
+                    "purpose": "",
+                    "topic": "Chat",
+                    "member_count": 3,
+                    "is_private": False,
+                    "is_member": True,
+                    "can_upload": True,
+                    "can_download": False,
+                    "can_read_history": False,
+                }]),
             ],
+            "response_metadata": {"next_cursor": ""},
         }
 
     client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
@@ -523,6 +659,41 @@ def test_list_channels_proxy_calls_centaur_api() -> None:
     ]
     assert [channel["id"] for channel in client.list_channels_proxy(history_only=True)] == [
         "C111111111"
+    ]
+    assert calls == [
+        {"limit": 200, "cursor": None, "query": None, "history_only": False},
+        {"limit": 200, "cursor": None, "query": None, "history_only": True},
+    ]
+
+
+def test_list_channels_proxy_paginates_and_passes_query() -> None:
+    client, _ = _make_client()
+    calls = []
+
+    def fake_get_json(path, params):
+        assert path == "/api/slack/channels"
+        calls.append(params)
+        channel_id = "C111111111" if params["cursor"] is None else "G222222222"
+        return {
+            "ok": True,
+            "channels": [{
+                "id": channel_id,
+                "name": "alpha" if params["cursor"] is None else "beta",
+                "can_read_history": True,
+            }],
+            "response_metadata": {
+                "next_cursor": "1" if params["cursor"] is None else ""
+            },
+        }
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    channels = client.list_channels_proxy(limit=2, history_only=True, query="a")
+
+    assert [channel["id"] for channel in channels] == ["C111111111", "G222222222"]
+    assert calls == [
+        {"limit": 2, "cursor": None, "query": "a", "history_only": True},
+        {"limit": 1, "cursor": "1", "query": "a", "history_only": True},
     ]
 
 
@@ -816,14 +987,9 @@ def test_file_proxy_methods_validate_inputs() -> None:
         client.get_channel_members_proxy(channel_id="general")
 
 
-def test_search_files_uses_proxy_without_direct_user_cache(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_search_files_uses_proxy_with_user_cache() -> None:
     client, _ = _make_client()
-    monkeypatch.setenv("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true")
-    client._get_user_cache = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
-        AssertionError("principal-proxied search must not use the direct bot client")
-    )
+    client._get_user_cache = lambda: {"U123456789": "alice"}  # type: ignore[method-assign]
 
     def fake_list_files_proxy(**kwargs):
         assert kwargs == {"channel_id": "C123456789", "limit": 200, "page": 1}
@@ -869,7 +1035,7 @@ def test_search_files_uses_proxy_without_direct_user_cache(
             "title": "Q4 Report",
             "filetype": "pdf",
             "size": 1234,
-            "user": "U123456789",
+            "user": "alice",
             "channels": ["C123456789"],
             "permalink": "https://slack.example/files/F123456789",
             "url_private": "https://files.example/F123456789",
@@ -878,21 +1044,9 @@ def test_search_files_uses_proxy_without_direct_user_cache(
     ]
 
 
-def test_search_files_raises_when_api_proxy_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client, _ = _make_client()
-    monkeypatch.setenv("CENTAUR_SANDBOX_API_SERVER_ENABLED", "false")
-
-    with pytest.raises(RuntimeError, match="proxy requires"):
-        client.search_files("C123456789", "report", max_results=10)
-
-
 def test_search_files_paginates_proxy_until_enough_matches() -> None:
     client, _ = _make_client()
-    client._get_user_cache = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
-        AssertionError("principal-proxied search must not use the direct bot client")
-    )
+    client._get_user_cache = lambda: {"U123456789": "alice"}  # type: ignore[method-assign]
     calls: list[dict] = []
 
     def fake_list_files_proxy(**kwargs):
@@ -946,11 +1100,8 @@ def test_search_files_paginates_proxy_until_enough_matches() -> None:
     assert [result["id"] for result in results] == ["F123456789"]
 
 
-def test_search_files_direct_uses_direct_files_list_when_api_proxy_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_search_files_direct_uses_direct_files_list() -> None:
     client, fake_web_client = _make_client()
-    monkeypatch.setenv("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true")
     client._get_user_cache = lambda: {"U123456789": "alice"}  # type: ignore[method-assign]
     client.list_files_proxy = pytest.fail  # type: ignore[method-assign]
     fake_web_client.files_list_pages = [
@@ -1023,6 +1174,11 @@ def test_search_messages_with_channel_ids_scans_proxy_history_without_listing() 
     )
     assert sorted(call["limit"] for call in proxy_calls) == [25, 25, 25]
     assert sorted(item["channel_id"] for item in results) == ["C042WDDP89Y", "C05HUE4KLF2"]
+    assert sorted(fake_web_client.permalink_calls, key=lambda call: call["channel"]) == [
+        {"channel": "C042WDDP89Y", "message_ts": "200.000000"},
+        {"channel": "C05HUE4KLF2", "message_ts": "300.000000"},
+    ]
+    assert all(result["permalink"].startswith("https://acme.slack.com/") for result in results)
 
 
 def test_search_messages_parses_channel_and_user_modifiers_locally() -> None:
@@ -1116,6 +1272,68 @@ def test_search_messages_falls_back_to_direct_history_and_threads_when_proxy_fai
     assert len(results) == 1
     assert results[0]["text"] == "needle is in the direct thread reply"
     assert results[0]["channel"] == "C123456789"
+
+
+def test_unscoped_search_uses_restricted_history_fallback_for_bot_token() -> None:
+    client, _ = _make_client()
+    fallback_result = [{"text": "matched through authorized history"}]
+    fallback_calls: list[tuple] = []
+
+    def fail_native_search(method: str, *, params: dict) -> None:
+        assert method == "search.messages"
+        assert params["query"] == "fire-drill after:2026-08-10"
+        raise _make_slack_error(error="not_allowed_token_type", status_code=200)
+
+    def search_local(*args):
+        fallback_calls.append(args)
+        return fallback_result
+
+    client._search_client.api_call = fail_native_search  # type: ignore[method-assign]
+    client._search_messages_local = search_local  # type: ignore[method-assign]
+
+    assert client.search_messages("fire-drill after:2026-08-10") == fallback_result
+    assert fallback_calls == [
+        ("fire-drill after:2026-08-10", 20, None, None, 200),
+    ]
+
+
+def test_unscoped_search_surfaces_missing_user_scope_without_scanning_history() -> None:
+    client, _ = _make_client()
+    search_client = _FakeWebClient()
+
+    def fail_native_search(method: str, *, params: dict) -> None:
+        assert method == "search.messages"
+        raise _make_slack_error(error="missing_scope", status_code=200)
+
+    search_client.api_call = fail_native_search  # type: ignore[method-assign]
+    client._search_client = search_client
+    client._search_messages_local = pytest.fail  # type: ignore[method-assign]
+
+    with pytest.raises(SlackAuthError) as exc_info:
+        client.search_messages("fire-drill after:2026-08-10")
+
+    assert exc_info.value.payload == {
+        "error": "slack_auth_failed",
+        "message": "Slack authentication failed for search.messages via search_token",
+        "slack_method": "search.messages",
+        "access_path": "search_token",
+        "error_code": "missing_scope",
+        "status_code": 200,
+        "requested_channel": None,
+        "resolved_channel": None,
+    }
+
+
+def test_unscoped_search_surfaces_native_runtime_failure_without_scanning_history() -> None:
+    client, fake_web_client = _make_client()
+    client._search_messages_local = pytest.fail  # type: ignore[method-assign]
+    fake_web_client.api_call = lambda method, *, params: {  # type: ignore[method-assign]
+        "ok": False,
+        "error": "internal_error",
+    }
+
+    with pytest.raises(RuntimeError, match="internal_error"):
+        client.search_messages("fire-drill after:2026-08-10")
 
 
 def test_list_channels_returns_cache_when_slack_rate_limited() -> None:
@@ -1275,6 +1493,22 @@ def test_upload_file_accepts_channel_id_alias_and_returns_preview() -> None:
         "csv_rows_sampled": 1,
         "csv_columns": 2,
     }
+    assert "initial_comment" not in fake_web_client.last_kwargs
+
+
+def test_upload_file_preserves_explicit_comment() -> None:
+    client, fake_web_client = _make_client()
+
+    client.upload_file(
+        channel_id="C123",
+        thread_ts="1780035646.228899",
+        content_base64="dGVzdA==",
+        filename="chart.png",
+        comment="Here is the chart.",
+    )
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["initial_comment"] == "Here is the chart."
 
 
 def test_upload_file_uses_explicit_destination() -> None:

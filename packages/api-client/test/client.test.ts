@@ -13,16 +13,15 @@ describe("CentaurClient", () => {
       apiKey: "test-key",
     });
     const postMock = vi.spyOn(client.http, "post").mockResolvedValue({
-      data: { ok: true, run_id: "run-123", task_id: "task-123", status: "queued", created: true },
+      data: { ok: true, run_id: "run-123", workflow_name: "nightly", status: "queued" },
     });
 
     await expect(
       client.startWorkflowRun({
         workflowName: "nightly",
-        idempotencyKey: "trigger-1",
+        triggerKey: "trigger-1",
         input: { topic: "incidents" },
-        harnessType: "codex",
-        maxAttempts: 3,
+        eagerStart: true,
         timeoutMs: 5000,
       }),
     ).resolves.toMatchObject({ run_id: "run-123" });
@@ -31,10 +30,9 @@ describe("CentaurClient", () => {
       "/api/workflows/runs",
       {
         workflow_name: "nightly",
-        idempotency_key: "trigger-1",
+        trigger_key: "trigger-1",
         input: { topic: "incidents" },
-        harness_type: "codex",
-        max_attempts: 3,
+        eager_start: true,
       },
       { timeout: 5000 },
     );
@@ -56,8 +54,11 @@ describe("CentaurClient", () => {
     await client.listWorkflowRuns({
       workflowName: "nightly",
       threadKey: "slack:C:1",
+      status: "running",
+      parentRunId: "root",
       limit: 5,
     });
+    await client.getWorkflowChildren("run:123", 10);
     await client.cancelWorkflowRun("run:123");
 
     expect(getMock).toHaveBeenNthCalledWith(1, "/api/workflows/runs/run%3A123");
@@ -65,8 +66,13 @@ describe("CentaurClient", () => {
       params: {
         workflow_name: "nightly",
         thread_key: "slack:C:1",
+        status: "running",
+        parent_run_id: "root",
         limit: 5,
       },
+    });
+    expect(getMock).toHaveBeenNthCalledWith(3, "/api/workflows/runs/run%3A123/children", {
+      params: { limit: 10 },
     });
     expect(postMock).toHaveBeenCalledWith("/api/workflows/runs/run%3A123/cancel");
   });
@@ -79,44 +85,15 @@ describe("CentaurClient", () => {
     const postMock = vi.spyOn(client.http, "post").mockResolvedValue({ data: { ok: true } });
 
     await client.sendWorkflowEvent({
-      eventName: "approval.received",
-      payload: { approved: true, correlation_id: "corr-1" },
+      eventType: "approval.received",
+      correlationId: "corr-1",
+      payload: { approved: true },
     });
 
     expect(postMock).toHaveBeenCalledWith("/api/workflows/events", {
-      event_name: "approval.received",
-      payload: { approved: true, correlation_id: "corr-1" },
+      event_type: "approval.received",
+      correlation_id: "corr-1",
+      payload: { approved: true },
     });
-  });
-
-  it("releases a session through the canonical owner-fenced endpoint", async () => {
-    const client = new CentaurClient({
-      apiUrl: "http://api.local",
-      apiKey: "test-key",
-    });
-    const postMock = vi.spyOn(client.http, "post").mockResolvedValue({
-      data: {
-        ok: true,
-        thread_key: "slack:T:C:1.2",
-        cancel_inflight: true,
-        sandbox_released: true,
-        execution_cancelled: true,
-      },
-    });
-
-    await client.releaseThread("slack:T:C:1.2", {
-      releaseId: "rel-123",
-      expectedSandboxId: "asbx-reviewed",
-      cancelInflight: true,
-    });
-
-    expect(postMock).toHaveBeenCalledWith(
-      "/api/session/slack%3AT%3AC%3A1.2/release",
-      {
-        release_id: "rel-123",
-        expected_sandbox_id: "asbx-reviewed",
-        cancel_inflight: true,
-      },
-    );
   });
 });

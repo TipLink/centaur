@@ -1,4 +1,4 @@
-use std::{env, str::FromStr};
+use std::str::FromStr;
 
 use centaur_api_server::{
     client::{CentaurClient, SseEvent as ApiSseEvent, SseEventStream},
@@ -26,6 +26,9 @@ pub(crate) type SseFrame = ApiSseEvent;
 struct Args {
     #[arg(long, env = "CENTAUR_API_URL", default_value = "http://127.0.0.1:8080")]
     api_url: ApiBaseUrl,
+
+    #[arg(long, env = "CENTAUR_API_TOKEN", hide_env_values = true)]
+    api_token: String,
 
     #[arg(long)]
     thread_key: Option<ThreadKeyArg>,
@@ -79,12 +82,11 @@ async fn main() -> Result<()> {
     if generated_thread_key {
         eprintln!("thread_key={}", thread_key.as_str());
     }
-    let api_key = env::var("CENTAUR_API_KEY")
-        .or_else(|_| env::var("CENTAUR_CONTROL_API_KEY"))
-        .wrap_err(
-            "CENTAUR_API_KEY or CENTAUR_CONTROL_API_KEY is required for authenticated session API access",
-        )?;
-    let client = CentaurClient::new(args.api_url.as_str()).with_bearer_token(api_key);
+    if args.api_token.trim().is_empty() {
+        bail!("CENTAUR_API_TOKEN must not be empty");
+    }
+    let client = CentaurClient::with_bearer_token(args.api_url.as_str(), &args.api_token)
+        .wrap_err("configure API authentication")?;
 
     if attach_mode {
         let events = client
@@ -580,6 +582,8 @@ enum HarnessTypeArg {
     Amp,
     #[value(name = "claudecode")]
     ClaudeCode,
+    Nanocodex,
+    Hermes,
 }
 
 impl From<HarnessTypeArg> for HarnessType {
@@ -588,6 +592,8 @@ impl From<HarnessTypeArg> for HarnessType {
             HarnessTypeArg::Codex => Self::Codex,
             HarnessTypeArg::Amp => Self::Amp,
             HarnessTypeArg::ClaudeCode => Self::ClaudeCode,
+            HarnessTypeArg::Nanocodex => Self::Nanocodex,
+            HarnessTypeArg::Hermes => Self::Hermes,
         }
     }
 }

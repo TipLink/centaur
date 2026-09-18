@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 
 use crate::{
     ObservedSandbox, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
@@ -54,11 +55,14 @@ pub trait SandboxBackend: Send + Sync {
     async fn stop(&self, id: &SandboxId) -> SandboxResult<()>;
 
     /// Rebind a running sandbox's managed iron-proxy to a different
-    /// iron-control principal.
+    /// iron-control principal, together with the requesting user's principal
+    /// for the current turn (`None` clears a previous requester binding).
     async fn assign_iron_control_proxy_principal(
         &self,
         _id: &SandboxId,
         _principal_id: &str,
+        _requester_principal_id: Option<&str>,
+        _labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         Err(crate::SandboxError::Unsupported {
             backend: self.name(),
@@ -67,12 +71,14 @@ pub trait SandboxBackend: Send + Sync {
     }
 
     /// Ensure a running sandbox's managed iron-proxy resources are present and
-    /// usable for the supplied iron-control principal without otherwise
-    /// changing the sandbox lifecycle.
+    /// usable for the supplied iron-control principal and requester without
+    /// otherwise changing the sandbox lifecycle.
     async fn ensure_iron_control_proxy_resources(
         &self,
         _id: &SandboxId,
         _principal_id: &str,
+        _requester_principal_id: Option<&str>,
+        _labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         Ok(())
     }
@@ -82,4 +88,18 @@ pub trait SandboxBackend: Send + Sync {
 
     /// Resume a previously suspended sandbox and wait until it can serve I/O.
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()>;
+
+    /// Delete iron-proxy resources that outlived their sandbox.
+    ///
+    /// A failed create, resume, or unwind can leave the proxy's pod, service,
+    /// and network policies behind, and once the Sandbox CR is gone nothing
+    /// keyed on an observed sandbox can reach them. Backends that manage no
+    /// proxy resources report none. Returns the number of resources deleted
+    /// per class.
+    async fn reap_orphan_iron_proxy_resources(
+        &self,
+        _grace: std::time::Duration,
+    ) -> SandboxResult<BTreeMap<String, u32>> {
+        Ok(BTreeMap::new())
+    }
 }

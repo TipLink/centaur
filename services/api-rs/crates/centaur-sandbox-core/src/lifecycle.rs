@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::{collections::BTreeMap, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -98,8 +98,14 @@ pub struct ObservedSandbox {
     pub backend: String,
     /// Current portable lifecycle status.
     pub status: SandboxStatus,
+    /// Backend metadata used to scope lifecycle reconciliation to an owner.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
     /// Backend-owned diagnostic reason for the observed status.
     pub reason: Option<String>,
+    /// Identity of the current backing runtime instance, if the backend exposes one.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     /// When the backend created the sandbox, if the backend records it.
     pub created_at: Option<SystemTime>,
     /// When the sandbox was suspended, if it is currently suspended and the
@@ -117,10 +123,17 @@ impl ObservedSandbox {
             id: id.into(),
             backend: backend.into(),
             status,
+            labels: BTreeMap::new(),
             reason: None,
+            instance_id: None,
             created_at: None,
             suspended_since: None,
         }
+    }
+
+    pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.labels = labels;
+        self
     }
 
     pub fn with_created_at(mut self, created_at: Option<SystemTime>) -> Self {
@@ -130,6 +143,16 @@ impl ObservedSandbox {
 
     pub fn with_suspended_since(mut self, suspended_since: Option<SystemTime>) -> Self {
         self.suspended_since = suspended_since;
+        self
+    }
+
+    pub fn with_reason(mut self, reason: Option<String>) -> Self {
+        self.reason = reason;
+        self
+    }
+
+    pub fn with_instance_id(mut self, instance_id: Option<String>) -> Self {
+        self.instance_id = instance_id;
         self
     }
 }

@@ -8,6 +8,9 @@ use thiserror::Error;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateSessionRequest {
     pub harness_type: HarnessType,
+    /// Used only when creating the session. The first persisted persona stays
+    /// pinned for the lifetime of the thread. An ID absent from the deployment
+    /// falls back to the eligible deployment default or no persona.
     pub persona_id: Option<String>,
     pub metadata: Option<Value>,
     /// What to do when the session already exists on a different harness.
@@ -31,6 +34,10 @@ pub struct CreateSessionResponse {
     pub session: Session,
     /// True when this request restarted the thread onto a different harness.
     pub harness_switched: bool,
+    /// Present only when a new-session request named an unavailable persona
+    /// and the returned session uses the resolved fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_requested_persona_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,30 +121,6 @@ pub struct ExecuteSessionResponse {
     pub status: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct ReleaseThreadRequest {
-    pub release_id: Option<String>,
-    /// Optional caller-side compare-and-swap fence. When present, release is
-    /// rejected unless the thread is still assigned to this exact sandbox.
-    pub expected_sandbox_id: Option<String>,
-    #[serde(default)]
-    pub cancel_inflight: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ReleaseThreadResponse {
-    pub ok: bool,
-    #[serde(flatten)]
-    pub session: Session,
-    pub release_id: Option<String>,
-    pub expected_sandbox_id: Option<String>,
-    pub cancel_inflight: bool,
-    pub sandbox_released: bool,
-    pub sandbox_release_error: Option<String>,
-    pub execution_id: Option<String>,
-    pub execution_cancelled: bool,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InterruptSessionExecutionRequest {
     pub reason: Option<String>,
@@ -161,12 +144,13 @@ pub struct EventsQuery {
 pub struct ListWorkflowRunsQuery {
     pub limit: Option<i64>,
     pub workflow_name: Option<String>,
-    pub thread_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EmitWorkflowEventRequest {
-    pub event_name: String,
+    pub event_name: Option<String>,
+    pub event_type: Option<String>,
+    pub correlation_id: Option<String>,
     #[serde(default)]
     pub payload: Value,
 }

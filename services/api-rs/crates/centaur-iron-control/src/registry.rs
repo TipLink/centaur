@@ -30,10 +30,6 @@ use crate::models::{
 };
 use crate::util::{managed_labels, slugify};
 
-const HTTP_METHODS: &[&str] = &[
-    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "*",
-];
-
 /// A role to register secrets against. ``foreign_id`` is the stable upsert key
 /// (e.g. ``infra`` or ``tool-github``); ``name`` is the human label.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,15 +108,13 @@ pub fn gcp_auth_scopes_or_default(scopes: Vec<String>) -> Vec<String> {
 /// without a follow-up lookup.
 pub async fn register_role(
     client: &IronControlClient,
-    namespace: &str,
     role: &RoleSpec,
     fragment: &ProxyFragment,
     policy: &SourcePolicy,
 ) -> Result<String, RegisterError> {
-    let inputs = secret_inputs_from_fragment(namespace, &role.foreign_id, fragment, policy)?;
+    let inputs = secret_inputs_from_fragment(&role.foreign_id, fragment, policy)?;
     let role_record = client
         .upsert_role(&IdentityInput {
-            namespace: namespace.to_owned(),
             foreign_id: role.foreign_id.clone(),
             name: role.name.clone(),
             labels: managed_labels(),
@@ -195,7 +189,6 @@ pub async fn grant_inputs_to_role(
 /// operator-managed via the ``centaur-perms`` CLI, which parses
 /// ``pyproject.toml`` directly.
 pub fn secret_inputs_from_fragment(
-    namespace: &str,
     role_foreign_id: &str,
     fragment: &ProxyFragment,
     policy: &SourcePolicy,
@@ -204,7 +197,7 @@ pub fn secret_inputs_from_fragment(
     let mut used_foreign_ids = BTreeSet::new();
 
     for listener in &fragment.postgres {
-        let mut input = pg_dsn_from_listener(namespace, role_foreign_id, listener, policy)?;
+        let mut input = pg_dsn_from_listener(role_foreign_id, listener, policy)?;
         input.foreign_id = unique_foreign_id(input.foreign_id, &mut used_foreign_ids);
         inputs.push(SecretInput::PgDsn(input));
     }
@@ -212,31 +205,27 @@ pub fn secret_inputs_from_fragment(
         match transform.name.as_str() {
             "secrets" => {
                 for secret in &transform.config.secrets {
-                    let mut input =
-                        static_secret_from_secret(namespace, role_foreign_id, secret, policy)?;
+                    let mut input = static_secret_from_secret(role_foreign_id, secret, policy)?;
                     input.foreign_id = unique_foreign_id(input.foreign_id, &mut used_foreign_ids);
                     inputs.push(SecretInput::Static(input));
                 }
             }
             "oauth_token" => {
                 for token in tokens_of(transform) {
-                    let mut input =
-                        oauth_token_from_value(namespace, role_foreign_id, token, policy)?;
+                    let mut input = oauth_token_from_value(role_foreign_id, token, policy)?;
                     input.foreign_id = unique_foreign_id(input.foreign_id, &mut used_foreign_ids);
                     inputs.push(SecretInput::OAuthToken(input));
                 }
             }
             "gcp_auth" => {
-                let mut input =
-                    gcp_auth_from_transform(namespace, role_foreign_id, transform, policy)?;
+                let mut input = gcp_auth_from_transform(role_foreign_id, transform, policy)?;
                 if let Some(foreign_id) = input.foreign_id.take() {
                     input.foreign_id = Some(unique_foreign_id(foreign_id, &mut used_foreign_ids));
                 }
                 inputs.push(SecretInput::GcpAuth(input));
             }
             "gcp_id_token" => {
-                let mut input =
-                    gcp_id_token_from_transform(namespace, role_foreign_id, transform, policy)?;
+                let mut input = gcp_id_token_from_transform(role_foreign_id, transform, policy)?;
                 input.foreign_id = unique_foreign_id(input.foreign_id, &mut used_foreign_ids);
                 inputs.push(SecretInput::GcpIdToken(input));
             }
@@ -249,8 +238,7 @@ pub fn secret_inputs_from_fragment(
                 });
             }
             "aws_auth" => {
-                let mut input =
-                    aws_auth_from_transform(namespace, role_foreign_id, transform, policy)?;
+                let mut input = aws_auth_from_transform(role_foreign_id, transform, policy)?;
                 input.foreign_id = unique_foreign_id(input.foreign_id, &mut used_foreign_ids);
                 inputs.push(SecretInput::AwsAuth(input));
             }
@@ -267,12 +255,11 @@ pub fn secret_inputs_from_fragment(
 // ---------------------------------------------------------------------------
 
 fn static_secret_from_secret(
-    namespace: &str,
     role: &str,
     secret: &Secret,
     policy: &SourcePolicy,
 ) -> Result<StaticSecretInput, TranslateError> {
-    let source = source_from_secret(namespace, role, secret, policy)?;
+    let source = source_from_secret(role, secret, policy)?;
     let (inject_config, replace_config) = match (&secret.inject, &secret.replace) {
         (Some(inject), None) => (Some(inject_config_from_value(role, inject)?), None),
         (None, Some(replace)) => (None, Some(replace_config_from(role, replace)?)),
@@ -289,7 +276,6 @@ fn static_secret_from_secret(
     let rules = rules_from_values(role, &secret.rules)?;
     let identity = static_secret_identity(secret);
     Ok(StaticSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: format!("{role}-{}", slugify(&identity)),
         name: identity,
         description: None,
@@ -342,7 +328,6 @@ fn static_secret_identity(secret: &Secret) -> String {
 /// ``value`` is not a token_broker source. ``what`` prefixes the error so the
 /// caller's context (e.g. ``"pg_dsn "``) appears in malformed messages.
 fn token_broker_source(
-    namespace: &str,
     role: &str,
     value: &YamlValue,
     what: &str,
@@ -356,17 +341,16 @@ fn token_broker_source(
             &format!("{what}token_broker source missing credential_id"),
         )
     })?;
-    Ok(Some(SecretSource::token_broker(credential_id, namespace)))
+    Ok(Some(SecretSource::token_broker(credential_id)))
 }
 
 fn source_from_secret(
-    namespace: &str,
     role: &str,
     secret: &Secret,
     policy: &SourcePolicy,
 ) -> Result<SecretSource, TranslateError> {
     if let Some(source) = &secret.source {
-        if let Some(broker) = token_broker_source(namespace, role, source, "")? {
+        if let Some(broker) = token_broker_source(role, source, "")? {
             return Ok(broker);
         }
         if let Some(placeholder) = yaml_str(source, "placeholder") {
@@ -402,7 +386,7 @@ pub fn source_from_placeholder(
 ) -> SecretSource {
     match policy.kind {
         SourceKind::Env => {
-            let mut config = json!({ "var": format!("{}{}", policy.env_prefix, placeholder) });
+            let mut config = json!({ "var": placeholder });
             insert_json_key(&mut config, json_key);
             SecretSource {
                 source_type: "env".to_owned(),
@@ -487,90 +471,14 @@ fn rules_from_values(role: &str, rules: &[YamlValue]) -> Result<Vec<RequestRule>
             if host.is_none() && cidr.is_none() {
                 return Err(malformed(role, "request rule must set host or cidr"));
             }
-            if yaml_get(rule, "http_methods").is_some() && yaml_get(rule, "methods").is_some() {
-                return Err(malformed(
-                    role,
-                    "request rule must declare only one of methods or http_methods",
-                ));
-            }
             Ok(RequestRule {
                 host,
                 cidr,
-                http_methods: request_methods(
-                    role,
-                    yaml_get(rule, "http_methods").or_else(|| yaml_get(rule, "methods")),
-                )?,
-                paths: request_paths(role, yaml_get(rule, "paths"))?,
+                http_methods: yaml_string_array(yaml_get(rule, "http_methods")),
+                paths: yaml_string_array(yaml_get(rule, "paths")),
             })
         })
         .collect()
-}
-
-fn request_scope_string_array(
-    role: &str,
-    value: Option<&YamlValue>,
-    key: &str,
-) -> Result<Vec<String>, TranslateError> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let Some(sequence) = value.as_sequence() else {
-        return Err(malformed(
-            role,
-            &format!("request rule {key} must be an array of strings"),
-        ));
-    };
-    if sequence.is_empty() {
-        return Err(malformed(
-            role,
-            &format!("request rule {key} must not be empty"),
-        ));
-    }
-    sequence
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| {
-                    malformed(
-                        role,
-                        &format!("request rule {key} must contain only non-empty strings"),
-                    )
-                })
-        })
-        .collect()
-}
-
-fn request_methods(role: &str, value: Option<&YamlValue>) -> Result<Vec<String>, TranslateError> {
-    request_scope_string_array(role, value, "methods")?
-        .into_iter()
-        .map(|method| {
-            let method = method.to_ascii_uppercase();
-            if HTTP_METHODS.contains(&method.as_str()) {
-                Ok(method)
-            } else {
-                Err(malformed(
-                    role,
-                    &format!("request rule method {method:?} must be one of {HTTP_METHODS:?}"),
-                ))
-            }
-        })
-        .collect()
-}
-
-fn request_paths(role: &str, value: Option<&YamlValue>) -> Result<Vec<String>, TranslateError> {
-    let paths = request_scope_string_array(role, value, "paths")?;
-    for path in &paths {
-        if !path.starts_with('/') {
-            return Err(malformed(
-                role,
-                &format!("request rule path {path:?} must start with '/'"),
-            ));
-        }
-    }
-    Ok(paths)
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +486,6 @@ fn request_paths(role: &str, value: Option<&YamlValue>) -> Result<Vec<String>, T
 // ---------------------------------------------------------------------------
 
 fn pg_dsn_from_listener(
-    namespace: &str,
     role: &str,
     listener: &PostgresListener,
     policy: &SourcePolicy,
@@ -599,7 +506,7 @@ fn pg_dsn_from_listener(
                 &format!("postgres listener {name} missing upstream.dsn"),
             )
         })?;
-    let dsn = pg_dsn_source(namespace, role, dsn_value, policy)?;
+    let dsn = pg_dsn_source(role, dsn_value, policy)?;
     let database = listener
         .sandbox_env
         .as_ref()
@@ -621,7 +528,6 @@ fn pg_dsn_from_listener(
         .filter(|role| !role.is_empty())
         .map(ToOwned::to_owned);
     Ok(PgDsnSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: pg_foreign_id(name),
         name: name.to_owned(),
         database,
@@ -645,10 +551,14 @@ fn pg_setting_from_listener(setting: &PgDsnSetting) -> PgDsnSettingInput {
             |PgDsnSettingValueFrom {
                  principal_label,
                  principal_field,
+                 requester_principal_field,
+                 proxy_label,
              }| {
                 PgDsnSettingValueFromInput {
                     principal_label: principal_label.clone(),
                     principal_field: principal_field.clone(),
+                    requester_principal_field: requester_principal_field.clone(),
+                    proxy_label: proxy_label.clone(),
                 }
             },
         ),
@@ -660,12 +570,11 @@ fn pg_setting_from_listener(setting: &PgDsnSetting) -> PgDsnSettingInput {
 /// placeholder (resolved against the deployment's [`SourcePolicy`], like any
 /// other secret).
 fn pg_dsn_source(
-    namespace: &str,
     role: &str,
     dsn: &YamlValue,
     policy: &SourcePolicy,
 ) -> Result<SecretSource, TranslateError> {
-    if let Some(broker) = token_broker_source(namespace, role, dsn, "pg_dsn ")? {
+    if let Some(broker) = token_broker_source(role, dsn, "pg_dsn ")? {
         return Ok(broker);
     }
     if yaml_str(dsn, "type") == Some("env") {
@@ -714,7 +623,6 @@ fn tokens_of(transform: &centaur_iron_proxy::Transform) -> Vec<&YamlValue> {
 }
 
 fn oauth_token_from_value(
-    namespace: &str,
     role: &str,
     token: &YamlValue,
     policy: &SourcePolicy,
@@ -760,7 +668,6 @@ fn oauth_token_from_value(
     let rules = rules_from_values(role, &sequence(yaml_get(token, "rules")))?;
     let identity = yaml_str(token, "token_endpoint").unwrap_or(&grant);
     Ok(OAuthTokenSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: format!("{role}-oauth-{}", slugify(identity)),
         name: format!("OAuth {grant}"),
         grant,
@@ -795,7 +702,6 @@ fn oauth_field_source(
 // ---------------------------------------------------------------------------
 
 fn gcp_auth_from_transform(
-    namespace: &str,
     role: &str,
     transform: &centaur_iron_proxy::Transform,
     policy: &SourcePolicy,
@@ -816,7 +722,6 @@ fn gcp_auth_from_transform(
         None => (None, None),
     };
     Ok(GcpAuthSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id,
         name: Some(format!("GCP Auth ({role})")),
         labels: resource_labels(config.get("labels")),
@@ -836,7 +741,6 @@ fn gcp_auth_from_transform(
 // ---------------------------------------------------------------------------
 
 fn gcp_id_token_from_transform(
-    namespace: &str,
     role: &str,
     transform: &centaur_iron_proxy::Transform,
     policy: &SourcePolicy,
@@ -876,7 +780,6 @@ fn gcp_id_token_from_transform(
         identity.push_str(header);
     }
     Ok(GcpIdTokenSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: format!("{role}-gcp-id-token-{}", slugify(&identity)),
         name: Some(format!("GCP ID Token ({role})")),
         description: None,
@@ -900,7 +803,6 @@ fn gcp_id_token_from_transform(
 /// shared request-rule shape. The ``foreign_id`` keys on the access-key
 /// placeholder so the same credential set is one stable secret.
 fn aws_auth_from_transform(
-    namespace: &str,
     role: &str,
     transform: &centaur_iron_proxy::Transform,
     policy: &SourcePolicy,
@@ -921,7 +823,6 @@ fn aws_auth_from_transform(
         .map(|value| aws_source(role, "session_token", value, policy).map(|(source, _)| source))
         .transpose()?;
     Ok(AwsAuthSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: format!("{role}-aws-{}", slugify(&placeholder)),
         name: Some(format!("AWS Auth ({role})")),
         description: None,
@@ -1035,25 +936,10 @@ pub fn unique_foreign_id(candidate: String, used: &mut BTreeSet<String>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use centaur_iron_proxy::{infra_fragment, load_fragment_str};
+    use centaur_iron_proxy::load_fragment_str;
 
     fn env_policy() -> SourcePolicy {
         SourcePolicy::env()
-    }
-
-    #[test]
-    fn env_policy_prefixes_the_resolved_environment_key() {
-        let source = source_from_placeholder(
-            &SourcePolicy::env().with_env_prefix("CENTAUR_"),
-            "SLACK_FEEDBACK_API_KEY",
-            None,
-        );
-
-        assert_eq!(source.source_type, "env");
-        assert_eq!(
-            source.config,
-            json!({ "var": "CENTAUR_SLACK_FEEDBACK_API_KEY" })
-        );
     }
 
     #[test]
@@ -1074,8 +960,7 @@ transforms:
 "#,
         )
         .unwrap();
-        let inputs =
-            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        let inputs = secret_inputs_from_fragment("infra", &fragment, &env_policy()).unwrap();
         assert_eq!(inputs.len(), 1);
         let SecretInput::Static(input) = &inputs[0] else {
             panic!("expected a static secret");
@@ -1105,79 +990,6 @@ transforms:
     }
 
     #[test]
-    fn proxy_style_request_methods_translate_to_request_rules() {
-        let fragment = load_fragment_str(
-            r#"
-transforms:
-  - name: secrets
-    config:
-      secrets:
-        - id: SLACK_SEARCH_TOKEN
-          source:
-            placeholder: SLACK_SEARCH_TOKEN
-          inject:
-            header: Authorization
-            formatter: "Bearer {{.Value}}"
-          rules:
-            - host: slack.com
-              methods: [POST]
-              paths: [/api/search.messages]
-"#,
-        )
-        .unwrap();
-        let inputs =
-            secret_inputs_from_fragment("default", "tool-slack", &fragment, &env_policy()).unwrap();
-        let SecretInput::Static(input) = &inputs[0] else {
-            panic!("expected a static secret");
-        };
-        assert_eq!(input.rules.len(), 1);
-        assert_eq!(input.rules[0].host.as_deref(), Some("slack.com"));
-        assert_eq!(input.rules[0].http_methods, vec!["POST".to_owned()]);
-        assert_eq!(
-            input.rules[0].paths,
-            vec!["/api/search.messages".to_owned()]
-        );
-    }
-
-    #[test]
-    fn malformed_request_scopes_do_not_translate_as_unscoped_rules() {
-        for rule in [
-            "methods: POST",
-            "methods: []",
-            "methods: [POST, 123]",
-            "methods: [TRACE]",
-            "http_methods: [POST]\n              methods: [GET]",
-            "paths: /api/search.messages",
-            "paths: []",
-            "paths: [/api/search.messages, 123]",
-            "paths: [api/search.messages]",
-        ] {
-            let fragment = load_fragment_str(&format!(
-                r#"
-transforms:
-  - name: secrets
-    config:
-      secrets:
-        - id: SLACK_SEARCH_TOKEN
-          source:
-            placeholder: SLACK_SEARCH_TOKEN
-          inject:
-            header: Authorization
-          rules:
-            - host: slack.com
-              {rule}
-"#
-            ))
-            .unwrap();
-
-            let err =
-                secret_inputs_from_fragment("default", "tool-slack", &fragment, &env_policy())
-                    .unwrap_err();
-            assert!(matches!(err, TranslateError::Malformed { .. }), "{err:?}");
-        }
-    }
-
-    #[test]
     fn translates_token_broker_inject_secret() {
         let fragment = load_fragment_str(
             r#"
@@ -1195,8 +1007,7 @@ transforms:
 "#,
         )
         .unwrap();
-        let inputs =
-            secret_inputs_from_fragment("default", "tool-codex", &fragment, &env_policy()).unwrap();
+        let inputs = secret_inputs_from_fragment("tool-codex", &fragment, &env_policy()).unwrap();
         let SecretInput::Static(input) = &inputs[0] else {
             panic!("expected a static secret");
         };
@@ -1204,52 +1015,12 @@ transforms:
         assert_eq!(input.source.source_type, "token_broker");
         assert_eq!(
             input.source.config,
-            json!({ "credential_id": "openai-codex", "credential_namespace": "default" })
+            json!({ "credential_id": "openai-codex" })
         );
         let inject = input.inject_config.as_ref().unwrap();
         assert_eq!(inject.header.as_deref(), Some("Authorization"));
         assert_eq!(inject.formatter.as_deref(), Some("Bearer {{.Value}}"));
         assert!(input.replace_config.is_none());
-    }
-
-    #[test]
-    fn built_in_github_broker_becomes_infra_replace_secret() {
-        let fragment = infra_fragment().expect("built-in infra fragment parses");
-        let inputs =
-            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
-        let input = inputs
-            .iter()
-            .find_map(|input| match input {
-                SecretInput::Static(input) if input.foreign_id == "infra-github-app" => Some(input),
-                _ => None,
-            })
-            .expect("built-in GitHub broker static secret");
-
-        assert_eq!(input.name, "github-app");
-        assert_eq!(input.source.source_type, "token_broker");
-        assert_eq!(
-            input.source.config,
-            json!({
-                "credential_id": "github-app",
-                "credential_namespace": "default",
-            })
-        );
-        assert!(input.inject_config.is_none());
-        let replace = input.replace_config.as_ref().expect("replace config");
-        assert_eq!(replace.proxy_value, "GITHUB_TOKEN");
-        assert_eq!(replace.match_headers, vec!["Authorization"]);
-        assert_eq!(
-            input
-                .rules
-                .iter()
-                .filter_map(|rule| rule.host.as_deref())
-                .collect::<Vec<_>>(),
-            vec!["github.com", "api.github.com"]
-        );
-        assert_eq!(
-            input.labels.get("managed-by").map(String::as_str),
-            Some("centaur")
-        );
     }
 
     #[test]
@@ -1268,8 +1039,7 @@ transforms:
 "#,
         )
         .unwrap();
-        let inputs =
-            secret_inputs_from_fragment("default", "tool-codex", &fragment, &env_policy()).unwrap();
+        let inputs = secret_inputs_from_fragment("tool-codex", &fragment, &env_policy()).unwrap();
         let SecretInput::Static(input) = &inputs[0] else {
             panic!("expected a static secret");
         };
@@ -1299,7 +1069,7 @@ transforms:
         )
         .unwrap();
         let policy = SourcePolicy::onepassword_connect("ai-agents", "10m");
-        let inputs = secret_inputs_from_fragment("default", "infra", &fragment, &policy).unwrap();
+        let inputs = secret_inputs_from_fragment("infra", &fragment, &policy).unwrap();
         let SecretInput::Static(input) = &inputs[0] else {
             panic!("expected a static secret");
         };
@@ -1327,12 +1097,17 @@ postgres:
     settings:
       - name: centaur.slack_channel_id
         value_from:
-          principal_label: slack_channel_id
+          principal_field: slack_channel_id
+      - name: centaur.slack_user_id
+        value_from:
+          proxy_label: centaur.slack_user_id
+      - name: centaur.requester_slack_user_id
+        value_from:
+          requester_principal_field: slack_user_id
 "#,
         )
         .unwrap();
-        let inputs =
-            secret_inputs_from_fragment("default", "tools", &fragment, &env_policy()).unwrap();
+        let inputs = secret_inputs_from_fragment("tools", &fragment, &env_policy()).unwrap();
         assert_eq!(inputs.len(), 1);
         let SecretInput::PgDsn(input) = &inputs[0] else {
             panic!("expected a pg_dsn secret");
@@ -1341,14 +1116,30 @@ postgres:
         assert_eq!(input.name, "analytics");
         assert_eq!(input.database, "analytics_db");
         assert_eq!(input.role.as_deref(), Some("readonly"));
-        assert_eq!(input.settings.len(), 1);
+        assert_eq!(input.settings.len(), 3);
         assert_eq!(input.settings[0].name, "centaur.slack_channel_id");
         assert_eq!(
             input.settings[0]
                 .value_from
                 .as_ref()
-                .and_then(|value_from| value_from.principal_label.as_deref()),
+                .and_then(|value_from| value_from.principal_field.as_deref()),
             Some("slack_channel_id")
+        );
+        assert_eq!(input.settings[1].name, "centaur.slack_user_id");
+        assert_eq!(
+            input.settings[1]
+                .value_from
+                .as_ref()
+                .and_then(|value_from| value_from.proxy_label.as_deref()),
+            Some("centaur.slack_user_id")
+        );
+        assert_eq!(input.settings[2].name, "centaur.requester_slack_user_id");
+        assert_eq!(
+            input.settings[2]
+                .value_from
+                .as_ref()
+                .and_then(|value_from| value_from.requester_principal_field.as_deref()),
+            Some("slack_user_id")
         );
         assert_eq!(input.dsn.source_type, "env");
         assert_eq!(input.dsn.config, json!({ "var": "PG_ANALYTICS_DSN" }));
@@ -1365,8 +1156,7 @@ transforms:
 "#,
         )
         .unwrap();
-        let err =
-            secret_inputs_from_fragment("default", "tool-x", &fragment, &env_policy()).unwrap_err();
+        let err = secret_inputs_from_fragment("tool-x", &fragment, &env_policy()).unwrap_err();
         assert!(matches!(err, TranslateError::Unsupported { .. }));
     }
 
@@ -1386,8 +1176,7 @@ transforms:
 "#,
         )
         .unwrap();
-        let inputs =
-            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        let inputs = secret_inputs_from_fragment("infra", &fragment, &env_policy()).unwrap();
         let SecretInput::AwsAuth(input) = &inputs[0] else {
             panic!("expected an aws_auth secret");
         };
@@ -1432,8 +1221,7 @@ transforms:
 "#,
         )
         .unwrap();
-        let inputs =
-            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        let inputs = secret_inputs_from_fragment("infra", &fragment, &env_policy()).unwrap();
         let SecretInput::GcpIdToken(input) = &inputs[0] else {
             panic!("expected a gcp_id_token secret");
         };
@@ -1477,8 +1265,7 @@ transforms:
 "#,
         )
         .unwrap();
-        let err =
-            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap_err();
+        let err = secret_inputs_from_fragment("infra", &fragment, &env_policy()).unwrap_err();
         assert!(matches!(err, TranslateError::Malformed { .. }), "{err:?}");
     }
 
@@ -1498,8 +1285,7 @@ transforms:
 "#,
         )
         .unwrap();
-        let inputs =
-            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap();
+        let inputs = secret_inputs_from_fragment("infra", &fragment, &env_policy()).unwrap();
         let SecretInput::AwsAuth(input) = &inputs[0] else {
             panic!("expected an aws_auth secret");
         };
@@ -1520,8 +1306,7 @@ transforms:
 "#,
         )
         .unwrap();
-        let err =
-            secret_inputs_from_fragment("default", "infra", &fragment, &env_policy()).unwrap_err();
+        let err = secret_inputs_from_fragment("infra", &fragment, &env_policy()).unwrap_err();
         assert!(matches!(err, TranslateError::Malformed { .. }), "{err:?}");
     }
 

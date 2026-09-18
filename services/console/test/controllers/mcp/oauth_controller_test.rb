@@ -73,6 +73,22 @@ module Mcp
       assert_equal [ "https://claude.ai/api/mcp/auth_callback" ], body.fetch("redirect_uris")
     end
 
+    test "dynamic client registration creates a private-use scheme native client" do
+      assert_difference -> { McpOauthClient.count }, 1 do
+        post "/mcp/oauth/register",
+             params: {
+               client_name: "Cursor",
+               redirect_uris: [ "cursor://anysphere.cursor-mcp/oauth/callback" ],
+               scope: "mcp:tools"
+             },
+             as: :json
+      end
+
+      assert_response :created
+      body = JSON.parse(response.body)
+      assert_equal [ "cursor://anysphere.cursor-mcp/oauth/callback" ], body.fetch("redirect_uris")
+    end
+
     test "dynamic client registration rejects non-loopback plain HTTP redirect URIs" do
       assert_no_difference -> { McpOauthClient.count } do
         post "/mcp/oauth/register",
@@ -156,6 +172,9 @@ module Mcp
       assert_equal @operator, stored_code.user
       assert_equal "http://localhost:3000/mcp", stored_code.resource
       assert_match(/\Aprn_/, stored_code.principal.oid)
+      assert_equal "console_user", stored_code.principal.kind
+      assert_equal @operator.id, stored_code.principal.console_user_id
+      assert_empty stored_code.principal.labels.slice("console-user-id", "email")
 
       exchange_authorization_code(client, code)
 
@@ -179,45 +198,76 @@ module Mcp
       code = authorize_code(client)
 
       principal = McpOauthAuthorizationCode.find_usable(code).principal
-      role = Role.find_by(namespace: principal.namespace, foreign_id: "user-mcp")
+      role = Role.find_by(foreign_id: "user-mcp")
       assert role, "expected the user-mcp role to be created"
       assert_equal "User MCP", role.name
       assert_equal "centaur", role.labels["managed-by"]
       assert_includes principal.roles, role
     end
 
-    test "authorization approval labels a principal from one Slack SSO identity" do
+    test "authorization approval identifies a principal from one Slack SSO identity" do
       @operator.user_identities.create!(
-        provider: "slack", subject: "U123", team_id: "T123", email: @operator.email, email_verified: true
+        provider: "slack", subject: "U0123456789", team_id: "T0123456789",
+        email: @operator.email, email_verified: true
       )
       client = create_client
 
       code = authorize_code(client)
 
       principal = McpOauthAuthorizationCode.find_usable(code).principal
-      assert_equal "U123", principal.labels["slack_user_id"]
-      assert_equal "T123", principal.labels["slack_team_id"]
+      assert_equal "U0123456789", principal.slack_user_id
+      assert_equal "T0123456789", principal.slack_team_id
+      assert_empty principal.labels.slice("slack_user_id", "slack_team_id")
     end
 
     test "authorization approval leaves Slack labels unset for ambiguous Slack SSO identities" do
       @operator.user_identities.create!(
-        provider: "slack", subject: "U123", team_id: "T123", email: @operator.email, email_verified: true
+        provider: "slack", subject: "U0123456789", team_id: "T0123456789",
+        email: @operator.email, email_verified: true
       )
       @operator.user_identities.create!(
-        provider: "slack", subject: "U456", team_id: "T456", email: @operator.email, email_verified: true
+        provider: "slack", subject: "U9999999999", team_id: "T9999999999",
+        email: @operator.email, email_verified: true
       )
       client = create_client
 
       code = authorize_code(client)
 
       principal = McpOauthAuthorizationCode.find_usable(code).principal
-      assert_nil principal.labels["slack_user_id"]
-      assert_nil principal.labels["slack_team_id"]
+      assert_nil principal.slack_user_id
+      assert_nil principal.slack_team_id
+    end
+
+    test "authorization approval leaves Slack fields unset for a malformed Slack user ID" do
+      @operator.user_identities.create!(
+        provider: "slack", subject: "U12345", team_id: "T0123456789",
+        email: @operator.email, email_verified: true
+      )
+      client = create_client
+
+      code = authorize_code(client)
+
+      principal = McpOauthAuthorizationCode.find_usable(code).principal
+      assert_nil principal.slack_user_id
+      assert_nil principal.slack_team_id
+    end
+
+    test "authorization approval leaves Slack fields unset for a malformed Slack team ID" do
+      @operator.user_identities.create!(
+        provider: "slack", subject: "U0123456789", team_id: "TACME",
+        email: @operator.email, email_verified: true
+      )
+      client = create_client
+
+      code = authorize_code(client)
+
+      principal = McpOauthAuthorizationCode.find_usable(code).principal
+      assert_nil principal.slack_user_id
+      assert_nil principal.slack_team_id
     end
 
     test "authorization approval reuses an existing user-mcp role" do
       existing = Role.create!(
-        namespace: "default",
         foreign_id: "user-mcp",
         name: "Custom user role",
         created_by: @operator

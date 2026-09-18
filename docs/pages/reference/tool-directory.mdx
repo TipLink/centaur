@@ -37,7 +37,6 @@ These are broadly useful across most deployments and are good candidates to conf
 | `company_context` | Search indexed company history, private Slack conversations, and Google Docs | None |
 | `grafana` | Query dashboards, alerts, VictoriaMetrics, VictoriaLogs, and annotations | `GRAFANA_URL`, `GRAFANA_API_KEY` |
 | `posthog` | Query product analytics, events, pageviews, breakdowns, and user agents | `POSTHOG_API_KEY`, `POSTHOG_PROJECT_ID` |
-| `amplitude` | Query product analytics — event segmentation, funnels, retention, user activity, and taxonomy | `AMPLITUDE_API_KEY`, `AMPLITUDE_SECRET_KEY` |
 | `attio` | Work with CRM objects, records, lists, notes, tasks, calls, and meetings | `ATTIO_API_KEY` |
 | `pylon` | Read and manage support issues, accounts, contacts, teams, tags, and users | `PYLON_API_KEY` |
 
@@ -65,7 +64,6 @@ These are broadly useful across most deployments and are good candidates to conf
 | `demo` | Test tool hot-reload and basic tool plumbing | None |
 | `grafana` | Grafana dashboards, alerts, VictoriaMetrics, VictoriaLogs, and annotations | `GRAFANA_URL`, `GRAFANA_API_KEY` |
 | `posthog` | Product analytics through HogQL, events, pageviews, and breakdowns | `POSTHOG_API_KEY`, `POSTHOG_PROJECT_ID` |
-| `amplitude` | Amplitude event segmentation, funnels, retention, user activity, realtime, and taxonomy | `AMPLITUDE_API_KEY`, `AMPLITUDE_SECRET_KEY` |
 | `profslice` | Extract Firefox Profiler data for analysis | None |
 | `reth` | Reth execution timing and performance metrics | None |
 | `reth-log-analyzer` | Parse Reth logs and generate performance graphs | None |
@@ -94,15 +92,14 @@ These are broadly useful across most deployments and are good candidates to conf
 | `archiver` | Extract and download investment documents through Reducto | `REDUCTO_API_KEY`, `BROWSER_USE_API_KEY` |
 | `congress` | Congress.gov bills, members, committees, hearings, and votes | `DATAGOV_API_KEY` |
 | `crunchbase` | Company, person, funding, acquisition, IPO, and search data | `CRUNCHBASE_API_KEY` |
-| `docsend` | Download DocSend documents through browser automation | `BROWSER_USE_API_KEY` |
+| `docsend` | Download DocSend documents through browser automation | `BROWSERBASE_API_KEY` |
 | `fedreg` | Federal Register agencies, articles, public inspection, and open comments | None |
 | `googlenews` | Google News headlines, topics, and search | None |
 | `harmonic` | Startup discovery, company enrichment, people search, and saved searches | `HARMONIC_API_KEY` |
-| `invest_intake` | Normalize raw investment inputs into context packs | None |
-| `investmemos` | Search and read indexed investment memos | None |
 | `legistorm` | Congressional staff, offices, hearings, town halls, trips, and issue portfolios | `LEGISTORM_API_KEY`; optional: `LEGISTORM_ISSUES_ENDPOINT` |
 | `listennotes` | Podcast and episode search and metadata | `LISTENNOTES_KEY` |
 | `newsapi` | News headlines, article search, and source lists | `NEWSAPI_KEY` |
+| `eventregistry` | Search recent articles with Event Registry | `EVENTREGISTRY_API_KEY` |
 | `openfec` | Federal election candidates, committees, contributions, filings, and totals | `DATAGOV_API_KEY` |
 | `plural` | State legislation, legislators, committees, events, and jurisdictions | `PLURAL_API_KEY` |
 | `sensortower` | Mobile app analytics, publisher data, charts, and sales estimates | `SENSOR_TOWER_AUTH_TOKEN` |

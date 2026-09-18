@@ -90,7 +90,7 @@ fn http_inherits_tool_level_hosts() {
 #[test]
 fn parses_inject_secret() {
     let parsed = tools::parse_secret(
-        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", inject_formatter = "Bearer {{.Value}}", hosts = ["api.example.com"], methods = ["post"], paths = ["/api/upload"]}"#),
+        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", inject_formatter = "Bearer {{.Value}}", hosts = ["api.example.com"]}"#),
         &[],
     )
     .unwrap();
@@ -100,39 +100,6 @@ fn parses_inject_secret() {
     assert_eq!(http.mode, SecretMode::Inject);
     assert_eq!(http.inject_header.as_deref(), Some("Authorization"));
     assert_eq!(http.inject_formatter.as_deref(), Some("Bearer {{.Value}}"));
-    assert_eq!(http.methods, vec!["POST".to_owned()]);
-    assert_eq!(http.paths, vec!["/api/upload".to_owned()]);
-}
-
-#[test]
-fn http_rejects_invalid_request_scope() {
-    let err = tools::parse_secret(
-        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["api.example.com"], methods = ["BREW"]}"#),
-        &[],
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("method"), "{err}");
-
-    let err = tools::parse_secret(
-        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["api.example.com"], paths = ["api/upload"]}"#),
-        &[],
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("must start with '/'"), "{err}");
-
-    let err = tools::parse_secret(
-        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["api.example.com"], methods = []}"#),
-        &[],
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("must not be empty"), "{err}");
-
-    let err = tools::parse_secret(
-        &entry(r#"{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["api.example.com"], paths = []}"#),
-        &[],
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("must not be empty"), "{err}");
 }
 
 #[test]
@@ -405,7 +372,7 @@ fn aws_auth_requires_hosts() {
 #[test]
 fn parses_pg_dsn_secret() {
     let parsed = tools::parse_secret(
-        &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", role = "centaur_slack_reader", settings = [{ name = "centaur.slack_channel_id", value_from = { principal_label = "slack_channel_id" } }] }"#),
+        &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", role = "centaur_slack_reader", settings = [{ name = "centaur.slack_channel_id", value_from = { principal_field = "slack_channel_id" } }, { name = "centaur.slack_user_id", value_from = { proxy_label = "centaur.slack_user_id" } }, { name = "centaur.requester_slack_user_id", value_from = { requester_principal_field = "slack_user_id" } }] }"#),
         &[],
     )
     .unwrap();
@@ -416,14 +383,44 @@ fn parses_pg_dsn_secret() {
     assert_eq!(pg.database, "pmadmin");
     assert_eq!(pg.secret_ref, "RESHIFT_DSN");
     assert_eq!(pg.role.as_deref(), Some("centaur_slack_reader"));
-    assert_eq!(pg.settings.len(), 1);
+    assert_eq!(pg.settings.len(), 3);
     assert_eq!(pg.settings[0].name, "centaur.slack_channel_id");
     assert_eq!(
         pg.settings[0]
             .value_from
             .as_ref()
-            .and_then(|value_from| value_from.principal_label.as_deref()),
+            .and_then(|value_from| value_from.principal_field.as_deref()),
         Some("slack_channel_id")
+    );
+    assert_eq!(pg.settings[1].name, "centaur.slack_user_id");
+    assert_eq!(
+        pg.settings[1]
+            .value_from
+            .as_ref()
+            .and_then(|value_from| value_from.proxy_label.as_deref()),
+        Some("centaur.slack_user_id")
+    );
+    assert_eq!(pg.settings[2].name, "centaur.requester_slack_user_id");
+    assert_eq!(
+        pg.settings[2]
+            .value_from
+            .as_ref()
+            .and_then(|value_from| value_from.requester_principal_field.as_deref()),
+        Some("slack_user_id")
+    );
+}
+
+#[test]
+fn rejects_pg_dsn_value_from_with_multiple_selectors() {
+    let err = tools::parse_secret(
+        &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", settings = [{ name = "centaur.slack_user_id", value_from = { principal_field = "slack_user_id", requester_principal_field = "slack_user_id" } }] }"#),
+        &[],
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("must declare exactly one"),
+        "{err}"
     );
 }
 
@@ -464,7 +461,7 @@ fn translates_http_replace_to_static_input() {
         )
         .unwrap(),
     ];
-    let out = translate::translate("default", "tool-slack", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-slack", &secrets, &SourcePolicy::env());
     let SecretInput::Static(input) = &out.inputs[0] else {
         panic!("expected static")
     };
@@ -484,63 +481,6 @@ fn translates_http_replace_to_static_input() {
 }
 
 #[test]
-fn translates_http_request_scope_to_static_rules() {
-    let secrets = vec![
-        tools::parse_secret(
-            &entry(r#"{type = "http", name = "SLACK_UPLOAD_TOKEN", secret_ref = "SLACK_BOT_TOKEN", mode = "inject", inject_header = "Authorization", inject_formatter = "Bearer {{.Value}}", hosts = ["slack.com", "www.slack.com"], methods = ["POST"], paths = ["/api/files.getUploadURLExternal", "/api/files.completeUploadExternal"]}"#),
-            &[],
-        )
-        .unwrap(),
-        tools::parse_secret(
-            &entry(r#"{type = "http", name = "SLACK_UPLOAD_TOKEN", secret_ref = "SLACK_BOT_TOKEN", mode = "inject", inject_header = "Authorization", inject_formatter = "Bearer {{.Value}}", hosts = ["slack.com", "www.slack.com"], methods = ["GET", "POST"], paths = ["/api/files.info"]}"#),
-            &[],
-        )
-        .unwrap(),
-    ];
-    let out = translate::translate("default", "tool-slack", &secrets, &SourcePolicy::env());
-    assert_eq!(out.inputs.len(), 2);
-    let SecretInput::Static(upload) = &out.inputs[0] else {
-        panic!("expected static")
-    };
-    assert_eq!(upload.name, "SLACK_UPLOAD_TOKEN");
-    assert_eq!(
-        upload.source.config,
-        serde_json::json!({ "var": "SLACK_BOT_TOKEN" })
-    );
-    assert_eq!(upload.rules.len(), 2);
-    assert_eq!(upload.rules[0].host.as_deref(), Some("slack.com"));
-    assert_eq!(upload.rules[0].http_methods, vec!["POST".to_owned()]);
-    assert_eq!(
-        upload.rules[0].paths,
-        vec![
-            "/api/files.getUploadURLExternal".to_owned(),
-            "/api/files.completeUploadExternal".to_owned()
-        ]
-    );
-    assert_eq!(upload.rules[1].host.as_deref(), Some("www.slack.com"));
-    assert_eq!(upload.rules[1].http_methods, upload.rules[0].http_methods);
-    assert_eq!(upload.rules[1].paths, upload.rules[0].paths);
-
-    let SecretInput::Static(info) = &out.inputs[1] else {
-        panic!("expected static")
-    };
-    assert_eq!(info.name, "SLACK_UPLOAD_TOKEN");
-    assert_eq!(
-        info.source.config,
-        serde_json::json!({ "var": "SLACK_BOT_TOKEN" })
-    );
-    assert_eq!(info.rules.len(), 2);
-    assert_eq!(info.rules[0].host.as_deref(), Some("slack.com"));
-    assert_eq!(
-        info.rules[0].http_methods,
-        vec!["GET".to_owned(), "POST".to_owned()]
-    );
-    assert_eq!(info.rules[0].paths, vec!["/api/files.info".to_owned()]);
-    assert_eq!(info.rules[1].host.as_deref(), Some("www.slack.com"));
-    assert_eq!(info.rules[1].http_methods, info.rules[0].http_methods);
-    assert_eq!(info.rules[1].paths, info.rules[0].paths);
-}
-#[test]
 fn translates_gcp_auth_defaults_scopes_when_unset() {
     let secrets = vec![
         tools::parse_secret(
@@ -551,7 +491,7 @@ fn translates_gcp_auth_defaults_scopes_when_unset() {
         )
         .unwrap(),
     ];
-    let out = translate::translate("default", "tool-gcs", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-gcs", &secrets, &SourcePolicy::env());
     let SecretInput::GcpAuth(input) = &out.inputs[0] else {
         panic!("expected gcp_auth")
     };
@@ -573,7 +513,7 @@ fn translates_gcp_id_token_to_input() {
         )
         .unwrap(),
     ];
-    let out = translate::translate("default", "tool-cloudrun", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-cloudrun", &secrets, &SourcePolicy::env());
     let SecretInput::GcpIdToken(input) = &out.inputs[0] else {
         panic!("expected gcp_id_token")
     };
@@ -610,7 +550,7 @@ fn translates_oauth_with_json_key_fields() {
         )
         .unwrap(),
     ];
-    let out = translate::translate("default", "tool-gsuite", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-gsuite", &secrets, &SourcePolicy::env());
     let SecretInput::OAuthToken(input) = &out.inputs[0] else {
         panic!("expected oauth")
     };
@@ -631,12 +571,12 @@ fn translates_oauth_with_json_key_fields() {
 fn translates_pg_dsn_to_input_with_roundtrip_foreign_id() {
     let secrets = vec![
         tools::parse_secret(
-            &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", role = "centaur_slack_reader", settings = [{ name = "centaur.slack_channel_id", value_from = { principal_label = "slack_channel_id" } }] }"#),
+            &entry(r#"{ type = "pg_dsn", name = "RESHIFT_DSN", database = "pmadmin", secret_ref = "RESHIFT_DSN", role = "centaur_slack_reader", settings = [{ name = "centaur.slack_channel_id", value_from = { principal_field = "slack_channel_id" } }, { name = "centaur.slack_user_id", value_from = { proxy_label = "centaur.slack_user_id" } }, { name = "centaur.requester_slack_user_id", value_from = { requester_principal_field = "slack_user_id" } }] }"#),
             &[],
         )
         .unwrap(),
     ];
-    let out = translate::translate("default", "tool-reshift", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-reshift", &secrets, &SourcePolicy::env());
     let SecretInput::PgDsn(input) = &out.inputs[0] else {
         panic!("expected pg_dsn")
     };
@@ -647,13 +587,27 @@ fn translates_pg_dsn_to_input_with_roundtrip_foreign_id() {
     assert_eq!(input.name, "RESHIFT_DSN");
     assert_eq!(input.database, "pmadmin");
     assert_eq!(input.role.as_deref(), Some("centaur_slack_reader"));
-    assert_eq!(input.settings.len(), 1);
+    assert_eq!(input.settings.len(), 3);
     assert_eq!(
         input.settings[0]
             .value_from
             .as_ref()
-            .and_then(|value_from| value_from.principal_label.as_deref()),
+            .and_then(|value_from| value_from.principal_field.as_deref()),
         Some("slack_channel_id")
+    );
+    assert_eq!(
+        input.settings[1]
+            .value_from
+            .as_ref()
+            .and_then(|value_from| value_from.proxy_label.as_deref()),
+        Some("centaur.slack_user_id")
+    );
+    assert_eq!(
+        input.settings[2]
+            .value_from
+            .as_ref()
+            .and_then(|value_from| value_from.requester_principal_field.as_deref()),
+        Some("slack_user_id")
     );
     assert_eq!(input.dsn.source_type, "env");
     assert_eq!(
@@ -665,7 +619,7 @@ fn translates_pg_dsn_to_input_with_roundtrip_foreign_id() {
 #[test]
 fn translates_hmac_to_input() {
     let secrets = vec![tools::parse_secret(&entry(FALCONX_HMAC), &[]).unwrap()];
-    let out = translate::translate("default", "tool-falconx", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-falconx", &secrets, &SourcePolicy::env());
     let SecretInput::Hmac(input) = &out.inputs[0] else {
         panic!("expected hmac")
     };
@@ -697,7 +651,7 @@ fn translates_hmac_to_input() {
 #[test]
 fn translates_aws_auth_to_input() {
     let secrets = vec![tools::parse_secret(&entry(CLOUDWATCH_AWS), &[]).unwrap()];
-    let out = translate::translate("default", "tool-cloudwatch", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-cloudwatch", &secrets, &SourcePolicy::env());
     let SecretInput::AwsAuth(input) = &out.inputs[0] else {
         panic!("expected aws_auth")
     };
@@ -741,7 +695,7 @@ fn translates_aws_auth_session_token_through_policy() {
         )
         .unwrap(),
     ];
-    let out = translate::translate("default", "tool-cw", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-cw", &secrets, &SourcePolicy::env());
     let SecretInput::AwsAuth(input) = &out.inputs[0] else {
         panic!("expected aws_auth")
     };
@@ -759,7 +713,7 @@ fn translates_brokered_token_to_token_broker_static_secret() {
         )
         .unwrap(),
     ];
-    let out = translate::translate("default", "tool-codex", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-codex", &secrets, &SourcePolicy::env());
     let SecretInput::Static(input) = &out.inputs[0] else {
         panic!("expected static")
     };
@@ -769,7 +723,7 @@ fn translates_brokered_token_to_token_broker_static_secret() {
     assert_eq!(input.source.source_type, "token_broker");
     assert_eq!(
         input.source.config,
-        serde_json::json!({ "credential_id": "openai-codex", "credential_namespace": "default" })
+        serde_json::json!({ "credential_id": "openai-codex", })
     );
     let inject = input.inject_config.as_ref().unwrap();
     assert_eq!(inject.header.as_deref(), Some("Authorization"));
@@ -796,7 +750,7 @@ fn duplicate_secret_names_get_unique_foreign_ids() {
         )
         .unwrap(),
     ];
-    let out = translate::translate("default", "tool-x", &secrets, &SourcePolicy::env());
+    let out = translate::translate("tool-x", &secrets, &SourcePolicy::env());
     let SecretInput::Static(a) = &out.inputs[0] else {
         panic!()
     };
@@ -820,13 +774,7 @@ fn translate_for_tool_adds_tool_identity_labels() {
         tool: "slack".to_owned(),
         overlay: "centaur-paradigm".to_owned(),
     };
-    let out = translate::translate_for_tool(
-        "default",
-        "tool-slack",
-        &labels,
-        &secrets,
-        &SourcePolicy::env(),
-    );
+    let out = translate::translate_for_tool("tool-slack", &labels, &secrets, &SourcePolicy::env());
     let SecretInput::Static(secret) = &out.inputs[0] else {
         panic!()
     };
@@ -992,7 +940,6 @@ fn real_slack_tool_parses_and_translates() {
     let manifest = tools::find_tool(&[tools_dir], "slack").unwrap();
     assert_eq!(manifest.name, "slack");
     let out = translate::translate(
-        "default",
         "tool-slack",
         &manifest.all_secrets().cloned().collect::<Vec<_>>(),
         &SourcePolicy::env(),
@@ -1003,69 +950,6 @@ fn real_slack_tool_parses_and_translates() {
         ),
         "expected the SLACK_BOT_TOKEN static secret"
     );
-
-    let etl_inputs = out
-        .inputs
-        .iter()
-        .filter_map(|input| match input {
-            SecretInput::Static(secret) if secret.name == "SLACK_ETL_TOKEN" => Some(secret),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(etl_inputs.len(), 2);
-    for secret in &etl_inputs {
-        let replace = secret
-            .replace_config
-            .as_ref()
-            .expect("expected header replacement for the Slack ETL token");
-        assert_eq!(replace.match_headers, vec!["Authorization".to_owned()]);
-    }
-
-    let slack_api = etl_inputs
-        .iter()
-        .find(|secret| {
-            secret
-                .rules
-                .iter()
-                .any(|rule| rule.host.as_deref() == Some("slack.com"))
-        })
-        .expect("expected Slack Web API ETL token rules");
-    let mut slack_hosts = slack_api
-        .rules
-        .iter()
-        .map(|rule| rule.host.as_deref().unwrap_or_default().to_owned())
-        .collect::<Vec<_>>();
-    slack_hosts.sort();
-    assert_eq!(
-        slack_hosts,
-        vec!["slack.com".to_owned(), "www.slack.com".to_owned()]
-    );
-    for rule in &slack_api.rules {
-        assert_eq!(rule.http_methods, vec!["GET".to_owned(), "POST".to_owned()]);
-        assert_eq!(
-            rule.paths,
-            vec![
-                "/api/conversations.list".to_owned(),
-                "/api/conversations.history".to_owned(),
-                "/api/conversations.replies".to_owned(),
-                "/api/users.list".to_owned(),
-            ]
-        );
-    }
-
-    let files = etl_inputs
-        .iter()
-        .find(|secret| {
-            secret
-                .rules
-                .iter()
-                .any(|rule| rule.host.as_deref() == Some("files.slack.com"))
-        })
-        .expect("expected Slack file download ETL token rule");
-    assert_eq!(files.rules.len(), 1);
-    assert_eq!(files.rules[0].host.as_deref(), Some("files.slack.com"));
-    assert_eq!(files.rules[0].http_methods, vec!["GET".to_owned()]);
-    assert!(files.rules[0].paths.is_empty());
 }
 
 #[test]
@@ -1075,7 +959,6 @@ fn real_gsuite_tool_parses_oauth() {
     };
     let manifest = tools::find_tool(&[tools_dir], "gsuite").unwrap();
     let out = translate::translate(
-        "default",
         "tool-gsuite",
         &manifest.all_secrets().cloned().collect::<Vec<_>>(),
         &SourcePolicy::env(),

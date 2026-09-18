@@ -1,4 +1,4 @@
-"""CLI for GSuite operations - Gmail, Calendar, Drive."""
+"""CLI for GSuite operations - Gmail, Calendar, Directory, Drive."""
 
 import json
 from pathlib import Path
@@ -7,7 +7,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(name="gsuite", help="GSuite CLI for AI agents - Gmail, Calendar, Drive")
+app = typer.Typer(
+    name="gsuite", help="GSuite CLI for AI agents - Gmail, Calendar, Directory, Drive"
+)
 
 
 @app.command("health")
@@ -40,6 +42,7 @@ docs_app = typer.Typer(help="Google Docs operations")
 sheets_app = typer.Typer(help="Google Sheets operations")
 slides_app = typer.Typer(help="Google Slides operations")
 analytics_app = typer.Typer(help="Google Analytics operations")
+directory_app = typer.Typer(help="Directory operations")
 
 app.add_typer(gmail_app, name="gmail")
 app.add_typer(calendar_app, name="calendar")
@@ -48,11 +51,12 @@ app.add_typer(docs_app, name="docs")
 app.add_typer(sheets_app, name="sheets")
 app.add_typer(slides_app, name="slides")
 app.add_typer(analytics_app, name="analytics")
+app.add_typer(directory_app, name="directory")
 
 
 @app.callback()
 def main():
-    """GSuite CLI for AI agents - Gmail, Calendar, Drive.
+    """GSuite CLI for AI agents - Gmail, Calendar, Directory, Drive.
 
     Authentication is handled transparently by iron-proxy's ``gcp_auth``
     transform, which mints a service-account token for outbound Google API
@@ -475,11 +479,40 @@ def calendar_rsvp_cmd(
 # Drive commands
 
 
+def extract_drive_file_id(file_id_or_url: str) -> str:
+    """Extract a Drive file ID from an editor/Drive URL or return an ID as-is."""
+    import re
+    from urllib.parse import parse_qs, urlparse
+
+    if not file_id_or_url.startswith(("http://", "https://")):
+        return file_id_or_url
+
+    path_match = re.search(r"/d/([a-zA-Z0-9_-]+)", file_id_or_url)
+    if path_match:
+        return path_match.group(1)
+
+    query_ids = parse_qs(urlparse(file_id_or_url).query).get("id")
+    if query_ids and query_ids[0]:
+        return query_ids[0]
+
+    raise ValueError(f"Could not extract Drive file ID from URL: {file_id_or_url}")
+
+
 @drive_app.command("list")
 def drive_list(
     limit: int = typer.Option(50, "--limit", "-n", help="Max results"),
     folder: str = typer.Option(None, "--folder", "-f", help="Folder ID to list"),
-    query: str = typer.Option(None, "--query", "-q", help="Search by name"),
+    query: str = typer.Option(
+        None,
+        "--query",
+        "-q",
+        help="Search by name unless --full-text is set",
+    ),
+    full_text: bool = typer.Option(
+        False,
+        "--full-text",
+        help="Search file contents and metadata with Drive fullText contains",
+    ),
     file_type: str = typer.Option(None, "--type", "-t", help="Filter by MIME type"),
 ):
     """List files in Google Drive.
@@ -487,6 +520,7 @@ def drive_list(
     Examples:
         gsuite drive list
         gsuite drive list -q "report"
+        gsuite drive list -q "contract language" --full-text
         gsuite drive list --folder "1234abc" -n 20
         gsuite drive list --type "application/pdf"
     """
@@ -497,6 +531,7 @@ def drive_list(
         folder_id=folder,
         max_results=limit,
         file_type=file_type,
+        full_text=full_text,
     )
 
     if not results:
@@ -715,6 +750,214 @@ def drive_info(
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
+
+
+@drive_app.command("revisions")
+def drive_revisions_cmd(
+    file_id_or_url: str = typer.Argument(
+        ...,
+        help="Drive file ID or Google Docs, Sheets, or Slides URL",
+    ),
+    limit: int = typer.Option(200, "--limit", "-n", help="Max revisions"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """List revisions for a Drive file, including Docs, Sheets, and Slides.
+
+    Google can omit older revisions for files with large or frequently updated
+    histories.
+
+    Examples:
+        gsuite drive revisions "1abc123"
+        gsuite drive revisions "https://docs.google.com/document/d/1abc123/edit"
+        gsuite drive revisions "https://docs.google.com/spreadsheets/d/1abc123/edit" -n 50
+        gsuite drive revisions "https://docs.google.com/presentation/d/1abc123/edit" --json
+    """
+    from .client import drive_list_revisions
+
+    try:
+        file_id = extract_drive_file_id(file_id_or_url)
+        revisions = drive_list_revisions(file_id, max_results=limit)
+        if json_output:
+            print(json.dumps(revisions, indent=2, ensure_ascii=False))
+            return
+        if not revisions:
+            console.print("[yellow]No revisions found.[/]")
+            return
+
+        table = Table(title=f"Drive Revisions ({len(revisions)})")
+        table.add_column("Revision ID", style="cyan")
+        table.add_column("Modified", style="green")
+        table.add_column("Modified By")
+        table.add_column("Published", justify="center")
+        table.add_column("Exports", style="dim")
+
+        for revision in revisions:
+            user = revision["last_modifying_user"]
+            modified_by = user["display_name"] or user["email"] or "-"
+            export_formats = ", ".join(sorted(revision["export_links"])) or "-"
+            table.add_row(
+                revision["id"],
+                revision["modified_time"],
+                modified_by,
+                "yes" if revision["published"] else "no",
+                export_formats,
+            )
+
+        console.print(table)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
+
+
+@drive_app.command("revision")
+def drive_revision_cmd(
+    file_id_or_url: str = typer.Argument(
+        ...,
+        help="Drive file ID or Google Docs, Sheets, or Slides URL",
+    ),
+    revision_id: str = typer.Argument(..., help="Revision ID"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """Get metadata and export links for a Drive file revision.
+
+    Examples:
+        gsuite drive revision "1abc123" "42"
+        gsuite drive revision "https://docs.google.com/spreadsheets/d/1abc123/edit" "42"
+        gsuite drive revision "https://docs.google.com/presentation/d/1abc123/edit" "42" --json
+    """
+    from .client import drive_get_revision
+
+    try:
+        file_id = extract_drive_file_id(file_id_or_url)
+        revision = drive_get_revision(file_id, revision_id)
+        if json_output:
+            print(json.dumps(revision, indent=2, ensure_ascii=False))
+            return
+
+        user = revision["last_modifying_user"]
+        modified_by = user["display_name"] or user["email"] or "-"
+        console.print(f"[bold cyan]Revision {revision['id']}[/]")
+        console.print(f"[green]Modified:[/] {revision['modified_time'] or '-'}")
+        console.print(f"[green]Modified by:[/] {modified_by}")
+        console.print(f"[green]MIME type:[/] {revision['mime_type'] or '-'}")
+        console.print(f"[green]Published:[/] {'yes' if revision['published'] else 'no'}")
+        if revision["published_link"]:
+            console.print(
+                f"[green]Published link:[/] {revision['published_link']}",
+                soft_wrap=True,
+            )
+        if revision["export_links"]:
+            console.print("[green]Historical exports:[/]")
+            for mime_type, link in sorted(revision["export_links"].items()):
+                console.print(f"  {mime_type}: {link}", soft_wrap=True)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
+
+
+@drive_app.command("export-revision")
+def drive_export_revision_cmd(
+    file_id_or_url: str = typer.Argument(
+        ...,
+        help="Drive file ID or Google Docs, Sheets, or Slides URL",
+    ),
+    revision_id: str = typer.Argument(..., help="Revision ID"),
+    format: str = typer.Option(
+        "pdf",
+        "--format",
+        "-f",
+        help="Export format: txt, pdf, docx, html, csv, xlsx, pptx, md",
+    ),
+    output: str = typer.Option(
+        ".",
+        "--output",
+        "-o",
+        help="Output directory or file path",
+    ),
+    stdout: bool = typer.Option(
+        False,
+        "--stdout",
+        help="Print text-based exports instead of writing a file",
+    ),
+):
+    """Export an earlier Docs, Sheets, or Slides revision.
+
+    Examples:
+        gsuite drive export-revision "1abc123" "42"
+        gsuite drive export-revision "https://docs.google.com/document/d/1abc123/edit" "42" -f docx
+        gsuite drive export-revision "https://docs.google.com/spreadsheets/d/1abc123/edit" "42" -f xlsx -o old.xlsx
+        gsuite drive export-revision "https://docs.google.com/presentation/d/1abc123/edit" "42" -f pptx
+        gsuite drive export-revision "1abc123" "42" -f txt --stdout
+    """
+    import re
+
+    from .client import _drive_export_revision_bytes
+
+    try:
+        if stdout and format not in {"txt", "csv", "html", "md"}:
+            raise ValueError("--stdout requires a text-based export format")
+
+        file_id = extract_drive_file_id(file_id_or_url)
+        metadata, _mime_type, data = _drive_export_revision_bytes(
+            file_id,
+            revision_id,
+            format,
+        )
+        if stdout:
+            console.print(data.decode("utf-8", errors="replace"), markup=False)
+            return
+
+        output_path = Path(output)
+        if output_path.is_dir():
+            stem = Path(metadata.get("name") or f"drive-{file_id}").stem
+            safe_revision_id = re.sub(r"[^a-zA-Z0-9_.-]", "_", revision_id)
+            output_path = output_path / f"{stem}-revision-{safe_revision_id}.{format}"
+        output_path.write_bytes(data)
+        console.print(f"[green]✓ Exported revision {revision_id} to {output_path}[/]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
+
+
+@drive_app.command("download-revision")
+def drive_download_revision_cmd(
+    file_id_or_url: str = typer.Argument(..., help="Drive file ID or URL"),
+    revision_id: str = typer.Argument(..., help="Revision ID"),
+    output: str = typer.Option(
+        ".",
+        "--output",
+        "-o",
+        help="Output directory or file path",
+    ),
+):
+    """Download the original bytes of an earlier binary Drive revision.
+
+    Use export-revision for native Google Docs, Sheets, and Slides files.
+
+    Examples:
+        gsuite drive download-revision "1abc123" "42"
+        gsuite drive download-revision "1abc123" "42" -o old-image.png
+    """
+    import re
+
+    from .client import _drive_download_revision_bytes
+
+    try:
+        file_id = extract_drive_file_id(file_id_or_url)
+        metadata, revision, data = _drive_download_revision_bytes(file_id, revision_id)
+        output_path = Path(output)
+        if output_path.is_dir():
+            original_name = revision["original_filename"] or metadata.get("name")
+            original_path = Path(original_name or f"drive-{file_id}")
+            safe_revision_id = re.sub(r"[^a-zA-Z0-9_.-]", "_", revision_id)
+            output_path = output_path / (
+                f"{original_path.stem}-revision-{safe_revision_id}{original_path.suffix}"
+            )
+        output_path.write_bytes(data)
+        console.print(f"[green]✓ Downloaded revision {revision_id} to {output_path}[/]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
 
 
 @drive_app.command("permissions")
@@ -1039,6 +1282,63 @@ def docs_read(
         raise typer.Exit(1)
 
 
+@docs_app.command("comments")
+def docs_comments(
+    doc_id: str = typer.Argument(..., help="Document ID or Google Docs URL"),
+    limit: int = typer.Option(100, "--limit", "-n", help="Max comments"),
+    include_deleted: bool = typer.Option(
+        False,
+        "--include-deleted",
+        help="Include deleted comments and replies",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """Read comments and replies on a Google Doc.
+
+    Examples:
+        gsuite docs comments "1abc123"
+        gsuite docs comments "https://docs.google.com/document/d/1abc123/edit" --json
+    """
+    from .client import docs_list_comments
+
+    try:
+        document_id = extract_doc_id(doc_id)
+        comments = docs_list_comments(
+            document_id,
+            max_results=limit,
+            include_deleted=include_deleted,
+        )
+        if json_output:
+            print(json.dumps(comments, indent=2, ensure_ascii=False))
+            return
+        if not comments:
+            console.print("[yellow]No comments found.[/]")
+            return
+
+        for comment in comments:
+            author = comment["author"]["display_name"] or "Unknown author"
+            status = (
+                "deleted" if comment["deleted"] else "resolved" if comment["resolved"] else "open"
+            )
+            console.print(f"Comment {comment['id']} by {author} [{status}]", markup=False)
+            quoted_text = comment["quoted_file_content"]["value"]
+            if quoted_text:
+                console.print(f"  Quoted: {quoted_text}", markup=False)
+            if comment["content"]:
+                console.print(f"  {comment['content']}", markup=False)
+            for reply in comment["replies"]:
+                reply_author = reply["author"]["display_name"] or "Unknown author"
+                reply_action = f" [{reply['action']}]" if reply["action"] else ""
+                console.print(
+                    f"  Reply {reply['id']} by {reply_author}{reply_action}: {reply['content']}",
+                    markup=False,
+                )
+            console.print()
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
+
+
 @docs_app.command("replace")
 def docs_replace_cmd(
     doc_id: str = typer.Argument(..., help="Document ID or Google Docs URL"),
@@ -1214,7 +1514,9 @@ def _get_channel_member_emails_via_cli(channel: str) -> list[str]:
 @docs_app.command("create")
 def docs_create_cmd(
     title: str = typer.Argument(..., help="Document title"),
-    channel: str = typer.Option(..., "--channel", help="Slack channel to share with (required)"),
+    channel: str | None = typer.Option(
+        None, "--channel", help="Optional Slack channel to share with"
+    ),
     owner: str = typer.Option(..., "--owner", help="Email of new owner (required)"),
     content: str = typer.Option(None, "--content", "-c", help="Initial content"),
 ):
@@ -1222,7 +1524,7 @@ def docs_create_cmd(
 
     This command:
     1. Creates the document
-    2. Shares with all channel members (writer role)
+    2. Shares with all channel members when --channel is provided (writer role)
     3. Transfers ownership to the specified owner
 
     The original owner (service account) is automatically downgraded to editor
@@ -1230,6 +1532,7 @@ def docs_create_cmd(
     removes the service account's editor role permissions after 7 days.
 
     Examples:
+        gsuite docs create "Personal Notes" --owner alice@paradigm.xyz
         gsuite docs create "Meeting Notes" --channel eng-ai --owner alice@paradigm.xyz
         gsuite docs create "Doc Title" --channel ai-agent --owner bob@paradigm.xyz --content "Hello"
     """
@@ -1241,8 +1544,11 @@ def docs_create_cmd(
         console.print(f"[cyan]URL: {result['url']}[/]", soft_wrap=True)
         console.print(f"[dim]ID: {result['document_id']}[/]")
 
-        member_emails = _get_channel_member_emails_via_cli(channel)
-        console.print(f"[dim]Setting up permissions for {len(member_emails)} channel members...[/]")
+        member_emails = _get_channel_member_emails_via_cli(channel) if channel else []
+        if channel:
+            console.print(
+                f"[dim]Setting up permissions for {len(member_emails)} channel members...[/]"
+            )
 
         perm_result = drive_setup_channel_permissions(
             file_id=result["document_id"],
@@ -1250,7 +1556,10 @@ def docs_create_cmd(
             requester_email=owner,
         )
 
-        console.print(f"[green]✓ Shared with {len(perm_result['shared_with'])} channel members[/]")
+        if channel:
+            console.print(
+                f"[green]✓ Shared with {len(perm_result['shared_with'])} channel members[/]"
+            )
         console.print(f"[green]✓ Ownership transferred to {owner}[/]")
 
     except Exception as e:
@@ -1303,6 +1612,48 @@ def sheets_read_cmd(
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
+
+
+@sheets_app.command("batch-read")
+def sheets_batch_read_cmd(
+    spreadsheet_id: str = typer.Argument(..., help="Spreadsheet ID (from URL)"),
+    range_notations: list[str] = typer.Option(..., "--range", "-r", help="A1 notation range"),  # noqa: B008
+    output_json: bool = typer.Option(False, "--json", "-o", help="Output as JSON"),
+):
+    """Read data from a Google Sheet, across several ranges.
+
+    Example:
+        gsuite sheets batch-read "1Abc..." --range "Sheet1!A1:D10" --range "Sheet2!A1:B5"
+        gsuite sheets batch-read "1Abc..." --range "Sheet1!A1:D10" --json
+    """
+    from .client import sheets_batch_read
+
+    try:
+        result = sheets_batch_read(spreadsheet_id, range_notations)
+
+        if output_json:
+            console.print(json.dumps(result, indent=2), markup=False, soft_wrap=True)
+            return
+
+        for value_range in result:
+            if not value_range["rows"]:
+                console.print(f"[yellow]{value_range['range']}: No data found.[/]")
+                continue
+
+            table = Table(title=f"{value_range['range']} ({len(value_range['rows'])} rows)")
+            for header in value_range["headers"]:
+                table.add_column(header, style="cyan", max_width=30)
+
+            for row in value_range["rows"][:50]:
+                values = [str(row.get(h, ""))[:30] for h in value_range["headers"]]
+                table.add_row(*values)
+
+            console.print(table)
+            if len(value_range["rows"]) > 50:
+                console.print(f"[dim]... and {len(value_range['rows']) - 50} more rows[/]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
 
 
 @sheets_app.command("update")
@@ -1941,6 +2292,97 @@ def analytics_query(
     except Exception as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
+
+
+# Directory commands
+
+
+@directory_app.command("list")
+def directory_list(
+    output_json: bool = typer.Option(False, "--json", "-o", help="Output as JSON"),
+    markdown: bool = typer.Option(False, "--markdown", help="Output as a Markdown table"),
+):
+    """List all visible Workspace directory profiles with names and email addresses.
+
+    Examples:
+        gsuite directory list
+        gsuite directory list --json
+    """
+    from .client import directory_list as list_people
+
+    try:
+        results = list_people()
+    except Exception as exc:
+        console.print(f"Error: {exc}", style="red", markup=False)
+        raise typer.Exit(1) from exc
+
+    _print_directory_people(results, output_json, markdown)
+
+
+@directory_app.command("search")
+def directory_search(
+    query: str = typer.Argument(..., help="Name or email prefix to search"),
+    limit: int = typer.Option(
+        20,
+        "--limit",
+        "-n",
+        min=1,
+        help="Maximum number of people",
+    ),
+    output_json: bool = typer.Option(False, "--json", "-o", help="Output as JSON"),
+    markdown: bool = typer.Option(False, "--markdown", help="Output as a Markdown table"),
+):
+    """Search Workspace directory profiles for names and email addresses.
+
+    Examples:
+        gsuite directory search "Alex" --json
+        gsuite directory search "alex@example.com" --limit 5
+    """
+    from .client import directory_search as search
+
+    try:
+        results = search(query, max_results=limit)
+    except Exception as exc:
+        console.print(f"Error: {exc}", style="red", markup=False)
+        raise typer.Exit(1) from exc
+
+    _print_directory_people(results, output_json, markdown)
+
+
+def _print_directory_people(results: list[dict], output_json: bool, markdown: bool) -> None:
+    """Render directory list and search results in the requested format."""
+    if output_json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+        return
+
+    if markdown:
+
+        def escape_cell(value: str) -> str:
+            return (
+                value.replace("\\", "\\\\")
+                .replace("|", "\\|")
+                .replace("\r", " ")
+                .replace("\n", " ")
+            )
+
+        print("| Name | Email addresses |")
+        print("| --- | --- |")
+        for person in results:
+            name = escape_cell(person["name"])
+            emails = escape_cell(", ".join(person["email_addresses"]))
+            print(f"| {name} | {emails} |")
+        return
+
+    if not results:
+        console.print("No people found.", style="yellow")
+        return
+
+    table = Table(title=f"Directory ({len(results)} people)")
+    table.add_column("Name", style="cyan")
+    table.add_column("Email addresses", style="green", overflow="fold")
+    for person in results:
+        table.add_row(person["name"], "\n".join(person["email_addresses"]))
+    console.print(table)
 
 
 if __name__ == "__main__":

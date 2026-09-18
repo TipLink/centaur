@@ -5,6 +5,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,65 +14,8 @@ from unittest import mock
 import install_tool_shims
 
 
-class OverlaySkillSourcesTest(unittest.TestCase):
-    def test_repo_overlay_skills_win_with_mounted_image_as_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo_overlay = root / "repo-overlay"
-            image_overlay = root / "image-overlay"
-            repo_skills = repo_overlay / ".agents" / "skills"
-            image_skills = image_overlay / ".agents" / "skills"
-            repo_skills.mkdir(parents=True)
-            image_skills.mkdir(parents=True)
-
-            with (
-                mock.patch.object(install_tool_shims, "_home_dir", return_value=root / "home"),
-                mock.patch.dict(
-                    os.environ,
-                    {
-                        "CENTAUR_OVERLAY_DIR": str(repo_overlay),
-                        "CENTAUR_IMAGE_OVERLAY_DIR": str(image_overlay),
-                    },
-                    clear=True,
-                ),
-            ):
-                sources = install_tool_shims._skill_sources()
-            self.assertIn(repo_skills, sources)
-            self.assertNotIn(image_skills, sources)
-
-            repo_skills.rmdir()
-            with (
-                mock.patch.object(install_tool_shims, "_home_dir", return_value=root / "home"),
-                mock.patch.dict(
-                    os.environ,
-                    {
-                        "CENTAUR_OVERLAY_DIR": str(repo_overlay),
-                        "CENTAUR_IMAGE_OVERLAY_DIR": str(image_overlay),
-                    },
-                    clear=True,
-                ),
-            ):
-                sources = install_tool_shims._skill_sources()
-            self.assertNotIn(image_skills, sources)
-
-            repo_overlay.rename(root / "repo-overlay-missing")
-            with (
-                mock.patch.object(install_tool_shims, "_home_dir", return_value=root / "home"),
-                mock.patch.dict(
-                    os.environ,
-                    {
-                        "CENTAUR_OVERLAY_DIR": str(repo_overlay),
-                        "CENTAUR_IMAGE_OVERLAY_DIR": str(image_overlay),
-                    },
-                    clear=True,
-                ),
-            ):
-                sources = install_tool_shims._skill_sources()
-            self.assertIn(image_skills, sources)
-
-
 class CopyPublishedToolsTest(unittest.TestCase):
-    def test_copies_tool_dirs_and_replaces_duplicate_names(self) -> None:
+    def test_copies_tool_dirs_and_skips_duplicate_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             published = root / "published"
@@ -97,31 +41,14 @@ class CopyPublishedToolsTest(unittest.TestCase):
                 (target / "research" / "sensortower" / "pyproject.toml").read_text(),
                 "base\n",
             )
-            self.assertIn("replacing duplicate tool websearch", stderr.getvalue())
+            self.assertIn("skipping duplicate tool websearch", stderr.getvalue())
             self.assertEqual(
                 (target / "research" / "websearch" / "pyproject.toml").read_text(),
-                "new project\n",
+                "old project\n",
             )
-            self.assertFalse((target / "research" / "websearch" / "old.py").exists())
-            self.assertEqual((target / "research" / "websearch" / "new.py").read_text(), "new\n")
+            self.assertEqual((target / "research" / "websearch" / "old.py").read_text(), "old\n")
+            self.assertFalse((target / "research" / "websearch" / "new.py").exists())
             self.assertEqual((target / "research" / "company" / "pyproject.toml").read_text(), "company\n")
-
-    def test_duplicate_name_replaces_package_even_if_category_changes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            published = root / "published"
-            target = root / "target"
-
-            (target / "productivity" / "slack").mkdir(parents=True)
-            (target / "productivity" / "slack" / "pyproject.toml").write_text("base\n")
-
-            (published / "slack").mkdir(parents=True)
-            (published / "slack" / "pyproject.toml").write_text("overlay\n")
-
-            install_tool_shims._copy_published_tools(target, published)
-
-            self.assertFalse((target / "productivity" / "slack").exists())
-            self.assertEqual((target / "slack" / "pyproject.toml").read_text(), "overlay\n")
 
     def test_tool_allowlist_restricts_installed_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -138,30 +65,6 @@ class CopyPublishedToolsTest(unittest.TestCase):
 
             # Allowlisted tool installed; unconfigured tool skipped.
             self.assertTrue((target / "research" / "websearch" / "pyproject.toml").exists())
-            self.assertFalse((target / "productivity" / "linear").exists())
-
-    def test_tool_allowlist_accepts_visible_script_name_when_copying(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            published = root / "published"
-            target = root / "target"
-
-            investigator = published / "infra" / "centaur_investigator"
-            investigator.mkdir(parents=True)
-            (investigator / "pyproject.toml").write_text(
-                '[project]\nname = "centaur_investigator"\n\n'
-                '[project.scripts]\ncentaur-investigator = "client:main"\n'
-            )
-            linear = published / "productivity" / "linear"
-            linear.mkdir(parents=True)
-            (linear / "pyproject.toml").write_text(
-                '[project]\nname = "linear"\n\n[project.scripts]\nlinear = "client:main"\n'
-            )
-
-            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": "centaur-investigator"}):
-                install_tool_shims._copy_published_tools(target, published)
-
-            self.assertTrue((target / "infra" / "centaur_investigator").exists())
             self.assertFalse((target / "productivity" / "linear").exists())
 
     def test_unset_allowlist_installs_all_tools(self) -> None:
@@ -212,17 +115,6 @@ class CopyPublishedToolsTest(unittest.TestCase):
             self.assertIn("websearch", scripts)
             self.assertNotIn("linear", scripts)
 
-            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": "centaur-investigator"}):
-                d = root / "infra" / "centaur_investigator"
-                d.mkdir(parents=True)
-                (d / "pyproject.toml").write_text(
-                    '[project]\nname = "centaur_investigator"\n\n'
-                    '[project.scripts]\ncentaur-investigator = "client:main"\n'
-                )
-                script_named = install_tool_shims._discover_scripts([root])
-            self.assertIn("centaur-investigator", script_named)
-            self.assertNotIn("websearch", script_named)
-
             with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": ""}):
                 scripts_all = install_tool_shims._discover_scripts([root])
             self.assertIn("websearch", scripts_all)
@@ -272,6 +164,60 @@ class GeneratedShimTest(unittest.TestCase):
             self.assertIn(f"exec {bin_dir / 'centaur-tools'} run websearch", content)
             self.assertNotIn("uvx --from", content)
             self.assertNotIn("/app/tools/research/websearch", content)
+
+    def test_centaur_tools_list_emits_analytics_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            index_path = bin_dir / ".centaur-tools.json"
+            index_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "name": "websearch",
+                            "project_dir": "/app/tools/research/websearch",
+                        }
+                    ]
+                )
+                + "\n"
+            )
+            install_tool_shims._write_catalog(
+                bin_dir / "centaur-tools", index_path, ""
+            )
+            analytics_log = root / "tool-analytics.log"
+            env = {
+                **os.environ,
+                "CENTAUR_THREAD_KEY": "cli:test-thread",
+                "CENTAUR_TOOL_ANALYTICS_LOG_PATH": str(analytics_log),
+            }
+
+            result = subprocess.run(
+                [str(bin_dir / "centaur-tools"), "list"],
+                check=False,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout, "websearch\t/app/tools/research/websearch\n"
+            )
+            analytics_events = [
+                json.loads(line) for line in analytics_log.read_text().splitlines()
+            ]
+            self.assertEqual(
+                [event["event"] for event in analytics_events],
+                ["tool_call_started", "tool_call_completed"],
+            )
+            for event in analytics_events:
+                self.assertEqual(event["tool_name"], "centaur-tools")
+                self.assertEqual(event["tool_method"], "list")
+                self.assertEqual(event["thread_key"], "cli:test-thread")
+            self.assertEqual(analytics_events[1]["exit_code"], 0)
+            self.assertEqual(analytics_events[1]["success"], "true")
+            self.assertIn("duration_ms", analytics_events[1])
 
     def test_centaur_tools_run_uses_catalog_entry_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -420,36 +366,26 @@ class GeneratedShimTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("usage: centaur-tools", result.stderr)
 
-    def test_centaur_tools_call_streams_large_payload_to_child(self) -> None:
+    def test_call_runner_loads_hyphenated_tool_as_normalized_package(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bin_dir = root / "bin"
             fake_bin = root / "fake-bin"
-            project_dir = root / "tools" / "demo"
-            sdk_dir = root / "sdk"
+            project_dir = root / "data-query-and-viz"
             bin_dir.mkdir()
             fake_bin.mkdir()
-            project_dir.mkdir(parents=True)
-            (sdk_dir / "centaur_sdk").mkdir(parents=True)
-
-            (sdk_dir / "centaur_sdk" / "__init__.py").write_text("")
-            (sdk_dir / "centaur_sdk" / "tool_sdk.py").write_text(
-                "class ToolContext:\n"
-                "    def __init__(self, **kwargs):\n"
-                "        self.kwargs = kwargs\n"
-                "def set_tool_context(ctx):\n"
-                "    return ctx\n"
-                "def reset_tool_context(token):\n"
-                "    return None\n"
-            )
+            project_dir.mkdir()
+            (project_dir / "__init__.py").write_text("")
+            (project_dir / "helper.py").write_text('VALUE = "package-loaded"\n')
             (project_dir / "client.py").write_text(
-                "def publish(content_base64, filename):\n"
-                "    return {\n"
-                "        'content_length': len(content_base64),\n"
-                "        'filename': filename,\n"
-                "    }\n"
-                "def defaults():\n"
-                "    return {'ok': True}\n"
+                "from .helper import VALUE\n"
+                "\n"
+                "class Client:\n"
+                "    def ping(self, suffix):\n"
+                "        return f'{VALUE}:{suffix}'\n"
+                "\n"
+                "def _client():\n"
+                "    return Client()\n"
             )
 
             index_path = bin_dir / ".centaur-tools.json"
@@ -457,10 +393,10 @@ class GeneratedShimTest(unittest.TestCase):
                 json.dumps(
                     [
                         {
-                            "name": "demo",
+                            "name": "data-query-and-viz",
                             "project_dir": str(project_dir),
-                            "package": "demo",
-                            "entrypoint": "client:main",
+                            "package": "data-query-and-viz",
+                            "entrypoint": "cli:app",
                             "client_module": "client.py",
                         }
                     ]
@@ -470,66 +406,32 @@ class GeneratedShimTest(unittest.TestCase):
             install_tool_shims._write_catalog(
                 bin_dir / "centaur-tools",
                 index_path,
-                str(sdk_dir),
+                str(Path(__file__).resolve().parents[2]),
             )
 
-            uvx_argv_log = root / "uvx-argv.json"
             fake_uvx = fake_bin / "uvx"
             fake_uvx.write_text(
-                "#!/usr/bin/env python3\n"
-                "import json\n"
-                "import os\n"
-                "from pathlib import Path\n"
+                f"#!{sys.executable}\n"
+                "import subprocess\n"
                 "import sys\n"
-                "Path(os.environ['UVX_ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))\n"
+                "\n"
                 "args = sys.argv[1:]\n"
-                "os.execvp(args[2], args[2:])\n"
+                "if len(args) < 3 or args[0] != '--from' or args[2] != 'python':\n"
+                "    raise SystemExit(2)\n"
+                "raise SystemExit(subprocess.call([sys.executable, *args[3:]]))\n"
             )
             fake_uvx.chmod(0o755)
 
             env = os.environ.copy()
             env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
-            env["UVX_ARGV_LOG"] = str(uvx_argv_log)
-            payload = {
-                "content_base64": "x" * 200_000,
-                "filename": "report.pdf",
-            }
-
+            env["CENTAUR_TOOL_ANALYTICS_LOG_PATH"] = "off"
             result = subprocess.run(
                 [
                     str(bin_dir / "centaur-tools"),
                     "call",
-                    "demo",
-                    "publish",
-                    "--stdin",
-                ],
-                input=json.dumps(payload),
-                check=False,
-                env=env,
-                text=True,
-                capture_output=True,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(
-                json.loads(result.stdout),
-                {"content_length": 200_000, "filename": "report.pdf"},
-            )
-            child_argv = json.loads(uvx_argv_log.read_text())
-            self.assertNotIn(payload["content_base64"], json.dumps(child_argv))
-            self.assertEqual(
-                child_argv[-3:],
-                [str(project_dir), "client.py", "publish"],
-            )
-
-            legacy_payload = {"filename": "legacy.pdf", "content_base64": "small"}
-            result = subprocess.run(
-                [
-                    str(bin_dir / "centaur-tools"),
-                    "call",
-                    "demo",
-                    "publish",
-                    json.dumps(legacy_payload),
+                    "data-query-and-viz",
+                    "ping",
+                    json.dumps({"suffix": "ok"}),
                 ],
                 check=False,
                 env=env,
@@ -538,21 +440,7 @@ class GeneratedShimTest(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(
-                json.loads(result.stdout),
-                {"content_length": 5, "filename": "legacy.pdf"},
-            )
-
-            result = subprocess.run(
-                [str(bin_dir / "centaur-tools"), "call", "demo", "defaults"],
-                check=False,
-                env=env,
-                text=True,
-                capture_output=True,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {"ok": True})
+            self.assertEqual(json.loads(result.stdout), "package-loaded:ok")
 
 
 class RefreshInstallTest(unittest.TestCase):

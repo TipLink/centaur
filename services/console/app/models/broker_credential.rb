@@ -18,8 +18,6 @@ class BrokerCredential < ApplicationRecord
 
   include ForeignIdCollisionGuard
 
-  GITHUB_APP_INSTALLATION = Broker::CredentialGrants::GITHUB_APP_INSTALLATION
-
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
 
@@ -50,7 +48,6 @@ class BrokerCredential < ApplicationRecord
   has_one :static_secret, dependent: :nullify
 
   attr_writer :refresh_client
-  attr_writer :github_app_client
 
   # Refuse to delete a credential that token_broker sources still reference: there
   # is no FK to cascade or nullify, so deletion would silently leave those secrets
@@ -79,8 +76,7 @@ class BrokerCredential < ApplicationRecord
   }
 
   validates :grant, inclusion: { in: GRANTS, message: "must be one of #{GRANTS.join(", ")}" }
-  validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
-  validates :foreign_id, uniqueness: { scope: :namespace, allow_nil: true },
+  validates :foreign_id, uniqueness: { allow_nil: true },
             format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }, allow_nil: true
   validates :token_endpoint, presence: true
   # client_id is sourced from the linked OauthApp for flow-minted credentials, so
@@ -119,10 +115,6 @@ class BrokerCredential < ApplicationRecord
     @refresh_client ||= Broker::RefreshClient.new
   end
 
-  def github_app_client
-    @github_app_client ||= Broker::GithubAppInstallationClient.new
-  end
-
   def refresh_scopes_for_provider
     oauth_app&.provider_strategy&.refresh_scopes(scopes) || scopes
   end
@@ -157,8 +149,13 @@ class BrokerCredential < ApplicationRecord
   def refresh!(now: Time.current)
     with_lock do
       return if dead?
+      # Poll ticks can enqueue the same credential more than once while an
+      # earlier refresh job is still waiting. Re-check the schedule after
+      # taking the row lock so jobs queued before a successful refresh become
+      # no-ops instead of rotating the newly issued token again.
+      return if next_attempt_at.present? && next_attempt_at > now
 
-      outcome = perform_refresh(now: now)
+      outcome = perform_refresh
       if outcome.dead_reason
         mark_dead!(outcome.dead_reason)
       elsif outcome.result
@@ -183,8 +180,8 @@ class BrokerCredential < ApplicationRecord
     PrincipalCredentialReconciliation.new.apply_for_credential(self)
   end
 
-  def perform_refresh(now:)
-    Broker::CredentialGrants.refresh(self, now: now)
+  def perform_refresh
+    Broker::CredentialGrants.refresh(self)
   end
 
   def apply_success!(result, now:, clear_refresh_token:)
@@ -241,11 +238,11 @@ class BrokerCredential < ApplicationRecord
   end
 
   def bump_referencing_principal_sync_config_versions
-    ids = SecretSource.referencing_broker_credential(self).flat_map do |source|
+    scopes = SecretSource.referencing_broker_credential(self).filter_map do |source|
       owner = source.sync_config_owner
-      owner ? Principal.effective_grantee_ids_for_grantable(owner) : []
+      Principal.effective_grantees_for_grantable(owner) if owner
     end
-    Principal.bump_sync_config_cache_versions(ids)
+    Principal.bump_sync_config_cache_versions(Principal.combine_scopes(scopes))
   end
 
   def labels_is_a_hash

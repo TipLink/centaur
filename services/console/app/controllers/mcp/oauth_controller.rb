@@ -8,17 +8,9 @@ module Mcp
 
     skip_before_action :require_login, only: %i[metadata register authorize token]
     skip_before_action :require_active_account, only: %i[metadata register authorize token]
-    # OAuth dynamic registration and token exchange are machine-to-machine
-    # endpoints with no browser session authority. Authorization approval keeps
-    # Rails CSRF protection; these two endpoints authenticate the protocol
-    # request itself (PKCE for code exchange).
     skip_forgery_protection only: %i[register token]
 
     ACCESS_TOKEN_TTL_SECONDS = 1.hour.to_i
-
-    # The shared role seeded onto new console-user principals. Admins attach
-    # tool secrets to this role to define what every MCP user gets by default.
-    USER_MCP_ROLE_FOREIGN_ID = "user-mcp"
 
     # GET /.well-known/oauth-authorization-server
     def metadata
@@ -448,73 +440,7 @@ module Mcp
     # every violation source (principal, role, or assignment race) converges
     # to the find path on the next pass.
     def principal_for_current_user
-      Principal.transaction do
-        foreign_id = principal_foreign_id(current_user.email)
-        principal = Principal.find_or_initialize_by(
-          namespace: mcp_principal_namespace, foreign_id: foreign_id
-        )
-        newly_created = principal.new_record?
-        principal.created_by ||= current_user
-        principal.name = current_user.name.presence || current_user.email
-        principal.labels = principal.labels.merge(
-          "managed-by" => "centaur",
-          "kind" => "console_user",
-          "console-user-id" => current_user.oid,
-          "email" => current_user.email
-        ).merge(slack_identity_labels_for(current_user))
-        principal.save!
-        assign_user_mcp_role(principal) if newly_created
-        principal
-      end
-    rescue ActiveRecord::RecordNotUnique
-      retry
-    end
-
-    # New console-user principals start with the shared user-mcp role. Seeded
-    # only at creation so an operator removing the role from a principal
-    # sticks, mirroring SessionRegistrar's seeding of the infra role for
-    # session principals.
-    def assign_user_mcp_role(principal)
-      role = Role
-        .create_with(
-          name: "User MCP",
-          labels: { "managed-by" => "centaur" },
-          created_by: current_user
-        )
-        .find_or_create_by!(
-          namespace: principal.namespace,
-          foreign_id: USER_MCP_ROLE_FOREIGN_ID
-        )
-      principal.principal_roles.find_or_create_by!(role: role)
-    end
-
-    # Slack's OIDC id_token is the authenticated source of the user's native
-    # Slack identity. Refuse an ambiguous account rather than guessing which
-    # workspace should determine company-context RLS.
-    def slack_identity_labels_for(user)
-      identities = user.user_identities.where(provider: UserIdentity::SLACK_PROVIDER).order(:id)
-      identities = identities.filter_map do |identity|
-        next if identity.subject.blank? || identity.team_id.blank?
-
-        [ identity.subject, identity.team_id ]
-      end.uniq
-      return {} unless identities.one?
-
-      slack_user_id, slack_team_id = identities.first
-      { "slack_user_id" => slack_user_id, "slack_team_id" => slack_team_id }
-    end
-
-    def principal_foreign_id(email)
-      normalized = email.to_s.downcase.strip
-      safe = normalized.gsub(/[^A-Za-z0-9\-._~]/, "-").gsub(/-+/, "-").first(48)
-      digest = Digest::SHA256.hexdigest(normalized).first(12)
-      "console-user-#{safe}-#{digest}"
-    end
-
-    def mcp_principal_namespace
-      ENV["CENTAUR_MCP_PRINCIPAL_NAMESPACE"].presence ||
-        ConsoleEnv["MCP_PRINCIPAL_NAMESPACE"].presence ||
-        "default"
+      ConsoleUserPrincipalProvisioner.call(current_user)
     end
 
     def access_token_ttl_seconds

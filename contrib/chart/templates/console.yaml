@@ -1,5 +1,4 @@
 {{- $console := include "centaur.consoleValues" . | fromYaml }}
-{{- if $console.enabled }}
 {{- $secretEnv := include "centaur.secretEnvName" . }}
 {{- $prefix := .Values.secretManager.envPrefix }}
 {{- $dbName := $console.database.name }}
@@ -52,6 +51,7 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
+{{- include "centaur.podScheduling" (dict "values" $console "indent" 6) }}
       initContainers:
         # Create the console logical databases on the bundled Postgres: the
         # primary plus the Solid Cache/Queue/Cable databases (see
@@ -128,6 +128,10 @@ spec:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sSLACK_BOT_TOKEN" $prefix }}
                   optional: true
+{{- if .Values.codex.customProviders }}
+            - name: CODEX_CUSTOM_PROVIDERS
+              value: {{ .Values.codex.customProviders | toJson | quote }}
+{{- end }}
 {{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" }}
 {{- if hasKey $.Values.sandbox.extraEnv $name }}
             # Mirror the deployer's harness default-model override
@@ -187,12 +191,22 @@ spec:
             - name: CENTAUR_CONSOLE_PUBLIC_URL
               value: {{ $console.publicUrl | quote }}
 {{- end }}
+{{- with $console.allowedHosts }}
+            - name: CENTAUR_CONSOLE_ALLOWED_HOSTS
+              value: {{ join "," . | quote }}
+{{- end }}
+{{- with $console.sentryDsn }}
+            - name: SENTRY_DSN
+              value: {{ . | quote }}
+{{- end }}
 {{- if $mcpPublicUrl }}
             - name: CENTAUR_MCP_PUBLIC_URL
               value: {{ $mcpPublicUrl | quote }}
 {{- end }}
             - name: CENTAUR_CONSOLE_PASSWORD_LOGIN_ENABLED
               value: {{ $console.passwordLoginEnabled | quote }}
+            - name: CENTAUR_CONSOLE_CHAT_ENABLED
+              value: {{ $console.chat.enabled | quote }}
             - name: CENTAUR_CONSOLE_PUBLIC_SLACK_THREADS_ENABLED
               value: {{ $console.publicSlackThreadsEnabled | quote }}
 {{- with $console.ssoEmailDomains }}
@@ -232,12 +246,32 @@ spec:
                   name: {{ $secretEnv }}
                   key: {{ printf "%sCENTAUR_CONSOLE_SLACK_CLIENT_SECRET" $prefix }}
 {{- end }}
+{{- if $console.oktaOauth.enabled }}
+            # Okta OIDC console sign-in. Client credentials come from the shared
+            # infra Secret; endpoints and signing keys are discovered from issuer.
+            - name: CENTAUR_CONSOLE_OKTA_ISSUER
+              value: {{ required "console.oktaOauth.issuer is required when Okta OAuth is enabled" $console.oktaOauth.issuer | quote }}
+            - name: CENTAUR_CONSOLE_OKTA_TOKEN_ENDPOINT_AUTH_METHOD
+              value: {{ $console.oktaOauth.tokenEndpointAuthMethod | quote }}
+            - name: CENTAUR_CONSOLE_OKTA_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretEnv }}
+                  key: {{ printf "%sCENTAUR_CONSOLE_OKTA_CLIENT_ID" $prefix }}
+            - name: CENTAUR_CONSOLE_OKTA_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretEnv }}
+                  key: {{ printf "%sCENTAUR_CONSOLE_OKTA_CLIENT_SECRET" $prefix }}
+{{- end }}
             - name: RAILS_ENV
               value: {{ $console.railsEnv | quote }}
 {{- with $console.slackDmSync.oauthAppSlug }}
             - name: CENTAUR_CONSOLE_SLACK_DM_SYNC_OAUTH_APP_SLUG
               value: {{ . | quote }}
 {{- end }}
+            - name: CENTAUR_CONSOLE_GOOGLE_DOCS_SYNC_ENABLED
+              value: {{ $console.googleDocsSync.enabled | quote }}
             - name: PORT
               value: {{ $console.service.httpPort | quote }}
             - name: RAILS_LOG_TO_STDOUT
@@ -249,11 +283,6 @@ spec:
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
             - name: CENTAUR_CONSOLE_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
-            - name: CENTAUR_CONSOLE_CENTAUR_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "centaur.secretEnvName" . }}
-                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.apiRs.controlApiKeySecretKey }}
 {{- end }}
           ports:
             - containerPort: {{ $console.service.httpPort }}
@@ -353,5 +382,4 @@ spec:
     - ports:
         - protocol: TCP
           port: 443
-{{- end }}
 {{- end }}

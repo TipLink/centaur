@@ -144,6 +144,10 @@ export type GithubbotOptions = {
   autoMerge?: boolean;
   /** Max consecutive CI-fix attempts on an owned PR before escalating. Default 3. */
   ciFixMaxAttempts?: number;
+  /** Delay before confirming a settled-green rollup. Default 15000ms. */
+  ciSettleConfirmMs?: number;
+  /** Emit settled CI and submitted-review workflow events. Default false. */
+  workflowEvents?: boolean;
   /** Delete the head branch after the bot merges an owned PR. Default true. */
   deleteBranchOnMerge?: boolean;
   /** Fallback @handle to tag when the bot gives up and escalates. */
@@ -175,6 +179,8 @@ export type Githubbot = {
 export type GithubbotThreadState = {
   /** Set once the thread's first turn has run (gates follow-up ingestion). */
   historyForwarded?: boolean;
+  /** Codex provider pinned for this thread. Null clears a previous selection. */
+  provider?: string | null;
   /**
    * Set once the full PR/issue context (with body) has ridden a turn's execute;
    * later turns prepend only the compact header instead.
@@ -239,6 +245,8 @@ export type ForwardSessionInput = {
   messages: GithubbotApiMessage[];
   /** Per-turn model override parsed from message flags (--model/--opus/...). */
   model?: string;
+  /** Effective model provider selected by a message flag; codex only. */
+  provider?: string;
   onEventId(eventId: number): void;
   openStream: boolean;
   threadId: string;

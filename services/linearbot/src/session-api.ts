@@ -1,4 +1,5 @@
 import type { RustSessionStreamEvent } from "@centaur/harness-events";
+import { isRetryableCodexErrorNotification } from "@centaur/rendering";
 import type { Attachment, Message } from "chat";
 import type {
   ForwardSessionInput,
@@ -190,6 +191,7 @@ export async function forwardToSessionApi(
     input.model,
     input.provider,
     input.contextPreamble,
+    input.reasoning,
   );
   traceLog(options, "linearbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -221,6 +223,7 @@ export async function executeSessionTurn(
     input.model,
     input.provider,
     input.contextPreamble,
+    input.reasoning,
   );
   traceLog(options, "linearbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -511,12 +514,20 @@ async function executeSession(
   model?: string,
   provider?: string,
   contextPreamble?: string,
+  reasoning?: string,
 ): Promise<LinearbotExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch;
   const body: LinearbotExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(message, { action: "execute" }),
-    input_lines: toCodexInputLines(message, threadId, model, provider, contextPreamble),
+    input_lines: toCodexInputLines(
+      message,
+      threadId,
+      model,
+      provider,
+      contextPreamble,
+      reasoning,
+    ),
     ...(options.idleTimeoutMs === undefined
       ? {}
       : { idle_timeout_ms: options.idleTimeoutMs }),
@@ -614,10 +625,7 @@ function ensureTrailingSlash(value: string): string {
 }
 
 function apiHeaders(options: LinearbotOptions, jsonBody = true): HeadersInit {
-  const apiKey =
-    options.apiKey ??
-    process.env.LINEARBOT_API_KEY ??
-    process.env.CENTAUR_API_KEY;
+  const apiKey = options.apiKey ?? process.env.LINEARBOT_API_KEY;
   return {
     ...(jsonBody ? { "content-type": "application/json" } : {}),
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
@@ -685,6 +693,7 @@ function toCodexInputLines(
   model?: string,
   provider?: string,
   contextPreamble?: string,
+  reasoning?: string,
 ): string[] {
   const staged = new Map<LinearbotApiAttachment, string>();
   const lines: string[] = [];
@@ -697,6 +706,7 @@ function toCodexInputLines(
       model,
       provider,
       contextPreamble,
+      reasoning,
     );
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS &&
@@ -716,6 +726,7 @@ function toCodexInputLines(
       model,
       provider,
       contextPreamble,
+      reasoning,
     ),
   );
   return lines;
@@ -728,6 +739,7 @@ function toCodexInputLineWithStaged(
   model?: string,
   provider?: string,
   contextPreamble?: string,
+  reasoning?: string,
 ): string {
   return JSON.stringify({
     type: "user",
@@ -735,6 +747,7 @@ function toCodexInputLineWithStaged(
     trace_metadata: sessionMetadata(message, { action: "execute" }),
     ...(model ? { model } : {}),
     ...(provider ? { provider } : {}),
+    ...(reasoning ? { reasoning } : {}),
     message: {
       role: "user",
       content: codexInputContent(message, staged, contextPreamble),
@@ -1006,6 +1019,7 @@ function isTerminalCodexOutputLine(line: string): boolean {
     return false;
   }
   if (!isJsonObject(payload)) return false;
+  if (isRetryableCodexErrorNotification(payload)) return false;
 
   return (
     payload.type === "turn.completed" ||

@@ -39,9 +39,8 @@ posting to Slack.
 
 Create a Slack user token for ETL reads and store it as `SLACK_ETL_TOKEN` in
 the same secret source used by tools. The Slack tool declares it as an optional
-HTTP secret scoped to `GET` and `POST` calls to the Slack Web API endpoints
-below, plus `GET` downloads from `files.slack.com`; iron-proxy replaces the
-`Authorization` header only for those requests.
+HTTP secret for `slack.com` and `files.slack.com`; iron-proxy injects the real
+value when the tool calls Slack.
 
 The token must be able to call:
 
@@ -113,9 +112,8 @@ apiRs:
 | `SLACK_ETL_RETENTION_DAYS` | `0` | Deletes Slack ETL messages, derived Slack documents, and terminal ETL run/job rows older than this many days. `0` disables ETL retention. |
 | `SLACK_DM_RETENTION_DAYS` | `0` | Deletes user-scoped private Slack messages, stale empty conversations, and terminal run/job rows older than this many days. `0` disables retention. |
 | `COMPANY_CONTEXT_DOCUMENTS_ENABLED` | `true` | Enables projection from Slack sync rows into company context documents. |
-| `COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS` | `14400` | How often the coordinator claims stale projection scopes. |
-| `COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS` | `21600` | Maximum source `updated_at` window claimed for one scope before it advances its watermark. |
-| `COMPANY_CONTEXT_DOCUMENTS_BATCH_SIZE` | `50` | Maximum changed source rows processed by one per-scope child workflow. |
+| `COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS` | `14400` | How often to project changed Slack rows into documents. |
+| `COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS` | `21600` | Maximum source `updated_at` window projected by one company context documents run. |
 
 Example exclusion list:
 
@@ -161,21 +159,18 @@ TTL is positive.
 ## Run it manually
 
 Use a manual run when enabling the feature or testing a configuration change.
-The control endpoint remains authenticated on localhost; run curl inside the
-API deployment so the trusted `CENTAUR_CONTROL_API_KEY` never leaves the pod:
+From inside the API deployment, localhost bypass avoids needing an external API
+key:
 
 ```bash
-kubectl exec -i -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
-  curl -s -X POST http://localhost:8080/api/workflows/runs \
-    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
-    -H "Content-Type: application/json" --data-binary @-
-' <<'JSON'
-{
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
+  http://localhost:8080/api/workflows/runs \
+  -H "Content-Type: application/json" \
+  -d '{
     "workflow_name": "slack_sync",
     "input": {"metadata": {"reason": "manual_check"}},
     "eager_start": true
-}
-JSON
+  }' | jq
 ```
 
 Then inspect the run:
@@ -183,42 +178,34 @@ Then inspect the run:
 ```bash
 RUN_ID=wfr_...
 
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
-  curl -s "http://localhost:8080/api/workflows/runs/$1" \
-    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"
-' sh "$RUN_ID" | jq
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
+  "http://localhost:8080/api/workflows/runs/${RUN_ID}" | jq
 ```
 
 To drain pending historical work immediately:
 
 ```bash
-kubectl exec -i -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
-  curl -s -X POST http://localhost:8080/api/workflows/runs \
-    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
-    -H "Content-Type: application/json" --data-binary @-
-' <<'JSON'
-{
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
+  http://localhost:8080/api/workflows/runs \
+  -H "Content-Type: application/json" \
+  -d '{
     "workflow_name": "slack_backfill",
     "input": {"channel_batch_limit": 10},
     "eager_start": true
-}
-JSON
+  }' | jq
 ```
 
 To force document projection after rows have synced:
 
 ```bash
-kubectl exec -i -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
-  curl -s -X POST http://localhost:8080/api/workflows/runs \
-    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}" \
-    -H "Content-Type: application/json" --data-binary @-
-' <<'JSON'
-{
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s -X POST \
+  http://localhost:8080/api/workflows/runs \
+  -H "Content-Type: application/json" \
+  -d '{
     "workflow_name": "company_context_documents",
     "input": {},
     "eager_start": true
-}
-JSON
+  }' | jq
 ```
 
 ## Verify
@@ -226,10 +213,8 @@ JSON
 Check the workflow schedules:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
-  curl -s http://localhost:8080/api/workflows/schedules \
-    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"
-' | jq \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
+  http://localhost:8080/api/workflows/schedules | jq \
   '.schedules[]
    | select(.schedule_id == "slack_sync"
      or .schedule_id == "slack_backfill"
@@ -240,10 +225,8 @@ kubectl exec -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
 Check recent workflow runs:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
-  curl -s "http://localhost:8080/api/workflows/runs?limit=20" \
-    -H "Authorization: Bearer ${CENTAUR_CONTROL_API_KEY:?}"
-' | jq \
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -s \
+  "http://localhost:8080/api/workflows/runs?limit=20" | jq \
   '.runs[]
    | select(.workflow_name == "slack_sync"
      or .workflow_name == "slack_backfill"
@@ -300,7 +283,7 @@ setting alerts.
 | Channels are all skipped | Check `SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS` for broad globs. |
 | Checkpoints show `missing_scope` or `not_allowed_token_type` | Add the missing Slack OAuth scope or use the expected user-token class. |
 | Backfill jobs keep failing | Inspect `slack_sync_backfill_jobs.last_error` and the corresponding `slack_sync_runs` row. |
-| Documents lag behind messages | Check `company_context_projection_checkpoints` for an expired lease or old watermark, then inspect the per-scope `company_context_documents` child workflow and `company_context_projection_lag_seconds`. |
+| Documents lag behind messages | Check the `company_context_documents` workflow status and `company_context_projection_lag_seconds`. |
 
 Keep the ETL token scoped to the channels and workspace data you actually want
 agents to retrieve. Synced rows and projected documents are deployment-wide

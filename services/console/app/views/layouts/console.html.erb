@@ -29,6 +29,7 @@
             return null;
           }
         };
+        const preference = () => storedTheme() || "system";
         const resolveTheme = () => storedTheme() || systemTheme();
         const applyTheme = (theme) => {
           const nextTheme = validTheme(theme) ? theme : systemTheme();
@@ -45,6 +46,16 @@
         window.ConsoleTheme = {
           apply: applyTheme,
           persist: (theme) => {
+            if (theme === "system") {
+              try {
+                localStorage.removeItem(storageKey);
+                localStorage.removeItem(storageSourceKey);
+              } catch (_error) {
+                // Theme still follows the system for this page load when storage is unavailable.
+              }
+              return applyTheme(systemTheme());
+            }
+
             const nextTheme = applyTheme(theme);
             try {
               localStorage.setItem(storageKey, nextTheme);
@@ -54,6 +65,7 @@
             }
             return nextTheme;
           },
+          preference: preference,
           resolve: resolveTheme
         };
 
@@ -240,7 +252,7 @@
         font-weight: 500;
       }
 
-      /* Keep stacked group tabs (Workflows / New chat / Chats) on the same
+      /* Keep stacked group tabs (Scheduled / Workflows / New chat / Chats) on the same
          0.125rem rhythm as the nav rows above them. */
       .console-thread-group + .console-thread-group {
         margin-top: 0.125rem;
@@ -1490,6 +1502,12 @@
         border-bottom-color: #e6e5de;
       }
 
+      html[data-console-theme="light"] .role-pill {
+        background: #eaf6ff;
+        color: #0369a1;
+        --tw-ring-color: rgb(14 165 233 / 0.3);
+      }
+
       html[data-console-theme="light"] .form-input {
         border-color: #d2d3cc;
         background: #ffffff;
@@ -1552,6 +1570,7 @@
       html[data-console-theme="light"] .bg-ink-950,
       html[data-console-theme="light"] .bg-ink-950\/15,
       html[data-console-theme="light"] .bg-ink-950\/35,
+      html[data-console-theme="light"] .bg-ink-950\/80,
       html[data-console-theme="light"] .bg-ink-900,
       html[data-console-theme="light"] .bg-ink-900\/25,
       html[data-console-theme="light"] .bg-ink-900\/35,
@@ -1796,7 +1815,9 @@
   </head>
 
   <% threads_view = request.path.start_with?("/console/threads") %>
+  <% scheduled_tasks_view = request.path.start_with?("/console/scheduled_tasks") %>
   <% workflows_view = request.path.start_with?("/console/workflows") %>
+  <% skills_view = request.path.start_with?("/console/skills") %>
   <%# The Control and Data Sync sections are admin-only (each controller enforces
       require_admin server-side); Integrations is for everyone -- it lists the
       public consent start links any team member can use. %>
@@ -1846,6 +1867,24 @@
             <% end %>
           </nav>
 
+          <div class="console-thread-group">
+            <a href="<%= console_skills_path %>"
+               class="console-thread-group-title <%= "console-thread-group-title-active" if skills_view %>"
+               title="Skills">
+              <span class="console-nav-icon"><%= console_icon("workflow", classes: "size-4") %></span>
+              <span class="console-nav-label">Skills</span>
+            </a>
+          </div>
+
+          <div class="console-thread-group">
+            <a href="<%= console_scheduled_tasks_path %>"
+               class="console-thread-group-title <%= "console-thread-group-title-active" if scheduled_tasks_view %>"
+               title="Scheduled">
+              <span class="console-nav-icon"><%= console_icon("clock", classes: "size-4") %></span>
+              <span class="console-nav-label">Scheduled</span>
+            </a>
+          </div>
+
           <% if acting_admin? %>
             <div class="console-thread-group">
               <a href="<%= console_workflows_path %>"
@@ -1857,54 +1896,55 @@
             </div>
           <% end %>
 
-          <%# New chat rides the thread-link machinery with the "new" sentinel
-              key: plain click opens the full-page composer, Cmd/Ctrl-click
-              adds a composer pane to the split view (and re-clicking an open
-              one closes it). %>
-          <div class="console-thread-group">
-            <a href="<%= console_threads_path(thread: Console::ThreadsController::NEW_PANE_KEY) %>"
-               class="console-thread-group-title"
-               aria-label="New chat"
-               title="New chat"
-               data-console-thread-link
-               data-console-new-chat>
-              <span class="console-nav-icon"><%= console_icon("plus", classes: "size-4") %></span>
-              <span class="console-nav-label">New chat</span>
-            </a>
-          </div>
-
-          <div class="console-thread-group">
-            <a href="<%= console_threads_path %>"
-               class="console-thread-group-title <%= "console-thread-group-title-active" if threads_view %>"
-               title="Chats">
-              <span class="console-nav-icon"><%= console_icon("message-square", classes: "size-4") %></span>
-              <span class="console-nav-label">Chats</span>
-            </a>
-            <%# The thread list is loaded lazily via a Turbo Frame so the
-                unindexed cross-database sessions query never blocks the primary
-                page render. See ApplicationController#init_console_sidebar_threads
-                and Console::ThreadsController#sidebar.
-
-                The current thread selection rides along on the frame src so the
-                initial out-of-band render can surface and highlight the open
-                thread(s). The wrapper div (not the frame itself — a permanent
-                turbo-frame trips Turbo's frame lifecycle and can wedge the
-                visit progress bar) is turbo-permanent: Turbo Drive carries the
-                loaded list across page visits instead of refetching it, so
-                thread navigation does not repaint the sidebar; the active
-                highlight is re-synced client-side from the page URL. %>
-            <div id="console_sidebar_thread_list"
-                 class="console-thread-list"
-                 data-turbo-permanent>
-              <%= turbo_frame_tag "console_sidebar_threads",
-                                  src: console_sidebar_threads_path(
-                                    thread: (params[:thread].to_s.presence if threads_view)
-                                  ),
-                                  loading: :lazy do %>
-                <div class="console-thread-empty">Loading chats…</div>
-              <% end %>
+          <% if console_chat_enabled? %>
+            <%# New chat rides the thread-link machinery with the "new" sentinel
+                key: plain click opens the full-page composer, Cmd/Ctrl-click
+                adds a composer pane to the split view. %>
+            <div class="console-thread-group">
+              <a href="<%= console_threads_path(thread: Console::ThreadsController::NEW_PANE_KEY) %>"
+                 class="console-thread-group-title"
+                 aria-label="New chat"
+                 title="New chat"
+                 data-console-thread-link
+                 data-console-new-chat>
+                <span class="console-nav-icon"><%= console_icon("plus", classes: "size-4") %></span>
+                <span class="console-nav-label">New chat</span>
+              </a>
             </div>
-          </div>
+
+            <div class="console-thread-group">
+              <a href="<%= console_threads_path %>"
+                 class="console-thread-group-title <%= "console-thread-group-title-active" if threads_view %>"
+                 title="Chats">
+                <span class="console-nav-icon"><%= console_icon("message-square", classes: "size-4") %></span>
+                <span class="console-nav-label">Chats</span>
+              </a>
+              <%# The thread list is loaded lazily via a Turbo Frame so the
+                  unindexed cross-database sessions query never blocks the primary
+                  page render. See ApplicationController#init_console_sidebar_threads
+                  and Console::ThreadsController#sidebar.
+
+                  The current thread selection rides along on the frame src so the
+                  initial out-of-band render can surface and highlight the open
+                  thread(s). The wrapper div (not the frame itself — a permanent
+                  turbo-frame trips Turbo's frame lifecycle and can wedge the
+                  visit progress bar) is turbo-permanent: Turbo Drive carries the
+                  loaded list across page visits instead of refetching it, so
+                  thread navigation does not repaint the sidebar; the active
+                  highlight is re-synced client-side from the page URL. %>
+              <div id="console_sidebar_thread_list"
+                   class="console-thread-list"
+                   data-turbo-permanent>
+                <%= turbo_frame_tag "console_sidebar_threads",
+                                    src: console_sidebar_threads_path(
+                                      thread: (params[:thread].to_s.presence if threads_view)
+                                    ),
+                                    loading: :lazy do %>
+                  <div class="console-thread-empty">Loading chats…</div>
+                <% end %>
+              </div>
+            </div>
+          <% end %>
         </div>
 
         <% if current_user %>
@@ -1946,10 +1986,11 @@
                       class="console-account-menu-button"
                       data-console-theme-toggle
                       role="menuitem"
-                      aria-label="Switch to light mode">
-                <span data-console-theme-action-icon="light"><%= console_icon("sun", classes: "size-4") %></span>
-                <span data-console-theme-action-icon="dark" hidden><%= console_icon("moon", classes: "size-4") %></span>
-                <span data-console-theme-label>Light mode</span>
+                      aria-label="Current theme: system. Switch to light mode">
+                <span data-console-theme-icon="light" hidden><%= console_icon("sun", classes: "size-4") %></span>
+                <span data-console-theme-icon="dark" hidden><%= console_icon("moon", classes: "size-4") %></span>
+                <span data-console-theme-icon="system"><%= console_icon("computer", classes: "size-4") %></span>
+                <span data-console-theme-label>System mode</span>
               </button>
               <% if acting_admin? %>
                 <%= button_to console_descope_path,
@@ -2101,35 +2142,51 @@
 
         const root = document.documentElement;
         const label = themeToggle.querySelector("[data-console-theme-label]");
-        const lightIcon = themeToggle.querySelector("[data-console-theme-action-icon='light']");
-        const darkIcon = themeToggle.querySelector("[data-console-theme-action-icon='dark']");
+        const lightIcon = themeToggle.querySelector("[data-console-theme-icon='light']");
+        const darkIcon = themeToggle.querySelector("[data-console-theme-icon='dark']");
+        const systemIcon = themeToggle.querySelector("[data-console-theme-icon='system']");
+        const themePreferences = ["system", "light", "dark"];
+        const themeLabels = {
+          system: "System mode",
+          light: "Light mode",
+          dark: "Dark mode"
+        };
 
-        const syncThemeControl = (theme) => {
-          const nextTheme = theme === "light" ? "light" : "dark";
-          const isLight = nextTheme === "light";
-          if (label) label.textContent = isLight ? "Dark mode" : "Light mode";
+        const nextThemePreference = (preference) => {
+          const currentIndex = themePreferences.indexOf(preference);
+          return themePreferences[(currentIndex + 1) % themePreferences.length];
+        };
+
+        const syncThemeControl = (preference) => {
+          const nextPreference = nextThemePreference(preference);
+          if (label) label.textContent = themeLabels[preference];
           themeToggle.setAttribute(
             "aria-label",
-            isLight ? "Switch to dark mode" : "Switch to light mode"
+            `Current theme: ${preference}. Switch to ${nextPreference} mode`
           );
-          if (lightIcon) lightIcon.hidden = isLight;
-          if (darkIcon) darkIcon.hidden = !isLight;
+          themeToggle.dataset.consoleThemePreference = preference;
+          if (lightIcon) lightIcon.hidden = preference !== "light";
+          if (darkIcon) darkIcon.hidden = preference !== "dark";
+          if (systemIcon) systemIcon.hidden = preference !== "system";
         };
 
-        const applyTheme = (theme, persist = false) => {
-          let nextTheme;
+        const applyTheme = (preference, persist = false) => {
           if (window.ConsoleTheme) {
-            nextTheme = persist ? window.ConsoleTheme.persist(theme) : window.ConsoleTheme.apply(theme);
+            if (persist) window.ConsoleTheme.persist(preference);
+            else window.ConsoleTheme.apply(preference);
           } else {
-            nextTheme = theme === "light" ? "light" : "dark";
+            const useLightTheme = preference === "light" ||
+              (preference === "system" && window.matchMedia?.("(prefers-color-scheme: light)").matches);
+            const nextTheme = useLightTheme ? "light" : "dark";
             root.dataset.consoleTheme = nextTheme;
           }
-          syncThemeControl(nextTheme);
+          syncThemeControl(preference);
         };
 
-        applyTheme(root.dataset.consoleTheme || window.ConsoleTheme?.resolve?.() || "dark");
+        applyTheme(window.ConsoleTheme?.preference?.() || root.dataset.consoleTheme || "dark");
         themeToggle.addEventListener("click", () => {
-          applyTheme(root.dataset.consoleTheme === "light" ? "dark" : "light", true);
+          const currentPreference = themeToggle.dataset.consoleThemePreference || "system";
+          applyTheme(nextThemePreference(currentPreference), true);
         });
       })();
 
@@ -2264,7 +2321,8 @@
       (() => {
         // Sidebar thread clicks against the split-view grid. The thread param
         // carries up to PANEL_LIMIT comma-separated keys in grid order.
-        //   - click or Cmd/Ctrl-click on an already-open thread closes it
+        //   - Cmd/Ctrl-click on an already-open thread closes it
+        //   - plain click on an already-open thread is a no-op
         //   - Cmd/Ctrl-click on a closed thread adds it as a pane
         //   - plain click on a closed thread falls through to Turbo (replaces
         //     the selection with that single thread)
@@ -2286,6 +2344,12 @@
             : [];
           const isOpen = openKeys.includes(key);
           const modified = event.metaKey || event.ctrlKey;
+
+          if (isOpen && !modified) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+          }
 
           let nextKeys;
           if (isOpen) {

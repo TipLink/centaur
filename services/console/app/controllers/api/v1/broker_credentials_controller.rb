@@ -15,7 +15,7 @@ module Api
         render json: { data: record_payload(ref) }
       end
 
-      # GET /api/v1/broker_credentials/lookup/:namespace/:foreign_id
+      # GET /api/v1/broker_credentials/lookup/:foreign_id
       def lookup
         render json: { data: record_payload(find_by_foreign_id!(BrokerCredential)) }
       end
@@ -48,20 +48,14 @@ module Api
       private
 
       def assign_and_save!(ref, attrs)
-        base = attrs.permit(:namespace, :foreign_id, :name, :description, :token_endpoint,
+        base = attrs.permit(:foreign_id, :name, :description, :token_endpoint,
                             :grant, :client_id,
                             :early_refresh_slack_seconds, :early_refresh_fraction,
                             :max_refresh_interval_seconds, :refresh_timeout_seconds,
                             labels: {}, scopes: [])
-        base[:grant] = normalize_grant(base[:grant]) if base[:grant].present?
-        if base[:grant].blank? && attrs[:credential_kind].present?
-          base[:grant] = normalize_grant(attrs[:credential_kind])
-        end
         # A PUT upsert by foreign_id sets identity before assignment; a blank body
         # value must not wipe it.
         base.delete(:foreign_id) if base[:foreign_id].blank? && ref.foreign_id.present?
-        base.delete(:namespace) if base[:namespace].blank? && ref.namespace.present?
-        base[:namespace] = "default" if base[:namespace].blank? && ref.namespace.blank?
 
         BrokerCredential.transaction do
           ref.assign_attributes(base)
@@ -87,7 +81,7 @@ module Api
         return if secret.blank?
 
         ref.client_secret = secret
-        reset_refresh_state(ref) if ref.grant == BrokerCredential::GITHUB_APP_INSTALLATION
+        reset_refresh_state(ref) if ref.grant == "client_credentials"
       end
 
       # These fields are write-only initial/re-auth values. Supplying any
@@ -105,7 +99,10 @@ module Api
         end
         return unless changed
 
-        reset_refresh_state(ref)
+        ref.dead = false
+        ref.dead_reason = nil
+        ref.failure_count = 0
+        ref.next_attempt_at = Time.current
       end
 
       def reset_refresh_state(ref)
@@ -115,10 +112,6 @@ module Api
         ref.next_attempt_at = Time.current
       end
 
-      def normalize_grant(value)
-        value == "oauth_refresh_token" ? "refresh_token" : value
-      end
-
       # Observability only. The client_secret, username/password/api_key, the
       # token_endpoint_headers values, the minted access_token, and the
       # refresh_token are deliberately never included; only the header names are
@@ -126,7 +119,6 @@ module Api
       def record_payload(ref)
         {
           id: ref.oid,
-          namespace: ref.namespace,
           foreign_id: ref.foreign_id,
           name: ref.name,
           description: ref.description,

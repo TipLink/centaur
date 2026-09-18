@@ -81,32 +81,20 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
 {{- define "centaur.overlaySources" -}}
-{{- $root := . -}}
 {{- $sources := list -}}
 {{- with .Values.overlays.sources -}}
 {{- range . -}}
 {{- if .repo -}}
 {{- $source := dict "repo" .repo -}}
-{{- $configuredRef := default "" .ref | toString -}}
-{{- $refFromOverlayImage := default false .refFromOverlayImage -}}
-{{- if and $configuredRef $refFromOverlayImage -}}
-{{- fail (printf "overlay source %s cannot set both ref and refFromOverlayImage" .repo) -}}
-{{- end -}}
-{{- if $refFromOverlayImage -}}
-{{- $overlayTag := default "" $root.Values.overlay.image.tag | toString -}}
-{{- if not (regexMatch "^(reviewed|auto-deploy)-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$" $overlayTag) -}}
-{{- fail (printf "overlay source %s uses refFromOverlayImage, but overlay.image.tag must be reviewed-<40-hex-sha> or auto-deploy-<40-hex-sha>, optionally with an immutable digest" .repo) -}}
-{{- end -}}
-{{- $_ := set $source "ref" (regexFind "[0-9a-f]{40}" $overlayTag) -}}
-{{- else -}}
-{{- with $configuredRef }}{{- $_ := set $source "ref" . -}}{{- end -}}
-{{- end -}}
+{{- with .ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
 {{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .visibility) -}}
 {{- /*
 Subdir defaults: an omitted key falls back to the conventional layout
 (tools, workflows, .agents/skills); a key explicitly set to "" disables
 that surface for the source. Missing directories are skipped at runtime,
 so the defaults are safe for repos that only carry some surfaces.
+Slackbot extensions are executable deployment code, so slackbotSubdir has no
+default and must be enabled explicitly.
 */ -}}
 {{- if hasKey . "toolsSubdir" -}}
 {{- with .toolsSubdir }}{{- $_ := set $source "toolsSubdir" . -}}{{- end -}}
@@ -123,6 +111,7 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- else -}}
 {{- $_ := set $source "skillsSubdir" ".agents/skills" -}}
 {{- end -}}
+{{- with .slackbotSubdir }}{{- $_ := set $source "slackbotSubdir" . -}}{{- end -}}
 {{- with .promptPath }}{{- $_ := set $source "promptPath" . -}}{{- end -}}
 {{- with .personasSubdir }}{{- $_ := set $source "personasSubdir" . -}}{{- end -}}
 {{- $sources = append $sources $source -}}
@@ -145,27 +134,6 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- end -}}
 {{- end -}}
 {{- toJson $sources -}}
-{{- end -}}
-
-{{- /*
-Hash every configured input whose contents are copied into a sandbox at boot.
-The API folds this value into SandboxSpec, making warm-pool identity sensitive
-to skills/workflow/prompt-only sources as well as tools and transitional images.
-Refs and image tags must still be immutable in production; this is an identity
-bridge, not a resolver for mutable branches or tags.
-*/ -}}
-{{- define "centaur.sandboxContentRevision" -}}
-{{- $payload := dict
-      "schemaVersion" 1
-      "overlaySources" (include "centaur.overlaySources" . | fromJsonArray)
-      "repositoryRefs" (.Values.repoCache.repositoryRefs | default dict)
-      "sandboxImage" (.Values.sandbox.image | default dict)
-      "ironProxyImage" (.Values.ironProxy.image | default dict)
-      "overlayImage" (.Values.overlay.image | default dict)
-      "overlaySystemPrompt" (.Values.overlay.systemPrompt | default "")
-      "sandboxHarness" (.Values.sandbox.harnessEngine | default "")
-      "operatorRevision" (.Values.apiRs.sandboxContentRevision | default "") -}}
-{{- toJson $payload | sha256sum -}}
 {{- end -}}
 
 {{- define "centaur.httpRouteName" -}}
@@ -213,9 +181,26 @@ namespace as this release, so a short DNS name is enough.
 {{- end -}}
 
 {{- /*
+Render the standard Kubernetes PodSpec scheduling fields supported by
+chart-managed workloads.
+*/ -}}
+{{- define "centaur.podScheduling" -}}
+{{- $values := .values -}}
+{{- $indent := .indent -}}
+{{- with $values.nodeSelector -}}
+{{- printf "nodeSelector:\n%s" (toYaml . | indent 2) | nindent $indent }}
+{{- end -}}
+{{- with $values.affinity -}}
+{{- printf "affinity:\n%s" (toYaml . | indent 2) | nindent $indent }}
+{{- end -}}
+{{- with $values.tolerations -}}
+{{- printf "tolerations:\n%s" (toYaml . | indent 2) | nindent $indent }}
+{{- end -}}
+{{- end -}}
+
+{{- /*
 console — Rails control plane (formerly "iron-control") for authenticated API
-access and encrypted secret storage. Flag-gated (console.enabled), in-cluster
-ClusterIP Service.
+access and encrypted secret storage. Required in-cluster ClusterIP Service.
 
 Backwards compatibility: the canonical values key is `console`; `ironControl` is
 a deprecated alias that is still honored. `centaur.consoleValues` returns the

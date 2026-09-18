@@ -27,12 +27,12 @@ def _split_paths(value: str) -> list[Path]:
 
 
 def _tool_allowlist() -> set[str] | None:
-    """Tool package/project/script names to install, from ``TOOL_ALLOWLIST``.
+    """Tool package names to install, from ``TOOL_ALLOWLIST``.
 
     Returns ``None`` when unset/empty -> install every mounted tool (backward
-    compatible). When set, only matching tools are installed, so the sandbox
-    catalog is exactly the configured tools and the agent neither sees nor
-    wastes context on unconfigured ones (which also lack credentials).
+    compatible). When set, only tools whose package name is listed are installed,
+    so the sandbox catalog is exactly the configured tools and the agent neither
+    sees nor wastes context on unconfigured ones (which also lack credentials).
     """
     raw = os.environ.get("TOOL_ALLOWLIST", "").strip()
     if not raw:
@@ -46,32 +46,6 @@ def _tool_blocklist() -> set[str]:
     if not raw:
         return set()
     return {name.strip() for name in raw.split(",") if name.strip()}
-
-
-def _tool_pyproject_data(package_dir: Path) -> dict:
-    pyproject = package_dir / "pyproject.toml"
-    if not pyproject.is_file():
-        return {}
-    try:
-        return tomllib.loads(pyproject.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        print(f"warning: failed to read {pyproject}: {exc}", file=sys.stderr)
-        return {}
-
-
-def _tool_identifiers(package_dir: Path, data: dict | None = None) -> set[str]:
-    identifiers = {package_dir.name}
-    data = data if data is not None else _tool_pyproject_data(package_dir)
-    project = data.get("project") if isinstance(data, dict) else None
-    if not isinstance(project, dict):
-        return identifiers
-    project_name = str(project.get("name") or "").strip()
-    if project_name:
-        identifiers.add(project_name)
-    project_scripts = project.get("scripts") or {}
-    if isinstance(project_scripts, dict):
-        identifiers.update(str(name) for name in project_scripts if str(name))
-    return identifiers
 
 
 def _home_dir() -> Path:
@@ -175,28 +149,21 @@ def _copy_published_tools(tool_dir: Path, published: Path) -> None:
     existing = {package_dir.name: package_dir for package_dir in _tool_package_dirs(tool_dir)}
     for package_dir in _tool_package_dirs(published):
         tool_name = package_dir.name
-        identifiers = _tool_identifiers(package_dir)
-        if allowlist is not None and identifiers.isdisjoint(allowlist):
+        if allowlist is not None and tool_name not in allowlist:
             # Not in TOOL_ALLOWLIST -> don't install; keeps the agent's catalog
             # to configured tools (no phantom, credential-less tools).
             continue
-        if not identifiers.isdisjoint(blocklist):
+        if tool_name in blocklist:
+            continue
+        if tool_name in existing:
+            print(
+                f"skipping duplicate tool {tool_name}: {package_dir} conflicts with {existing[tool_name]}",
+                file=sys.stderr,
+            )
             continue
         relative_package_dir = package_dir.relative_to(published)
         target = tool_dir / relative_package_dir
-        previous = existing.get(tool_name)
-        if previous is not None and previous != target and (previous.exists() or previous.is_symlink()):
-            print(
-                f"replacing duplicate tool {tool_name}: {package_dir} overrides {previous}",
-                file=sys.stderr,
-            )
-            _remove_path(previous)
         if target.exists() or target.is_symlink():
-            if previous is not None:
-                print(
-                    f"replacing duplicate tool {tool_name}: {package_dir} overrides {previous}",
-                    file=sys.stderr,
-                )
             _remove_path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(package_dir, target, symlinks=True)
@@ -389,21 +356,8 @@ def _skill_sources() -> list[Path]:
     sources.append(home_dir / "centaur-overlay-skills")
 
     overlay_dir = os.environ.get("CENTAUR_OVERLAY_DIR")
-    image_overlay_dir = os.environ.get("CENTAUR_IMAGE_OVERLAY_DIR")
-    # The explicit repo root is authoritative as a whole. Once it is mounted,
-    # a missing skills subtree means "no overlay skills" rather than permission
-    # to resurrect stale image-baked skills. Use the image only when the repo
-    # root itself is unavailable during the transitional rollout.
-    selected_overlay_dir = next(
-        (
-            Path(candidate)
-            for candidate in (overlay_dir, image_overlay_dir)
-            if candidate and Path(candidate).is_dir()
-        ),
-        None,
-    )
-    if selected_overlay_dir:
-        overlay_tree_skills = selected_overlay_dir / ".agents" / "skills"
+    if overlay_dir:
+        overlay_tree_skills = Path(overlay_dir) / ".agents" / "skills"
         if overlay_tree_skills.is_dir():
             sources.append(overlay_tree_skills)
 
@@ -444,17 +398,23 @@ def _discover_scripts(tool_dirs: list[Path]) -> dict[str, dict[str, str]]:
                 for part in pyproject.parts
             ):
                 continue
-            data = _tool_pyproject_data(pyproject.parent)
-            if not data:
+            try:
+                data = tomllib.loads(pyproject.read_text())
+            except (OSError, tomllib.TOMLDecodeError) as exc:
+                print(f"warning: failed to read {pyproject}: {exc}", file=sys.stderr)
                 continue
             project = data.get("project") or {}
-            # Only shim allowlisted tools so the agent's catalog is exactly the
-            # configured tools. Match package dir, project name, or script name.
-            # Unset -> shim all.
-            identifiers = _tool_identifiers(pyproject.parent, data)
-            if allowlist is not None and identifiers.isdisjoint(allowlist):
+            # Only shim allowlisted tools (by package dir or project name) so the
+            # agent's catalog is exactly the configured tools. Unset -> shim all.
+            package_dir = pyproject.parent.name
+            project_name = str(project.get("name") or "")
+            if (
+                allowlist is not None
+                and package_dir not in allowlist
+                and project_name not in allowlist
+            ):
                 continue
-            if not identifiers.isdisjoint(blocklist):
+            if package_dir in blocklist or project_name in blocklist:
                 continue
             project_scripts = project.get("scripts") or {}
             if not isinstance(project_scripts, dict):
@@ -520,7 +480,7 @@ def load():
 
 
 def usage():
-    print("usage: centaur-tools [list|json|refresh|which <name>|run <name> [args...]|call <name> <method> [json|--stdin]]", file=sys.stderr)
+    print("usage: centaur-tools [list|json|refresh|which <name>|run <name> [args...]|call <name> <method> [json]]", file=sys.stderr)
     return 2
 
 
@@ -551,15 +511,26 @@ from centaur_sdk.tool_sdk import ToolContext, reset_tool_context, set_tool_conte
 project_dir = Path(sys.argv[1])
 client_module = sys.argv[2]
 method = sys.argv[3]
-payload = json.load(sys.stdin)
+payload = json.loads(sys.argv[4])
 
 module_path = project_dir / client_module
 package_name = project_dir.name.replace("-", "_")
 if (project_dir / "__init__.py").is_file() and package_name.isidentifier() and module_path.suffix == ".py":
-    parent = str(project_dir.parent)
-    if parent not in sys.path:
-        sys.path.insert(0, parent)
-    module = importlib.import_module(f"{{package_name}}.{{module_path.stem}}")
+    package_path = project_dir / "__init__.py"
+    package_spec = importlib.util.spec_from_file_location(
+        package_name,
+        package_path,
+        submodule_search_locations=[str(project_dir)],
+    )
+    if package_spec is None or package_spec.loader is None:
+        raise RuntimeError(f"cannot load tool package from {{package_path}}")
+    package = importlib.util.module_from_spec(package_spec)
+    sys.modules[package_name] = package
+    package_spec.loader.exec_module(package)
+
+    relative_module = module_path.relative_to(project_dir).with_suffix("")
+    module_name = ".".join((package_name, *relative_module.parts))
+    module = importlib.import_module(module_name)
 else:
     spec = importlib.util.spec_from_file_location("_centaur_tool_client", module_path)
     if spec is None or spec.loader is None:
@@ -693,6 +664,32 @@ def emit_tool_call_event(event, tool, method, tool_args=None, started_at=None, r
         pass
 
 
+def list_tools(tools):
+    catalog = {{"name": "centaur-tools"}}
+    started_at = time.monotonic()
+    emit_tool_call_event("tool_call_started", catalog, "list")
+    try:
+        for tool in tools:
+            print(f'{{tool["name"]}}\t{{tool["project_dir"]}}')
+    except Exception:
+        emit_tool_call_event(
+            "tool_call_completed",
+            catalog,
+            "list",
+            started_at=started_at,
+            returncode=1,
+        )
+        raise
+    emit_tool_call_event(
+        "tool_call_completed",
+        catalog,
+        "list",
+        started_at=started_at,
+        returncode=0,
+    )
+    return 0
+
+
 def run_tool(tool, args):
     project_dir = Path(tool["project_dir"])
     started_at = time.monotonic()
@@ -740,9 +737,9 @@ def call_tool(tool, method, payload):
                 str(project_dir),
                 client_module,
                 method,
+                json.dumps(payload, separators=(",", ":")),
             ],
             check=False,
-            input=json.dumps(payload, separators=(",", ":")),
             text=True,
             capture_output=True,
             env=tool_env(),
@@ -774,9 +771,7 @@ def main(argv):
         tools = load()
         by_name = {{tool["name"]: tool for tool in tools}}
         if command == "list":
-            for tool in tools:
-                print(f'{{tool["name"]}}\\t{{tool["project_dir"]}}')
-            return 0
+            return list_tools(tools)
         if command == "json":
             print(json.dumps(tools, indent=2, sort_keys=True))
             return 0
@@ -802,16 +797,7 @@ def main(argv):
                 print(f"unknown tool: {{name}}", file=sys.stderr)
                 return 1
             try:
-                if len(argv) >= 5 and argv[4] == "--stdin":
-                    raw_payload = sys.stdin.read()
-                elif len(argv) >= 5:
-                    # Keep the original CLI form working for interactive and
-                    # older callers. Workflow callers use stdin to avoid OS
-                    # limits on the size of a single process argument.
-                    raw_payload = argv[4]
-                else:
-                    raw_payload = ""
-                payload = json.loads(raw_payload) if raw_payload.strip() else {{}}
+                payload = json.loads(argv[4]) if len(argv) >= 5 else {{}}
                 result = call_tool(by_name[name], method, payload)
                 if result.stdout:
                     print(result.stdout, end="")

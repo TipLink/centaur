@@ -1,6 +1,5 @@
-import { mountSlashCommands, verifySlackSignature } from './slack-commands'
-import { mountWorkflowSlackTransport } from './workflow-slack-transport'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import {
@@ -13,20 +12,26 @@ import {
   type Logger,
   type Message as ChatMessage,
   type StateAdapter,
-  type Thread
+  type Thread,
+  type WebhookOptions
 } from 'chat'
-import { createSlackAdapter } from '@chat-adapter/slack'
-import { fetchSlackThreadReplies } from '@chat-adapter/slack/api'
+import { SlackAdapter, type SlackAdapterConfig } from '@chat-adapter/slack'
+import {
+  assertSlackOk,
+  callSlackApi,
+  fetchSlackThreadReplies
+} from '@chat-adapter/slack/api'
 import { createPostgresState } from '@chat-adapter/state-pg'
 import pg from 'pg'
 import {
-  codexAppServerToChatSdkStream,
+  harnessToChatSdkStream,
   EMPTY_FINAL_ANSWER_TEXT,
   type CodexAppServerToChatStreamOptions,
   type ChatSDKStreamChunk,
   type RendererEvent
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
+import { resolveHarnessRollout } from './harness-rollout'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import {
   renderSlackDisplayText,
@@ -37,6 +42,7 @@ import { slackUserIdForMessage } from './slack-user'
 import {
   collectInitialContext,
   dispatchSlackBlockAction,
+  fetchWithTimeout,
   forwardToSessionApi,
   harnessRestartPreamble,
   interruptSessionExecution,
@@ -46,22 +52,47 @@ import {
   serializeMessageLinks,
   serializeMessage,
   sessionStreamError,
+  slackApiTimeoutMs,
+  WORKFLOW_ACTION_PREFIX,
   withSlackApiTimeout
 } from './session-api'
 import {
-  buildConsoleSessionContextBlock,
+  buildSlackResponseContextBlock,
   defaultModelForHarness,
+  defaultServiceTierForHarness,
+  effectiveReasoningForHarness,
+  personaFallbackNotice,
+  reasoningForModel,
   type SlackContextBlock
 } from './console-session-link'
-import { channelIdFromThreadId, resolveChannelDefault } from './channel-defaults'
-import { type HarnessOverrides } from './overrides'
+import { resolveChannelDefault } from './channel-defaults'
+import {
+  extractMessageOverrides,
+  extractPersonaOverride,
+  type HarnessOverrides
+} from './overrides'
 import { createFlagMessageOverridesStrategy } from './message-overrides-strategy'
 import {
+  createSlackbotExtensionClaims,
+  loadSlackbotExtensions,
+  registerSlackbotExtension,
+  type SlackbotExtensionClaims,
+  type SlackbotExtensionContext,
+  type SlackbotExtensionManifest,
+  type SlackbotExtensionRegister
+} from './extensions'
+import {
   isAllowedSlackMessage,
+  isAllowedSlackPayload,
   isAllowedSlackWebhookBody,
   parseSlackWebhookPayload
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
+import {
+  createSteeringReactionController,
+  type SteeringReactionAck,
+  type SteeringReactionController
+} from './steering-reaction'
 import type {
   ForwardSessionInput,
   JsonObject,
@@ -80,6 +111,7 @@ import type {
 import {
   elapsedMs,
   errorMessage,
+  escapeRegExp,
   isJsonObject,
   noopLogger,
   nowMs,
@@ -104,6 +136,12 @@ export type {
   SlackbotV2SessionMessage,
   SlackbotV2SessionMessageRole
 } from './types'
+export type {
+  SlackbotExtensionContext,
+  SlackbotExtensionManifest,
+  SlackbotExtensionModuleConfig,
+  SlackbotExtensionRegister
+} from './extensions'
 
 type WaitUntilContext = {
   waitUntil(promise: Promise<unknown>): void
@@ -123,6 +161,20 @@ const MAX_SLACK_MESSAGE_ATTACHMENTS = 20
 
 type SlackbotV2RequestContext = {
   waitUntil(promise: Promise<unknown>): void
+  actionError?: unknown
+  extensionError?: unknown
+}
+
+type StateConnectionStatus = {
+  attempts: number
+  connected: boolean
+  lastError?: string
+}
+
+type SocketInitializationStatus = {
+  error?: string
+  initialized: boolean
+  required: boolean
 }
 
 const requestContext = new AsyncLocalStorage<SlackbotV2RequestContext>()
@@ -137,8 +189,10 @@ const RENDER_RECOVERY_MAX_THREAD_FAILURES = 5
 const RENDER_RETRY_INITIAL_DELAY_MS = 250
 const RENDER_RETRY_MAX_DELAY_MS = 5_000
 const ASSISTANT_STATUS_MAX_CHARS = 50
-const SLACK_TASK_DETAILS_MAX_CHARS = 500
+const SLACK_TASK_DETAILS_MAX_CHARS = 256
 const SLACK_FALLBACK_TEXT_MAX_CHARS = 35_000
+// Leave room below Slack's 12,000-character limit for adapter mention and emoji expansion.
+const SLACK_FALLBACK_MARKDOWN_MAX_CHARS = 11_500
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
 const HANDOFF_RETRY_DELAYS_MS: readonly number[] = [5_000, 30_000, 120_000]
@@ -160,7 +214,10 @@ type PendingLateSlackFileMention = {
   user: string
 }
 
-type StickyThreadOverrides = Pick<SlackbotV2ThreadState, 'harnessType' | 'model' | 'provider'>
+type StickyThreadOverrides = Pick<
+  SlackbotV2ThreadState,
+  'harnessType' | 'model' | 'personaId' | 'provider'
+>
 const DEFAULT_MESSAGE_OVERRIDES_STRATEGY = createFlagMessageOverridesStrategy()
 
 export async function messageOverridesForText(
@@ -169,13 +226,26 @@ export async function messageOverridesForText(
   trace: SlackbotV2Trace
 ): Promise<{ cleanedText?: string; overrides: HarnessOverrides }> {
   const strategy = options.messageOverridesStrategy ?? DEFAULT_MESSAGE_OVERRIDES_STRATEGY
+  const persona = extractPersonaOverride(text)
+  let result: { cleanedText?: string; overrides: HarnessOverrides }
   try {
-    return await strategy({ text })
+    result = await strategy({ text: persona.cleanedText })
   } catch (error) {
     traceWarn(options, 'slackbotv2_message_overrides_strategy_failed', trace, {
       error: errorMessage(error)
     })
-    return { overrides: {} }
+    result = await DEFAULT_MESSAGE_OVERRIDES_STRATEGY({ text: persona.cleanedText })
+  }
+  const { personaId: _strategyPersonaId, ...strategyOverrides } = result.overrides
+  return {
+    ...result,
+    ...(persona.personaId && result.cleanedText === undefined
+      ? { cleanedText: persona.cleanedText }
+      : {}),
+    overrides: {
+      ...strategyOverrides,
+      ...(persona.personaId ? { personaId: persona.personaId } : {})
+    }
   }
 }
 
@@ -189,11 +259,16 @@ function stickyThreadOverrideUpdate(
     if (!overrides.provider) update.provider = null
   }
   if (overrides.model) update.model = overrides.model
+  if (overrides.personaId) update.personaId = overrides.personaId
   if (overrides.provider) {
     update.provider = overrides.provider
     if (!overrides.model) update.model = null
   }
   return Object.keys(update).length > 0 ? update : undefined
+}
+
+function hasStickyModelOverride(overrides: StickyThreadOverrides): boolean {
+  return Boolean(overrides.harnessType || overrides.model || overrides.provider)
 }
 
 function resolveStickyThreadOverrides(
@@ -202,13 +277,34 @@ function resolveStickyThreadOverrides(
 ): {
   harnessType?: string
   model?: string
+  personaId?: string
   provider?: string
 } {
   return {
     harnessType: stickyOverrideValue(state, update, 'harnessType'),
     model: stickyOverrideValue(state, update, 'model'),
+    personaId: stickyOverrideValue(state, update, 'personaId'),
     provider: stickyOverrideValue(state, update, 'provider')
   }
+}
+
+function personaOnlyStickyOverride(
+  update: StickyThreadOverrides | undefined
+): StickyThreadOverrides | undefined {
+  return update?.personaId ? { personaId: update.personaId } : undefined
+}
+
+function preservePinnedPersona(
+  state: SlackbotV2ThreadState,
+  update: StickyThreadOverrides | undefined
+): StickyThreadOverrides | undefined {
+  if (
+    !update?.personaId ||
+    !Object.prototype.hasOwnProperty.call(state, 'personaId')
+  ) {
+    return update
+  }
+  return { ...update, personaId: state.personaId ?? null }
 }
 
 function stickyOverrideValue(
@@ -231,17 +327,153 @@ function stickyOverrideRaw(
   return update && Object.prototype.hasOwnProperty.call(update, key) ? update[key] : state[key]
 }
 
+function isExtensionInteraction(
+  payload: unknown,
+  claims: SlackbotExtensionClaims
+): boolean {
+  if (!isJsonObject(payload)) return false
+  if (payload.type === 'block_actions') {
+    return Array.isArray(payload.actions) && payload.actions.some(action =>
+      isJsonObject(action)
+      && typeof action.action_id === 'string'
+      && claims.ownsAction(action.action_id)
+    )
+  }
+  if (payload.type === 'view_submission') {
+    const view = isJsonObject(payload.view) ? payload.view : undefined
+    return typeof view?.callback_id === 'string'
+      && claims.ownsModalCallback(view.callback_id)
+  }
+  return payload.type === 'block_suggestion'
+    && typeof payload.action_id === 'string'
+    && claims.ownsOptionsLoad(payload.action_id)
+}
+
+/**
+ * Chat SDK normally acknowledges Slack interactive and Socket Mode slash events
+ * before async handlers finish. Extension-owned actions, modals, option loads,
+ * and slash commands may need a short durable write first, so await only their tasks.
+ */
+class SlackbotExtensionAdapter extends SlackAdapter {
+  constructor(
+    config: SlackAdapterConfig,
+    private readonly extensionClaims: SlackbotExtensionClaims
+  ) {
+    super(config)
+  }
+
+  protected override async dispatchInteractivePayload(
+    payload: unknown,
+    options?: WebhookOptions
+  ): Promise<Response> {
+    if (!isExtensionInteraction(payload, this.extensionClaims)) {
+      return super.dispatchInteractivePayload(payload as never, options)
+    }
+    return this.awaitExtensionTasks(
+      trackedOptions => super.dispatchInteractivePayload(payload as never, trackedOptions),
+      options
+    )
+  }
+
+  protected override async runSlashCommand(
+    params: URLSearchParams,
+    options?: WebhookOptions
+  ): Promise<Response> {
+    if (!this.extensionClaims.ownsSlashCommand(params.get('command') ?? '')) {
+      return super.runSlashCommand(params, options)
+    }
+    return this.awaitExtensionTasks(
+      trackedOptions => super.runSlashCommand(params, trackedOptions),
+      options
+    )
+  }
+
+  protected override async routeSocketEvent(
+    body: Record<string, unknown>,
+    eventType: string,
+    ack: (response?: Record<string, unknown>) => Promise<void>,
+    options?: WebhookOptions,
+    retryNum?: number
+  ): Promise<void> {
+    const command = typeof body.command === 'string' ? body.command : ''
+    if (eventType === 'slash_commands' && this.extensionClaims.ownsSlashCommand(command)) {
+      const params = new URLSearchParams()
+      for (const [key, value] of Object.entries(body)) {
+        if (typeof value === 'string' || typeof value === 'boolean') {
+          params.set(key, String(value))
+        }
+      }
+      try {
+        await this.runSlashCommand(params, options)
+        await ack()
+      } catch (error) {
+        this.logger.error('Slack extension slash command failed before acknowledgement', {
+          command,
+          error
+        })
+      }
+      return
+    }
+
+    if (eventType === 'interactive' && isExtensionInteraction(body, this.extensionClaims)) {
+      try {
+        await super.routeSocketEvent(body, eventType, ack, options, retryNum)
+      } catch (error) {
+        this.logger.error('Slack extension interaction failed before acknowledgement', { error })
+      }
+      return
+    }
+    return super.routeSocketEvent(body, eventType, ack, options, retryNum)
+  }
+
+  private async awaitExtensionTasks<T>(
+    operation: (options: WebhookOptions) => T | Promise<T>,
+    options?: WebhookOptions
+  ): Promise<T> {
+    const tasks: Promise<unknown>[] = []
+    const trackedOptions: WebhookOptions = {
+      ...options,
+      waitUntil: task => {
+        tasks.push(task)
+        options?.waitUntil?.(task)
+      }
+    }
+    const execute = async (): Promise<T> => {
+      const result = await operation(trackedOptions)
+      await Promise.all(tasks)
+      return result
+    }
+    if (requestContext.getStore()) return execute()
+
+    const context: SlackbotV2RequestContext = { waitUntil: detachedWaitUntil }
+    return requestContext.run(context, async () => {
+      const result = await execute()
+      if (context.extensionError) throw context.extensionError
+      return result
+    })
+  }
+}
+
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
   const logger = options.logger ?? noopLogger
-  const slack = createSlackAdapter({
+  const extensionClaims = createSlackbotExtensionClaims(WORKFLOW_ACTION_PREFIX)
+  const appToken = options.appToken ?? process.env.SLACK_APP_TOKEN
+  const slack = new SlackbotExtensionAdapter({
+    agentView: options.agentViewEnabled === true,
+    appToken,
+    // Titles come from durable session events, including recovery.
+    sessionTitle: false,
     apiUrl: options.slackApiUrl,
     botToken: options.botToken,
     botUserId: options.botUserId,
     signingSecret: options.signingSecret,
+    socketForwardingSecret: process.env.SLACK_SOCKET_FORWARDING_SECRET,
+    streamSegmentMaxAgeMs: Number(process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS) || undefined,
     userName,
-    logger
-  })
+    logger,
+    mode: options.slackMode ?? 'webhook'
+  }, extensionClaims)
   const state = options.state ?? createDefaultState(options, logger)
   const chat = new Chat<{ slack: typeof slack }, SlackbotV2ThreadState>({
     userName,
@@ -250,11 +482,31 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     onLockConflict: 'force',
     logger
   })
-  const lateSlackFiles = createLateSlackFileRepair(options, state)
+  const extensionContext: SlackbotExtensionContext = { chat, logger }
+  const allowExtensionEvent = (raw: unknown): boolean =>
+    isAllowedSlackPayload(raw, options, logger)
+  const reportExtensionError = (error: unknown): void => {
+    const context = requestContext.getStore()
+    if (context) context.extensionError = error
+  }
+  const steeringReactions = createSteeringReactionController(options)
+  const lateSlackFiles = createLateSlackFileRepair(options, state, steeringReactions)
+  const stateConnectionStatus: StateConnectionStatus = { attempts: 0, connected: false }
+  const socketInitializationStatus: SocketInitializationStatus = {
+    initialized: false,
+    required: options.slackMode === 'socket'
+  }
+  const stateConnected = ensureStateConnected(state, options, stateConnectionStatus)
+  backgroundWaitUntil(stateConnected)
 
   chat.onAction(async event => {
+    if (!isAllowedSlackPayload(event.raw, options, logger)) return
+    if (extensionClaims.ownsAction(event.actionId)) return
     const payload = slackBlockActionPayload(event)
-    const dedupeKey = slackBlockActionDedupeKey(payload)
+    const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
+    // Workflow starts deduplicate durably using the Slack click identity.
+    // A temporary ingress lease must never acknowledge a lost click.
+    const dedupeKey = workflowAction ? undefined : slackBlockActionDedupeKey(payload)
     const leaseToken = randomUUID()
     if (
       dedupeKey
@@ -270,8 +522,33 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       return
     }
     try {
-      await dispatchSlackBlockAction(options, payload)
+      const result = await dispatchSlackBlockAction(options, payload)
+      // The workflow owns the message and its final button state. Successful
+      // handoff (including redelivery) only needs Slack's native acknowledgment;
+      // a separate success message adds noise before the actual result arrives.
+      if (result?.outcome === 'unavailable' && payload.channel_id) {
+        backgroundWaitUntil(
+          withSlackApiTimeout(options, 'post workflow action feedback', () =>
+            callSlackApi('chat.postEphemeral', {
+              channel: payload.channel_id,
+              user: payload.user_id,
+              ...(payload.thread_ts ? { thread_ts: payload.thread_ts } : {}),
+              text: 'This request is no longer available.'
+            }, {
+              apiUrl: options.slackApiUrl,
+              fetch: options.fetch as typeof globalThis.fetch | undefined,
+              token: options.botToken
+            })
+          ).catch(error => {
+            traceWarn(options, 'slackbotv2_action_feedback_failed', undefined, {
+              error: errorMessage(error)
+            })
+          })
+        )
+      }
     } catch (error) {
+      const context = requestContext.getStore()
+      if (workflowAction && context) context.actionError = error
       try {
         if (dedupeKey && (await state.get(dedupeKey)) === leaseToken) {
           await state.delete(dedupeKey)
@@ -310,9 +587,46 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       message_ts: payload.message_ts,
       team_id: payload.team_id,
       thread_ts: payload.thread_ts,
-      workflow_event_name: `slack.block_action.${payload.action_id}`
+      workflow_event_name: workflowAction ? undefined : `slack.block_action.${payload.action_id}`
     })
   })
+
+  if (options.agentViewEnabled) {
+    chat.onDirectMessage(async (_thread, message) => {
+      if (!(await isAllowedSlackMessage(message, options, logger))) return
+      const raw = isJsonObject(message.raw) ? message.raw : {}
+      const channel = stringValue(raw.channel)
+      const threadTs = stringValue(raw.thread_ts) ?? stringValue(raw.ts)
+      if (!channel || !threadTs) return
+      // Legacy DMs leave a conversation-wide subscription behind. The SDK
+      // preserves that routing for proactive bots; our agent sessions always
+      // follow Slack's thread roots, including after toggling modes.
+      const threadId = slack.encodeThreadId({ channel, threadTs })
+      const thread = chat.thread(threadId)
+      const directMessage = new ChatSdkMessage({
+        attachments: message.attachments,
+        author: message.author,
+        formatted: message.formatted,
+        id: message.id,
+        isMention: true,
+        links: message.links,
+        metadata: message.metadata,
+        raw: message.raw,
+        text: message.text,
+        threadId
+      })
+      lateSlackFiles.rememberFilelessMention(thread, directMessage)
+      await handleSlackMessageHandoff(thread, directMessage, {
+        assistantStatusRequested: true,
+        mode: 'execute',
+        options,
+        state,
+        steeringReactions,
+        subscribe: true,
+        trigger: 'direct_message'
+      })
+    })
+  }
 
   chat.onNewMention(async (thread, message) => {
     if (!(await isAllowedSlackMessage(message, options, logger))) return
@@ -322,55 +636,58 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       mode: 'execute',
       options,
       state,
+      steeringReactions,
       subscribe: true,
       trigger: 'new_mention'
     })
   })
 
-  const ambientSlackChannelIds = ambientSlackChannelIdSet(options)
-
   // Slack does not classify mentions inside Block Kit or legacy attachments as
-  // app_mention events. Alertmanager uses attachment.pretext. Ambient channels
-  // also execute root messages without mentions, so handle both cases in one
-  // callback to avoid double execution when a rich mention is ambient.
-  chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
-    const richMention = slackRichTextMentionsUser(message.raw, options.botUserId)
-    const isAmbientMessage = isAmbientSlackChannelMessage(message, ambientSlackChannelIds)
-    if (!richMention && !isAmbientMessage) return
+  // app_mention events. Alertmanager uses attachment.pretext, so inspect rich
+  // payloads after Chat SDK has verified the webhook and before executing.
+  chat.onNewMessage(/^.*$/s, async (thread, message) => {
+    if (!slackRichTextMentionsUser(message.raw, options.botUserId)) return
     if (!(await isAllowedSlackMessage(message, options, logger))) return
-    if (richMention) message.isMention = true
-    lateSlackFiles.rememberFilelessMention(thread, message)
+    message.isMention = true
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
       mode: 'execute',
       options,
       state,
+      steeringReactions,
       subscribe: true,
-      trigger: richMention ? 'new_mention' : 'ambient_channel_message'
+      trigger: 'new_mention'
     })
   })
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!(await isAllowedSlackMessage(message, options, logger))) return
     if (slackRichTextMentionsUser(message.raw, options.botUserId)) message.isMention = true
+    if (message.isMention !== true) {
+      traceLog(
+        options,
+        'slackbotv2_subscribed_message_without_mention_ignored',
+        createHandoffTrace(thread, message, 'append'),
+        { trigger: 'subscribed_message' }
+      )
+      return
+    }
     lateSlackFiles.rememberFilelessMention(thread, message)
-    const isAmbientMessage = isAmbientSlackChannelMessage(message, ambientSlackChannelIds)
-    const shouldExecute = message.isMention === true || isAmbientMessage
     await handleSlackMessageHandoff(thread, message, {
-      assistantStatusRequested: shouldExecute,
-      mode: shouldExecute ? 'execute' : 'append',
+      assistantStatusRequested: true,
+      mode: 'execute',
       options,
       state,
-      trigger: isAmbientMessage ? 'ambient_channel_message' : 'subscribed_message'
+      steeringReactions,
+      trigger: 'subscribed_message'
     })
   })
 
   const app = new Hono()
-  for (const extension of options.commandExtensions ?? [])
-    extension.mount?.({ app, options, state, verifySlackSignature })
-  mountSlashCommands(app, options, state)
-  mountWorkflowSlackTransport(app, options, state, threadId => chat.thread(threadId))
-  app.get('/health', c => c.json({ ok: true, service: 'slackbotv2' }))
+  app.get('/live', c => c.json({ ok: true, service: 'slackbotv2' }))
+  app.get('/health', c =>
+    healthResponse(c, stateConnectionStatus, socketInitializationStatus)
+  )
   app.get('/metrics', c =>
     c.text(slackbotMetrics.expose(), 200, {
       'Content-Type': 'text/plain; version=0.0.4; charset=utf-8'
@@ -381,14 +698,38 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     const route = c.req.path
     const rawBody = await c.req.raw.clone().text()
     const eventType = slackWebhookEventType(rawBody)
+    const webhookFields = {
+      ...slackWebhookLogFields(rawBody),
+      slack_retry_num: c.req.header('x-slack-retry-num') || undefined,
+      slack_retry_reason: c.req.header('x-slack-retry-reason') || undefined
+    }
     let outcome = 'success'
     try {
+      traceLog(options, 'slackbotv2_webhook_received', undefined, {
+        body_bytes: Buffer.byteLength(rawBody, 'utf8'),
+        route,
+        ...webhookFields
+      })
       if (!isAllowedSlackWebhookBody(rawBody, options, logger)) {
         outcome = 'ignored'
         return new globalThis.Response('ok', { status: 200 })
       }
-      const awaitHandoff = shouldAwaitSlackHandoff(rawBody)
-      const webhookFields = slackWebhookLogFields(rawBody)
+      const interaction = parseSlackWebhookPayload(rawBody)
+      const workflowAction = interaction?.type === 'block_actions'
+        && Array.isArray(interaction.actions)
+        && interaction.actions.some(action => isJsonObject(action)
+          && typeof action.action_id === 'string'
+          && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
+      const extensionInteraction = isExtensionInteraction(interaction, extensionClaims)
+      const slashCommand = typeof interaction?.command === 'string'
+        ? interaction.command
+        : undefined
+      const extensionSlashCommand = typeof slashCommand === 'string'
+        && extensionClaims.ownsSlashCommand(slashCommand)
+      const awaitHandoff = workflowAction
+        || extensionInteraction
+        || extensionSlashCommand
+        || shouldAwaitSlackHandoff(rawBody)
       const handoffTasks: Promise<unknown>[] = []
       const context: SlackbotV2RequestContext = {
         waitUntil: promise => waitUntil(c, promise)
@@ -404,6 +745,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
           }
         })
       })
+      const channelCreatedJoinTask = response.ok && options.autoJoinCreatedChannels === true
+        ? joinSlackChannelCreatedEvent(rawBody, options)
+        : null
+      if (channelCreatedJoinTask) waitUntil(c, channelCreatedJoinTask)
       if (awaitHandoff && response.ok) {
         const waitStartedAtMs = nowMs()
         const waitFields = {
@@ -432,6 +777,14 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
             phase_ms: elapsedMs(waitStartedAtMs)
           })
         }
+        if (workflowAction && (waitError || context.actionError)) {
+          outcome = 'error'
+          return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
+        }
+        if ((extensionInteraction || extensionSlashCommand) && (waitError || context.extensionError)) {
+          outcome = 'error'
+          return new globalThis.Response('Slack extension request could not be recorded. Please retry.', { status: 503 })
+        }
       }
       const lateFileTask = lateSlackFiles.repairFromWebhook(rawBody)
       if (lateFileTask) waitUntil(c, lateFileTask)
@@ -457,37 +810,61 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   app.post('/api/slack/options', handleSlackWebhook)
   app.post('/api/slack/commands', handleSlackWebhook)
 
-  if (options.recoverRenderObligationsOnStart !== false) {
-    scheduleRenderObligationRecovery(chat, state, options)
+  let recoveryScheduled = false
+  const scheduleRecovery = (): void => {
+    if (recoveryScheduled || options.recoverRenderObligationsOnStart === false) return
+    recoveryScheduled = true
+    scheduleRenderObligationRecovery(chat, state, options, stateConnected)
+  }
+  const initialize = async (): Promise<void> => {
+    try {
+      await stateConnected
+      await chat.initialize()
+      socketInitializationStatus.initialized = true
+      socketInitializationStatus.error = undefined
+      if (options.slackMode === 'socket') scheduleRecovery()
+    } catch (error) {
+      socketInitializationStatus.initialized = false
+      socketInitializationStatus.error = errorMessage(error)
+      throw error
+    }
   }
 
-  return { app, chat }
-}
+  // Preserve webhook startup semantics: serve health while the state adapter
+  // connects and let Chat initialize lazily on the first webhook. Socket Mode
+  // has no webhook to trigger initialization, so the executable starts it
+  // after registering deployment extensions and opening the health server.
+  if (options.slackMode !== 'socket') scheduleRecovery()
 
-function isAmbientSlackChannelMessage(
-  message: ChatMessage,
-  allowedChannels: ReadonlySet<string>
-): boolean {
-  if (message.isMention === true) return false
+  const registerExtension = async (
+    manifest: SlackbotExtensionManifest,
+    register: SlackbotExtensionRegister
+  ): Promise<void> => {
+    await registerSlackbotExtension(
+      manifest,
+      register,
+      extensionContext,
+      extensionClaims,
+      `<inline:${manifest.id}>`,
+      allowExtensionEvent,
+      reportExtensionError
+    )
+  }
 
-  const raw = isJsonObject(message.raw) ? message.raw : undefined
-  if (raw && stringValue(raw.type) !== 'message') return false
-
-  const channelId = stringValue(raw?.channel) ?? channelIdFromThreadId(message.threadId)
-  return Boolean(channelId && allowedChannels.has(channelId))
-}
-
-function ambientSlackChannelIdSet(options: SlackbotV2Options): ReadonlySet<string> {
-  return new Set(
-    options.ambientSlackChannelIds ?? splitEnvList(process.env.SLACKBOT_AMBIENT_CHANNEL_IDS)
-  )
-}
-
-function splitEnvList(value: string | undefined): string[] {
-  return (value ?? '')
-    .split(/[\s,]+/)
-    .map(part => part.trim())
-    .filter(Boolean)
+  return {
+    app,
+    chat,
+    initialize,
+    loadExtensions: modules =>
+      loadSlackbotExtensions(
+        modules,
+        extensionContext,
+        extensionClaims,
+        allowExtensionEvent,
+        reportExtensionError
+      ),
+    registerExtension
+  }
 }
 
 async function handleSlackMessageHandoff(
@@ -498,6 +875,7 @@ async function handleSlackMessageHandoff(
     mode: SlackbotV2MessageMode
     options: SlackbotV2Options
     state: StateAdapter
+    steeringReactions: SteeringReactionController
     subscribe?: boolean
     trigger: string
   }
@@ -509,35 +887,40 @@ async function handleSlackMessageHandoff(
     trigger: input.trigger
   })
   let initialAssistantStatusVisible = false
-  const assistantStatus = input.assistantStatusRequested
-    ? setInitialAssistantStatus(thread, input.options, trace)
-        .then(visible => {
-          initialAssistantStatusVisible = visible
-          return visible
-        })
-    : Promise.resolve(false)
-  if (input.assistantStatusRequested) {
-    backgroundWaitUntil(assistantStatus.then(() => undefined).catch(() => undefined))
-  }
+  let assistantStatus = Promise.resolve(false)
   try {
     if (await handleStopCommand(thread, message, input.options, input.trigger)) {
       return
+    }
+    // Assistant status is thread-wide. A mentioned follow-up that steers an
+    // active execution must not clear or replace the status owned by that run.
+    const assistantStatusRequested =
+      input.assistantStatusRequested && ((await thread.state)?.activeExecution !== true)
+    assistantStatus = assistantStatusRequested
+      ? setInitialAssistantStatus(thread, input.options, trace).then(visible => {
+          initialAssistantStatusVisible = visible
+          return visible
+        })
+      : Promise.resolve(false)
+    if (assistantStatusRequested) {
+      backgroundWaitUntil(assistantStatus.then(() => undefined).catch(() => undefined))
     }
     if (input.subscribe) {
       await subscribeSlackThreadForHandoff(thread, input.options, trace, input.trigger)
     }
     traceLog(input.options, 'slackbotv2_handoff_sync_starting', trace, {
       initial_assistant_status_deferred:
-        input.assistantStatusRequested && !initialAssistantStatusVisible,
+        assistantStatusRequested && !initialAssistantStatusVisible,
       initial_assistant_status_visible: initialAssistantStatusVisible,
       trigger: input.trigger
     })
     await syncThreadMessageToSession(thread, message, {
-      initialAssistantStatusRequested: input.assistantStatusRequested,
+      initialAssistantStatusRequested: assistantStatusRequested,
       initialAssistantStatusVisible,
       mode: input.mode,
       options: input.options,
-      state: input.state
+      state: input.state,
+      steeringReactions: input.steeringReactions
     })
     traceLog(input.options, 'slackbotv2_handoff_complete', trace, {
       trigger: input.trigger
@@ -549,9 +932,10 @@ async function handleSlackMessageHandoff(
     })
     backgroundWaitUntil(
       assistantStatus
-        .then(visible =>
-          visible ? setAssistantStatus(thread, '', input.options, trace) : undefined
-        )
+        .then(async visible => {
+          if (!visible || (await thread.state)?.activeExecution === true) return
+          await setAssistantStatus(thread, '', input.options, trace)
+        })
         .then(() => undefined)
         .catch(() => undefined)
     )
@@ -651,6 +1035,92 @@ function slackWebhookEventType(rawBody: string): string {
   return stringValue(payload.type) ?? 'unknown'
 }
 
+function slackChannelCreatedJoinInput(rawBody: string): {
+  channelId: string
+  channelName?: string
+  eventId?: string
+  teamId?: string
+} | null {
+  const payload = slackWebhookPayload(rawBody)
+  if (!payload || payload.type !== 'event_callback') return null
+  const event = slackWebhookEvent(payload)
+  if (!event || stringValue(event.type) !== 'channel_created') return null
+  const channel = isJsonObject(event.channel) ? event.channel : undefined
+  const channelId = stringValue(channel?.id) ?? stringValue(event.channel)
+  if (!channelId) return null
+  return {
+    channelId,
+    channelName: stringValue(channel?.name),
+    eventId: stringValue(payload.event_id),
+    teamId: slackEventTeamId(payload, event) || undefined
+  }
+}
+
+function joinSlackChannelCreatedEvent(
+  rawBody: string,
+  options: SlackbotV2Options
+): Promise<void> | null {
+  const input = slackChannelCreatedJoinInput(rawBody)
+  if (!input) return null
+
+  return (async () => {
+    const startedAtMs = nowMs()
+    const fields = {
+      channel_id: input.channelId,
+      channel_name: input.channelName,
+      slack_event_id: input.eventId,
+      team_id: input.teamId
+    }
+    traceLog(options, 'slackbotv2_channel_created_join_started', undefined, fields)
+    try {
+      const result = await joinSlackChannel(input.channelId, options)
+      traceLog(options, 'slackbotv2_channel_created_join_complete', undefined, {
+        ...fields,
+        already_joined: result.alreadyJoined,
+        phase_ms: elapsedMs(startedAtMs)
+      })
+    } catch (error) {
+      traceWarn(options, 'slackbotv2_channel_created_join_failed', undefined, {
+        ...fields,
+        error: errorMessage(error),
+        phase_ms: elapsedMs(startedAtMs)
+      })
+    }
+  })()
+}
+
+async function joinSlackChannel(
+  channelId: string,
+  options: SlackbotV2Options
+): Promise<{ alreadyJoined: boolean }> {
+  const fetchFn = options.fetch ?? fetch
+  const timeoutFetch = Object.assign(
+    (input: RequestInfo | URL, init?: RequestInit) =>
+      fetchWithTimeout(
+        fetchFn,
+        input,
+        init ?? {},
+        slackApiTimeoutMs(options),
+        'Slack API conversations.join'
+      ),
+    { preconnect: fetch.preconnect }
+  )
+  const payload = await callSlackApi(
+    'conversations.join',
+    { channel: channelId },
+    {
+      apiUrl: options.slackApiUrl,
+      fetch: timeoutFetch,
+      token: options.botToken
+    }
+  )
+  const alreadyJoined =
+    stringValue(payload.warning) === 'already_in_channel'
+    || payload.response_metadata?.warnings?.includes('already_in_channel') === true
+  assertSlackOk('conversations.join', payload)
+  return { alreadyJoined }
+}
+
 function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPayload {
   const raw = isJsonObject(event.raw) ? event.raw : {}
   const action = Array.isArray(raw.actions)
@@ -665,6 +1135,9 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
   const messageTs = stringValue(message.ts) ?? stringValue(container.message_ts)
   const messageId = event.messageId.startsWith('ephemeral:') ? (messageTs ?? '') : event.messageId
   return removeUndefinedValues({
+    ...(event.actionId.startsWith(WORKFLOW_ACTION_PREFIX) && Array.isArray(message.blocks)
+      ? { workflow_message: { text: stringValue(message.text) ?? '', blocks: message.blocks } }
+      : {}),
     action_id: event.actionId,
     action_ts: stringValue(rawAction.action_ts),
     block_id: stringValue(rawAction.block_id),
@@ -788,6 +1261,45 @@ function createDefaultState(options: SlackbotV2Options, logger: Logger): StateAd
   })
 }
 
+function healthResponse(
+  c: Context,
+  stateConnectionStatus: StateConnectionStatus,
+  socketInitializationStatus: SocketInitializationStatus
+): Response {
+  if (
+    stateConnectionStatus.connected
+    && (!socketInitializationStatus.required || socketInitializationStatus.initialized)
+  ) {
+    return c.json({
+      ok: true,
+      service: 'slackbotv2',
+      database_connected: true
+    })
+  }
+  if (stateConnectionStatus.connected && socketInitializationStatus.required) {
+    return c.json(
+      {
+        ok: false,
+        service: 'slackbotv2',
+        database_connected: true,
+        database_status: 'connected',
+        slack_transport_status: socketInitializationStatus.error ? 'failed' : 'connecting'
+      },
+      503
+    )
+  }
+  return c.json(
+    {
+      ok: false,
+      service: 'slackbotv2',
+      database_connected: false,
+      database_status: 'connecting',
+      database_connect_attempts: stateConnectionStatus.attempts
+    },
+    503
+  )
+}
+
 /**
  * Blocks until the state backend accepts a connection, retrying with exponential
  * backoff. The first DB connection fires within milliseconds of process start and
@@ -795,15 +1307,24 @@ function createDefaultState(options: SlackbotV2Options, logger: Logger): StateAd
  * Retrying instead of throwing absorbs that race; the first successful connect
  * also flips the adapter's `connected` flag, so the message path comes alive too.
  */
-async function ensureStateConnected(state: StateAdapter, options: SlackbotV2Options): Promise<void> {
+async function ensureStateConnected(
+  state: StateAdapter,
+  options: SlackbotV2Options,
+  status: StateConnectionStatus
+): Promise<void> {
   for (let attempt = 0; ; attempt++) {
+    status.attempts = attempt + 1
     try {
       await state.connect()
+      status.connected = true
+      status.lastError = undefined
       if (attempt > 0) {
         traceLog(options, 'slackbotv2_postgres_connected', undefined, { attempts: attempt + 1 })
       }
       return
     } catch (error) {
+      status.connected = false
+      status.lastError = errorMessage(error)
       const delayMs = Math.min(
         POSTGRES_CONNECT_INITIAL_DELAY_MS * 2 ** attempt,
         POSTGRES_CONNECT_MAX_DELAY_MS
@@ -811,7 +1332,7 @@ async function ensureStateConnected(state: StateAdapter, options: SlackbotV2Opti
       traceLog(options, 'slackbotv2_postgres_connect_retry', undefined, {
         attempt: attempt + 1,
         delay_ms: delayMs,
-        error: errorMessage(error)
+        error: status.lastError
       })
       await sleep(delayMs)
     }
@@ -828,6 +1349,8 @@ type SyncThreadMessageInput = {
   /** Resolved once per local handoff chain so retryable failures stay idempotent. */
   resolvedMessageOverrides?: Awaited<ReturnType<typeof messageOverridesForText>>
   state: StateAdapter
+  steeringReactionAck?: SteeringReactionAck
+  steeringReactions: SteeringReactionController
 }
 
 /**
@@ -868,9 +1391,10 @@ function scheduleHandoffRetry(
         attempt: attempt + 1,
         error: errorMessage(retryError)
       })
+      finishSteeringReaction(input, trace)
       // A retry chain that dies outside the normal failure paths (which clear
       // the status themselves) must not leave "Thinking..." stuck on the thread.
-      if (input.mode === 'execute') {
+      if (input.mode === 'execute' && input.initialAssistantStatusRequested) {
         try {
           await setAssistantStatus(thread, '', input.options, trace)
         } catch {
@@ -880,6 +1404,16 @@ function scheduleHandoffRetry(
     })
   )
   return true
+}
+
+function finishSteeringReaction(
+  input: SyncThreadMessageInput,
+  trace?: SlackbotV2Trace
+): void {
+  const ack = input.steeringReactionAck
+  if (!ack) return
+  input.steeringReactionAck = undefined
+  backgroundWaitUntil(input.steeringReactions.complete(ack, trace))
 }
 
 /**
@@ -913,7 +1447,8 @@ async function syncThreadMessageToSession(
   }
   if (isDuplicateIncrementalMessage) {
     traceLog(input.options, 'slackbotv2_forward_duplicate_skipped', trace)
-    if (input.initialAssistantStatusVisible) {
+    finishSteeringReaction(input, trace)
+    if (input.initialAssistantStatusVisible && state.activeExecution !== true) {
       await setAssistantStatus(thread, '', input.options, trace)
     }
     recordForward(input.mode, 'duplicate_skipped', traceStartedAtMs)
@@ -934,12 +1469,19 @@ async function syncThreadMessageToSession(
         .catch(() => undefined)
     )
   }
-  if (!shouldStartExecution && input.initialAssistantStatusVisible) {
+  if (
+    !shouldStartExecution
+    && input.initialAssistantStatusVisible
+    && state.activeExecution !== true
+  ) {
     await setAssistantStatus(thread, '', input.options, trace)
   }
 
   const serializeStartedAtMs = nowMs()
   const serializedMessage = await serializeMessage(message, input.options)
+  // Inspect the original text before the strategy strips recognized flags.
+  // This is the authority for whether a sticky thread selection may change.
+  const explicitOverrides = extractMessageOverrides(serializedMessage.text)
   const messageOverrides =
     input.resolvedMessageOverrides ??
     (input.resolvedMessageOverrides = await messageOverridesForText(
@@ -951,7 +1493,28 @@ async function syncThreadMessageToSession(
     setMessageText(serializedMessage, messageOverrides.cleanedText)
   }
   const overrides = messageOverrides.overrides
-  const stickyOverridesUpdate = stickyThreadOverrideUpdate(overrides)
+  const requestedStickyOverrides = preservePinnedPersona(
+    state,
+    stickyThreadOverrideUpdate(overrides)
+  )
+  // Once the thread's model configuration is sticky, only another explicit
+  // model or harness flag may move it. The persona is handled separately by
+  // preservePinnedPersona and never moves after the API persists it.
+  const preserveStickyModelOverrides = Boolean(
+    requestedStickyOverrides &&
+      hasStickyModelOverride(requestedStickyOverrides) &&
+      hasStickyModelOverride(state) &&
+      !hasStickyModelOverride(explicitOverrides)
+  )
+  let stickyOverridesUpdate = preserveStickyModelOverrides
+    ? personaOnlyStickyOverride(requestedStickyOverrides)
+    : requestedStickyOverrides
+  if (preserveStickyModelOverrides) {
+    traceLog(input.options, 'slackbotv2_forward_sticky_overrides_preserved', trace, {
+      pinned_harness_type: state.harnessType,
+      requested_harness_type: requestedStickyOverrides?.harnessType
+    })
+  }
   const effectiveOverrides = resolveStickyThreadOverrides(state, stickyOverridesUpdate)
   // Slack-only "Open chat in Console" link on the FIRST assistant message in
   // a thread (the reply to the first message that starts an execution). The
@@ -975,27 +1538,48 @@ async function syncThreadMessageToSession(
     stickyOverrideRaw(state, stickyOverridesUpdate, 'provider') === null
       ? undefined
       : effectiveOverrides.provider ?? channelDefault?.provider
-  const resolvedReasoning = overrides.reasoning ?? channelDefault?.reasoning
-  const effectiveHarnessType =
-    resolvedHarnessType ?? input.options.defaultHarnessType ?? 'codex'
+  const effectiveHarnessType = resolvedHarnessType ?? input.options.defaultHarnessType ?? 'codex'
   // Without an explicit override or channel default the harness runs its
   // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
   // config); show and record that instead of dropping the model entirely.
-  const effectiveModel =
-    resolvedModel ??
-    defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
-  const consoleSessionBlock = isFirstAssistantMessage
-    ? buildConsoleSessionContextBlock({
-        consoleBaseUrl: input.options.consolePublicUrl,
-        threadKey: thread.id,
-        harnessType: effectiveHarnessType,
-        model: effectiveModel
-      })
-    : undefined
-  if (overrides.harnessType || overrides.model || overrides.provider || overrides.reasoning) {
+  const harnessDefaultModel = defaultModelForHarness(
+    effectiveHarnessType,
+    input.options.harnessDefaultModels
+  )
+  const effectiveModel = resolvedModel ?? harnessDefaultModel
+  const modelOverride = resolvedModel !== harnessDefaultModel ? resolvedModel : undefined
+  const harnessRollout = resolveHarnessRollout({
+    modelOverride,
+    requestedHarness: effectiveHarnessType,
+    rolloutPercent: input.options.codexNanocodexRolloutPercent ?? 0,
+    threadId: thread.id
+  })
+  const rolloutSelected = harnessRollout.assignment !== undefined
+  const resolvedReasoning = reasoningForModel(
+    effectiveHarnessType,
+    effectiveModel,
+    overrides.reasoning ?? channelDefault?.reasoning
+  )
+  const effectiveReasoning = effectiveReasoningForHarness(
+    effectiveHarnessType,
+    resolvedReasoning,
+    input.options.harnessDefaultReasoning
+  )
+  const responseMetadataMode = input.options.responseMetadataMode ?? 'first'
+  const includeResponseMetadata =
+    responseMetadataMode === 'always' ||
+    (responseMetadataMode === 'first' && isFirstAssistantMessage)
+  if (
+    overrides.harnessType ||
+    overrides.model ||
+    overrides.personaId ||
+    overrides.provider ||
+    overrides.reasoning
+  ) {
     traceLog(input.options, 'slackbotv2_forward_overrides_parsed', trace, {
       harness_type: overrides.harnessType,
       model: overrides.model,
+      persona_id: overrides.personaId,
       provider: overrides.provider,
       reasoning: overrides.reasoning
     })
@@ -1050,6 +1634,15 @@ async function syncThreadMessageToSession(
   const candidateMessages = context ?? [serializedMessage]
   const messagesToAppend = candidateMessages.filter(item => !messageIds.has(item.id))
 
+  if (
+    state.activeExecution === true
+    && message.isMention === true
+    && messagesToAppend.some(item => item.id === message.id)
+    && !input.steeringReactionAck
+  ) {
+    input.steeringReactionAck = input.steeringReactions.begin(thread, message, trace)
+  }
+
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
     executeContextMessages:
@@ -1057,12 +1650,21 @@ async function syncThreadMessageToSession(
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     // Sticky harness changes only apply when a message starts an execution;
     // restarting the thread out from under an active execution would kill it.
-    harnessType: shouldStartExecution ? resolvedHarnessType : undefined,
+    harnessType: shouldStartExecution
+      ? rolloutSelected
+        ? harnessRollout.harnessType
+        : resolvedHarnessType
+      : undefined,
+    harnessAssignment: shouldStartExecution ? harnessRollout.assignment : undefined,
+    metadataHarnessType: shouldStartExecution ? effectiveHarnessType : undefined,
     messages: messagesToAppend,
     model: shouldStartExecution ? resolvedModel : undefined,
     metadataModel: shouldStartExecution ? effectiveModel : undefined,
+    personaId: shouldStartExecution ? effectiveOverrides.personaId : undefined,
     provider: shouldStartExecution ? resolvedProvider : undefined,
     reasoning: resolvedReasoning,
+    restartOnHarnessConflict:
+      shouldStartExecution && rolloutSelected ? Boolean(resolvedHarnessType) : undefined,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },
@@ -1105,12 +1707,19 @@ async function syncThreadMessageToSession(
     const latest = (await thread.state) ?? {}
     const latestMessageIds = new Set(latest.forwardedMessageIds ?? [])
     for (const item of messagesToAppend) latestMessageIds.add(item.id)
+    const steeringReactionAck = input.steeringReactionAck
+    const holdSteeringReaction =
+      steeringReactionAck !== undefined && latest.activeExecution === true
     await thread.setState({
       ...(stickyOverridesUpdate ?? {}),
       forwardedMessageIds: Array.from(latestMessageIds).slice(-1000),
       historyForwarded: latest.historyForwarded || (shouldIncludeContext && !contextDegraded),
       lastEventId
     })
+    if (holdSteeringReaction) {
+      input.steeringReactions.hold(steeringReactionAck)
+      input.steeringReactionAck = undefined
+    }
     traceLog(input.options, 'slackbotv2_forward_messages_committed', trace, {
       appended_message_count: messagesToAppend.length,
       forwarded_message_count: Math.min(latestMessageIds.size, 1000)
@@ -1123,6 +1732,7 @@ async function syncThreadMessageToSession(
     const latest = (await thread.state) ?? {}
     const latestExecutedMessageIds = new Set(latest.executedMessageIds ?? [])
     latestExecutedMessageIds.add(serializedMessage.id)
+    const steeringReactionAck = input.steeringReactionAck
     forwardInput.executionId = execution.execution_id
     // Take the render lease before the obligation becomes visible so a
     // concurrent recovery sweep never claims it while this process is about
@@ -1145,6 +1755,10 @@ async function syncThreadMessageToSession(
         message: serializedMessage
       }
     })
+    if (steeringReactionAck) {
+      input.steeringReactions.hold(steeringReactionAck)
+      input.steeringReactionAck = undefined
+    }
     await indexRenderObligation(input.state, {
       options: input.options,
       threadId: thread.id,
@@ -1174,23 +1788,86 @@ async function syncThreadMessageToSession(
           error: errorMessage(error)
         })
       }
+      finishSteeringReaction(input, trace)
       recordForward(input.mode, 'error', traceStartedAtMs)
       throw error
     }
+    finishSteeringReaction(input, trace)
     traceLog(input.options, 'slackbotv2_forward_complete', trace)
     recordForward(input.mode, 'complete', traceStartedAtMs)
     if (input.retryAttempt) slackbotMetrics.handoffRetries.inc({ outcome: 'succeeded' })
     return
   }
 
+  let responseContextBlock: SlackContextBlock | undefined
   try {
     await thread.setState({ activeExecution: true })
     traceLog(input.options, 'slackbotv2_forward_active_execution_marked', trace)
     await forwardToSessionApi(input.options, forwardInput, {
       onExecutionStarted: commitExecutionStarted,
       onMessagesAppended: commitMessagesAppended,
+      onSessionCreated: async outcome => {
+        const fallbackNotice = personaFallbackNotice(
+          outcome.unavailableRequestedPersonaId,
+          outcome.personaId
+        )
+        if (outcome.personaId !== undefined) {
+          const requestedPersonaId = forwardInput.personaId
+          stickyOverridesUpdate = {
+            ...(stickyOverridesUpdate ?? {}),
+            personaId: outcome.personaId
+          }
+          forwardInput.personaId = outcome.personaId ?? undefined
+          if (requestedPersonaId !== undefined && outcome.personaId !== requestedPersonaId) {
+            traceLog(input.options, 'slackbotv2_session_persona_reconciled', trace, {
+              requested_persona_id: requestedPersonaId,
+              resolved_persona_id: outcome.personaId,
+              unavailable_requested_persona_id: outcome.unavailableRequestedPersonaId
+            })
+          }
+        }
+        const harnessType = outcome.harnessType ?? effectiveHarnessType
+        const abTested = outcome.harnessAssignment?.experiment === 'codex_nanocodex_ab'
+        forwardInput.metadataHarnessType = harnessType
+        forwardInput.harnessAssignment = outcome.harnessAssignment
+        let model = effectiveModel
+        let reasoning = effectiveReasoning
+        if (harnessType !== effectiveHarnessType || abTested) {
+          model =
+            resolvedModel ?? defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
+          const requestedReasoning = reasoningForModel(harnessType, model, resolvedReasoning)
+          reasoning = effectiveReasoningForHarness(
+            harnessType,
+            requestedReasoning,
+            input.options.harnessDefaultReasoning
+          )
+          forwardInput.metadataModel = model
+          forwardInput.reasoning = requestedReasoning
+          traceLog(input.options, 'slackbotv2_session_harness_resolved', trace, {
+            ab_tested: abTested,
+            ab_test_experiment: outcome.harnessAssignment?.experiment,
+            ab_test_cohort: outcome.harnessAssignment?.cohort,
+            requested_harness_type: effectiveHarnessType,
+            resolved_harness_type: harnessType
+          })
+        }
+        responseContextBlock = buildSlackResponseContextBlock({
+          consoleBaseUrl: isFirstAssistantMessage ? input.options.consolePublicUrl : undefined,
+          threadKey: thread.id,
+          harnessType,
+          metadataEnabled: includeResponseMetadata,
+          model,
+          notice: fallbackNotice,
+          reasoning,
+          serviceTier:
+            input.options.responseServiceTierEnabled === true && !resolvedProvider
+              ? defaultServiceTierForHarness(harnessType)
+              : undefined
+        })
+      },
       onSessionRestarted: handleSessionRestarted
     })
+    finishSteeringReaction(input, trace)
     scheduleExecutionRender(
       thread,
       serializedMessage,
@@ -1199,8 +1876,9 @@ async function syncThreadMessageToSession(
       () => lastEventId,
       renderLease,
       assistantStatusVisible,
+      input.steeringReactions,
       trace,
-      consoleSessionBlock
+      responseContextBlock
     )
     traceLog(input.options, 'slackbotv2_forward_complete', trace, {
       last_event_id: lastEventId
@@ -1252,6 +1930,7 @@ async function syncThreadMessageToSession(
         error: errorMessage(renderError)
       })
     }
+    finishSteeringReaction(input, trace)
     traceLog(input.options, 'slackbotv2_forward_complete', trace, {
       latest_active_execution: latest.activeExecution === true,
       last_event_id: lastEventId
@@ -1268,8 +1947,9 @@ function scheduleExecutionRender(
   getLastEventId: () => number,
   renderLease: { release: (() => Promise<void>) | null },
   assistantStatusVisible: boolean,
+  steeringReactions: SteeringReactionController,
   trace?: SlackbotV2Trace,
-  consoleSessionBlock?: SlackContextBlock
+  responseContextBlock?: SlackContextBlock
 ): void {
   const promise = (async () => {
     slackbotMetrics.activeLiveRenders.inc()
@@ -1283,8 +1963,9 @@ function scheduleExecutionRender(
           input,
           getLastEventId,
           assistantStatusVisible,
+          steeringReactions,
           trace,
-          consoleSessionBlock
+          responseContextBlock
         )
         if (result === 'complete') return
         const delayMs = renderRetryDelayMs(attempt)
@@ -1327,8 +2008,9 @@ async function renderExecutionAttempt(
   input: ForwardSessionInput,
   getLastEventId: () => number,
   assistantStatusVisible: boolean,
+  steeringReactions: SteeringReactionController,
   trace?: SlackbotV2Trace,
-  consoleSessionBlock?: SlackContextBlock
+  responseContextBlock?: SlackContextBlock
 ): Promise<'complete' | 'retry'> {
   const renderStartedAtMs = nowMs()
   let outcome = 'failure'
@@ -1338,12 +2020,12 @@ async function renderExecutionAttempt(
   try {
     const streamResult = await renderExecutionStream(
       thread,
-      streamSessionAfterHandoff(options, input),
+      clearRejectedStickyModel(thread, input, streamSessionAfterHandoff(options, input), options),
       message,
       options,
       trace,
       assistantStatusVisible,
-      consoleSessionBlock
+      responseContextBlock
     )
     rendered = true
     outcome = 'complete'
@@ -1470,6 +2152,7 @@ async function renderExecutionAttempt(
       lastEventId: Math.max(latest.lastEventId ?? 0, getLastEventId(), fallbackLastEventId),
       ...(rendered ? { renderObligation: null } : {})
     })
+    if (rendered) await steeringReactions.completeThread(thread.id, trace)
     traceLog(options, 'slackbotv2_render_finalized', trace, {
       obligation_cleared: rendered,
       render_duration_ms: elapsedMs(renderStartedAtMs),
@@ -1478,6 +2161,47 @@ async function renderExecutionAttempt(
     })
     recordRenderAttempt('live', outcome, renderStartedAtMs)
   }
+}
+
+async function* clearRejectedStickyModel(
+  thread: Thread<SlackbotV2ThreadState>,
+  input: ForwardSessionInput,
+  stream: AsyncIterable<SlackbotV2RendererSource>,
+  options: SlackbotV2Options
+): AsyncIterable<SlackbotV2RendererSource> {
+  for await (const event of stream) {
+    if (input.model && isRejectedModelEvent(event)) {
+      const latest = (await thread.state) ?? {}
+      // A newer turn may already have replaced the sticky model while this
+      // stream was finishing. Clear only the value rejected by this execution.
+      if (latest.model === input.model) {
+        await thread.setState({ model: null })
+        traceLog(options, 'slackbotv2_rejected_sticky_model_cleared', input.trace, {
+          model: input.model
+        })
+      }
+    }
+    yield event
+  }
+}
+
+function isRejectedModelEvent(event: SlackbotV2RendererSource): boolean {
+  if (!event || typeof event !== 'object') return false
+  const eventKind = String(
+    'eventKind' in event ? event.eventKind : 'event' in event ? event.event : ''
+  )
+  if (eventKind !== 'session.execution_failed' && eventKind !== 'session.stream_error') {
+    return false
+  }
+  const detail = JSON.stringify('data' in event ? event.data : event).toLowerCase()
+  return (
+    detail.includes('model_not_found') ||
+    (/\bmodel\b/.test(detail) &&
+      (detail.includes('does not exist') ||
+        detail.includes('not supported') ||
+        detail.includes('unsupported model') ||
+        detail.includes('invalid model')))
+  )
 }
 
 /**
@@ -1515,10 +2239,10 @@ function slackStreamErrorCode(error: unknown): string {
   return typeof record.message === 'string' ? record.message : ''
 }
 
-const FALLBACK_REPLAY_MAX_ATTEMPTS = 4
+const FALLBACK_OPEN_MAX_ATTEMPTS = 4
 
 /**
- * Delivers the durable final answer as a plain thread post after the live
+ * Delivers the durable final answer as a CommonMark thread post after the live
  * Slack streaming render failed. Replays the session event stream from the
  * execution's starting position (the control plane keeps the events durably,
  * so the terminal result is replayable even when the failed render already
@@ -1537,14 +2261,10 @@ async function renderFallbackFinalAnswer(
   let outcome = 'error'
   let lastEventId = source.afterEventId
   try {
-    let fallback: SlackRenderFallback
+    let stream: AsyncIterable<SlackbotV2RendererSource> | undefined
     for (let attempt = 0; ; attempt++) {
-      // Rebuild from the execution's original cursor after a disconnected
-      // body as well as a failed open. Reusing a partial collector would
-      // concatenate replayed deltas and can duplicate the final answer.
-      fallback = new SlackRenderFallback()
       try {
-        const stream = await openSessionEventStream(options, {
+        stream = await openSessionEventStream(options, {
           afterEventId: source.afterEventId,
           executionId: source.executionId,
           onEventId: eventId => {
@@ -1553,24 +2273,25 @@ async function renderFallbackFinalAnswer(
           threadId: source.threadId,
           trace
         })
-        const chatStream = fallback.collectChatSdk(
-          slackSafeChatSdkStream(
-            codexAppServerToChatSdkStream(
-              fallback.collectSource(stream),
-              fallbackRendererOptions(options)
-            )
-          )
-        )
-        for await (const _chunk of chatStream) {
-          void _chunk
-        }
         break
       } catch (error) {
-        if (!isRetryableSessionApiError(error) || attempt + 1 >= FALLBACK_REPLAY_MAX_ATTEMPTS) {
+        if (!isRetryableSessionApiError(error) || attempt + 1 >= FALLBACK_OPEN_MAX_ATTEMPTS) {
           throw error
         }
         await sleep(renderRetryDelayMs(attempt))
       }
+    }
+    const fallback = new SlackRenderFallback()
+    const chatStream = fallback.collectChatSdk(
+      slackSafeChatSdkStream(
+        harnessToChatSdkStream(
+          fallback.collectSource(stream),
+          fallbackRendererOptions(options)
+        )
+      )
+    )
+    for await (const _chunk of chatStream) {
+      void _chunk
     }
     const capturedText = fallback.text()
     if (!capturedText && !fallback.isInterrupted()) {
@@ -1582,11 +2303,19 @@ async function renderFallbackFinalAnswer(
       return null
     }
     const text = fallback.textOrDefault()
-    const fallbackText = truncateSlackText(text, SLACK_FALLBACK_TEXT_MAX_CHARS, 'Slack final answer')
+    const fallbackMarkdown = truncateSlackText(
+      text,
+      SLACK_FALLBACK_MARKDOWN_MAX_CHARS,
+      'Slack final answer'
+    )
     if (replacement) {
-      await thread.adapter.editMessage(thread.id, replacement.replaceMessageId, fallbackText)
+      await thread.adapter.editMessage(
+        thread.id,
+        replacement.replaceMessageId,
+        { markdown: fallbackMarkdown }
+      )
     } else {
-      await thread.post(fallbackText)
+      await thread.post({ markdown: fallbackMarkdown })
     }
     traceLog(options, 'slackbotv2_render_fallback_complete', trace, {
       chars: text.length,
@@ -1617,21 +2346,22 @@ async function renderFallbackFinalAnswer(
 function scheduleRenderObligationRecovery(
   chat: Chat<Record<string, Adapter>, SlackbotV2ThreadState>,
   state: StateAdapter,
-  options: SlackbotV2Options
+  options: SlackbotV2Options,
+  stateConnected: Promise<void>
 ): void {
   backgroundWaitUntil(
-    recoverRenderObligationsWithRetry(chat, state, options)
+    recoverRenderObligationsWithRetry(chat, state, options, stateConnected)
   )
 }
 
 async function recoverRenderObligationsWithRetry(
   chat: Chat<Record<string, Adapter>, SlackbotV2ThreadState>,
   state: StateAdapter,
-  options: SlackbotV2Options
+  options: SlackbotV2Options,
+  stateConnected: Promise<void>
 ): Promise<void> {
-  // Wait for Postgres before scanning for obligations. This is also what warms the
-  // shared pool at startup, so transient connect failures don't wedge the bot.
-  await ensureStateConnected(state, options)
+  // Wait for the startup Postgres connection before scanning for obligations.
+  await stateConnected
   const failureCounts = new Map<string, number>()
   let attempt = 0
   while (true) {
@@ -1904,13 +2634,7 @@ async function recoverRenderObligation(
       recordRenderAttempt('recovery', renderOutcome, renderStartedAtMs)
       return true
     }
-    await renderRecoveredExecutionStream(
-      thread,
-      streamError(error),
-      obligation.message,
-      options,
-      trace
-    )
+    await renderRecoveredExecutionStream(thread, streamError(error), obligation.message, options, trace)
     await thread.setState({
       activeExecution: false,
       lastEventId,
@@ -2165,7 +2889,7 @@ async function renderExecutionStream(
   options: SlackbotV2Options,
   trace?: SlackbotV2Trace,
   assistantStatusVisible = false,
-  consoleSessionBlock?: SlackContextBlock
+  responseContextBlock?: SlackContextBlock
 ): Promise<{ diverged: boolean; messageId?: string }> {
   const promptText = slackMessagePromptText(message)
   if (isPlainTextOnlyRequest(promptText)) {
@@ -2189,20 +2913,17 @@ async function renderExecutionStream(
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
-  const fallback = new SlackRenderFallback()
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
     const visibleStream = await streamAfterFirstChunk(
-      fallback.collectChatSdk(
-        conflateChatSdkStream(
-          slackSafeChatSdkStream(
-            slackVisibleChatSdkStream(
-              codexAppServerToChatSdkStream(
-                fallback.collectSource(stream),
-                rendererOptions(thread, options, capture, trace)
-              ),
-              taskDisplayMode
-            )
+      conflateChatSdkStream(
+        slackSafeChatSdkStream(
+          slackVisibleChatSdkStream(
+            harnessToChatSdkStream(
+              stream,
+              rendererOptions(thread, options, capture, trace)
+            ),
+            taskDisplayMode
           )
         )
       )
@@ -2218,14 +2939,11 @@ async function renderExecutionStream(
       recipientUserId: message.author.userId,
       ...(taskDisplayMode === 'none' ? {} : { taskDisplayMode }),
       // stopBlocks are appended to the end of the finalized Slack message via
-      // chat.stopStream. Present only for the first assistant message so the
-      // Console link renders once per thread.
-      ...(consoleSessionBlock ? { stopBlocks: [consoleSessionBlock] } : {})
-    })
-    return {
-      diverged: capture.diverged || fallback.terminalResultMismatch(),
-      messageId: sent?.id
-    }
+      // chat.stopStream. The Console link is only included on the first assistant
+      // message; optional response metadata may be appended on every live response.
+      ...(responseContextBlock ? { stopBlocks: [responseContextBlock] } : {})
+    }) ?? await thread.post(visibleStream)
+    return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
     await setAssistantStatus(thread, '', options, trace)
   }
@@ -2250,20 +2968,17 @@ async function renderRecoveredExecutionStream(
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
-  const fallback = new SlackRenderFallback()
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
     const visibleStream = await streamAfterFirstChunk(
-      fallback.collectChatSdk(
-        conflateChatSdkStream(
-          slackSafeChatSdkStream(
-            slackVisibleChatSdkStream(
-              codexAppServerToChatSdkStream(
-                fallback.collectSource(stream),
-                rendererOptions(thread, options, capture, trace)
-              ),
-              taskDisplayMode
-            )
+      conflateChatSdkStream(
+        slackSafeChatSdkStream(
+          slackVisibleChatSdkStream(
+            harnessToChatSdkStream(
+              stream,
+              rendererOptions(thread, options, capture, trace)
+            ),
+            taskDisplayMode
           )
         )
       )
@@ -2277,11 +2992,8 @@ async function renderRecoveredExecutionStream(
         recipientUserId: message.author.userId,
         ...(taskDisplayMode === 'none' ? {} : { taskDisplayMode })
       }
-    )
-    return {
-      diverged: capture.diverged || fallback.terminalResultMismatch(),
-      messageId: sent?.id
-    }
+    ) ?? await thread.post(visibleStream)
+    return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
     await setAssistantStatus(thread, '', options, trace)
   }
@@ -2313,7 +3025,7 @@ async function renderPlainTextExecutionStream(
   try {
     const chatStream = fallback.collectChatSdk(
       slackSafeChatSdkStream(
-        codexAppServerToChatSdkStream(
+        harnessToChatSdkStream(
           fallback.collectSource(stream),
           rendererOptions(thread, options, undefined, trace)
         )
@@ -2377,12 +3089,6 @@ class SlackRenderFallback {
 
   isInterrupted(): boolean {
     return this.interrupted
-  }
-
-  terminalResultMismatch(): boolean {
-    const terminalText = this.terminalText.trim()
-    if (!terminalText) return false
-    return terminalText !== this.markdownText.trim()
   }
 
   private captureTerminalText(event: SlackbotV2RendererSource): void {
@@ -2460,7 +3166,10 @@ function truncateSlackText(value: string, maxChars: number, label: string): stri
   let omitted = value.length - maxChars
   while (true) {
     const suffix = `\n[truncated ${omitted} chars from ${label}]`
-    const keep = Math.max(0, maxChars - suffix.length)
+    let keep = Math.max(0, maxChars - suffix.length)
+    // Keep a Unicode surrogate pair together at the truncation boundary.
+    const lastCode = value.charCodeAt(keep - 1)
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) keep -= 1
     const actualOmitted = value.length - keep
     if (actualOmitted === omitted) return `${value.slice(0, keep).trimEnd()}${suffix}`
     omitted = actualOmitted
@@ -2532,10 +3241,18 @@ function backgroundWaitUntil(promise: Promise<unknown>): void {
     context.waitUntil(promise)
     return
   }
+  detachedWaitUntil(promise)
+}
+
+function detachedWaitUntil(promise: Promise<unknown>): void {
   void promise.catch(() => undefined)
 }
 
-function createLateSlackFileRepair(options: SlackbotV2Options, state: StateAdapter) {
+function createLateSlackFileRepair(
+  options: SlackbotV2Options,
+  state: StateAdapter,
+  steeringReactions: SteeringReactionController
+) {
   const pending = new Map<string, PendingLateSlackFileMention[]>()
   const consumed = new Map<string, number>()
 
@@ -2615,7 +3332,13 @@ function createLateSlackFileRepair(options: SlackbotV2Options, state: StateAdapt
       }
 
       consumed.set(dedupeKey, Date.now())
-      return repairLateSlackFileMessage(options, state, match, event).catch(error => {
+      return repairLateSlackFileMessage(
+        options,
+        state,
+        steeringReactions,
+        match,
+        event
+      ).catch(error => {
         traceWarn(options, 'slackbotv2_late_file_repair_failed', undefined, {
           dedupe_key: dedupeKey,
           error: errorMessage(error),
@@ -2631,6 +3354,7 @@ function createLateSlackFileRepair(options: SlackbotV2Options, state: StateAdapt
 async function repairLateSlackFileMessage(
   options: SlackbotV2Options,
   state: StateAdapter,
+  steeringReactions: SteeringReactionController,
   pending: PendingLateSlackFileMention,
   event: Record<string, unknown>
 ): Promise<void> {
@@ -2660,6 +3384,7 @@ async function repairLateSlackFileMessage(
     mode: 'execute',
     options,
     state,
+    steeringReactions,
     trigger: 'late_file_message'
   })
   traceLog(options, 'slackbotv2_late_file_repair_complete', undefined, {
@@ -2863,6 +3588,7 @@ function slackWebhookLogFields(rawBody: string): JsonObject {
   const payload = parseSlackWebhookPayload(rawBody)
   if (!payload) return { slack_payload_parse_error: true }
   const event = isJsonObject(payload.event) ? payload.event : {}
+  const eventChannel = isJsonObject(event.channel) ? event.channel : {}
   const team = isJsonObject(payload.team) ? payload.team : {}
   const channel = isJsonObject(payload.channel) ? payload.channel : {}
   const message = isJsonObject(payload.message) ? payload.message : {}
@@ -2870,9 +3596,22 @@ function slackWebhookLogFields(rawBody: string): JsonObject {
   const action = Array.isArray(payload.actions) ? payload.actions.find(isJsonObject) : undefined
   const fields: JsonObject = {}
   setStringField(fields, 'slack_event_id', payload.event_id)
-  setStringField(fields, 'slack_event_type', event.type ?? payload.type)
+  setStringField(
+    fields,
+    'slack_event_type',
+    event.type ?? payload.type ?? (payload.command ? 'slash_command' : undefined)
+  )
+  setStringField(fields, 'slack_command', payload.command)
   setStringField(fields, 'slack_action_id', action?.action_id)
-  setStringField(fields, 'slack_channel', event.channel ?? channel.id ?? container.channel_id)
+  setStringField(
+    fields,
+    'slack_channel',
+    stringValue(event.channel)
+      ?? eventChannel.id
+      ?? channel.id
+      ?? container.channel_id
+      ?? payload.channel_id
+  )
   setStringField(fields, 'slack_message_ts', event.ts ?? message.ts ?? container.message_ts)
   setStringField(
     fields,
@@ -2957,7 +3696,7 @@ async function slackApiMessageFromSlack(
     author: {
       fullName: actorId,
       isBot,
-      isMe: Boolean(actorId && actorId === currentMessage.author.userId),
+      isMe: Boolean(actorId && options.botUserId && actorId === options.botUserId),
       userId: actorId,
       userName: actorId
     },
@@ -3128,9 +3867,9 @@ export function normalizeSlackText(input: string): string {
     .replace(/<@([A-Z0-9]+)>/g, '@$1')
     .replace(/<!subteam\^([A-Z0-9]+)\|([^>]+)>/g, '@$2')
     .replace(/<!(channel|here|everyone)>/g, '@$1')
+    .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
     .trim()
 }
 
@@ -3354,10 +4093,6 @@ function clipOneLine(value: string, max: number): string {
   const oneLine = value.replace(/\s+/g, ' ').trim()
   if (oneLine.length <= max) return oneLine
   return `${oneLine.slice(0, Math.max(0, max - 1)).trimEnd()}...`
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function waitUntil(c: { executionCtx: WaitUntilContext }, promise: Promise<unknown>): void {

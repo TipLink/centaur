@@ -243,14 +243,6 @@ impl HarnessServer for ClaudeCodeHarness {
         if !state.model.is_empty() {
             command.args(["--model", &state.model]);
         }
-        // The Fable shortcut is a maximum-reasoning session, including resumed
-        // turns. Override the inherited effort on this child only: Claude's
-        // environment setting takes precedence over --effort and settings.json,
-        // and max cannot be persisted as an effortLevel setting.
-        if state.model == "claude-fable-5-1" {
-            command.env("CLAUDE_CODE_EFFORT_LEVEL", "max");
-            command.args(["--settings", r#"{"alwaysThinkingEnabled":true}"#]);
-        }
         if PathBuf::from("AGENTS.md").is_file() {
             command.args(["--append-system-prompt-file", "AGENTS.md"]);
         }
@@ -310,62 +302,12 @@ impl HarnessServer for ClaudeCodeHarness {
 
 #[cfg(test)]
 mod tests {
-    use codex_app_server_protocol::{ThreadStartParams, UserInput};
+    use codex_app_server_protocol::UserInput;
     use serde_json::{Value, json};
 
     use crate::{HarnessServer, NormalizedContent, NormalizedEvent};
 
     use super::{ClaudeCodeHarness, ClaudeEventNormalizer};
-
-    #[test]
-    fn fable_51_enables_max_thinking_on_new_and_resumed_turns() {
-        let harness = ClaudeCodeHarness;
-        let mut state = harness.thread_state(
-            &ThreadStartParams {
-                model: Some("claude-fable-5-1".into()),
-                ..Default::default()
-            },
-            std::env::temp_dir(),
-        );
-        for session_id in [None, Some("existing-session".to_string())] {
-            state.harness_session_id = session_id.clone();
-            let command = harness.command_for_turn(&state);
-            assert!(command.get_envs().any(|(key, value)| {
-                key == "CLAUDE_CODE_EFFORT_LEVEL" && value == Some("max".as_ref())
-            }));
-            let args: Vec<_> = command.get_args().collect();
-            assert!(args.windows(2).any(|pair| {
-                pair[0] == "--settings" && pair[1] == r#"{"alwaysThinkingEnabled":true}"#
-            }));
-            if let Some(session_id) = session_id {
-                assert!(
-                    args.windows(2)
-                        .any(|pair| { pair[0] == "--resume" && pair[1] == session_id.as_str() })
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn other_claude_models_keep_their_deployment_thinking_settings() {
-        let harness = ClaudeCodeHarness;
-        for model in ["", "claude-sonnet-5", "claude-opus-4-8", "claude-fable-5"] {
-            let state = harness.thread_state(
-                &ThreadStartParams {
-                    model: Some(model.into()),
-                    ..Default::default()
-                },
-                std::env::temp_dir(),
-            );
-            let command = harness.command_for_turn(&state);
-            assert!(
-                !command
-                    .get_envs()
-                    .any(|(key, _)| key == "CLAUDE_CODE_EFFORT_LEVEL")
-            );
-            assert!(!command.get_args().any(|arg| arg == "--settings"));
-        }
-    }
 
     fn normalize(normalizer: &mut ClaudeEventNormalizer, event: Value) -> Vec<NormalizedEvent> {
         normalizer.normalize(serde_json::from_value(event).unwrap())

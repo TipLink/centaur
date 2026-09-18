@@ -5,7 +5,6 @@ module Granola
     def create_credential(app:, access_token: "token", dead: false)
       BrokerCredential.create!(
         oauth_app: app,
-        namespace: "acme",
         foreign_id: "granola-job-#{SecureRandom.hex(6)}",
         token_endpoint: app.provider_strategy.token_endpoint,
         access_token: access_token,
@@ -26,7 +25,6 @@ module Granola
         client_id: "granola-client",
         client_secret: "granola-secret",
         allowed_scopes: %w[meetings:read],
-        credential_namespace: "acme",
         enabled: enabled,
         created_by: users(:acme_admin)
       )
@@ -45,6 +43,40 @@ module Granola
         .select { |job| job[:job] == SyncCredentialJob }
         .map { |job| job[:args].first }
       assert_equal [ expected.id ], enqueued_ids
+    end
+
+    test "sync job retries when the Centaur API refuses the connection" do
+      app = create_granola_app
+      credential = create_credential(app: app)
+      sync = Object.new
+      sync.define_singleton_method(:call) { raise Errno::ECONNREFUSED }
+      sync_factory = ->(_credential) { sync }
+
+      Granola::SyncCredential.stub(:syncable?, true) do
+        Granola::SyncCredential.stub(:new, sync_factory) do
+          assert_enqueued_with(job: SyncCredentialJob, args: [ credential.id ]) do
+            SyncCredentialJob.perform_now(credential.id)
+          end
+        end
+      end
+    end
+
+    test "sync job retries transient Granola API errors" do
+      app = create_granola_app
+      credential = create_credential(app: app)
+      sync = Object.new
+      sync.define_singleton_method(:call) do
+        raise SyncCredential::TransientGranolaApiError, "Granola MCP returned HTTP 503"
+      end
+      sync_factory = ->(_credential) { sync }
+
+      Granola::SyncCredential.stub(:syncable?, true) do
+        Granola::SyncCredential.stub(:new, sync_factory) do
+          assert_enqueued_with(job: SyncCredentialJob, args: [ credential.id ]) do
+            SyncCredentialJob.perform_now(credential.id)
+          end
+        end
+      end
     end
   end
 end

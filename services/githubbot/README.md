@@ -56,7 +56,7 @@ reviewer** like any other collaborator.
   `GITHUBBOT_ISSUE_PROMPT` / `GITHUBBOT_ISSUE_PROMPT_FILE` (used verbatim, like the review prompt).
 - **Per-turn context**: every turn prepends a compact header naming the PR/issue so a recycled
   sandbox always knows which subject to act on and where to reply.
-- `--claude` / `--codex` / `--amp` / `--model …` / `--opus|--sonnet|--haiku` inline flags pick the
+- `--claude` / `--codex` / `--amp` / `--provider …` / `--model …` / `--opus|--sonnet|--haiku` inline flags pick the
   harness/model, same as the other bots.
 
 ## PR self-management (v2)
@@ -75,7 +75,26 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
   exhaustion the bot comments tagging a human and stops. On the steady-state CI path it backs off if
   the failing head commit was authored by a human (it won't step on someone mid-edit) — except right
   after assignment, where being assigned is an explicit hand-off, so it fixes the PR regardless of who
-  pushed last.
+  pushed last. **`centaur-skip` checks** are excluded from that evaluation — see below.
+- **Skip a check.** Put `centaur-skip` anywhere in a job's display name and the bot ignores that
+  check: it never counts as red, never triggers a fix turn, and never appears in the escalation
+  comment's "still failing" list.
+
+  ```yaml
+  jobs:
+    agent-pr-rules:
+      name: Agent PR rules (centaur-skip)
+  ```
+
+  The match is case-insensitive and applies to the check-run name GitHub reports. When a job has no
+  explicit `name`, GitHub uses its job id as the display name.
+- **Reading checks without the Checks API.** A fine-grained PAT has no Checks permission, so
+  `statusCheckRollup` hands it null check nodes and CI collapses to a bare pass/fail with no names —
+  and no way to spot a `centaur-skip` check. When the nodes are unreadable, githubbot rebuilds the
+  checks from the Actions API (a job *is* a check run) and trusts it only if it accounts for every
+  context GitHub counted; otherwise it keeps the old aggregate behavior rather than risk calling a
+  PR green on a check it never saw. Commit statuses and check runs from other GitHub Apps aren't
+  Actions jobs, which is exactly what that count check catches.
 - **Address review.** A submitted review (`changes_requested` / `commented`) triggers one holistic
   turn that reads all the feedback, makes a single coherent commit, replies on each thread, resolves
   what it addressed, and re-requests review.
@@ -138,7 +157,7 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUB_BOT_USERNAME` | ✅ | The bot account's GitHub login — drives `@`-mention and requested-reviewer matching (or `GITHUBBOT_USER_NAME`). |
 | `GITHUBBOT_DATABASE_URL` | ✅ | Postgres for chat-SDK state (falls back to `DATABASE_URL` / `POSTGRES_URL`). |
 | `CENTAUR_API_URL` | — | api-rs control plane, default `http://127.0.0.1:8080`. |
-| `GITHUBBOT_API_KEY` | — | Bearer sent to api-rs (falls back to `CENTAUR_API_KEY`). |
+| `GITHUBBOT_API_KEY` | — | Dedicated bearer sent to api-rs. |
 | `GITHUBBOT_DEFAULT_HARNESS` | — | Harness for new threads without an inline flag, default `codex`. |
 | `GITHUBBOT_REVIEW_PROMPT` | — | Full review methodology, inline. Replaces the bundled default verbatim. |
 | `GITHUBBOT_REVIEW_PROMPT_FILE` | — | Path to a file holding the review methodology (e.g. an overlay-mounted file). Used when the inline var is unset. |
@@ -155,6 +174,7 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_MERGE_METHOD` | — | `merge` / `squash` / `rebase`. Default `squash`. |
 | `GITHUBBOT_HOLD_LABEL` | — | Label that pauses auto-merge. Default `do-not-merge`. |
 | `GITHUBBOT_CI_FIX_MAX_ATTEMPTS` | — | Consecutive CI-fix attempts before escalating. Default 3. |
+| `GITHUBBOT_WORKFLOW_EVENTS` | — | Emit settled CI and submitted-review events to durable workflows. Default `false`. |
 | `GITHUBBOT_DELETE_BRANCH_ON_MERGE` | — | Delete head branch after merge. Default `true`. |
 | `GITHUBBOT_ESCALATION_HANDLE` | — | Fallback @handle (no leading @) tagged when the bot gives up. |
 | `SESSION_IDLE_TIMEOUT_MS` / `SESSION_MAX_DURATION_MS` | — | Forwarded to api-rs executes. |
@@ -164,6 +184,6 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 
 `bun test test` — unit tests for the override flag parser, the GitHub thread-key parsing / context
 preamble, the review-request trigger gating (incl. team requests), the issue-assignment gating, the
-v2 PR-manager decision logic (CI evaluation, assignment-based ownership, merge gating, the CI-fix
-counter / escalation, and the merge-claim release-on-failure), the author-association gate, body
-mentions, and the per-session serialization queue.
+v2 PR-manager decision logic (CI evaluation, centaur-skip checks, the Actions fallback for unreadable check detail, assignment-based ownership, merge
+gating, the CI-fix counter / escalation, and the merge-claim release-on-failure), the
+author-association gate, body mentions, and the per-session serialization queue.

@@ -48,18 +48,16 @@ async def call_tool_shim(
     method: str,
     args: dict[str, Any],
 ) -> Any:
-    payload = json.dumps(args, separators=(",", ":"), default=str).encode()
     proc = await asyncio.create_subprocess_exec(
         tool_shim,
         "call",
         tool,
         method,
-        "--stdin",
-        stdin=asyncio.subprocess.PIPE,
+        json.dumps(args, separators=(",", ":"), default=str),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate(payload)
+    stdout, stderr = await proc.communicate()
     text = stdout.decode(errors="replace").strip()
     err = stderr.decode(errors="replace").strip()
     if proc.returncode != 0:

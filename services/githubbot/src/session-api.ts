@@ -1,4 +1,5 @@
 import type { RustSessionStreamEvent } from "@centaur/harness-events";
+import { isRetryableCodexErrorNotification } from "@centaur/rendering";
 import type { Attachment, Message } from "chat";
 import type {
   ForwardSessionInput,
@@ -16,6 +17,7 @@ import type {
 } from "./types";
 import {
   elapsedMs,
+  errorMessage,
   isJsonObject,
   noopLogger,
   nowMs,
@@ -55,7 +57,11 @@ export class SessionApiError extends Error {
 export function isRetryableSessionApiError(error: unknown): boolean {
   if (error instanceof SessionApiError) return error.retryable;
   if (!(error instanceof Error)) return false;
-  return error.name === "AbortError" || error.name === "TypeError";
+  return (
+    error.name === "AbortError" ||
+    error.name === "TimeoutError" ||
+    error.name === "TypeError"
+  );
 }
 
 type ForwardSessionApiCallbacks = {
@@ -184,6 +190,7 @@ export async function forwardToSessionApi(
     input.threadId,
     input.executeMessage,
     input.model,
+    input.provider,
     input.contextPreamble,
   );
   traceLog(options, "githubbot_session_execute_complete", input.trace, {
@@ -214,6 +221,7 @@ export async function executeSessionTurn(
     input.threadId,
     input.executeMessage,
     input.model,
+    input.provider,
     input.contextPreamble,
   );
   traceLog(options, "githubbot_session_execute_complete", input.trace, {
@@ -503,13 +511,14 @@ async function executeSession(
   threadId: string,
   message: GithubbotApiMessage,
   model?: string,
+  provider?: string,
   contextPreamble?: string,
 ): Promise<GithubbotExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch;
   const body: GithubbotExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(message, { action: "execute" }),
-    input_lines: toCodexInputLines(message, threadId, model, contextPreamble),
+    input_lines: toCodexInputLines(message, threadId, model, provider, contextPreamble),
     ...(options.idleTimeoutMs === undefined
       ? {}
       : { idle_timeout_ms: options.idleTimeoutMs }),
@@ -593,6 +602,68 @@ async function streamSessionNotifications(
   return parseSessionEventStream(response.body, onEventId);
 }
 
+export type EmitWorkflowEventInput = {
+  eventType: string;
+  correlationId: string;
+  payload: JsonObject;
+};
+
+const WORKFLOW_EVENT_MAX_RETRIES = 3;
+const WORKFLOW_EVENT_REQUEST_TIMEOUT_MS = 5_000;
+
+/** Emit an idempotent durable workflow event, retrying transient failures. */
+export async function emitWorkflowEvent(
+  options: GithubbotOptions,
+  input: EmitWorkflowEventInput,
+): Promise<void> {
+  const url = new URL(
+    "/api/workflows/events",
+    ensureTrailingSlash(options.apiUrl),
+  ).toString();
+  const fetchFn = options.fetch ?? fetch;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= WORKFLOW_EVENT_MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetchFn(url, {
+        method: "POST",
+        headers: apiHeaders(options),
+        body: JSON.stringify({
+          event_type: input.eventType,
+          correlation_id: input.correlationId,
+          payload: input.payload,
+        }),
+        signal: AbortSignal.timeout(WORKFLOW_EVENT_REQUEST_TIMEOUT_MS),
+      });
+      await ensureApiOk(response, "emit workflow event", options);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (
+        attempt === WORKFLOW_EVENT_MAX_RETRIES ||
+        !isRetryableSessionApiError(error)
+      ) {
+        break;
+      }
+      await sleep(workflowEventRetryDelayMs(attempt));
+    }
+  }
+
+  (options.logger ?? noopLogger).warn("githubbot_workflow_event_emit_failed", {
+    correlation_id: input.correlationId,
+    error: errorMessage(lastError),
+    event_type: input.eventType,
+  });
+  throw lastError;
+}
+
+function workflowEventRetryDelayMs(attempt: number): number {
+  return 250 * 4 ** attempt;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function apiSessionUrl(
   apiUrl: string,
   threadId: string,
@@ -607,10 +678,7 @@ function ensureTrailingSlash(value: string): string {
 }
 
 function apiHeaders(options: GithubbotOptions, jsonBody = true): HeadersInit {
-  const apiKey =
-    options.apiKey ??
-    process.env.GITHUBBOT_API_KEY ??
-    process.env.CENTAUR_API_KEY;
+  const apiKey = options.apiKey ?? process.env.GITHUBBOT_API_KEY;
   return {
     ...(jsonBody ? { "content-type": "application/json" } : {}),
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
@@ -676,6 +744,7 @@ function toCodexInputLines(
   message: GithubbotApiMessage,
   threadId: string,
   model?: string,
+  provider?: string,
   contextPreamble?: string,
 ): string[] {
   const staged = new Map<GithubbotApiAttachment, string>();
@@ -709,6 +778,7 @@ function toCodexInputLines(
     threadId,
     staged,
     model,
+    provider,
     contextPreamble,
   );
   if (inlineLine.length > MAX_CODEX_INPUT_LINE_CHARS) {
@@ -722,6 +792,7 @@ function toCodexInputLines(
         threadId,
         staged,
         model,
+        provider,
         contextPreamble,
       );
       if (inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS) break;
@@ -736,6 +807,7 @@ function toCodexInputLineWithStaged(
   threadId: string,
   staged: Map<GithubbotApiAttachment, string>,
   model?: string,
+  provider?: string,
   contextPreamble?: string,
 ): string {
   return JSON.stringify({
@@ -743,6 +815,7 @@ function toCodexInputLineWithStaged(
     thread_key: threadId,
     trace_metadata: sessionMetadata(message, { action: "execute" }),
     ...(model ? { model } : {}),
+    ...(provider ? { provider } : {}),
     message: {
       role: "user",
       content: codexInputContent(message, staged, contextPreamble),
@@ -1014,6 +1087,7 @@ function isTerminalCodexOutputLine(line: string): boolean {
     return false;
   }
   if (!isJsonObject(payload)) return false;
+  if (isRetryableCodexErrorNotification(payload)) return false;
 
   return (
     payload.type === "turn.completed" ||

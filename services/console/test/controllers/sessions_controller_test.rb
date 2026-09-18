@@ -40,7 +40,7 @@ class SessionsControllerTest < ActionDispatch::IntegrationTest
     get console_credentials_url(kind: "oauth")
     assert_equal "/console/credentials?kind=oauth", session[:return_to]
 
-    post console_roles_url, params: { role: { foreign_id: "new-role", namespace: "default" } }
+    post console_roles_url, params: { role: { foreign_id: "new-role" } }
     assert_redirected_to login_path
     assert_equal "/console/credentials?kind=oauth", session[:return_to]
   end
@@ -60,6 +60,14 @@ class SessionsControllerTest < ActionDispatch::IntegrationTest
     post login_url, params: { email: member.email, password: "password123456" }
     assert_redirected_to console_threads_path
     assert_equal member.id, session[:user_id]
+  end
+
+  test "a non-admin lands on integrations when console chat is disabled" do
+    member = users(:member_user)
+    with_env("CENTAUR_CONSOLE_CHAT_ENABLED" => "false") do
+      post login_url, params: { email: member.email, password: "password123456" }
+      assert_redirected_to console_integrations_path
+    end
   end
 
   test "email match is case-insensitive" do

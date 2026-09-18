@@ -5,7 +5,7 @@
 //! the shared sandbox trait.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     process::Stdio,
     sync::{
         Arc,
@@ -15,9 +15,10 @@ use std::{
 
 use async_trait::async_trait;
 use centaur_sandbox_core::{
-    ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
-    SandboxRead, SandboxResult, SandboxSpec, SandboxStatus, SandboxWrite,
+    ObservedSandbox, SANDBOX_AGENT_HOME, SandboxBackend, SandboxError, SandboxFile, SandboxHandle,
+    SandboxId, SandboxIo, SandboxRead, SandboxResult, SandboxSpec, SandboxStatus, SandboxWrite,
 };
+use tempfile::TempDir;
 use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::Mutex,
@@ -40,6 +41,8 @@ struct LocalSandbox {
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
     status: SandboxStatus,
+    labels: BTreeMap<String, String>,
+    _home_dir: Option<TempDir>,
 }
 
 impl LocalSandboxBackend {
@@ -71,6 +74,7 @@ impl SandboxBackend for LocalSandboxBackend {
 
     async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
         let (program, args) = command_parts(&spec)?;
+        let materialized_home = materialize_files(&spec.files)?;
         let mut command = Command::new(program);
         command.args(args);
         command.stdin(Stdio::piped());
@@ -82,6 +86,9 @@ impl SandboxBackend for LocalSandboxBackend {
         }
         for env in &spec.env {
             command.env(&env.name, &env.value);
+        }
+        if let Some(home) = &materialized_home {
+            command.env("HOME", home.path());
         }
 
         let mut child = command
@@ -101,6 +108,8 @@ impl SandboxBackend for LocalSandboxBackend {
                 stdout,
                 stderr,
                 status: SandboxStatus::Running,
+                labels: spec.labels,
+                _home_dir: materialized_home,
             })),
         );
 
@@ -146,11 +155,11 @@ impl SandboxBackend for LocalSandboxBackend {
     }
 
     async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
-        Ok(ObservedSandbox::new(
-            id.clone(),
-            self.name(),
-            self.status(id).await?,
-        ))
+        let sandbox = self.sandbox(id).await?;
+        let mut sandbox = sandbox.lock().await;
+        let status = refresh_status(&mut sandbox).await?;
+        Ok(ObservedSandbox::new(id.clone(), self.name(), status)
+            .with_labels(sandbox.labels.clone()))
     }
 
     async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
@@ -197,6 +206,49 @@ impl SandboxBackend for LocalSandboxBackend {
         sandbox.status = SandboxStatus::Running;
         Ok(())
     }
+}
+
+fn materialize_files(files: &[SandboxFile]) -> SandboxResult<Option<TempDir>> {
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("centaur-sandbox-home-")
+        .tempdir()
+        .map_err(|error| SandboxError::backend_source("create sandbox home directory", error))?;
+    for file in files {
+        let target_path = std::path::Path::new(&file.target_path);
+        let relative_path = target_path.strip_prefix(SANDBOX_AGENT_HOME).map_err(|_| {
+            SandboxError::InvalidSpec(format!(
+                "local sandbox files must target {SANDBOX_AGENT_HOME}, got {:?}",
+                file.target_path,
+            ))
+        })?;
+        validate_local_file_path(relative_path, &file.target_path)?;
+        let path = dir.path().join(relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                SandboxError::backend_source("create sandbox home file directory", error)
+            })?;
+        }
+        std::fs::write(&path, &file.contents)
+            .map_err(|error| SandboxError::backend_source("write sandbox home file", error))?;
+    }
+    Ok(Some(dir))
+}
+
+fn validate_local_file_path(path: &std::path::Path, target_path: &str) -> SandboxResult<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(SandboxError::InvalidSpec(format!(
+            "invalid sandbox file target path {target_path:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn command_parts(spec: &SandboxSpec) -> SandboxResult<(&str, Vec<&str>)> {
@@ -288,6 +340,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(read, b"ping\n");
+        manager.stop(&handle.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_backend_preserves_observation_labels() {
+        let backend = Arc::new(LocalSandboxBackend::new());
+        let manager = SandboxManager::new(backend);
+        let spec = cat_spec().label("centaur.ai/component", "workflow-run");
+        let handle = manager.create_running(spec).await.unwrap();
+
+        let observed = manager.observe(&handle.id).await.unwrap();
+        assert_eq!(
+            observed
+                .labels
+                .get("centaur.ai/component")
+                .map(String::as_str),
+            Some("workflow-run")
+        );
+
+        manager.stop(&handle.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_backend_materializes_sandbox_files() {
+        let backend = Arc::new(LocalSandboxBackend::new());
+        let manager = SandboxManager::new(backend);
+        let prompt = "large persona prompt\n";
+        let spec = SandboxSpec::new("/bin/sh")
+            .command(["/bin/sh", "-lc"])
+            .args(["cat \"$HOME/AGENTS_PERSONA.md\"; cat"])
+            .file("/home/agent/AGENTS_PERSONA.md", prompt);
+        let handle = manager.create_running(spec).await.unwrap();
+        let mut io = manager.open_io(&handle.id).await.unwrap().into_parts();
+
+        let mut read = vec![0; prompt.len()];
+        timeout(Duration::from_secs(1), io.stdout.read_exact(&mut read))
+            .await
+            .expect("stdout read timed out")
+            .unwrap();
+
+        assert_eq!(read, prompt.as_bytes());
         manager.stop(&handle.id).await.unwrap();
     }
 

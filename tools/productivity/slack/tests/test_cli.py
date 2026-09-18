@@ -1,10 +1,54 @@
 import base64
+import json
 import sys
 import types
 from pathlib import Path
 
+import pytest
 from slack.cli import _channel_arg_is_id, app
 from typer.testing import CliRunner
+
+
+@pytest.mark.parametrize("added", [True, False])
+def test_react_calls_client_and_reports_result(monkeypatch, added) -> None:
+    calls = []
+
+    def fake_add_reaction(*args):
+        calls.append(args)
+        return {"added": added}
+
+    monkeypatch.setitem(
+        sys.modules, "slack.client", types.SimpleNamespace(add_reaction=fake_add_reaction)
+    )
+    result = CliRunner().invoke(app, ["react", "C1234567890", "123.000001", ":pencil2:"])
+
+    assert result.exit_code == 0
+    assert calls == [("C1234567890", "123.000001", ":pencil2:")]
+    assert ("Reaction added" if added else "Reaction already present") in result.output
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("Slack API error: missing_scope"), ValueError("invalid emoji")]
+)
+def test_react_reports_failure(monkeypatch, error) -> None:
+    def fake_add_reaction(*args):
+        raise error
+
+    monkeypatch.setitem(
+        sys.modules, "slack.client", types.SimpleNamespace(add_reaction=fake_add_reaction)
+    )
+    result = CliRunner().invoke(app, ["react", "C1234567890", "123.456", "pencil2"])
+
+    assert result.exit_code == 1
+    assert str(error) in result.output
+    assert "Reaction added" not in result.output
+
+
+def test_react_is_discoverable() -> None:
+    assert "react" in CliRunner().invoke(app, ["--help"]).output
+    result = CliRunner().invoke(app, ["react", "--help"])
+    assert result.exit_code == 0
+    assert "reactions:write" in result.output
 
 
 def test_channel_arg_is_id_accepts_channel_id_forms() -> None:
@@ -47,6 +91,7 @@ def test_channel_calls_proxy_client(monkeypatch) -> None:
     )
 
     assert result.exit_code == 0
+    assert json.loads(result.output)["messages"][0]["text"] == "root"
     assert calls == [
         (
             ("C1234567890",),
@@ -88,6 +133,7 @@ def test_channel_direct_calls_direct_client(monkeypatch) -> None:
     )
 
     assert result.exit_code == 0
+    assert json.loads(result.output)["messages"][0]["text"] == "root"
     assert calls == [
         (
             ("C1234567890",),
@@ -126,11 +172,11 @@ def test_channels_calls_proxy_client(monkeypatch) -> None:
 
     result = CliRunner().invoke(
         app,
-        ["channels", "--limit", "10", "--bot-member-only"],
+        ["channels", "--limit", "10", "--query", "general"],
     )
 
     assert result.exit_code == 0
-    assert calls == [((), {"limit": 10, "history_only": True})]
+    assert calls == [((), {"limit": 10, "query": "general"})]
     assert "general" in result.output
 
 
@@ -418,6 +464,7 @@ def test_download_writes_file_with_proxy(monkeypatch, tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert calls == [{"file_id": "F1234567890", "channel_id": "C1234567890"}]
     assert (tmp_path / "report.pdf").read_bytes() == b"%PDF"
+    assert json.loads(result.output)["output_path"] == str((tmp_path / "report.pdf").absolute())
 
 
 def test_file_info_calls_proxy_client(monkeypatch) -> None:
@@ -447,8 +494,9 @@ def test_file_info_calls_proxy_client(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert calls == [{"file_id": "F1234567890", "channel_id": "C1234567890"}]
-    assert "report.pdf" in result.output
-    assert "1KB" in result.output
+    payload = json.loads(result.output)
+    assert payload["file"]["name"] == "report.pdf"
+    assert payload["file"]["size"] == 1234
 
 
 def test_thread_calls_api_server_client(monkeypatch) -> None:
@@ -498,47 +546,33 @@ def test_thread_calls_api_server_client(monkeypatch) -> None:
     ]
 
 
-def test_thread_fails_closed_when_api_server_fails(monkeypatch) -> None:
+def test_help_explains_channel_and_dm_access_paths() -> None:
+    result = CliRunner().invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "proxy-backed commands" in result.output
+    assert "Slack channels" in result.output
+    assert "Use commands ending in" in result.output
+    assert "Slack DMs" in result.output
+
+
+def test_thread_does_not_fall_back_when_api_server_fails(monkeypatch) -> None:
     proxy_calls = []
-    direct_calls = []
 
     def fake_get_thread_replies_proxy(*args, **kwargs):
         proxy_calls.append((args, kwargs))
         raise RuntimeError("proxy unavailable")
 
-    def fake_get_thread_replies_page(*args, **kwargs):
-        direct_calls.append((args, kwargs))
-        raise AssertionError("direct fallback must not be used")
-
-    fake_client = types.SimpleNamespace(
-        get_thread_replies_page=fake_get_thread_replies_page,
-        get_thread_replies_proxy=fake_get_thread_replies_proxy,
-    )
+    fake_client = types.SimpleNamespace(get_thread_replies_proxy=fake_get_thread_replies_proxy)
     monkeypatch.setitem(sys.modules, "slack.client", fake_client)
 
     result = CliRunner().invoke(
         app,
-        [
-            "thread",
-            "C1234567890:1780000000.000000",
-            "--limit",
-            "10",
-        ],
+        ["thread", "C1234567890:1780000000.000000", "--limit", "10"],
     )
 
-    expected_call = (
-        ("C1234567890", "1780000000.000000"),
-        {
-            "limit": 10,
-            "cursor": None,
-            "oldest": None,
-            "latest": None,
-            "inclusive": True,
-        },
-    )
     assert result.exit_code == 1
-    assert proxy_calls == [expected_call]
-    assert direct_calls == []
+    assert len(proxy_calls) == 1
     assert "proxy unavailable" in result.output
 
 

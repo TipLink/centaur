@@ -10,6 +10,9 @@ mod io;
 mod lifecycle;
 mod spec;
 
+/// Home directory used by the sandbox agent image.
+pub const SANDBOX_AGENT_HOME: &str = "/home/agent";
+
 pub use backend::SandboxBackend;
 pub use error::{BoxedError, SandboxError, SandboxResult};
 pub use io::{SandboxIo, SandboxIoGuard, SandboxIoParts, SandboxRead, SandboxWrite};
@@ -17,5 +20,6 @@ pub use lifecycle::{
     DesiredSandboxState, ObservedSandbox, SandboxHandle, SandboxId, SandboxStatus,
 };
 pub use spec::{
-    EnvVar, Mount, MountKind, RepoCacheAccess, ResourceLimits, SandboxCapabilities, SandboxSpec,
+    EnvVar, Mount, MountKind, RepoCacheAccess, ResourceClaim, ResourceRequirements,
+    SandboxCapabilities, SandboxFile, SandboxSpec,
 };

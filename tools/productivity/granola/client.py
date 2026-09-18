@@ -14,20 +14,39 @@ GRANOLA_BACKEND=mcp|rest.
 
 import json
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from xml.etree import ElementTree
 
 import httpx
+
 from centaur_sdk import secret
 
 API_BASE = "https://public-api.granola.ai"
 MCP_URL = "https://mcp.granola.ai/mcp"
+_NOTE_ID_RE = re.compile(r"^not_[a-zA-Z0-9]{14}$")
+_SHARE_ID_RE = re.compile(
+    r"(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
+    re.IGNORECASE,
+)
+
+
+def _normalize_note_ref(note_ref: str) -> str:
+    """Return a Granola API note ID or meeting UUID from an ID/share link."""
+    value = note_ref.strip().removeprefix("<").split("|", 1)[0].removesuffix(">")
+    if _NOTE_ID_RE.fullmatch(value):
+        return value
+    match = _SHARE_ID_RE.search(value)
+    if match:
+        return match.group(1).lower()
+    raise ValueError("expected a Granola not_* ID, meeting UUID, or notes.granola.ai share link")
 
 
 class GranolaClient:
     """Client for Granola Enterprise API (workspace-wide notes access)."""
 
-    def __init__(self, api_key: str | None = None):
+    def __init__(self, api_key: str | None = None, max_rate_limit_retries: int = 2):
         self._api_key = api_key or secret("GRANOLA_API_KEY", "")
         if not self._api_key:
             raise RuntimeError(
@@ -42,13 +61,23 @@ class GranolaClient:
             },
             timeout=30.0,
         )
+        self.max_rate_limit_retries = max_rate_limit_retries
 
     def close(self) -> None:
         self._client.close()
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Make authenticated GET request."""
-        response = self._client.get(path, params=params)
+        for attempt in range(self.max_rate_limit_retries + 1):
+            response = self._client.get(path, params=params)
+            if response.status_code != 429 or attempt == self.max_rate_limit_retries:
+                break
+            retry_after = response.headers.get("Retry-After", "1")
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                delay = 1.0
+            time.sleep(min(max(delay, 0.0), 60.0))
         response.raise_for_status()
         return response.json()
 
@@ -76,12 +105,42 @@ class GranolaClient:
             params["updated_after"] = updated_after
         return self._get("/v1/notes", params=params)
 
+    def _resolve_note_id(self, note_ref: str) -> str:
+        normalized = _normalize_note_ref(note_ref)
+        if _NOTE_ID_RE.fullmatch(normalized):
+            return normalized
+
+        cursor: str | None = None
+        while True:
+            page = self.list_notes(page_size=30, cursor=cursor)
+            for note in page.get("notes", []):
+                note_id = note.get("id")
+                if not note_id:
+                    continue
+                candidate = note
+                if not candidate.get("web_url"):
+                    candidate = self._get(f"/v1/notes/{note_id}")
+                try:
+                    web_id = _normalize_note_ref(candidate.get("web_url") or "")
+                except ValueError:
+                    continue
+                if web_id == normalized:
+                    return note_id
+            cursor = page.get("cursor")
+            if not page.get("hasMore") or not cursor:
+                break
+        raise RuntimeError(
+            f"meeting {normalized} not found in accessible Granola notes; "
+            "the note may require user-scoped Granola access"
+        )
+
     def get_note(self, note_id: str, include_transcript: bool = False) -> dict[str, Any]:
         """Fetch a single note by ID (not_* format, e.g. not_1d3tmYTlCICgjy).
 
         Returns full note with title, owner, attendees, summary_markdown,
         calendar_event, folder_membership, and optionally transcript.
         """
+        note_id = self._resolve_note_id(note_id)
         params: dict[str, Any] = {}
         if include_transcript:
             params["include"] = "transcript"
@@ -127,56 +186,63 @@ class GranolaClient:
         return [n for n in all_notes if query_lower in (n.get("title") or "").lower()][:limit]
 
 
-# Matches one <meeting ...>...</meeting> block in MCP meetings_data output.
-_MEETING_RE = re.compile(
-    r'<meeting id="(?P<id>[^"]+)" title="(?P<title>[^"]*)" date="(?P<date>[^"]*)">'
-    r"(?P<body>.*?)</meeting>",
-    re.DOTALL,
-)
-_PARTICIPANTS_RE = re.compile(r"<known_participants>(.*?)</known_participants>", re.DOTALL)
-_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
-# "Zygimantas (note creator) from Tempo <z@tempo.xyz>" -> name + email
 _PARTICIPANT_RE = re.compile(r"(?P<name>[^,<]+?)\s*<(?P<email>[^>]+)>")
 
 
 def _parse_meeting_date(raw: str) -> str:
     """Convert MCP dates like 'Jul 8, 2026 5:30 PM GMT+2' to ISO, best effort."""
-    m = re.match(r"(\w+ \d+, \d+ \d+:\d+ [AP]M) GMT(?P<off>[+-]\d+)?", raw)
-    if not m:
+    date_text, separator, offset_text = raw.rpartition(" GMT")
+    if not separator:
         return raw
     try:
-        dt = datetime.strptime(m.group(1), "%b %d, %Y %I:%M %p")
-        off = m.group("off")
-        return dt.isoformat() + (f"{int(off):+03d}:00" if off else "")
+        offset_hours = int(offset_text or "0")
+        if not -23 <= offset_hours <= 23:
+            return raw
+        dt = datetime.strptime(date_text, "%b %d, %Y %I:%M %p")
+        return dt.replace(tzinfo=timezone(timedelta(hours=offset_hours))).isoformat()
     except ValueError:
         return raw
 
 
+def _parse_participants(text: str) -> list[dict[str, str]]:
+    """Parse Granola's display-name/email participant text."""
+    return [
+        {
+            "name": participant.group("name").strip(),
+            "email": participant.group("email").strip().lower(),
+        }
+        for participant in _PARTICIPANT_RE.finditer(text)
+    ]
+
+
 def _parse_meetings(text: str) -> list[dict[str, Any]]:
     """Parse MCP meetings_data text into REST-shaped note dicts."""
+    try:
+        root = ElementTree.fromstring(f"<granola_response>{text}</granola_response>")
+    except ElementTree.ParseError as error:
+        raise RuntimeError("Granola MCP returned malformed meeting XML") from error
+
     notes = []
-    for m in _MEETING_RE.finditer(text):
-        body = m.group("body")
-        attendees = []
-        pm = _PARTICIPANTS_RE.search(body)
-        if pm:
-            for p in _PARTICIPANT_RE.finditer(pm.group(1)):
-                attendees.append({"name": p.group("name").strip(), "email": p.group("email")})
+    for meeting in root.findall(".//meeting"):
+        if not all(meeting.get(name) for name in ("id", "title", "date")):
+            continue
+        participants = meeting.findtext("known_participants", default="")
+        attendees = _parse_participants(participants)
         owner = next(
             (a for a in attendees if "(note creator)" in a["name"]),
             attendees[0] if attendees else {},
         )
         if owner:
             owner = {**owner, "name": owner["name"].replace("(note creator)", "").split(" from ")[0].strip()}
-        sm = _SUMMARY_RE.search(body)
+        summary = meeting.findtext("summary")
         notes.append(
             {
-                "id": m.group("id"),
-                "title": m.group("title"),
-                "created_at": _parse_meeting_date(m.group("date")),
+                "id": meeting.get("id"),
+                "title": meeting.get("title"),
+                "created_at": _parse_meeting_date(meeting.get("date", "")),
                 "owner": owner,
                 "attendees": attendees,
-                "summary_markdown": sm.group(1).strip() if sm else None,
+                "summary_markdown": summary.strip() if summary else None,
             }
         )
     return notes
@@ -286,6 +352,7 @@ class GranolaMcpClient:
     def get_note(self, note_id: str, include_transcript: bool = False) -> dict[str, Any]:
         """Fetch a single meeting by UUID, REST-shaped (title, owner, attendees,
         summary_markdown, optionally transcript)."""
+        note_id = _normalize_note_ref(note_id)
         text = self._call_tool("get_meetings", {"meeting_ids": [note_id]})
         notes = _parse_meetings(text)
         if not notes:
@@ -298,6 +365,7 @@ class GranolaMcpClient:
     def get_transcript(self, note_id: str) -> list[dict[str, Any]]:
         """Fetch the transcript for a meeting. Returns a list of utterances
         (single block if the MCP text is not line-structured)."""
+        note_id = _normalize_note_ref(note_id)
         text = self._call_tool("get_meeting_transcript", {"meeting_id": note_id})
         if not text.strip():
             return []

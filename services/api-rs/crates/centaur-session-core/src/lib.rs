@@ -3,7 +3,7 @@
 //! A session is the public control-plane object for one ongoing agent
 //! conversation. `thread_key` is the canonical identifier.
 
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
@@ -192,11 +192,21 @@ impl ChatDestination {
             Self::Slack {
                 channel_id,
                 thread_ts,
-            } => format!(
-                "[chat surface: Slack · channel {channel_id} · thread {thread_ts}. \
-                 Centaur delivers your reply to this thread automatically — do not repost it with the slack tool. \
-                 Send files here with `slack upload`.]"
-            ),
+            } => {
+                if channel_id.starts_with('D') {
+                    format!(
+                        "[chat surface: Slack DM · conversation {channel_id} · thread {thread_ts}. \
+                         Slack tool policy: use direct (`*-direct`) methods. \
+                         Centaur delivers your reply automatically.]"
+                    )
+                } else {
+                    format!(
+                        "[chat surface: Slack channel · channel {channel_id} · thread {thread_ts}. \
+                         Slack tool policy: use proxied methods (without `-direct`). \
+                         Centaur delivers your reply automatically.]"
+                    )
+                }
+            }
             Self::Discord {
                 guild_id,
                 channel_id,
@@ -360,6 +370,8 @@ pub enum HarnessType {
     Codex,
     Amp,
     ClaudeCode,
+    Nanocodex,
+    Hermes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, Display, EnumString)]
@@ -414,7 +426,6 @@ pub struct SandboxCapabilities {
     #[serde(default)]
     pub repo_cache: SandboxRepoCacheAccess,
     pub observability_enabled: bool,
-    pub api_server_enabled: bool,
 }
 
 impl SandboxCapabilities {
@@ -422,14 +433,11 @@ impl SandboxCapabilities {
         Self {
             repo_cache: SandboxRepoCacheAccess::All,
             observability_enabled: true,
-            api_server_enabled: true,
         }
     }
 
     pub const fn is_default_enabled(&self) -> bool {
-        matches!(self.repo_cache, SandboxRepoCacheAccess::All)
-            && self.observability_enabled
-            && self.api_server_enabled
+        matches!(self.repo_cache, SandboxRepoCacheAccess::All) && self.observability_enabled
     }
 
     pub const fn repo_cache_enabled(&self) -> bool {
@@ -449,12 +457,6 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub sandbox_id: Option<String>,
-    /// Digest binding the deployment boot-content generation to the sandbox
-    /// ID that received it. `None` is a legacy/untracked assignment; an older
-    /// rollback writer may also leave a stale `Some` after clearing/changing
-    /// `sandbox_id`, which fails ID-bound validation on the next forward turn.
-    #[serde(default)]
-    pub sandbox_content_revision: Option<String>,
     /// Capabilities applied to the currently assigned sandbox. `None` means the
     /// sandbox predates capability tracking; callers may treat it as compatible
     /// only with the default-enabled profile.
@@ -467,6 +469,10 @@ pub struct Session {
     /// iron-control principal OID this session's egress proxy binds to,
     /// captured at registration so a resumed session can recreate its sandbox.
     pub iron_control_principal: Option<String>,
+    /// Per-proxy labels captured at session creation and applied whenever this
+    /// session's egress proxy is created, repaired, or rebound.
+    #[serde(default)]
+    pub proxy_labels: BTreeMap<String, String>,
     /// Last meaningful activity for the currently assigned sandbox. This is
     /// the eviction signal for capacity pressure and intentionally separate
     /// from `updated_at`, which also changes for metadata/status writes.
@@ -787,14 +793,23 @@ mod tests {
 
     #[test]
     fn chat_destination_renders_a_platform_context_line() {
-        let slack = ThreadKey::parse("slack:C123:123.456")
+        let slack_channel = ThreadKey::parse("slack:C123:123.456")
             .unwrap()
             .chat_destination()
             .unwrap()
             .context_line();
-        assert!(slack.contains("Slack"));
-        assert!(slack.contains("C123"));
-        assert!(slack.contains("slack upload"));
+        assert!(slack_channel.contains("Slack channel"));
+        assert!(slack_channel.contains("C123"));
+        assert!(slack_channel.contains("use proxied methods"));
+
+        let slack_dm = ThreadKey::parse("slack:D123:123.456")
+            .unwrap()
+            .chat_destination()
+            .unwrap()
+            .context_line();
+        assert!(slack_dm.contains("Slack DM"));
+        assert!(slack_dm.contains("D123"));
+        assert!(slack_dm.contains("use direct (`*-direct`) methods"));
 
         let discord = ThreadKey::parse("discord:111:222:333")
             .unwrap()
@@ -861,6 +876,10 @@ mod tests {
     fn harness_type_accepts_supported_values() {
         assert_eq!(HarnessType::from_str("codex").unwrap(), HarnessType::Codex);
         assert_eq!(HarnessType::from_str("amp").unwrap(), HarnessType::Amp);
+        assert_eq!(
+            HarnessType::from_str("nanocodex").unwrap(),
+            HarnessType::Nanocodex
+        );
         assert_eq!(
             HarnessType::from_str("claudecode").unwrap(),
             HarnessType::ClaudeCode

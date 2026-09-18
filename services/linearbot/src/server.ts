@@ -47,7 +47,7 @@ if (!postgresUrl) {
 
 const options: LinearbotOptions = {
   apiUrl,
-  apiKey: optionalEnv("LINEARBOT_API_KEY") ?? optionalEnv("CENTAUR_API_KEY"),
+  apiKey: optionalEnv("LINEARBOT_API_KEY"),
   defaultHarnessType: optionalEnv("LINEARBOT_DEFAULT_HARNESS"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
   linearAccessToken,
@@ -55,6 +55,10 @@ const options: LinearbotOptions = {
   linearApiUrl: optionalEnv("LINEAR_API_URL"),
   linearWebhookSecret,
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
+  reasoningEffort: {
+    assignment: optionalEnv("LINEARBOT_EFFORT_ASSIGNMENT"),
+    comment: optionalEnv("LINEARBOT_EFFORT_COMMENT"),
+  },
   postgresUrl,
   stateKeyPrefix: optionalEnv("LINEARBOT_STATE_KEY_PREFIX"),
   userName: stringEnv("LINEARBOT_USER_NAME", "centaur"),

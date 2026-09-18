@@ -69,10 +69,6 @@ const OAUTH_GRANT_FIELDS: &[(&str, &[&str], &[&str])] = &[
     ),
 ];
 
-const HTTP_METHODS: &[&str] = &[
-    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "*",
-];
-
 /// How an HTTP credential rides on the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretMode {
@@ -97,8 +93,6 @@ pub struct HttpSecret {
     pub secret_ref: String,
     pub mode: SecretMode,
     pub hosts: Vec<String>,
-    pub methods: Vec<String>,
-    pub paths: Vec<String>,
     // replace mode
     pub replacer: String,
     pub match_headers: Vec<String>,
@@ -375,9 +369,8 @@ pub fn parse_manifest(tool_dir: &Path) -> Result<ToolManifest> {
     let path = tool_dir.join("pyproject.toml");
     let text =
         std::fs::read_to_string(&path).wrap_err_with(|| format!("reading {}", path.display()))?;
-    let doc: Value = text
-        .parse::<Value>()
-        .wrap_err_with(|| format!("parsing {}", path.display()))?;
+    let doc: Value =
+        toml::from_str(&text).wrap_err_with(|| format!("parsing {}", path.display()))?;
     let centaur = doc
         .get("tool")
         .and_then(|t| t.get("centaur"))
@@ -435,8 +428,6 @@ pub fn parse_secret(entry: &Value, default_hosts: &[String]) -> Result<ParsedSec
             secret_ref: s.to_owned(),
             mode: SecretMode::Replace,
             hosts: default_hosts.to_vec(),
-            methods: vec![],
-            paths: vec![],
             replacer: s.to_owned(),
             match_headers: DEFAULT_MATCH_HEADERS
                 .iter()
@@ -519,8 +510,6 @@ fn parse_http(
              unscoped in iron-proxy"
         ),
     };
-    let methods = request_methods(table, name)?;
-    let paths = request_paths(table, name)?;
 
     match mode {
         SecretMode::Replace => {
@@ -549,8 +538,6 @@ fn parse_http(
                 secret_ref: secret_ref.to_owned(),
                 mode,
                 hosts,
-                methods,
-                paths,
                 replacer,
                 match_headers,
                 match_path,
@@ -587,8 +574,6 @@ fn parse_http(
                 secret_ref: secret_ref.to_owned(),
                 mode,
                 hosts,
-                methods,
-                paths,
                 replacer: String::new(),
                 match_headers: vec![],
                 match_path: false,
@@ -755,12 +740,27 @@ fn parse_pg_dsn_setting_value_from(value: Option<&Value>) -> Result<Option<PgDsn
         .ok_or_else(|| eyre!("pg_dsn setting value_from must be a table"))?;
     let principal_label = opt_str(table, "principal_label");
     let principal_field = opt_str(table, "principal_field");
-    if principal_label.is_none() && principal_field.is_none() {
-        bail!("pg_dsn setting value_from must declare principal_label or principal_field");
+    let requester_principal_field = opt_str(table, "requester_principal_field");
+    let proxy_label = opt_str(table, "proxy_label");
+    let declared = [
+        principal_label.as_ref(),
+        principal_field.as_ref(),
+        requester_principal_field.as_ref(),
+        proxy_label.as_ref(),
+    ]
+    .into_iter()
+    .filter(|value| value.is_some())
+    .count();
+    if declared != 1 {
+        bail!(
+            "pg_dsn setting value_from must declare exactly one of principal_label, principal_field, requester_principal_field, or proxy_label"
+        );
     }
     Ok(Some(PgDsnSettingValueFrom {
         principal_label,
         principal_field,
+        requester_principal_field,
+        proxy_label,
     }))
 }
 
@@ -1008,52 +1008,6 @@ fn parse_field_map(
     Ok(out)
 }
 
-fn request_methods(table: &toml::Table, name: &str) -> Result<Vec<String>> {
-    if table.contains_key("methods") && table.contains_key("http_methods") {
-        bail!("HTTP secret {name:?} must declare only one of 'methods' or 'http_methods'");
-    }
-    let (key, values) = if table.contains_key("methods") {
-        ("methods", strict_str_array(table, name, "methods")?)
-    } else {
-        (
-            "http_methods",
-            strict_str_array(table, name, "http_methods")?,
-        )
-    };
-    let values = match values {
-        Some(values) if values.is_empty() => {
-            bail!("HTTP secret {name:?} {key:?} must not be empty")
-        }
-        Some(values) => values,
-        None => Vec::new(),
-    };
-    values
-        .into_iter()
-        .map(|method| {
-            let method = method.to_ascii_uppercase();
-            if HTTP_METHODS.contains(&method.as_str()) {
-                Ok(method)
-            } else {
-                bail!("HTTP secret {name:?} method {method:?} must be one of {HTTP_METHODS:?}")
-            }
-        })
-        .collect()
-}
-
-fn request_paths(table: &toml::Table, name: &str) -> Result<Vec<String>> {
-    let paths = match strict_str_array(table, name, "paths")? {
-        Some(paths) if paths.is_empty() => bail!("HTTP secret {name:?} 'paths' must not be empty"),
-        Some(paths) => paths,
-        None => Vec::new(),
-    };
-    for path in &paths {
-        if !path.starts_with('/') {
-            bail!("HTTP secret {name:?} path {path:?} must start with '/'");
-        }
-    }
-    Ok(paths)
-}
-
 // ---------------------------------------------------------------------------
 // small toml helpers
 // ---------------------------------------------------------------------------
@@ -1121,23 +1075,6 @@ fn validate_gcp_id_token_header(value: String) -> Result<String> {
             GCP_ID_TOKEN_ALLOWED_HEADERS.join(", ")
         )
     })
-}
-
-fn strict_str_array(table: &toml::Table, name: &str, key: &str) -> Result<Option<Vec<String>>> {
-    let Some(value) = table.get(key) else {
-        return Ok(None);
-    };
-    let arr = value.as_array().ok_or_else(|| {
-        eyre!("HTTP secret {name:?} {key:?} must be an array of non-empty strings")
-    })?;
-    let mut out = Vec::with_capacity(arr.len());
-    for item in arr {
-        let value = item.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
-            eyre!("HTTP secret {name:?} {key:?} must be an array of non-empty strings")
-        })?;
-        out.push(value.to_owned());
-    }
-    Ok(Some(out))
 }
 
 fn reject_keys(table: &toml::Table, name: &str, mode: &str, keys: &[&str]) -> Result<()> {

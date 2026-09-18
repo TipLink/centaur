@@ -59,6 +59,7 @@ Supported v2 primitives:
 | `handler(inp, ctx)` | Supported |
 | `ctx.step(name, fn)` | Supported |
 | `ctx.agent_turn(...)` / `ctx.run_agent(...)` | Supported |
+| `ctx.run_agents(...)` | Supported for bounded concurrent agent turns with ordered outcomes |
 | `ctx.call_tool(...)` | Supported through the generated `centaur-tools call` bridge in the workflow-host sandbox |
 | `ctx.post_to_slack(...)` | Supported |
 | `ctx._pool` | Supported when the workflow-host sandbox receives `DATABASE_URL` |
@@ -97,10 +98,19 @@ be wrapped in `ctx.step(...)` so the result is checkpointed:
 async def handler(inp: dict, ctx: WorkflowContext) -> dict:
     posted = await ctx.step(
         "post_summary",
-        lambda: ctx.post_to_slack(inp["channel"], inp["summary"]),
+        lambda: ctx.post_to_slack(
+            inp["channel"],
+            inp["summary"],
+            username="Summary Bot",
+            icon_emoji=":memo:",
+        ),
     )
     return {"posted": posted}
 ```
+
+`username` and `icon_emoji` are optional. They customize the Slack app identity
+for that message and require the app installation to grant
+`chat:write.customize`. Omitting them preserves the app's default identity.
 
 ### Make agent turns explicit
 
@@ -121,12 +131,34 @@ The workflow host sandbox is separate from the agent sandbox. The workflow
 handler coordinates the run; the agent turn runs through the normal Centaur
 session runtime.
 
-Production deployments should keep `WORKFLOW_HOST_SANDBOX=true` (the default).
-`false` runs Python as a child process of api-rs for local development and is
-not an isolation boundary. Centaur removes its known control, bot, feedback,
-GitHub, Slack, and model-provider credentials from that child, but arbitrary
-ambient process configuration can still be visible; use only trusted workflow
-code in local mode.
+`ctx.agent_turn(...)` resolves to the execution record, not to the answer. Read
+`result_text` for the agent's final text:
+
+```python
+{
+    "thread_key": "wf:<task-id>:agent:<workflow-name>",
+    "execution_id": "...",
+    "status": "completed",
+    "output_lines": [...],
+    "result_text": "the agent's final text",
+}
+```
+
+Use `ctx.run_agents(...)` for independent work that should run concurrently:
+
+```python
+reviews = await ctx.run_agents(
+    [
+        {"name": "correctness", "text": "Review the PR for correctness."},
+        {"name": "security", "text": "Review the PR for security issues."},
+    ],
+    max_concurrency=2,
+)
+```
+
+Each item uses a separate workflow-owned session. Results stay in input order.
+An individual agent failure produces an item with `ok: false`; it does not fail
+the whole batch or discard successful results.
 
 #### Declare Workflow-Host Permissions
 
@@ -148,9 +180,17 @@ cargo run -p centaur-perms -- \
   --tool slack
 ```
 
-The principal id is always `workflow-` plus the slugged `WORKFLOW_NAME`.
-Workflow code cannot choose another principal id, display name, or labels.
-`WORKFLOW_PRINCIPAL = True` requires `apiRs.workflowHostSandbox=true`, which
+To use an existing principal instead, declare its foreign ID or `prn_`-prefixed
+OID:
+
+```python
+WORKFLOW_PRINCIPAL = "finance-automation"
+```
+
+The string form resolves the existing principal by foreign ID or OID and fails
+startup when it does not exist. It does not create or update the principal. The
+`True` form remains `workflow-` plus the slugged `WORKFLOW_NAME`. Any
+`WORKFLOW_PRINCIPAL` value requires `apiRs.workflowHostSandbox=true`, which
 renders `WORKFLOW_HOST_SANDBOX=true`; startup fails if a workflow declares a
 principal while workflow-host sandboxing is disabled.
 
@@ -181,6 +221,21 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 Keep `harness` and `model` together — a model is only meaningful within its
 harness, and because kwargs override `AGENT_DEFAULTS` key by key, overriding one
 without the other can strand a model on the wrong harness.
+
+Agent turns can also select an existing principal by foreign ID. This applies
+to `ctx.agent_turn(...)`, its aliases, and each `ctx.run_agents(...)` item:
+
+```python
+result = await ctx.agent_turn(
+    "Prepare the finance report.",
+    principal="finance-automation",
+)
+```
+
+Principal lookup failures fail the turn. Put `principal` in `AGENT_DEFAULTS`
+when every agent turn in the workflow should use the same principal. An
+existing session bound to another principal returns a conflict and is not
+rebound.
 
 ### Declare webhook metadata in the workflow
 
@@ -284,8 +339,11 @@ EOF
 Then create a real run:
 
 ```bash
+CENTAUR_API_TOKEN=$(kubectl exec -n centaur-system deploy/centaur-centaur-console -- \
+  bin/rails runner 'print ApiServer::Jwt.encode_for_console_service')
+
 curl -s "$CENTAUR_API_URL/api/workflows/runs" \
-  -H "Authorization: Bearer $CENTAUR_CONTROL_API_KEY" \
+  -H "Authorization: Bearer $CENTAUR_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_name": "nightly_report",
@@ -296,69 +354,3 @@ curl -s "$CENTAUR_API_URL/api/workflows/runs" \
 Inspect the run, checkpoints, and sandbox state. A migrated workflow is not done
 until it has completed through the `api-rs` runtime in the same sandbox image
 and database configuration used by the deployment.
-
-## Deployment-provided Slack commands and workflow transport
-
-Slackbot v2 loads trusted deployment command modules from the colon-separated
-absolute paths in `SLACK_COMMAND_EXTENSION_MODULES`. Each ES module exports a
-factory that returns a `commands` array and may provide a `mount` function for
-related signed Slack routes. The chart mounts the configured overlay image into
-Slackbot, allowing a deployment to keep command definitions, parsing,
-validation, and domain routes in its overlay while Centaur owns the generic
-picker and durable handoff.
-
-The root slash command opens a searchable modal command picker. A bare command
-name opens its form directly; complete text commands remain available. Configure
-the Slack app's Interactivity Request URL as `/api/slack/actions` and its Select
-Menus Options Load URL as `/api/slack/options`. `SLACK_COMMAND_TEAM_ID` optionally
-restricts the entry points to one workspace. The public ingress must admit signed
-POST requests to all three command, action, and options routes.
-
-Each command definition declares a unique name, title, description, search
-keywords, enablement, form fields, text/form parsers, and trusted workflow name.
-`slack-command-registry.ts` owns the shared UI schema and search. The router in
-`slack-commands.ts` requires no new route or feature-specific branches. Treat
-extension modules as trusted deployment code; do not load definitions from a
-sandbox or user-controlled path. Keep business authorization and durable effects
-in the target workflow.
-
-Required form errors attach to individual input blocks. Picker search returns
-at most 100 matches per query, so larger catalogs remain searchable. Signed modal
-metadata binds the creator, workspace, channel, command, and one-hour expiry.
-The Postgres-backed state adapter freezes input before handoff and serializes
-submissions; retries reuse both relative deadlines and workflow idempotency keys.
-Modal receipts confirm acceptance only. The workflow reports final validation or
-results in the originating channel. No workflow starts merely by browsing forms.
-
-On api-rs, set `WORKFLOW_API_SLACKBOT_ALLOWED_NAMES` to the exact workflow names
-the command registry may enqueue. The existing
-`SLACKBOT_API_KEY` authenticates these submissions. This grant defaults to empty,
-does not accept wildcards, and applies only to creating runs; it does not grant
-workflow listing, cancellation, scheduling, or global event access. Keep it
-separate from the sandbox-facing `WORKFLOW_API_ALLOWED_NAMES` grant.
-
-For principal-authenticated workflow creation, api-rs reserves the `_centaur`
-input object. It replaces any caller-supplied value with context from the active
-execution for `input.thread_key`. Slack-started executions include the verified
-requester's user ID as `_centaur.slack_user_id`. A state-changing overlay
-workflow can authorize that server-bound identity without accepting an actor ID
-from an agent tool or another caller. Reject the operation when the required
-identity is absent.
-
-The Python host exposes `ctx.slack_transport(operation, args)` to explicitly
-allowlisted workflows. Configure `WORKFLOW_SLACK_TRANSPORT_ALLOWED_NAMES` on
-api-rs and point `WORKFLOW_SLACK_TRANSPORT_URL` at the internal Slackbot v2
-`/internal/workflow/slack` endpoint. The API supplies `SLACKBOT_API_KEY` itself;
-that key and the bot token never cross the workflow-host RPC boundary.
-The transport checks bot workspace identity and live channel membership.
-It supports bounded Slack posting, root-message updates, private responses,
-user/channel reads, history, and session context registration. `context`
-subscribes the thread before collecting existing messages, then appends the
-structured workflow context through the ordinary session API. It does not
-execute an agent turn.
-
-Expose state-changing workflows through sandbox workflow API grants only when
-they authorize server-bound principal context and the exact thread-scoped
-resource. Deployment overlays own their domain schemas, transition rules,
-provider mappings, and workflow code. Both the API-to-Slackbot egress policy and
-the Slackbot ingress policy must allow the authenticated internal callback.

@@ -2,51 +2,33 @@ import axios, { type AxiosInstance } from "axios";
 
 export interface WorkflowRunOptions {
   workflowName: string;
-  idempotencyKey?: string;
+  triggerKey?: string;
   input?: Record<string, unknown>;
-  harnessType?: "codex" | "amp" | "claudecode";
-  maxAttempts?: number;
+  eagerStart?: boolean;
   timeoutMs?: number;
 }
 
-export interface WorkflowRunCreated {
+export interface WorkflowRunAccepted {
   ok: boolean;
   run_id: string;
-  task_id: string;
-  status: string;
-  created: boolean;
-}
-
-export interface WorkflowRun {
-  run_id: string;
-  task_id: string;
   workflow_name: string;
+  workflow_version?: string;
+  workflow_source_path?: string | null;
+  parent_run_id?: string | null;
+  root_run_id?: string | null;
   status: string;
-  input: unknown;
-  result: unknown | null;
-  failure: unknown | null;
-  attempts: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface ReleaseThreadOptions {
-  releaseId?: string;
-  expectedSandboxId?: string;
-  cancelInflight?: boolean;
-}
-
-export interface ReleaseThreadResponse {
-  ok: boolean;
-  thread_key: string;
-  sandbox_id?: string | null;
-  release_id?: string | null;
-  expected_sandbox_id?: string | null;
-  cancel_inflight: boolean;
-  sandbox_released: boolean;
-  sandbox_release_error?: string | null;
+  thread_key?: string | null;
   execution_id?: string | null;
-  execution_cancelled: boolean;
+  output_json?: Record<string, unknown> | null;
+  error_text?: string | null;
+  latest_checkpoint_name?: string | null;
+  latest_step_kind?: string | null;
+  waiting_on?: Record<string, unknown> | null;
+  child_runs_count?: number;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  idempotent?: boolean;
 }
 
 export class CentaurClient {
@@ -64,69 +46,72 @@ export class CentaurClient {
     });
   }
 
-  async startWorkflowRun(opts: WorkflowRunOptions): Promise<WorkflowRunCreated> {
+  async startWorkflowRun(opts: WorkflowRunOptions): Promise<WorkflowRunAccepted> {
     const { data } = await this.http.post(
       "/api/workflows/runs",
       {
         workflow_name: opts.workflowName,
-        idempotency_key: opts.idempotencyKey,
+        trigger_key: opts.triggerKey,
         input: opts.input ?? {},
-        harness_type: opts.harnessType,
-        max_attempts: opts.maxAttempts,
+        eager_start: opts.eagerStart ?? false,
       },
       {
         timeout: opts.timeoutMs,
       },
     );
-    return data as WorkflowRunCreated;
+    return data as WorkflowRunAccepted;
   }
 
-  async getWorkflowRun(runId: string): Promise<{ ok: boolean; run: WorkflowRun }> {
+  async getWorkflowRun(runId: string): Promise<WorkflowRunAccepted> {
     const { data } = await this.http.get(`/api/workflows/runs/${encodeURIComponent(runId)}`);
-    return data as { ok: boolean; run: WorkflowRun };
+    return data as WorkflowRunAccepted;
   }
 
   async listWorkflowRuns(opts?: {
     workflowName?: string;
     threadKey?: string;
+    status?: string;
+    parentRunId?: string;
     limit?: number;
-  }): Promise<{ ok: boolean; runs: WorkflowRun[] }> {
+  }): Promise<{ ok: boolean; items: WorkflowRunAccepted[] }> {
     const { data } = await this.http.get("/api/workflows/runs", {
       params: {
         workflow_name: opts?.workflowName,
         thread_key: opts?.threadKey,
+        status: opts?.status,
+        parent_run_id: opts?.parentRunId,
         limit: opts?.limit,
       },
     });
-    return data as { ok: boolean; runs: WorkflowRun[] };
+    return data as { ok: boolean; items: WorkflowRunAccepted[] };
   }
 
-  async cancelWorkflowRun(runId: string): Promise<{ ok: boolean; status: "cancelled" }> {
-    const { data } = await this.http.post(`/api/workflows/runs/${encodeURIComponent(runId)}/cancel`);
-    return data as { ok: boolean; status: "cancelled" };
-  }
-
-  async releaseThread(
-    threadKey: string,
-    opts: ReleaseThreadOptions = {},
-  ): Promise<ReleaseThreadResponse> {
-    const { data } = await this.http.post(
-      `/api/session/${encodeURIComponent(threadKey)}/release`,
+  async getWorkflowChildren(
+    runId: string,
+    limit = 200,
+  ): Promise<{ ok: boolean; items: WorkflowRunAccepted[] }> {
+    const { data } = await this.http.get(
+      `/api/workflows/runs/${encodeURIComponent(runId)}/children`,
       {
-        release_id: opts.releaseId,
-        expected_sandbox_id: opts.expectedSandboxId,
-        cancel_inflight: opts.cancelInflight ?? false,
+        params: { limit },
       },
     );
-    return data as ReleaseThreadResponse;
+    return data as { ok: boolean; items: WorkflowRunAccepted[] };
+  }
+
+  async cancelWorkflowRun(runId: string): Promise<WorkflowRunAccepted> {
+    const { data } = await this.http.post(`/api/workflows/runs/${encodeURIComponent(runId)}/cancel`);
+    return data as WorkflowRunAccepted;
   }
 
   async sendWorkflowEvent(opts: {
-    eventName: string;
+    eventType: string;
+    correlationId: string;
     payload?: Record<string, unknown>;
   }): Promise<Record<string, unknown>> {
     const { data } = await this.http.post("/api/workflows/events", {
-      event_name: opts.eventName,
+      event_type: opts.eventType,
+      correlation_id: opts.correlationId,
       payload: opts.payload ?? {},
     });
     return data as Record<string, unknown>;

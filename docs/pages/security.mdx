@@ -50,6 +50,17 @@ in the cluster or on the internet is directly reachable. Because
 iron-proxy is per-sandbox rather than shared, a compromise of one
 sandbox's proxy cannot leak into another sandbox.
 
+This boundary requires a CNI that enforces Kubernetes NetworkPolicy; proxy
+environment variables alone do not prevent a compromised sandbox from making
+direct connections. The per-sandbox proxy policy admits only the intended
+in-cluster backends and ports, including the Console control plane. As an
+additional guard, `ironProxy.upstreamDenyCidrs` blocks loopback, cloud metadata,
+and the default k3s pod CIDR. It deliberately does not block the k3s Service
+CIDR because sandboxes reach authenticated control-plane APIs through ClusterIP
+Services. On clusters with a different pod CIDR, add that range to
+`ironProxy.upstreamDenyCidrs`; do not add the Service CIDR unless those required
+Services are exposed through another permitted route.
+
 ### Egress policy
 
 All outbound traffic from the sandbox routes through iron-proxy, so
@@ -84,6 +95,12 @@ secrets = [
     {type = "http", name = "WAREHOUSE_API_KEY", match_headers = ["Authorization"], hosts = ["warehouse.internal.example.com"]},
 ]
 ```
+
+The Centaur Console assigns each sandbox proxy to a principal derived from its
+user, channel, issue, conversation, or workflow. The proxy receives only the
+secrets granted directly to that principal or inherited from its roles. See
+[Advanced Permissioning](/secrets/advanced-permissioning) for the setup and
+verification workflow.
 
 Three properties of this declaration matter:
 
@@ -127,16 +144,13 @@ and what credentials it reached for.
 
 A few honest caveats:
 
-- **Credentials are deployment-scoped, not yet user-scoped.** Tool
-  and harness secrets live in a single vault (a Kubernetes Secret or
-  a 1Password vault) that every sandbox in the deployment draws from,
-  so a tool's reach is the same regardless of which user invokes it.
-  Per-user and per-channel scoping is on the roadmap. A thread in
-  `#payments` would get the payments `GITHUB_TOKEN` rather than a
-  deployment-wide one, and a DM would resolve to the invoking user's
-  credentials. See the [Advanced Permissioning roadmap](/secrets/advanced-permissioning).
-  Until that lands, pick which tools and harnesses an installation
-  exposes with the current scope in mind.
+- **A shared backing store still requires careful grants.** Credentials may
+  live together in one Kubernetes Secret or 1Password vault, but the Centaur
+  Console scopes their use by principal, role, and request rules. The `infra`
+  role is assigned to new principals by default so they can run a harness.
+  Operators must configure tool roles, direct grants, default roles, and
+  sandbox capabilities for their environment. See
+  [Advanced Permissioning](/secrets/advanced-permissioning).
 - **The default egress allowlist is permissive.** Leaving it open is
   a deliberate UX choice. An open configuration lets users start
   using agents immediately and develop an allowlist over time. If

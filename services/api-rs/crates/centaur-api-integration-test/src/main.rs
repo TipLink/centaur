@@ -8,7 +8,10 @@ use anyhow::{Context, Result, bail};
 use centaur_session_core::HarnessType;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use reqwest::{Client as HttpClient, StatusCode};
+use reqwest::{
+    Client as HttpClient, StatusCode,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+};
 use serde_json::{Value, json};
 use tokio::time::{Instant, sleep, timeout};
 use uuid::Uuid;
@@ -17,33 +20,27 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:18080";
 const SOURCE_PATH: &str = "services/api-rs/crates/centaur-api-integration-test/src/main.rs";
 const TEST_MODEL: &str = "gpt-api-integration-test";
 
-fn workflow_api_key() -> Result<String> {
-    env::var("WORKFLOW_API_KEY")
-        .context("WORKFLOW_API_KEY is required for workflow API integration tests")
-}
-
-fn session_api_key() -> Result<String> {
-    env::var("SLACKBOT_API_KEY")
-        .context("SLACKBOT_API_KEY is required for session API integration tests")
-}
-
-fn control_api_key() -> Result<String> {
-    env::var("CENTAUR_CONTROL_API_KEY")
-        .context("CENTAUR_CONTROL_API_KEY is required for control API integration tests")
-}
-
-fn feedback_api_key() -> Result<String> {
-    env::var("SLACK_FEEDBACK_API_KEY")
-        .context("SLACK_FEEDBACK_API_KEY is required for feedback API integration tests")
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let base_url = env::var("CENTAUR_API_URL")
         .unwrap_or_else(|_| DEFAULT_API_URL.to_owned())
         .trim_end_matches('/')
         .to_owned();
-    let http = HttpClient::new();
+    let api_token = env::var("CENTAUR_API_TOKEN")
+        .context("CENTAUR_API_TOKEN must be set for api-rs integration tests")?;
+    if api_token.trim().is_empty() {
+        bail!("CENTAUR_API_TOKEN must not be empty");
+    }
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {api_token}"))
+            .context("CENTAUR_API_TOKEN is not a valid HTTP bearer credential")?,
+    );
+    let http = HttpClient::builder()
+        .default_headers(default_headers)
+        .build()
+        .context("failed to build authenticated HTTP client")?;
 
     let mut results = Vec::new();
 
@@ -90,19 +87,17 @@ async fn main() -> Result<()> {
     let line = line!() + 1;
     record_result(
         &mut results,
-        "Metrics expose API request counters",
+        "Python workflows call agent turns and durable context methods",
         line,
-        test_metrics(&http, &base_url).await,
+        test_python_workflow_durable_methods(&http, &base_url).await,
     );
 
-    // The authorized drain is intentionally last: it irreversibly fences new
-    // executions for the lifetime of this control-plane process.
     let line = line!() + 1;
     record_result(
         &mut results,
-        "Control authorization drains sandboxes after other API checks",
+        "Metrics expose API request counters",
         line,
-        test_control_drain(&http, &base_url).await,
+        test_metrics(&http, &base_url).await,
     );
 
     write_report(&results)?;
@@ -252,6 +247,8 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
         (HarnessType::Codex, "codex"),
         (HarnessType::Amp, "amp"),
         (HarnessType::ClaudeCode, "claudecode"),
+        (HarnessType::Nanocodex, "nanocodex"),
+        (HarnessType::Hermes, "hermes"),
     ];
 
     for (harness_type, expected_wire_value) in cases {
@@ -279,7 +276,6 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
                     "harness_wire_value": wire_value,
                 },
             }),
-            Some(&session_api_key()?),
         )
         .await
         .with_context(|| format!("create {wire_value} session"))?;
@@ -304,7 +300,6 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
     let invalid_thread_key = test_thread_key("invalid-harness")?;
     let invalid_response = http
         .post(session_url(base_url, &invalid_thread_key))
-        .bearer_auth(session_api_key()?)
         .json(&json!({
             "harness_type": "claude-code",
             "metadata": {"source": "centaur-api-integration-test"},
@@ -322,46 +317,6 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
 }
 
 async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
-    let feedback_thread = format!(
-        "feedback-improvement:api-integration:{}",
-        Uuid::new_v4().simple()
-    );
-    let anonymous_feedback = http
-        .post(session_url(base_url, &feedback_thread))
-        .header("X-Centaur-Feedback-Key", feedback_api_key()?)
-        .json(&json!({"harness_type": "codex"}))
-        .send()
-        .await
-        .context("request feedback session without principal JWT")?;
-    if anonymous_feedback.status() != StatusCode::UNAUTHORIZED {
-        let status = anonymous_feedback.status();
-        let body = anonymous_feedback.text().await.unwrap_or_default();
-        bail!("feedback session without principal JWT returned {status}, expected 401: {body}");
-    }
-
-    let anonymous_drain = http
-        .post(format!("{base_url}/api/sandboxes/drain"))
-        .send()
-        .await
-        .context("request sandbox drain without authorization")?;
-    if anonymous_drain.status() != StatusCode::UNAUTHORIZED {
-        let status = anonymous_drain.status();
-        let body = anonymous_drain.text().await.unwrap_or_default();
-        bail!("anonymous sandbox drain returned {status}, expected 401: {body}");
-    }
-
-    let bot_drain = http
-        .post(format!("{base_url}/api/sandboxes/drain"))
-        .bearer_auth(session_api_key()?)
-        .send()
-        .await
-        .context("request sandbox drain with bot authorization")?;
-    if bot_drain.status() != StatusCode::UNAUTHORIZED {
-        let status = bot_drain.status();
-        let body = bot_drain.text().await.unwrap_or_default();
-        bail!("bot-authorized sandbox drain returned {status}, expected 401: {body}");
-    }
-
     let thread_key = test_thread_key("turn")?;
     let harness_wire_value = serde_json::to_value(HarnessType::Codex)
         .context("serialize executable harness type")?
@@ -379,22 +334,9 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
             },
             "on_harness_conflict": "restart",
         }),
-        Some(&session_api_key()?),
     )
     .await
     .context("create executable session")?;
-
-    let anonymous_release = http
-        .post(format!("{}/release", session_url(base_url, &thread_key)))
-        .json(&json!({"release_id": "anonymous", "cancel_inflight": false}))
-        .send()
-        .await
-        .context("request session release without authorization")?;
-    if anonymous_release.status() != StatusCode::UNAUTHORIZED {
-        let status = anonymous_release.status();
-        let body = anonymous_release.text().await.unwrap_or_default();
-        bail!("anonymous session release returned {status}, expected 401: {body}");
-    }
 
     let append = post_json_ok(
         http,
@@ -415,7 +357,6 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
                 },
             ],
         }),
-        Some(&session_api_key()?),
     )
     .await
     .context("append user message")?;
@@ -458,7 +399,6 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
             "idle_timeout_ms": 5_000,
             "max_duration_ms": 15_000,
         }),
-        Some(&session_api_key()?),
     )
     .await
     .context("execute session")?;
@@ -484,7 +424,6 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
             "idle_timeout_ms": 5_000,
             "max_duration_ms": 15_000,
         }),
-        Some(&session_api_key()?),
     )
     .await
     .context("replay idempotent execute")?;
@@ -504,7 +443,6 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
             "{}/events?after_event_id=0",
             session_url(base_url, &thread_key)
         ))
-        .bearer_auth(session_api_key()?)
         .send()
         .await
         .context("open session event stream")?;
@@ -558,24 +496,6 @@ async fn test_session_turn(http: &HttpClient, base_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn test_control_drain(http: &HttpClient, base_url: &str) -> Result<()> {
-    let response = http
-        .post(format!("{base_url}/api/sandboxes/drain"))
-        .bearer_auth(control_api_key()?)
-        .send()
-        .await
-        .context("request sandbox drain with control authorization")?;
-    let status = response.status();
-    let body = response
-        .json::<Value>()
-        .await
-        .context("parse control-authorized sandbox drain response")?;
-    if status != StatusCode::OK || body.get("ok").and_then(Value::as_bool) != Some(true) {
-        bail!("control-authorized sandbox drain returned {status}: {body}");
-    }
-    Ok(())
-}
-
 async fn test_metrics(http: &HttpClient, base_url: &str) -> Result<()> {
     let response = http
         .get(format!("{base_url}/metrics"))
@@ -599,46 +519,6 @@ async fn test_metrics(http: &HttpClient, base_url: &str) -> Result<()> {
 }
 
 async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
-    let anonymous_malformed_workflow = http
-        .post(format!("{base_url}/api/workflows/runs"))
-        .header("content-type", "application/json")
-        .body("{not-json")
-        .send()
-        .await
-        .context("request malformed workflow without authorization")?;
-    if anonymous_malformed_workflow.status() != StatusCode::UNAUTHORIZED {
-        let status = anonymous_malformed_workflow.status();
-        let body = anonymous_malformed_workflow
-            .text()
-            .await
-            .unwrap_or_default();
-        bail!("anonymous malformed workflow returned {status}, expected 401: {body}");
-    }
-
-    let anonymous_admin_batch = http
-        .post(format!("{base_url}/api/admin/slack/dm-sync/batch"))
-        .header("content-type", "application/json")
-        .body(format!("{{{}", "x".repeat(1024 * 1024)))
-        .send()
-        .await
-        .context("request oversized malformed admin batch without authorization")?;
-    if anonymous_admin_batch.status() != StatusCode::UNAUTHORIZED {
-        let status = anonymous_admin_batch.status();
-        let body = anonymous_admin_batch.text().await.unwrap_or_default();
-        bail!("anonymous malformed admin batch returned {status}, expected 401: {body}");
-    }
-
-    let anonymous = http
-        .get(format!("{base_url}/api/workflows/schedules"))
-        .send()
-        .await
-        .context("request workflow schedules without authorization")?;
-    if anonymous.status() != StatusCode::UNAUTHORIZED {
-        let status = anonymous.status();
-        let body = anonymous.text().await.unwrap_or_default();
-        bail!("anonymous workflow schedules request returned {status}, expected 401: {body}");
-    }
-
     let workflow_dir = integration_workflow_dir()?;
     fs::create_dir_all(&workflow_dir)
         .with_context(|| format!("create workflow dir {}", workflow_dir.display()))?;
@@ -647,6 +527,7 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
     let sentinel_name = format!("api_integration_sentinel_{unique}");
     let workflow_name = format!("api_integration_workflow_{unique}");
     let workflow_path = workflow_dir.join(format!("{workflow_name}.py"));
+    let workflow_started_path = workflow_dir.join(format!("{workflow_name}.started"));
 
     write_sentinel_workflow(&workflow_dir, &sentinel_name)?;
     write_test_workflow(&workflow_path, &workflow_name)?;
@@ -662,7 +543,6 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         json!({
             "case": "added-workflow-run",
             "sleep_ms": 0,
-            "thread_key": "api-integration-test:workflow-filter",
         }),
     )
     .await
@@ -681,34 +561,6 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         bail!("completed workflow output did not echo input: {completed_run}");
     }
 
-    let filtered = http
-        .get(format!(
-            "{base_url}/api/workflows/runs?workflow_name={workflow_name}&thread_key=api-integration-test%3Aworkflow-filter"
-        ))
-        .bearer_auth(workflow_api_key()?)
-        .send()
-        .await
-        .context("list workflow runs with resource filters")?;
-    if !filtered.status().is_success() {
-        let status = filtered.status();
-        let body = filtered.text().await.unwrap_or_default();
-        bail!("filtered workflow run list returned {status}: {body}");
-    }
-    let filtered = filtered
-        .json::<Value>()
-        .await
-        .context("parse filtered workflow run list")?;
-    let filtered_runs = filtered
-        .get("runs")
-        .and_then(Value::as_array)
-        .context("filtered workflow run list missing runs")?;
-    if filtered_runs.len() != 1
-        || filtered_runs[0].get("run_id").and_then(Value::as_str) != Some(completed_run_id.as_str())
-    {
-        bail!("workflow run filters returned unexpected rows: {filtered}");
-    }
-
-    let started_marker = workflow_path.with_extension("started");
     let removed_run_id = create_workflow_run(
         http,
         base_url,
@@ -716,25 +568,17 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
         json!({
             "case": "removed-workflow-run",
             "sleep_ms": 60_000,
-            "started_marker": started_marker,
+            "started_path": workflow_started_path,
         }),
     )
     .await
     .context("create long-running workflow run")?;
-    wait_for_workflow_run_status(http, base_url, &removed_run_id, &["running"])
+    // The queue marks a run as running before the Python host has loaded its
+    // module. Wait for handler entry so removing the file cannot race loading.
+    wait_for_workflow_handler_start(http, base_url, &removed_run_id, &workflow_started_path)
         .await
-        .context("wait for long-running workflow run to start")?;
+        .context("wait for long-running workflow handler to start")?;
 
-    // A run becomes running before the Python host imports its module. Wait
-    // until the handler has entered before removing the source under test.
-    let deadline = Instant::now() + Duration::from_secs(25);
-    while !started_marker.try_exists()? {
-        if Instant::now() >= deadline {
-            bail!("workflow handler did not write its start marker before timeout");
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    fs::remove_file(&started_marker)?;
     fs::remove_file(&workflow_path)
         .with_context(|| format!("remove workflow file {}", workflow_path.display()))?;
 
@@ -744,6 +588,105 @@ async fn test_workflows_api(http: &HttpClient, base_url: &str) -> Result<()> {
     wait_for_workflow_run_status(http, base_url, &removed_run_id, &["cancelled"])
         .await
         .context("wait for removed workflow run to be cancelled")?;
+
+    Ok(())
+}
+
+async fn test_python_workflow_durable_methods(http: &HttpClient, base_url: &str) -> Result<()> {
+    let workflow_dir = integration_workflow_dir()?;
+    fs::create_dir_all(&workflow_dir)
+        .with_context(|| format!("create workflow dir {}", workflow_dir.display()))?;
+
+    let unique = Uuid::new_v4().simple().to_string();
+    let workflow_name = format!("api_integration_durable_{unique}");
+    let child_workflow_name = format!("api_integration_child_{unique}");
+    let correlation_id = format!("api-integration-event-{unique}");
+    let workflow_path = workflow_dir.join(format!("{workflow_name}.py"));
+    let child_workflow_path = workflow_dir.join(format!("{child_workflow_name}.py"));
+
+    write_child_workflow(&child_workflow_path, &child_workflow_name)?;
+    write_durable_context_workflow(&workflow_path, &workflow_name)?;
+
+    wait_for_workflow_schedule(http, base_url, &workflow_name, true)
+        .await
+        .context("wait for durable context workflow to be discovered")?;
+
+    let run_id = create_workflow_run(
+        http,
+        base_url,
+        &workflow_name,
+        json!({
+            "child_workflow_name": child_workflow_name,
+            "correlation_id": correlation_id,
+            "model": TEST_MODEL,
+        }),
+    )
+    .await
+    .context("create durable context workflow run")?;
+
+    post_json_ok(
+        http,
+        format!("{base_url}/api/workflows/events"),
+        json!({
+            "event_type": "integration_test",
+            "correlation_id": correlation_id,
+            "payload": {"approved": true},
+        }),
+    )
+    .await
+    .context("emit durable workflow event")?;
+
+    let completed_run = wait_for_workflow_run_status(http, base_url, &run_id, &["completed"])
+        .await
+        .context("wait for durable context workflow completion")?;
+    let output = completed_run
+        .pointer("/result/output")
+        .context("durable context workflow missing result output")?;
+
+    let checkpoint_host = output
+        .pointer("/checkpoint/host_instance_id")
+        .and_then(Value::as_str)
+        .context("durable step output missing host instance id")?;
+    let result_host = output
+        .get("result_host_instance_id")
+        .and_then(Value::as_str)
+        .context("workflow output missing result host instance id")?;
+    if checkpoint_host == result_host {
+        bail!("checkpointed step was recomputed after durable sleep instead of replayed: {output}");
+    }
+    if output.pointer("/event/approved").and_then(Value::as_bool) != Some(true) {
+        bail!("workflow did not receive the durable event: {output}");
+    }
+    if output.pointer("/agent/status").and_then(Value::as_str) != Some("completed") {
+        bail!("workflow agent turn did not complete: {output}");
+    }
+    let result_text = output
+        .pointer("/agent/result_text")
+        .and_then(Value::as_str)
+        .context("workflow agent turn missing result text")?;
+    if !result_text.contains("PONG")
+        || !result_text.contains(&format!("model={TEST_MODEL}"))
+        || !result_text.contains("harness=codex")
+    {
+        bail!("workflow agent turn returned unexpected output: {result_text:?}");
+    }
+    if output.pointer("/child/created").and_then(Value::as_bool) != Some(true) {
+        bail!("workflow did not create its durable child: {output}");
+    }
+    let child_run_id = output
+        .pointer("/child/run_id")
+        .and_then(Value::as_str)
+        .context("durable child result missing run id")?;
+    let child_run = wait_for_workflow_run_status(http, base_url, child_run_id, &["completed"])
+        .await
+        .context("wait for durable child workflow completion")?;
+    if child_run
+        .pointer("/result/output/received/from_parent")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("durable child workflow did not receive parent input: {child_run}");
+    }
 
     Ok(())
 }
@@ -789,8 +732,9 @@ SCHEDULE = {{
 
 
 async def handler(params, ctx):
-    if params.get("started_marker"):
-        Path(params["started_marker"]).write_text("started")
+    started_path = params.get("started_path")
+    if started_path:
+        Path(started_path).touch()
     sleep_ms = int(params.get("sleep_ms") or 0)
     if sleep_ms:
         await asyncio.sleep(sleep_ms / 1000)
@@ -803,6 +747,71 @@ async def handler(params, ctx):
 "#
     );
     fs::write(path, source).with_context(|| format!("write test workflow {}", path.display()))
+}
+
+fn write_child_workflow(path: &Path, workflow_name: &str) -> Result<()> {
+    let source = format!(
+        r#"
+WORKFLOW_NAME = "{workflow_name}"
+
+
+async def handler(params, ctx):
+    return {{"workflow_name": ctx.workflow_name, "received": params}}
+"#
+    );
+    fs::write(path, source).with_context(|| format!("write child workflow {}", path.display()))
+}
+
+fn write_durable_context_workflow(path: &Path, workflow_name: &str) -> Result<()> {
+    let source = format!(
+        r#"
+import uuid
+
+WORKFLOW_NAME = "{workflow_name}"
+HOST_INSTANCE_ID = uuid.uuid4().hex
+SCHEDULE = {{
+    "schedule_id": "{workflow_name}",
+    "interval_seconds": 3600,
+    "enabled": True,
+    "no_delivery": True,
+    "input": {{"source": "centaur-api-integration-test"}},
+}}
+
+
+async def handler(params, ctx):
+    checkpoint = await ctx.step(
+        "checkpoint_before_sleep",
+        lambda: {{"host_instance_id": HOST_INSTANCE_ID}},
+    )
+    await ctx.sleep("durable_sleep", 0.05)
+    event = await ctx.wait_for_event(
+        "durable_event",
+        "integration_test",
+        params["correlation_id"],
+        timeout=10,
+    )
+    agent = await ctx.agent_turn(
+        "Reply with PONG, the model, and the harness.",
+        model=params["model"],
+        idle_timeout_ms=5_000,
+        max_duration_ms=15_000,
+    )
+    child = await ctx.start_workflow(
+        params["child_workflow_name"],
+        {{"from_parent": True}},
+        idempotency_key=f"{{ctx.run_id}}:child",
+    )
+    return {{
+        "checkpoint": checkpoint,
+        "result_host_instance_id": HOST_INSTANCE_ID,
+        "event": event,
+        "agent": agent,
+        "child": child,
+    }}
+"#
+    );
+    fs::write(path, source)
+        .with_context(|| format!("write durable context workflow {}", path.display()))
 }
 
 async fn create_workflow_run(
@@ -821,7 +830,6 @@ async fn create_workflow_run(
             "harness_type": HarnessType::Codex,
             "max_attempts": 1,
         }),
-        Some(&workflow_api_key()?),
     )
     .await?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -847,12 +855,7 @@ async fn wait_for_workflow_run_status(
     let mut last_run = Value::Null;
 
     while Instant::now() < deadline {
-        let body = get_json_ok(
-            http,
-            format!("{base_url}/api/workflows/runs/{run_id}"),
-            Some(&workflow_api_key()?),
-        )
-        .await?;
+        let body = get_json_ok(http, format!("{base_url}/api/workflows/runs/{run_id}")).await?;
         let run = body
             .get("run")
             .cloned()
@@ -880,6 +883,41 @@ async fn wait_for_workflow_run_status(
     )
 }
 
+async fn wait_for_workflow_handler_start(
+    http: &HttpClient,
+    base_url: &str,
+    run_id: &str,
+    started_path: &Path,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut last_run = Value::Null;
+
+    while Instant::now() < deadline {
+        if started_path.is_file() {
+            return Ok(());
+        }
+
+        let body = get_json_ok(http, format!("{base_url}/api/workflows/runs/{run_id}")).await?;
+        let run = body
+            .get("run")
+            .cloned()
+            .context("workflow run response missing run")?;
+        let status = run
+            .get("status")
+            .and_then(Value::as_str)
+            .context("workflow run missing status")?;
+        if matches!(status, "completed" | "failed" | "cancelled") {
+            bail!(
+                "workflow run {run_id} reached terminal status {status} before its handler started: {run}"
+            );
+        }
+        last_run = run;
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    bail!("workflow run {run_id} handler did not start before timeout; last run: {last_run}")
+}
+
 async fn wait_for_workflow_schedule(
     http: &HttpClient,
     base_url: &str,
@@ -890,12 +928,7 @@ async fn wait_for_workflow_schedule(
     let mut last_body = Value::Null;
 
     while Instant::now() < deadline {
-        let body = get_json_ok(
-            http,
-            format!("{base_url}/api/workflows/schedules"),
-            Some(&workflow_api_key()?),
-        )
-        .await?;
+        let body = get_json_ok(http, format!("{base_url}/api/workflows/schedules")).await?;
         let present = body
             .get("schedules")
             .and_then(Value::as_array)
@@ -919,16 +952,9 @@ fn parse_json(data: &str) -> Result<Value> {
     serde_json::from_str(data).with_context(|| format!("parse event payload as JSON: {data}"))
 }
 
-async fn get_json_ok(
-    http: &HttpClient,
-    url: impl AsRef<str>,
-    bearer_token: Option<&str>,
-) -> Result<Value> {
-    let mut request = http.get(url.as_ref());
-    if let Some(token) = bearer_token {
-        request = request.bearer_auth(token);
-    }
-    let response = request
+async fn get_json_ok(http: &HttpClient, url: impl AsRef<str>) -> Result<Value> {
+    let response = http
+        .get(url.as_ref())
         .send()
         .await
         .with_context(|| format!("GET {}", url.as_ref()))?;
@@ -943,17 +969,10 @@ async fn get_json_ok(
         .with_context(|| format!("parse GET {} response", url.as_ref()))
 }
 
-async fn post_json_ok(
-    http: &HttpClient,
-    url: impl AsRef<str>,
-    body: Value,
-    bearer_token: Option<&str>,
-) -> Result<Value> {
-    let mut request = http.post(url.as_ref()).json(&body);
-    if let Some(token) = bearer_token {
-        request = request.bearer_auth(token);
-    }
-    let response = request
+async fn post_json_ok(http: &HttpClient, url: impl AsRef<str>, body: Value) -> Result<Value> {
+    let response = http
+        .post(url.as_ref())
+        .json(&body)
         .send()
         .await
         .with_context(|| format!("POST {}", url.as_ref()))?;

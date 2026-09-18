@@ -208,12 +208,17 @@ def records(
     limit: int = typer.Option(25, "--limit", "-n", help="Max results"),
     filter_json: str = typer.Option(None, "--filter", "-f", help="Filter as JSON"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+    all_results: bool = typer.Option(False, "--all", help="Fetch all result pages"),
 ):
     """Query records for any object."""
     client = _get_client()
 
     filter_obj = json.loads(filter_json) if filter_json else None
-    records_list = client.query_records(object_slug, filter_obj=filter_obj, limit=limit)
+    records_list = (
+        client.query_all_records(object_slug, filter_obj=filter_obj, page_size=limit)
+        if all_results
+        else client.query_records(object_slug, filter_obj=filter_obj, limit=limit)
+    )
 
     if json_output:
         print(json.dumps(records_list, indent=2, ensure_ascii=False), file=sys.stdout)
@@ -280,17 +285,41 @@ def update(
     object_slug: str = typer.Argument(..., help="Object slug"),
     record_id: str = typer.Argument(..., help="Record ID"),
     values_json: str = typer.Argument(..., help="Values to update as JSON"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output canonical response"),
 ):
-    """Update an existing record.
+    """Update a record, appending rather than replacing multiselect values.
 
     Examples:
         attio update people abc123 '{"email_addresses": [{"email_address": "new@email.com"}]}'
     """
     client = _get_client()
     values = json.loads(values_json)
-    client.update_record(object_slug, record_id, values)
+    record = client.update_record(object_slug, record_id, values)
+
+    if json_output:
+        print(json.dumps(record, indent=2, ensure_ascii=False), file=sys.stdout)
+        raise typer.Exit()
 
     console.print(f"[green]✓ Updated {object_slug} record {record_id[:8]}...[/]")
+
+
+@app.command()
+def replace(
+    object_slug: str = typer.Argument(..., help="Object slug"),
+    record_id: str = typer.Argument(..., help="Record ID"),
+    values_json: str = typer.Argument(..., help="Values to replace as JSON"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output canonical response"),
+):
+    """Replace supplied attribute values, including multi-value relationships."""
+    client = _get_client()
+    values = json.loads(values_json)
+    record = client.replace_record_values(object_slug, record_id, values)
+
+    if json_output:
+        print(json.dumps(record, indent=2, ensure_ascii=False), file=sys.stdout)
+        raise typer.Exit()
+
+    console.print(f"[green]✓ Replaced values on {object_slug} record {record_id[:8]}...[/]")
 
 
 @app.command()
@@ -390,10 +419,15 @@ def notes(
     object_slug: str = typer.Argument(..., help="Parent object slug"),
     record_id: str = typer.Argument(..., help="Parent record ID"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+    all_results: bool = typer.Option(False, "--all", help="Fetch all result pages"),
 ):
     """List notes for a record."""
     client = _get_client()
-    notes_list = client.list_notes(object_slug, record_id)
+    notes_list = (
+        client.list_all_notes(object_slug, record_id)
+        if all_results
+        else client.list_notes(object_slug, record_id)
+    )
 
     if json_output:
         print(json.dumps(notes_list, indent=2, ensure_ascii=False), file=sys.stdout)
@@ -615,6 +649,26 @@ def add_note(
     note_id = note.get("id", {}).get("note_id", "")
     console.print("[green]✓ Created note[/]")
     console.print(f"[cyan]ID:[/] {note_id}")
+
+
+@app.command("upload-file")
+def upload_file(
+    object_slug: str = typer.Argument(..., help="Object slug (e.g., 'people', 'companies')"),
+    record_id: str = typer.Argument(..., help="Record ID to attach the file to"),
+    file_path: str = typer.Argument(..., help="Path to the local file (maximum 50 MB)"),
+    parent_folder_id: str = typer.Option(None, "--parent-folder", help="Optional folder ID"),
+):
+    """Upload a file, including a PDF, to an Attio record."""
+    client = _get_client()
+    uploaded = client.upload_file(
+        object_slug,
+        record_id,
+        file_path,
+        parent_folder_id=parent_folder_id,
+    )
+    file_id = uploaded.get("id", {}).get("file_id", "")
+    console.print(f"[green]✓ Uploaded {uploaded.get('name', file_path)}[/]")
+    console.print(f"[cyan]ID:[/] {file_id}")
 
 
 @app.command()

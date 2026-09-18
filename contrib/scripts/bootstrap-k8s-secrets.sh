@@ -11,23 +11,14 @@ Usage: scripts/bootstrap-k8s-secrets.sh [--namespace NAMESPACE] [--force]
 Creates the required local-dev Kubernetes infra Secrets consumed by the Helm chart.
 When creating centaur-infra-env from scratch or with --force, requires
 OP_SERVICE_ACCOUNT_TOKEN, OP_VAULT, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET,
-and SLACKBOT_API_KEY in the shell environment. A stable
-CENTAUR_CONTROL_API_KEY is generated for Console/API administration, and a
-distinct SLACK_FEEDBACK_API_KEY is generated for the sandbox feedback tool.
-Existing Secrets are only topped up with newly generated keys when absent.
-All configured control, bot, workflow, and feedback API credentials must be
-pairwise distinct; api-rs refuses to start if trust lanes share a value.
+and SLACKBOT_API_KEY in the shell environment. Existing Secrets are only topped
+up with newly generated optional keys when absent.
 
 Optional 1Password Connect bootstrap (when ironProxy.manager.secretSource is
 set to onepassword-connect in the Helm values):
   OP_CONNECT_CREDENTIALS_FILE  path to 1password-credentials.json; if set,
                                creates Secret centaur-onepassword-connect-credentials
   OP_CONNECT_TOKEN             Connect API token; added to centaur-infra-env
-
-Optional local-dev admin key:
-  LOCAL_DEV_API_KEY            seeded as the admin bearer for the API service
-                               (envFrom centaur-infra-env). Re-run with --force
-                               or kubectl patch to rotate.
 
 Optional repo-cache GitHub token:
   GITHUB_TOKEN                 added to centaur-infra-env when present; the
@@ -78,14 +69,24 @@ Optional Teams ingress bootstrap (consumed when teamsbot.enabled=true):
   TEAMSBOT_API_KEY             bearer the bot sends to api-rs; auto-generated
                                once when absent (never rotated in place)
 
-Optional iron-control bootstrap (consumed when ironControl.enabled=true):
+Console bootstrap:
   IRON_CONTROL_DATABASE_URL    overrides the derived DSN (default points at the
                                bundled Postgres server with no database path, so
                                Rails resolves db names from its database.yml)
+  CONSOLE_SQLEXPORTER_DATABASE_URL
+                               database DSN for a separately
+                               provisioned read-only PostgreSQL role; copied
+                               into centaur-infra-env when set
   IRON_CONTROL_INITIAL_USER_EMAIL
                                initial admin email (default admin@centaur.local)
   The initial password, API key, the three ActiveRecord encryption keys, and
   SECRET_KEY_BASE are auto-generated when absent (never rotated in place).
+
+Note: harness access-token modes (sandbox.codexAuthMode / claudeCodeAuthMode
+set to access_token) also need a console broker credential (openai-codex /
+anthropic-claude) created out of band with `centaur-perms broker create`;
+without it api-rs fails registration at startup. This script cannot seed it.
+See the Codex/Claude Auth Modes sections in docs/pages/deploying-in-production.mdx.
 EOF
 }
 
@@ -198,54 +199,10 @@ secret_key_present() {
   [[ -n "$value" ]]
 }
 
-assert_service_api_keys_distinct() {
-  local keys=(
-    CENTAUR_CONTROL_API_KEY
-    SLACKBOT_API_KEY
-    GITHUBBOT_API_KEY
-    LINEARBOT_API_KEY
-    DISCORDBOT_API_KEY
-    TEAMSBOT_API_KEY
-    WORKFLOW_API_KEY
-    SLACK_FEEDBACK_API_KEY
-  )
-  local names=()
-  local values=()
-  local key value index
-  for key in "${keys[@]}"; do
-    value="$(kubectl -n "$NAMESPACE" get secret centaur-infra-env \
-      -o "jsonpath={.data.${key}}" 2>/dev/null || true)"
-    [[ -n "$value" ]] || continue
-    for index in "${!values[@]}"; do
-      if [[ "$value" == "${values[$index]}" ]]; then
-        echo "${names[$index]} and $key must contain distinct service credentials" >&2
-        return 1
-      fi
-    done
-    names+=("$key")
-    values+=("$value")
-  done
-}
-
 if secret_exists centaur-infra-env; then
   patch_data=()
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     patch_data+=("\"OP_CONNECT_TOKEN\":\"$(printf '%s' "$OP_CONNECT_TOKEN" | base64 | tr -d '\n')\"")
-  fi
-  # Top-up IRON_BROKER_TOKEN for clusters bootstrapped before iron-token-broker
-  # support landed. Only generated when absent so we don't rotate it out from
-  # under cached iron-proxy access tokens on every script run.
-  if ! secret_key_present IRON_BROKER_TOKEN; then
-    patch_data+=("\"IRON_BROKER_TOKEN\":\"$(rand_hex | base64 | tr -d '\n')\"")
-  fi
-  if ! secret_key_present CENTAUR_CONTROL_API_KEY; then
-    patch_data+=("\"CENTAUR_CONTROL_API_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
-  fi
-  if ! secret_key_present SLACK_FEEDBACK_API_KEY; then
-    patch_data+=("\"SLACK_FEEDBACK_API_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
-  fi
-  if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
-    patch_data+=("\"LOCAL_DEV_API_KEY\":\"$(printf '%s' "$LOCAL_DEV_API_KEY" | base64 | tr -d '\n')\"")
   fi
   # GITHUB_TOKEN for the repo-cache DaemonSet. Set whenever present so it can be
   # rotated; harmless when repoCache is disabled.
@@ -288,6 +245,10 @@ if secret_exists centaur-infra-env; then
       ic_db_url="${existing_db_url%/ai_v2}"
     fi
     patch_data+=("\"IRON_CONTROL_DATABASE_URL\":\"$(printf '%s' "$ic_db_url" | base64 | tr -d '\n')\"")
+  fi
+  if [[ -n "${CONSOLE_SQLEXPORTER_DATABASE_URL:-}" ]] && \
+     ! secret_key_present CONSOLE_SQLEXPORTER_DATABASE_URL; then
+    patch_data+=("\"CONSOLE_SQLEXPORTER_DATABASE_URL\":\"$(printf '%s' "$CONSOLE_SQLEXPORTER_DATABASE_URL" | base64 | tr -d '\n')\"")
   fi
   if ! secret_key_present IRON_CONTROL_INITIAL_USER_EMAIL; then
     ic_email="${IRON_CONTROL_INITIAL_USER_EMAIL:-admin@centaur.local}"
@@ -341,7 +302,6 @@ if secret_exists centaur-infra-env; then
     kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
     echo "Updated optional keys in Secret centaur-infra-env in namespace $NAMESPACE"
   fi
-  assert_service_api_keys_distinct
   echo "Secret centaur-infra-env already exists in namespace $NAMESPACE; leaving unchanged"
 else
   POSTGRES_PASSWORD="$(rand_hex)"
@@ -355,15 +315,11 @@ else
   secret_args=(
     -n "$NAMESPACE" create secret generic centaur-infra-env
     --from-literal=IRON_MANAGEMENT_API_KEY="$(rand_hex)"
-    --from-literal=IRON_BROKER_TOKEN="$(rand_hex)"
-    --from-literal=SANDBOX_SIGNING_KEY="$(rand_hex)"
     --from-literal=OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN"
     --from-literal=OP_VAULT="$OP_VAULT"
     --from-literal=SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN"
     --from-literal=SLACK_SIGNING_SECRET="$SLACK_SIGNING_SECRET"
     --from-literal=SLACKBOT_API_KEY="$SLACKBOT_API_KEY"
-    --from-literal=CENTAUR_CONTROL_API_KEY="$(rand_hex)"
-    --from-literal=SLACK_FEEDBACK_API_KEY="$(rand_hex)"
     --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
     --from-literal=DATABASE_URL="$DATABASE_URL"
     --from-literal=IRON_CONTROL_DATABASE_URL="$IRON_CONTROL_DATABASE_URL"
@@ -376,6 +332,11 @@ else
     --from-literal=IRON_CONTROL_SECRET_KEY_BASE="$(rand_hex)$(rand_hex)"
     --from-literal=CENTAUR_JWT_SIGNING_SECRET="$(rand_hex)$(rand_hex)"
   )
+  if [[ -n "${CONSOLE_SQLEXPORTER_DATABASE_URL:-}" ]]; then
+    secret_args+=(
+      --from-literal=CONSOLE_SQLEXPORTER_DATABASE_URL="$CONSOLE_SQLEXPORTER_DATABASE_URL"
+    )
+  fi
   if [[ -n "${DISCORD_BOT_TOKEN:-}" ]]; then
     secret_args+=(
       --from-literal=DISCORD_BOT_TOKEN="$DISCORD_BOT_TOKEN"
@@ -395,9 +356,6 @@ else
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")
   fi
-  if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
-    secret_args+=(--from-literal=LOCAL_DEV_API_KEY="$LOCAL_DEV_API_KEY")
-  fi
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=GITHUB_TOKEN="$GITHUB_TOKEN")
   fi
@@ -412,7 +370,6 @@ else
     secret_args+=(--from-literal=GITHUBBOT_API_KEY="${GITHUBBOT_API_KEY:-$(rand_hex)}")
   fi
   kubectl "${secret_args[@]}" >/dev/null
-  assert_service_api_keys_distinct
   echo "Created Secret centaur-infra-env in namespace $NAMESPACE"
 fi
 

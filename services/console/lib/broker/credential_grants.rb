@@ -1,5 +1,3 @@
-require "uri"
-
 module Broker
   # Registry for broker credential token-exchange strategies. BrokerCredential
   # owns persistence and scheduling; these strategies own provider-specific
@@ -7,11 +5,9 @@ module Broker
   module CredentialGrants
     PREQIN_TOKEN_ENDPOINT = "https://api.preqin.com/connect/token".freeze
     PREQIN_REFRESH_TOKEN_ENDPOINT = "https://api.preqin.com/connect/refresh_token".freeze
-    GITHUB_APP_INSTALLATION = "github_app_installation".freeze
-    DEFAULT_GITHUB_APP_TOKEN_ENDPOINT_HOSTS = [ "api.github.com" ].freeze
 
-    GRANTS = [ "refresh_token", "password", "preqin", GITHUB_APP_INSTALLATION ].freeze
-    REFRESHABLE_WITHOUT_TOKEN_GRANTS = [ "password", "preqin", GITHUB_APP_INSTALLATION ].freeze
+    GRANTS = %w[refresh_token client_credentials password preqin].freeze
+    REFRESHABLE_WITHOUT_TOKEN_GRANTS = %w[client_credentials password preqin].freeze
 
     Outcome = Data.define(:result, :clear_refresh_token, :dead_reason)
 
@@ -26,43 +22,26 @@ module Broker
 
       def validate(credential)
         case credential.grant
+        when "client_credentials"
+          validate_client_credentials(credential)
         when "password"
           validate_password(credential)
         when "preqin"
           validate_preqin(credential)
-        when GITHUB_APP_INSTALLATION
-          validate_github_app_installation(credential)
         end
       end
 
-      def refresh(credential, now: Time.current)
+      def refresh(credential)
         case credential.grant
+        when "client_credentials"
+          refresh_client_credentials(credential)
         when "password"
           refresh_password(credential)
         when "preqin"
           refresh_preqin(credential)
-        when GITHUB_APP_INSTALLATION
-          refresh_github_app_installation(credential, now: now)
         else
           refresh_token(credential)
         end
-      end
-
-      def github_app_installation_token_endpoint?(value)
-        uri = URI.parse(value.to_s)
-        allowed_hosts = ENV.fetch(
-          "GITHUB_APP_TOKEN_ENDPOINT_HOSTS",
-          DEFAULT_GITHUB_APP_TOKEN_ENDPOINT_HOSTS.join(",")
-        ).split(",").filter_map { |host| host.strip.downcase.presence }.uniq
-        uri.is_a?(URI::HTTPS) &&
-          allowed_hosts.include?(uri.host.to_s.downcase) &&
-          uri.port == 443 &&
-          uri.userinfo.nil? &&
-          uri.query.nil? &&
-          uri.fragment.nil? &&
-          uri.path.match?(%r{\A/app/installations/[^/]+/access_tokens\z})
-      rescue URI::InvalidURIError
-        false
       end
 
       private
@@ -105,6 +84,15 @@ module Broker
         success(result, clear_refresh_token: clear_stale_refresh_token && result.refresh_token.blank?)
       end
 
+      def refresh_client_credentials(credential)
+        result = post_token_form(
+          credential,
+          url: credential.token_endpoint,
+          form: client_credentials_form(credential)
+        )
+        success(result)
+      end
+
       def refresh_preqin(credential)
         clear_stale_refresh_token = false
 
@@ -139,17 +127,6 @@ module Broker
           strict_4xx: true
         )
         success(result, clear_refresh_token: clear_stale_refresh_token && result.refresh_token.blank?)
-      end
-
-      def refresh_github_app_installation(credential, now:)
-        result = credential.github_app_client.mint(
-          token_endpoint: credential.token_endpoint,
-          app_id: credential.effective_client_id,
-          private_key_pem: credential.effective_client_secret,
-          timeout: credential.refresh_timeout_seconds,
-          now: now
-        )
-        success(result, clear_refresh_token: true)
       end
 
       def oauth_refresh_token(credential)
@@ -197,6 +174,18 @@ module Broker
         add_oauth_optional_fields(form, credential)
       end
 
+      def client_credentials_form(credential)
+        require_value!("client_id", credential.effective_client_id)
+        require_value!("client_secret", credential.effective_client_secret)
+
+        form = {
+          "grant_type" => "client_credentials",
+          "client_id" => credential.effective_client_id,
+          "client_secret" => credential.effective_client_secret
+        }
+        add_oauth_optional_fields(form, credential)
+      end
+
       def preqin_token_form(credential)
         require_value!("username", credential.username)
         require_value!("api_key", credential.api_key)
@@ -230,23 +219,15 @@ module Broker
         credential.errors.add(:password, "can't be blank for the password grant") if credential.password.blank?
       end
 
+      def validate_client_credentials(credential)
+        if credential.effective_client_secret.blank?
+          credential.errors.add(:client_secret, "can't be blank for the client_credentials grant")
+        end
+      end
+
       def validate_preqin(credential)
         credential.errors.add(:username, "can't be blank for the Preqin broker grant") if credential.username.blank?
         credential.errors.add(:api_key, "can't be blank for the Preqin broker grant") if credential.api_key.blank?
-      end
-
-      def validate_github_app_installation(credential)
-        if credential.effective_client_secret.blank?
-          credential.errors.add(:client_secret, "can't be blank for a GitHub App installation credential")
-        end
-        return if credential.token_endpoint.blank?
-
-        unless github_app_installation_token_endpoint?(credential.token_endpoint)
-          credential.errors.add(
-            :token_endpoint,
-            "must be an approved HTTPS GitHub App installation access-token endpoint"
-          )
-        end
       end
 
       def password_values_present?(credential)

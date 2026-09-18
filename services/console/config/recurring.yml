@@ -20,13 +20,23 @@ production:
     class: "Broker::PollRefreshJob"
     schedule: every minute
   slack_dm_poll_sync:
-    class: "SlackDm::PollSyncJob"
+    class: "SlackDm::SyncCredentialJob"
+    schedule: every 10 minutes
+  slack_channel_catalog_refresh:
+    class: "SlackChannelCatalogRefreshJob"
+    schedule: every hour
+  slack_channel_catalog_membership_refresh:
+    class: "SlackChannelCatalogMembershipRefreshJob"
     schedule: every 10 minutes
   google_docs_poll_sync:
     class: "GoogleDocs::PollSyncJob"
+    schedule: every 30 minutes
   granola_poll_sync:
     class: "Granola::PollSyncJob"
     schedule: every 30 minutes
   prune_principal_sync_config_snapshots:
     class: "PrunePrincipalSyncConfigSnapshotsJob"
     schedule: every 10 minutes
+  scheduled_task_scheduler:
+    class: "ScheduledTaskSchedulerJob"
+    schedule: every minute

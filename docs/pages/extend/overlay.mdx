@@ -1,6 +1,6 @@
 ---
 title: Using an overlay
-description: Package and mount organization-specific Centaur tools, workflows, skills, personas, and prompts without forking the base repo.
+description: Package and mount organization-specific Centaur tools, workflows, skills, Slack handlers, personas, and prompts without forking the base repo.
 ---
 
 # Using an overlay
@@ -28,6 +28,8 @@ centaur-overlay/
 │       └── pyproject.toml
 ├── workflows/
 │   └── nightly_report.py
+├── slackbot/
+│   └── index.mjs
 ├── .agents/
 │   └── skills/
 │       └── incident-response/
@@ -67,11 +69,11 @@ It defaults to `private`. Set `visibility: public` only for repos whose full
 contents are safe to expose to principals configured with
 `sandbox_repo_cache=public`; invalid or missing values are treated as `private`.
 
-Each source defaults to the conventional layout — `toolsSubdir: tools`,
-`workflowsSubdir: workflows`, `skillsSubdir: .agents/skills` — and directories
-a repo does not contain are skipped at runtime, so a skills-only overlay needs
-no extra configuration. Set a subdir to a non-default path to relocate it, or
-to `""` to explicitly disable that surface for a source:
+Each source defaults to the conventional layout: `toolsSubdir: tools`,
+`workflowsSubdir: workflows`, `skillsSubdir: .agents/skills`. Directories a
+repo does not contain are skipped at runtime, so a skills-only overlay needs no
+extra configuration. Set a subdir to a non-default path to relocate it, or to
+`""` to explicitly disable that surface for a source:
 
 ```yaml
     - repo: your-org/workflows-only
@@ -80,6 +82,73 @@ to `""` to explicitly disable that surface for a source:
       toolsSubdir: ""
       skillsSubdir: ""
 ```
+
+Slackbot extensions are disabled unless a source sets `slackbotSubdir`. The
+named directory must contain an `index.mjs` ESM module. Because the code loads
+inside the long-running ingress process, the source `ref` must be a full
+40-character commit SHA:
+
+```yaml
+    - repo: your-org/centaur-overlay
+      ref: 0123456789abcdef0123456789abcdef01234567
+      slackbotSubdir: slackbot
+```
+
+```js title="slackbot/index.mjs"
+export const extension = {
+  id: 'support',
+  slashCommands: ['/support'],
+  actionIds: ['support.resolve'],
+  actionIdPrefixes: [],
+  modalCallbackIds: [],
+  optionsLoadIds: []
+}
+
+export function register({ chat, logger }) {
+  chat.onSlashCommand('/support', async event => {
+    await event.channel.postEphemeral(event.user, 'Choose a support action.', {
+      fallbackToDM: false
+    })
+  })
+
+  chat.onAction('support.resolve', async event => {
+    logger.info('support_resolve_requested', { user_id: event.user.userId })
+    await event.thread?.post('Resolution requested.')
+  })
+}
+```
+
+The `extension` manifest declares every slash command, modal callback, options
+loader, exact action ID, and optional legacy action-ID prefix the module owns.
+The `chat` object is the existing Chat SDK instance. Its registration methods
+are scoped to the manifest: undeclared registrations and declared routes that
+the module never registers fail startup. Register explicit, stable action IDs
+and carry changing state in the button value. Prefix claims are available for
+migrations from dynamic action IDs. Claimed actions bypass Centaur's generic
+workflow-action dispatcher; duplicates and the reserved
+`centaur.workflow.action:` prefix also fail startup.
+
+For an extension-owned action, modal submission, option load, or slash command,
+Slackbot waits for the handler's returned promise before acknowledging Slack in
+both webhook and Socket Mode. Keep that critical section bounded and use it only
+for validation plus a durable write. Start provider delivery after the durable
+write so slow message updates do not consume Slack's acknowledgement window.
+Normal modal validation and option responses are returned in the acknowledgement.
+An uncaught pre-ack handler error returns a retryable webhook failure or leaves
+the Socket Mode envelope unacknowledged.
+
+Extensions run as trusted code inside Slackbot. Centaur does not pass the bot
+token, signing secret, or full Slackbot options in the extension context, but
+the module still shares the service process and must receive the same review as
+deployment code. An import error, missing `extension` or `register` export,
+or registration error fails startup instead of silently dropping commands.
+Extensions load once when Slackbot starts. Changing a pinned overlay `ref`
+changes the Slackbot pod template and triggers a rollout. At startup Slackbot
+compares the repo checkout's detached `HEAD` with the configured SHA and fails
+before importing code if repo-cache has not reached that revision. Kubernetes
+then retries startup after repo-cache syncs, which prevents a rollout from
+staying on the previous overlay code. The chart rejects mutable refs for
+extension-enabled sources.
 
 For compatibility, when `overlays.sources` is empty the chart maps
 `toolServer.repo`, `toolServer.ref`, `toolServer.subdir`, and
@@ -93,12 +162,17 @@ you are debugging:
 | Runtime | Mount | Used for |
 |---------|-------|----------|
 | API | `/var/lib/centaur/repos/<owner>/<repo>` | Tool-secret discovery and workflow discovery. |
+| Slackbot | `/var/lib/centaur/repos/<owner>/<repo>` | Deployment-defined slash commands, modals, option loaders, and actions. |
 | Sandbox | `/home/agent/github/<owner>/<repo>` | Workflow-host execution, skills, persona files, prompt fragments, and runtime files available to agents. |
 
 Do not use the sandbox path when debugging API discovery. If a tool or workflow
 is missing from API discovery, inspect `/var/lib/centaur/repos/...` in the API
 container. If a skill or workflow-host import is missing, inspect
 `/home/agent/github/...` in the sandbox.
+
+Both mounts are served by repo-cache, so overlays require `repoCache.enabled:
+true` (the default). If the cluster disallows writable hostPath volumes, set
+`repoCache.storage.type: persistentVolumeClaim` instead of disabling the cache.
 
 ## Discovery paths
 
@@ -125,6 +199,13 @@ The sandbox entrypoint copies each existing directory from `CENTAUR_SKILL_DIRS`
 into the agent workspace in order, so later overlay skill directories can
 replace earlier skill names.
 
+Slackbot receives an ordered JSON list of explicitly enabled modules through
+`SLACKBOTV2_EXTENSION_MODULES`:
+
+```text
+[{"modulePath":"/var/lib/centaur/repos/your-org/centaur-overlay/slackbot/index.mjs","repositoryPath":"/var/lib/centaur/repos/your-org/centaur-overlay","revision":"0123456789abcdef0123456789abcdef01234567"}]
+```
+
 ## Prompt overlays
 
 For small prompt additions, keep using the chart-level escape hatch:
@@ -135,8 +216,9 @@ overlay:
     Add deployment-specific agent guidance here.
 ```
 
-For larger prompt/persona sets, keep files in an overlay repo and expose their
-paths through `overlays.sources` as that surface is wired into your deployment.
+For larger prompt/persona sets, keep files in overlay repos. The sandbox starts
+with the root prompt, then appends every mounted
+`/home/agent/github/<owner>/<repo>/services/sandbox/SYSTEM_PROMPT.md` it finds.
 Do not rely on `overlay.image.*`; repo-cache-backed overlays are the default
 delivery path.
 
@@ -150,6 +232,14 @@ kubectl exec -n centaur deploy/centaur-centaur-api-rs -- sh -lc '
   echo "$WORKFLOW_DIRS"
   for d in ${TOOL_DIRS//:/ }; do test -d "$d" && find "$d" -maxdepth 1 -mindepth 1 -type d | sort; done
   for d in ${WORKFLOW_DIRS//:/ }; do test -d "$d" && find "$d" -maxdepth 1 -name "*.py" | sort; done
+'
+```
+
+Verify Slackbot sees each configured startup module:
+
+```bash
+kubectl exec -n centaur deploy/centaur-centaur-slackbotv2 -- sh -lc '
+  printf "%s\n" "$SLACKBOTV2_EXTENSION_MODULES"
 '
 ```
 

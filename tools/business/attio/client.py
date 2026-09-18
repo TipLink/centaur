@@ -1,5 +1,10 @@
 """Attio API client."""
 
+import mimetypes
+import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -10,9 +15,10 @@ from centaur_sdk import secret
 class AttioClient:
     """Authenticated Attio CRM API client."""
 
-    def __init__(self, api_key: str | None = None):
+    def __init__(self, api_key: str | None = None, max_rate_limit_retries: int = 2):
         self._api_key_override = api_key
         self._client: httpx.Client | None = None
+        self.max_rate_limit_retries = max_rate_limit_retries
 
     def _http(self) -> httpx.Client:
         """Return the cached HTTP client, building it after secrets are injected."""
@@ -28,7 +34,6 @@ class AttioClient:
             base_url="https://api.attio.com/v2",
             headers={
                 "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
             },
             timeout=30.0,
         )
@@ -36,7 +41,12 @@ class AttioClient:
 
     def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         """Make authenticated request to Attio API."""
-        response = self._http().request(method, path, **kwargs)
+        for attempt in range(self.max_rate_limit_retries + 1):
+            response = self._http().request(method, path, **kwargs)
+            if response.status_code != 429 or attempt == self.max_rate_limit_retries:
+                break
+            retry_after = response.headers.get("Retry-After", "1")
+            time.sleep(self._retry_delay(retry_after))
         if response.status_code >= 400:
             try:
                 error = response.json()
@@ -45,6 +55,20 @@ class AttioClient:
                 msg = response.text
             raise RuntimeError(f"Attio API error ({response.status_code}): {msg}")
         return response.json()
+
+    def _retry_delay(self, retry_after: str, now: datetime | None = None) -> float:
+        """Parse Retry-After as delta seconds or an HTTP date, bounded to one minute."""
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                delay = (retry_at - (now or datetime.now(UTC))).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                delay = 1.0
+        return min(max(delay, 0.0), 60.0)
 
     def _clean_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Remove unset values and encode list query params the way Attio expects."""
@@ -139,6 +163,31 @@ class AttioClient:
         data = self._request("POST", f"/objects/{object_slug}/records/query", json=body)
         return data.get("data", [])
 
+    def query_all_records(
+        self,
+        object_slug: str,
+        filter_obj: dict | None = None,
+        sorts: list[dict] | None = None,
+        page_size: int = 500,
+    ) -> list[dict]:
+        """Query every matching record using Attio's limit/offset pagination."""
+        if not 1 <= page_size <= 500:
+            raise ValueError("page_size must be between 1 and 500")
+        records: list[dict] = []
+        offset = 0
+        while True:
+            page = self.query_records(
+                object_slug,
+                filter_obj=filter_obj,
+                sorts=sorts,
+                limit=page_size,
+                offset=offset,
+            )
+            records.extend(page)
+            if len(page) < page_size:
+                return records
+            offset += page_size
+
     def get_record(self, object_slug: str, record_id: str) -> dict:
         """Get a specific record by ID."""
         data = self._request("GET", f"/objects/{object_slug}/records/{record_id}")
@@ -162,14 +211,30 @@ class AttioClient:
         return data.get("data", {})
 
     def update_record(self, object_slug: str, record_id: str, values: dict) -> dict:
-        """Update an existing record.
+        """Update a record, appending rather than replacing multiselect values.
 
         values format is the same as create_record — attribute slugs mapping to
         lists of typed value objects.
         """
         body = {"data": {"values": values}}
         data = self._request("PATCH", f"/objects/{object_slug}/records/{record_id}", json=body)
-        return data.get("data", {})
+        return self._validated_record_response(data, record_id)
+
+    def replace_record_values(self, object_slug: str, record_id: str, values: dict) -> dict:
+        """Replace the supplied record attribute values instead of appending them."""
+        body = {"data": {"values": values}}
+        data = self._request("PUT", f"/objects/{object_slug}/records/{record_id}", json=body)
+        return self._validated_record_response(data, record_id)
+
+    def _validated_record_response(self, response: dict[str, Any], record_id: str) -> dict:
+        """Require Attio to return the record that was mutated."""
+        record = response.get("data", {})
+        returned_id = record.get("id", {}).get("record_id")
+        if returned_id != record_id:
+            raise RuntimeError(
+                f"Attio mutation response did not confirm record {record_id}; got {returned_id!r}"
+            )
+        return record
 
     def delete_record(self, object_slug: str, record_id: str) -> bool:
         """Delete a record."""
@@ -216,9 +281,7 @@ class AttioClient:
         data = self._request("POST", f"/lists/{list_id}/entries/query", json=body)
         return data.get("data", [])
 
-    def create_entry(
-        self, list_id: str, parent_record_id: str, values: dict | None = None
-    ) -> dict:
+    def create_entry(self, list_id: str, parent_record_id: str, values: dict | None = None) -> dict:
         """Create a new entry in a list."""
         body: dict[str, Any] = {"data": {"parent_record_id": parent_record_id}}
         if values:
@@ -226,14 +289,75 @@ class AttioClient:
         data = self._request("POST", f"/lists/{list_id}/entries", json=body)
         return data.get("data", {})
 
-    def list_notes(self, parent_object: str, parent_record_id: str) -> list[dict]:
+    def list_notes(
+        self,
+        parent_object: str,
+        parent_record_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
         """List notes for a record."""
         data = self._request(
             "GET",
             "/notes",
-            params={"parent_object": parent_object, "parent_record_id": parent_record_id},
+            params={
+                "parent_object": parent_object,
+                "parent_record_id": parent_record_id,
+                "limit": limit,
+                "offset": offset,
+            },
         )
         return data.get("data", [])
+
+    def list_all_notes(
+        self, parent_object: str, parent_record_id: str, page_size: int = 50
+    ) -> list[dict]:
+        """List every note for a record using Attio's limit/offset pagination."""
+        if not 1 <= page_size <= 50:
+            raise ValueError("page_size must be between 1 and 50")
+        notes: list[dict] = []
+        offset = 0
+        while True:
+            page = self.list_notes(
+                parent_object,
+                parent_record_id,
+                limit=page_size,
+                offset=offset,
+            )
+            notes.extend(page)
+            if len(page) < page_size:
+                return notes
+            offset += page_size
+
+    def upload_file(
+        self,
+        object_slug: str,
+        record_id: str,
+        file_path: str,
+        parent_folder_id: str | None = None,
+    ) -> dict:
+        """Upload a local file to an Attio record's native file storage."""
+        path = Path(file_path)
+        if not path.is_file():
+            raise ValueError(f"File does not exist or is not a regular file: {file_path}")
+
+        max_size = 50 * 1024 * 1024
+        if path.stat().st_size > max_size:
+            raise ValueError("Attio files must be 50 MB or smaller")
+
+        form = {"object": object_slug, "record_id": record_id}
+        if parent_folder_id:
+            form["parent_folder_id"] = parent_folder_id
+
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        with path.open("rb") as file_handle:
+            data = self._request(
+                "POST",
+                "/files/upload",
+                data=form,
+                files={"file": (path.name, file_handle, content_type)},
+            )
+        return data.get("data", {})
 
     def list_threads(
         self,

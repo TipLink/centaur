@@ -57,6 +57,22 @@ Rails.application.routes.draw do
         post :run, action: :force_start
       end
     end
+    resources :scheduled_tasks, except: :show do
+      post :run, on: :member
+      get :slack_channel_options,
+          on: :collection,
+          to: "slack_channel_options#index",
+          defaults: { owner_type: "scheduled_task" }
+    end
+    resources :skills do
+      collection do
+        get :mine
+      end
+      member do
+        post :share
+        post :unshare
+      end
+    end
     # Lazily-loaded sidebar thread list (Turbo Frame src). Kept off the main
     # page render so the unindexed cross-database sessions query does not block
     # every console page. See ApplicationController#load_console_sidebar_threads.
@@ -65,16 +81,24 @@ Rails.application.routes.draw do
   namespace :console do
     resources :roles, only: %i[index show new create edit update] do
       member do
+        get "slack_channel_options", to: "slack_channel_options#index",
+            defaults: { owner_type: "role" }, as: :slack_channel_options
         post "grants", to: "roles#grant_secret", as: :grant_secret
         delete "grants/:grant_id", to: "roles#revoke_grant", as: :revoke_grant
+        patch "slack_channel_permissions", to: "roles#update_slack_channel_permissions",
+              as: :slack_channel_permissions
       end
     end
+    delete "slack_channel_permissions/:slack_channel_permission_id", to: "slack_channel_permissions#destroy",
+           as: :slack_channel_permission
   end
   # Role assignments and direct grants managed from the principal detail page. The
   # extra /roles and /grants path segments keep these clear of the show route above
   # and avoid clobbering the console_principal_path helper.
   namespace :console do
     delete "principals/:id",                  to: "principals#destroy", as: :delete_principal
+    get    "principals/:id/slack_channel_options", to: "slack_channel_options#index",
+           defaults: { owner_type: "principal" }, as: :principal_slack_channel_options
     patch  "principals/:id/sandbox_access",   to: "principals#update_sandbox_access", as: :principal_sandbox_access
     patch  "principals/:id/slack_channel_permissions", to: "principals#update_slack_channel_permissions", as: :principal_slack_channel_permissions
     post   "principals/:id/roles",            to: "principals#assign_role",   as: :principal_assign_role
@@ -136,6 +160,7 @@ Rails.application.routes.draw do
         post :approve
         post :disable
         post :promote
+        post :demote
       end
     end
     resource :system_settings, only: %i[edit update], path: "settings"
@@ -146,41 +171,72 @@ Rails.application.routes.draw do
 
   namespace :api do
     namespace :v1 do
-      # Each secret type is addressable by opaque oid (member routes) or by an
-      # explicit namespace + foreign_id via the namespaced lookup route.
+      # Each secret type is addressable by opaque oid or globally unique foreign_id.
+      # The /lookup/default/... form is a temporary compatibility alias.
       resources :static_secrets, only: %i[index show create update destroy] do
-        collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
+        collection do
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
+          get "lookup/:foreign_id", action: :lookup, as: :lookup
+        end
       end
       resources :gcp_auth_secrets, only: %i[index show create update destroy] do
-        collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
+        collection do
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
+          get "lookup/:foreign_id", action: :lookup, as: :lookup
+        end
       end
       resources :gcp_id_token_secrets, only: %i[index show create update destroy] do
-        collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
+        collection do
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
+          get "lookup/:foreign_id", action: :lookup, as: :lookup
+        end
       end
       resources :aws_auth_secrets, only: %i[index show create update destroy] do
-        collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
+        collection do
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
+          get "lookup/:foreign_id", action: :lookup, as: :lookup
+        end
       end
       resources :oauth_token_secrets, only: %i[index show create update destroy] do
-        collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
+        collection do
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
+          get "lookup/:foreign_id", action: :lookup, as: :lookup
+        end
       end
       resources :pg_dsn_secrets, only: %i[index show create update destroy] do
-        collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
+        collection do
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
+          get "lookup/:foreign_id", action: :lookup, as: :lookup
+        end
       end
       resources :hmac_secrets, only: %i[index show create update destroy] do
-        collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
+        collection do
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
+          get "lookup/:foreign_id", action: :lookup, as: :lookup
+        end
       end
       resources :roles, only: %i[index show create update destroy] do
         collection do
-          get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
+          get "lookup/:foreign_id", action: :lookup, as: :lookup
+        end
+        member do
+          post "slack_channel_permissions", action: :upsert_slack_channel_permission
         end
         # Grants whose grantee is this role. :role_id is the role's oid.
         resources :grants, only: %i[index], controller: :grantee_grants
       end
       resources :principals, only: %i[index show create update] do
         collection do
-          get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup
-          get "lookup/:namespace/:foreign_id/effective_config",
-              action: :effective_config, as: :lookup_effective_config
+          get "lookup/default/:foreign_id/effective_config",
+              action: :effective_config, as: :default_lookup_effective_config,
+              constraints: { foreign_id: /[^\/]+/ }
+          get "lookup/:foreign_id/effective_config", action: :effective_config, as: :lookup_effective_config,
+              constraints: { foreign_id: /[^\/]+/ }
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup,
+              constraints: { foreign_id: /[^\/]+/ }
+          get "lookup/:foreign_id", action: :lookup, as: :lookup,
+              constraints: { foreign_id: /[^\/]+/ }
         end
         member do
           get "effective_config"
@@ -194,11 +250,14 @@ Rails.application.routes.draw do
       resources :grants, only: %i[show create destroy]
       resources :api_keys, only: %i[index show create destroy]
       resources :proxies, only: %i[index show create update destroy]
-
+      resources :scheduled_tasks, only: %i[show]
       # Operator-managed broker credentials (ApiKey auth). CRUD + lookup; the
       # rotating token blob is never serialized back.
       resources :broker_credentials, only: %i[index show create update destroy] do
-        collection { get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup }
+        collection do
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
+          get "lookup/:foreign_id", action: :lookup, as: :lookup
+        end
       end
 
       # Operator-managed OAuth apps (ApiKey auth). Addressed by oid or slug; CRUD
@@ -212,8 +271,23 @@ Rails.application.routes.draw do
 
       # Called from inside sandboxes through their assigned iron-proxy. The
       # proxy injects a short-lived sandbox entitlement JWT scoped to these paths.
-      get "sandbox/permissions", to: "sandbox_permissions#show"
-      get "sandbox/oauth_apps", to: "sandbox_oauth_apps#index"
+      namespace :sandbox do
+        resource :permissions, only: :show
+        resources :oauth_apps, only: :index
+        resources :scheduled_tasks, only: %i[index show create update destroy] do
+          post :run, on: :member
+        end
+        resources :skills, only: %i[index show create update destroy] do
+          collection { get :search }
+          member do
+            post :share
+            post :unshare
+            get :editors
+            post :add_editor, path: "editors"
+            delete :remove_editor, path: "editors"
+          end
+        end
+      end
     end
   end
 

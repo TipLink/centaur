@@ -37,61 +37,30 @@ pub struct ToolLabels {
 }
 
 fn rules_from_hosts(hosts: &[String]) -> Vec<RequestRule> {
-    rules_from_hosts_with_scope(hosts, &[], &[])
-}
-
-fn rules_from_hosts_with_scope(
-    hosts: &[String],
-    methods: &[String],
-    paths: &[String],
-) -> Vec<RequestRule> {
-    hosts
-        .iter()
-        .map(|host| RequestRule {
-            host: Some(host.clone()),
-            cidr: None,
-            http_methods: methods.to_vec(),
-            paths: paths.to_vec(),
-        })
-        .collect()
+    hosts.iter().map(RequestRule::host).collect()
 }
 
 /// Translate every secret declared by a tool into iron-control inputs to grant
 /// to the tool's role (`role_foreign_id`, e.g. `tool-github`).
 #[cfg(test)]
 pub fn translate(
-    namespace: &str,
     role_foreign_id: &str,
     secrets: &[ParsedSecret],
     policy: &SourcePolicy,
 ) -> Translation {
-    translate_with_labels(
-        namespace,
-        role_foreign_id,
-        secrets,
-        policy,
-        &managed_labels(),
-    )
+    translate_with_labels(role_foreign_id, secrets, policy, &managed_labels())
 }
 
 pub fn translate_for_tool(
-    namespace: &str,
     role_foreign_id: &str,
     labels: &ToolLabels,
     secrets: &[ParsedSecret],
     policy: &SourcePolicy,
 ) -> Translation {
-    translate_with_labels(
-        namespace,
-        role_foreign_id,
-        secrets,
-        policy,
-        &tool_labels(labels),
-    )
+    translate_with_labels(role_foreign_id, secrets, policy, &tool_labels(labels))
 }
 
 fn translate_with_labels(
-    namespace: &str,
     role_foreign_id: &str,
     secrets: &[ParsedSecret],
     policy: &SourcePolicy,
@@ -103,7 +72,6 @@ fn translate_with_labels(
         match secret {
             ParsedSecret::Http(http) => {
                 out.inputs.push(SecretInput::Static(static_input(
-                    namespace,
                     role_foreign_id,
                     http,
                     policy,
@@ -113,7 +81,6 @@ fn translate_with_labels(
             }
             ParsedSecret::OAuthToken(oauth) => {
                 out.inputs.push(SecretInput::OAuthToken(oauth_input(
-                    namespace,
                     role_foreign_id,
                     oauth,
                     policy,
@@ -123,7 +90,6 @@ fn translate_with_labels(
             }
             ParsedSecret::GcpAuth(gcp) => {
                 out.inputs.push(SecretInput::GcpAuth(gcp_input(
-                    namespace,
                     role_foreign_id,
                     gcp,
                     policy,
@@ -133,7 +99,6 @@ fn translate_with_labels(
             }
             ParsedSecret::GcpIdToken(gcp) => {
                 out.inputs.push(SecretInput::GcpIdToken(gcp_id_token_input(
-                    namespace,
                     role_foreign_id,
                     gcp,
                     policy,
@@ -142,13 +107,11 @@ fn translate_with_labels(
                 )));
             }
             ParsedSecret::PgDsn(pg) => {
-                out.inputs.push(SecretInput::PgDsn(pg_dsn_input(
-                    namespace, pg, policy, labels,
-                )));
+                out.inputs
+                    .push(SecretInput::PgDsn(pg_dsn_input(pg, policy, labels)));
             }
             ParsedSecret::Hmac(hmac) => {
                 out.inputs.push(SecretInput::Hmac(hmac_input(
-                    namespace,
                     role_foreign_id,
                     hmac,
                     policy,
@@ -158,7 +121,6 @@ fn translate_with_labels(
             }
             ParsedSecret::BrokerToken(broker) => {
                 out.inputs.push(SecretInput::Static(broker_token_input(
-                    namespace,
                     role_foreign_id,
                     broker,
                     labels,
@@ -167,7 +129,6 @@ fn translate_with_labels(
             }
             ParsedSecret::AwsAuth(aws) => {
                 out.inputs.push(SecretInput::AwsAuth(aws_input(
-                    namespace,
                     role_foreign_id,
                     aws,
                     policy,
@@ -188,7 +149,6 @@ fn tool_labels(tool: &ToolLabels) -> BTreeMap<String, String> {
 }
 
 fn static_input(
-    namespace: &str,
     role: &str,
     http: &HttpSecret,
     policy: &SourcePolicy,
@@ -217,7 +177,6 @@ fn static_input(
         ),
     };
     StaticSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: unique_foreign_id(format!("{role}-{}", slugify(&http.name)), used),
         name: http.name.clone(),
         description: None,
@@ -225,12 +184,11 @@ fn static_input(
         inject_config,
         replace_config,
         source: source_from_placeholder(policy, &http.secret_ref, None),
-        rules: rules_from_hosts_with_scope(&http.hosts, &http.methods, &http.paths),
+        rules: rules_from_hosts(&http.hosts),
     }
 }
 
 fn oauth_input(
-    namespace: &str,
     role: &str,
     oauth: &OAuthTokenSecret,
     policy: &SourcePolicy,
@@ -239,7 +197,6 @@ fn oauth_input(
 ) -> OAuthTokenSecretInput {
     let identity = oauth.token_endpoint.as_deref().unwrap_or(&oauth.name);
     OAuthTokenSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: unique_foreign_id(format!("{role}-oauth-{}", slugify(identity)), used),
         name: format!("OAuth {}", oauth.grant),
         grant: oauth.grant.clone(),
@@ -254,7 +211,6 @@ fn oauth_input(
 }
 
 fn gcp_input(
-    namespace: &str,
     role: &str,
     gcp: &GcpAuthSecret,
     policy: &SourcePolicy,
@@ -262,7 +218,6 @@ fn gcp_input(
     used: &mut BTreeSet<String>,
 ) -> GcpAuthSecretInput {
     GcpAuthSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: Some(unique_foreign_id(
             format!("{role}-gcp-{}", slugify(&gcp.name)),
             used,
@@ -278,7 +233,6 @@ fn gcp_input(
 }
 
 fn gcp_id_token_input(
-    namespace: &str,
     role: &str,
     gcp: &GcpIdTokenSecret,
     policy: &SourcePolicy,
@@ -291,7 +245,6 @@ fn gcp_id_token_input(
         identity.push_str(header);
     }
     GcpIdTokenSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: unique_foreign_id(format!("{role}-gcp-id-token-{}", slugify(&identity)), used),
         name: Some(format!("GCP ID Token ({role})")),
         description: None,
@@ -312,13 +265,11 @@ fn gcp_id_token_input(
 /// trailing `_dsn`/`-dsn` is stripped before slugifying — e.g. `RESHIFT_DSN`
 /// becomes `reshift`, which `pg_sandbox_env_var` turns back into `RESHIFT_DSN`.
 fn pg_dsn_input(
-    namespace: &str,
     pg: &PgDsnSecret,
     policy: &SourcePolicy,
     labels: &BTreeMap<String, String>,
 ) -> PgDsnSecretInput {
     PgDsnSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: pg_dsn_foreign_id(&pg.name),
         name: pg.name.clone(),
         database: pg.database.clone(),
@@ -338,10 +289,14 @@ fn pg_setting_input(setting: &PgDsnSetting) -> PgDsnSettingInput {
             |PgDsnSettingValueFrom {
                  principal_label,
                  principal_field,
+                 requester_principal_field,
+                 proxy_label,
              }| {
                 PgDsnSettingValueFromInput {
                     principal_label: principal_label.clone(),
                     principal_field: principal_field.clone(),
+                    requester_principal_field: requester_principal_field.clone(),
+                    proxy_label: proxy_label.clone(),
                 }
             },
         ),
@@ -366,7 +321,6 @@ fn pg_dsn_foreign_id(name: &str) -> String {
 /// transform with its own rules (like a `gcp_auth` secret), so the `foreign_id`
 /// is role-prefixed and deduped (`{role}-hmac-{slug}`).
 fn hmac_input(
-    namespace: &str,
     role: &str,
     hmac: &HmacSignSecret,
     policy: &SourcePolicy,
@@ -374,7 +328,6 @@ fn hmac_input(
     used: &mut BTreeSet<String>,
 ) -> HmacSecretInput {
     HmacSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: unique_foreign_id(format!("{role}-hmac-{}", slugify(&hmac.name)), used),
         name: hmac.name.clone(),
         description: None,
@@ -405,7 +358,6 @@ fn hmac_input(
 /// credential refs resolve through the deployment's [`SourcePolicy`] like every
 /// other secret source.
 fn aws_input(
-    namespace: &str,
     role: &str,
     aws: &AwsAuthSecret,
     policy: &SourcePolicy,
@@ -413,7 +365,6 @@ fn aws_input(
     used: &mut BTreeSet<String>,
 ) -> AwsAuthSecretInput {
     AwsAuthSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: unique_foreign_id(format!("{role}-aws-{}", slugify(&aws.name)), used),
         name: Some(format!("AWS Auth ({role})")),
         description: None,
@@ -437,14 +388,12 @@ fn aws_input(
 /// `centaur-perms broker create`); nothing here creates it. The `foreign_id` is
 /// role-prefixed and deduped like the other secret types.
 fn broker_token_input(
-    namespace: &str,
     role: &str,
     broker: &BrokerTokenSecret,
     labels: &BTreeMap<String, String>,
     used: &mut BTreeSet<String>,
 ) -> StaticSecretInput {
     StaticSecretInput {
-        namespace: namespace.to_owned(),
         foreign_id: unique_foreign_id(format!("{role}-{}", slugify(&broker.name)), used),
         name: broker.name.clone(),
         description: None,
@@ -455,7 +404,7 @@ fn broker_token_input(
             formatter: Some(broker.inject_formatter.clone()),
         }),
         replace_config: None,
-        source: SecretSource::token_broker(&broker.credential, namespace),
+        source: SecretSource::token_broker(&broker.credential),
         rules: rules_from_hosts(&broker.hosts),
     }
 }

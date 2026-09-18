@@ -1,9 +1,199 @@
+import json
+from unittest.mock import Mock
+
+import pytest
 from typer.testing import CliRunner
 
 from gsuite import client
-from gsuite.cli import app
+from gsuite.cli import app, extract_drive_file_id
 
 runner = CliRunner()
+
+
+def test_sheets_batch_read_passes_repeated_ranges_and_outputs_json(monkeypatch):
+    calls = []
+    expected = [{"spreadsheet_id": "sheet-123", "raw_values": [["[bold]data"]]}]
+
+    def fake_batch_read(spreadsheet_id, range_notations):
+        calls.append((spreadsheet_id, range_notations))
+        return expected
+
+    monkeypatch.setattr(client, "sheets_batch_read", fake_batch_read)
+    for json_flag in ["--json", "-o"]:
+        calls.clear()
+        result = runner.invoke(
+            app,
+            [
+                "sheets",
+                "batch-read",
+                "sheet-123",
+                "-r",
+                "Data!A1:B3",
+                "--range",
+                "Other!A1",
+                json_flag,
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert calls == [("sheet-123", ["Data!A1:B3", "Other!A1"])]
+        assert json.loads(result.stdout) == expected
+
+
+def test_sheets_batch_read_displays_each_range_by_default(monkeypatch):
+    monkeypatch.setattr(
+        client,
+        "sheets_batch_read",
+        lambda spreadsheet_id, range_notations: [
+            {"range": "Empty!A1", "headers": [], "rows": []},
+            {"range": "Data!A1:A2", "headers": ["Name"], "rows": [{"Name": "Alice"}]},
+            {"range": "Other!A1:A2", "headers": ["Name"], "rows": [{"Name": "Bob"}]},
+        ],
+    )
+    result = runner.invoke(
+        app,
+        [
+            "sheets",
+            "batch-read",
+            "sheet-123",
+            "-r",
+            "Empty!A1",
+            "-r",
+            "Data!A1:A2",
+            "-r",
+            "Other!A1:A2",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Empty!A1: No data found." in result.stdout
+    assert "Data!A1:A2" in "".join(result.stdout.split())
+    assert "Alice" in result.stdout
+    assert "Other!A1:A2" in "".join(result.stdout.split())
+    assert "Bob" in result.stdout
+
+
+def test_sheets_batch_read_requires_ranges():
+    result = runner.invoke(app, ["sheets", "batch-read", "sheet-123"])
+    assert result.exit_code == 2
+
+
+def test_sheets_batch_read_requires_range_flag():
+    result = runner.invoke(app, ["sheets", "batch-read", "sheet-123", "Data!A1"])
+    assert result.exit_code == 2
+
+
+def test_sheets_batch_read_accepts_one_range(monkeypatch):
+    calls = []
+
+    def fake_batch_read(spreadsheet_id, range_notations):
+        calls.append((spreadsheet_id, range_notations))
+        return []
+
+    monkeypatch.setattr(client, "sheets_batch_read", fake_batch_read)
+    result = runner.invoke(app, ["sheets", "batch-read", "sheet-123", "--range", "Data!A1"])
+    assert result.exit_code == 0
+    assert calls == [("sheet-123", ["Data!A1"])]
+
+
+def test_sheets_batch_read_reports_errors(monkeypatch):
+    def fake_batch_read(spreadsheet_id, range_notations):
+        raise ValueError("Invalid range")
+
+    monkeypatch.setattr(client, "sheets_batch_read", fake_batch_read)
+    result = runner.invoke(app, ["sheets", "batch-read", "sheet-123", "-r", "invalid"])
+    assert result.exit_code == 1
+    assert "Invalid range" in result.stdout
+
+
+def test_extract_drive_file_id_accepts_editor_and_drive_urls():
+    assert (
+        extract_drive_file_id("https://docs.google.com/document/d/doc-123/edit")
+        == "doc-123"
+    )
+    assert (
+        extract_drive_file_id("https://docs.google.com/spreadsheets/d/sheet-123/edit")
+        == "sheet-123"
+    )
+    assert (
+        extract_drive_file_id("https://docs.google.com/presentation/d/slides-123/edit")
+        == "slides-123"
+    )
+    assert extract_drive_file_id("https://drive.google.com/open?id=file-123") == "file-123"
+    assert extract_drive_file_id("raw-file-id") == "raw-file-id"
+
+
+def test_docs_create_allows_omitting_channel(monkeypatch):
+    permission_calls: list[dict] = []
+    monkeypatch.setattr(
+        client,
+        "docs_create",
+        lambda title, content: {
+            "document_id": "doc-123",
+            "title": title,
+            "url": "https://docs.google.com/document/d/doc-123/edit",
+        },
+    )
+    monkeypatch.setattr(
+        client,
+        "drive_setup_channel_permissions",
+        lambda **kwargs: (
+            permission_calls.append(kwargs)
+            or {"shared_with": [], "new_owner": kwargs["requester_email"]}
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        ["docs", "create", "Personal Notes", "--owner", "alice@example.com"],
+    )
+
+    assert result.exit_code == 0
+    assert permission_calls == [
+        {
+            "file_id": "doc-123",
+            "channel_member_emails": [],
+            "requester_email": "alice@example.com",
+        }
+    ]
+    assert "Created document: Personal Notes" in result.output
+    assert "Shared with" not in result.output
+    assert "Ownership transferred to alice@example.com" in result.output
+
+
+def test_drive_list_full_text_flag_is_passed_to_client(monkeypatch):
+    calls: list[dict] = []
+
+    def fake_drive_list(**kwargs):
+        calls.append(kwargs)
+        return [
+            {
+                "id": "file-123",
+                "name": "Contract Notes",
+                "mime_type": "application/vnd.google-apps.document",
+                "size": 0,
+                "modified_time": "2026-07-21T10:00:00Z",
+                "web_view_link": "https://drive.google.com/file/file-123",
+                "parent_ids": [],
+            }
+        ]
+
+    monkeypatch.setattr(client, "drive_list", fake_drive_list)
+
+    result = runner.invoke(
+        app,
+        ["drive", "list", "--query", "contract language", "--full-text", "--limit", "5"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "query": "contract language",
+            "folder_id": None,
+            "max_results": 5,
+            "file_type": None,
+            "full_text": True,
+        }
+    ]
 
 
 def test_docs_bullets_command_prints_verification_summary(monkeypatch):
@@ -43,3 +233,402 @@ def test_docs_bullets_command_prints_verification_summary(monkeypatch):
     assert "Verification: matched 2, updated 2, verified 2, already bulleted 1" in result.output
     assert "paragraph 2:" in result.output
     assert "tab tab-2 paragraph 4:" in result.output
+
+
+def test_docs_comments_command_accepts_url_and_outputs_json(monkeypatch):
+    calls: list[dict] = []
+    comments = [
+        {
+            "id": "comment-1",
+            "content": "Please clarify this section.",
+            "author": {"display_name": "Ada Lovelace"},
+            "quoted_file_content": {"value": "Draft language"},
+            "resolved": False,
+            "deleted": False,
+            "replies": [],
+        }
+    ]
+    monkeypatch.setattr(
+        client,
+        "docs_list_comments",
+        lambda document_id, max_results, include_deleted: (
+            calls.append(
+                {
+                    "document_id": document_id,
+                    "max_results": max_results,
+                    "include_deleted": include_deleted,
+                }
+            )
+            or comments
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "docs",
+            "comments",
+            "https://docs.google.com/document/d/doc-123/edit",
+            "--limit",
+            "25",
+            "--include-deleted",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == comments
+    assert calls == [
+        {
+            "document_id": "doc-123",
+            "max_results": 25,
+            "include_deleted": True,
+        }
+    ]
+
+
+def test_docs_comments_command_prints_threads_without_rich_markup(monkeypatch):
+    monkeypatch.setattr(
+        client,
+        "docs_list_comments",
+        lambda document_id, max_results, include_deleted: [
+            {
+                "id": "comment-1",
+                "content": "Use [draft] here.",
+                "author": {"display_name": "Ada Lovelace"},
+                "quoted_file_content": {"value": "Original [text]"},
+                "resolved": True,
+                "deleted": False,
+                "replies": [
+                    {
+                        "id": "reply-1",
+                        "content": "Done [now].",
+                        "action": "resolve",
+                        "author": {"display_name": "Grace Hopper"},
+                    }
+                ],
+            }
+        ],
+    )
+
+    result = runner.invoke(app, ["docs", "comments", "doc-123"])
+
+    assert result.exit_code == 0
+    assert "Comment comment-1 by Ada Lovelace [resolved]" in result.output
+    assert "Quoted: Original [text]" in result.output
+    assert "Use [draft] here." in result.output
+    assert "Reply reply-1 by Grace Hopper [resolve]: Done [now]." in result.output
+
+
+def test_drive_revisions_command_accepts_sheets_url_and_outputs_json(monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        client,
+        "drive_list_revisions",
+        lambda file_id, max_results: (
+            calls.append({"file_id": file_id, "max_results": max_results})
+            or [{"id": "rev-1", "modified_time": "2026-08-10T10:00:00Z"}]
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drive",
+            "revisions",
+            "https://docs.google.com/spreadsheets/d/sheet-123/edit",
+            "--limit",
+            "25",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == [{"id": "rev-1", "modified_time": "2026-08-10T10:00:00Z"}]
+    assert calls == [{"file_id": "sheet-123", "max_results": 25}]
+
+
+def test_drive_revision_command_accepts_slides_url_and_outputs_export_links(monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        client,
+        "drive_get_revision",
+        lambda file_id, revision_id: (
+            calls.append({"file_id": file_id, "revision_id": revision_id})
+            or {
+                "id": revision_id,
+                "mime_type": "application/vnd.google-apps.document",
+                "modified_time": "2026-08-10T10:00:00Z",
+                "published": False,
+                "published_link": "",
+                "last_modifying_user": {"display_name": "Ada", "email": "ada@example.com"},
+                "export_links": {"application/pdf": "https://docs.google.com/export/rev-42.pdf"},
+            }
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drive",
+            "revision",
+            "https://docs.google.com/presentation/d/slides-123/edit",
+            "rev-42",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Revision rev-42" in result.output
+    assert "Ada" in result.output
+    assert "application/pdf" in result.output
+    assert "https://docs.google.com/export/rev-42.pdf" in result.output
+    assert calls == [{"file_id": "slides-123", "revision_id": "rev-42"}]
+
+
+def test_drive_export_revision_command_writes_selected_revision(tmp_path, monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        client,
+        "_drive_export_revision_bytes",
+        lambda file_id, revision_id, export_format: (
+            calls.append(
+                {
+                    "file_id": file_id,
+                    "revision_id": revision_id,
+                    "export_format": export_format,
+                }
+            )
+            or (
+                {"name": "Quarterly Model"},
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                b"historical workbook",
+            )
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drive",
+            "export-revision",
+            "https://docs.google.com/spreadsheets/d/sheet-123/edit",
+            "rev-42",
+            "--format",
+            "xlsx",
+            "--output",
+            str(tmp_path),
+        ],
+    )
+
+    output_path = tmp_path / "Quarterly Model-revision-rev-42.xlsx"
+    assert result.exit_code == 0
+    assert output_path.read_bytes() == b"historical workbook"
+    assert "Exported revision rev-42" in result.output
+    assert calls == [
+        {"file_id": "sheet-123", "revision_id": "rev-42", "export_format": "xlsx"}
+    ]
+
+
+def test_drive_export_revision_command_prints_text_to_stdout(monkeypatch):
+    monkeypatch.setattr(
+        client,
+        "_drive_export_revision_bytes",
+        lambda file_id, revision_id, export_format: (
+            {"name": "Old Draft"},
+            "text/plain",
+            b"[Historical draft]",
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drive",
+            "export-revision",
+            "doc-123",
+            "rev-7",
+            "--format",
+            "txt",
+            "--stdout",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "[Historical draft]" in result.output
+
+
+def test_drive_download_revision_command_writes_original_binary(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        client,
+        "_drive_download_revision_bytes",
+        lambda file_id, revision_id: (
+            {"name": "diagram.png"},
+            {"original_filename": "diagram.png"},
+            b"historical image",
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drive",
+            "download-revision",
+            "file-123",
+            "rev-42",
+            "--output",
+            str(tmp_path),
+        ],
+    )
+
+    output_path = tmp_path / "diagram-revision-rev-42.png"
+    assert result.exit_code == 0
+    assert output_path.read_bytes() == b"historical image"
+    assert "Downloaded revision rev-42" in result.output
+
+
+@pytest.mark.parametrize("json_flag", ["--json", "-o"])
+def test_directory_search_json_and_limit(monkeypatch, json_flag):
+    expected = [
+        {
+            "resource_name": "people/123",
+            "name": "[bold]Alex",
+            "email_addresses": ["alex@example.com"],
+        }
+    ]
+    search = Mock(return_value=expected)
+    monkeypatch.setattr(client, "directory_search", search)
+    result = runner.invoke(app, ["directory", "search", "Alex", "-n", "7", json_flag])
+
+    assert result.exit_code == 0
+    search.assert_called_once_with("Alex", max_results=7)
+    assert json.loads(result.stdout) == expected
+
+
+def test_directory_table_preserves_names_and_all_emails(monkeypatch):
+    monkeypatch.setattr(
+        client,
+        "directory_list",
+        lambda *args, **kwargs: [
+            {
+                "resource_name": "people/123",
+                "name": "Alex",
+                "email_addresses": ["alex@example.com", "alias@example.com"],
+            },
+            {"resource_name": "people/456", "name": "No email", "email_addresses": []},
+        ],
+    )
+
+    result = runner.invoke(app, ["directory", "list"])
+
+    assert result.exit_code == 0
+    for text in ["Alex", "alex@example.com", "alias@example.com", "No email"]:
+        assert text in result.stdout
+
+
+def test_directory_markdown_escapes_cells(monkeypatch):
+    monkeypatch.setattr(
+        client,
+        "directory_list",
+        lambda *args, **kwargs: [
+            {
+                "resource_name": "people/123",
+                "name": "Alex|Example\nTeam",
+                "email_addresses": ["alex@example.com", "alias@example.com"],
+            },
+        ],
+    )
+
+    result = runner.invoke(app, ["directory", "list", "--markdown"])
+
+    assert result.exit_code == 0
+    assert result.stdout == (
+        "| Name | Email addresses |\n| --- | --- |\n"
+        "| Alex\\|Example Team | alex@example.com, alias@example.com |\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        ([], "No people found."),
+        (["--json"], "[]"),
+        (["--markdown"], "| Name | Email addresses |\n| --- | --- |"),
+    ],
+)
+def test_directory_empty_output(monkeypatch, flags, expected):
+    monkeypatch.setattr(client, "directory_list", lambda *args, **kwargs: [])
+
+    result = runner.invoke(app, ["directory", "list", *flags])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["Alex", "--limit", "0"],
+        ["Alex", "--limit", "-1"],
+    ],
+)
+def test_directory_search_cli_rejects_invalid_arguments(monkeypatch, args):
+    search = Mock()
+    monkeypatch.setattr(client, "directory_search", search)
+
+    assert runner.invoke(app, ["directory", "search", *args]).exit_code == 2
+    search.assert_not_called()
+
+
+@pytest.mark.parametrize("command", [["list"], ["search", "Alex"]])
+def test_directory_cli_reports_api_error(monkeypatch, command):
+    search = Mock(side_effect=RuntimeError("Insufficient authentication scopes"))
+    monkeypatch.setattr(client, f"directory_{command[0]}", search)
+    result = runner.invoke(app, ["directory", *command, "--json"])
+
+    assert result.exit_code == 1
+    assert "Insufficient authentication scopes" in result.stdout
+
+
+def test_directory_is_discoverable_in_help():
+    for args, expected in [
+        (["--help"], ["directory"]),
+        (["directory", "--help"], ["search", "list"]),
+    ]:
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0
+        for command in expected:
+            assert command in result.stdout
+
+
+@pytest.mark.parametrize("json_flag", ["--json", "-o"])
+def test_directory_list_outputs_json(monkeypatch, json_flag):
+    expected = [
+        {
+            "resource_name": "people/1",
+            "name": "Alex",
+            "email_addresses": ["alex@example.com"],
+        }
+    ]
+
+    list_people = Mock(return_value=expected)
+    monkeypatch.setattr(client, "directory_list", list_people)
+    result = runner.invoke(app, ["directory", "list", json_flag])
+
+    assert result.exit_code == 0
+    list_people.assert_called_once_with()
+    assert json.loads(result.stdout) == expected
+
+
+@pytest.mark.parametrize("args", [["--limit", "100"], ["-n", "100"], ["Alex"]])
+def test_directory_list_rejects_invalid_arguments(args):
+    assert runner.invoke(app, ["directory", "list", *args]).exit_code == 2
+
+
+def test_directory_json_takes_precedence_over_markdown(monkeypatch):
+    monkeypatch.setattr(client, "directory_list", lambda *args, **kwargs: [])
+
+    result = runner.invoke(app, ["directory", "list", "--json", "--markdown"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == []

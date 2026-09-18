@@ -10,7 +10,14 @@ from rich.table import Table
 
 load_dotenv()
 
-app = typer.Typer(name="slack", help="Slack CLI for AI agents")
+app = typer.Typer(
+    name="slack",
+    help=(
+        "Slack CLI for AI agents. Use proxy-backed commands such as `thread` and `upload` "
+        "in Slack channels. Use commands ending in `-direct`, such as `thread-direct` and "
+        "`upload-direct`, in Slack DMs."
+    ),
+)
 
 
 @app.command("health")
@@ -20,18 +27,8 @@ def health():
 
     client = _client()
     try:
-        if client._api_server_proxy_enabled():
-            details = client.list_channels_proxy(limit=1)
-            access_path = "principal_proxy"
-        else:
-            details = client.list_bot_channels(limit=1)
-            access_path = "bot_token"
-        payload = {
-            "ok": True,
-            "tool": "slack",
-            "error": None,
-            "details": {"access_path": access_path, "channels": details},
-        }
+        details = client.list_bot_channels(limit=1)
+        payload = {"ok": True, "tool": "slack", "error": None, "details": details}
     except Exception as exc:
         payload = {"ok": False, "tool": "slack", "error": str(exc), "details": {}}
         print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
@@ -88,6 +85,29 @@ def send(
 
 
 @app.command()
+def react(
+    channel_id: str = typer.Argument(..., help="Slack conversation ID, e.g. C1234567890"),
+    timestamp: str = typer.Argument(..., help="Timestamp of the message to react to"),
+    emoji: str = typer.Argument(..., help="Emoji name, e.g. pencil2 (surrounding colons optional)"),
+):
+    """Add an emoji reaction to a message using the bot's reactions:write scope.
+
+    Example: slack react C1234567890 1234567890.123456 pencil2
+    """
+    from .client import add_reaction
+
+    try:
+        result = add_reaction(channel_id, timestamp, emoji)
+        if result["added"]:
+            console.print("[green]✓ Reaction added[/]")
+        else:
+            console.print("[green]✓ Reaction already present[/]")
+    except (RuntimeError, ValueError) as e:
+        stderr_console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
+
+
+@app.command()
 def dm(
     user_id: str = typer.Argument(..., help="Slack user ID, e.g. U12345678"),
     message: str = typer.Argument(..., help="Message text to send"),
@@ -126,12 +146,13 @@ def search(
 ):
     """Search messages in bot-accessible channels.
 
-    Searches across Slack native search first, then scans channel history through
-    the Centaur API server proxy. Results are ranked by relevance (exact phrase
-    matches score higher). Use --channels to limit scope.
+    Workspace-wide queries use Slack's native search API. Queries with --channels
+    scan proxy-accessible public or explicitly granted channel history and rank
+    results by relevance (exact phrase matches score higher).
 
-    Note: Only searches channels where the bot is a member. To search more channels,
-    invite the bot to those channels first.
+    Native search uses the linked Slack user's token. If the principal has no
+    linked Slack account, search falls back to bot-accessible channel history.
+    Scoped history searches are limited to proxy-accessible channels.
 
     Examples:
         slack search "deploy"
@@ -201,7 +222,9 @@ def channel_direct(
         "--allow-name-resolution",
         help="Allow resolving a channel name instead of requiring an explicit Slack channel ID",
     ),
-    json_output: bool = typer.Option(False, "--json", help="Output full page metadata as JSON"),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Output full page metadata as JSON (default)"
+    ),
 ):
     """Get recent messages from a channel directly with the Slack SDK."""
     import sys
@@ -275,7 +298,9 @@ def channel(
         help="Ask Slack to return all message metadata",
     ),
     full: bool = typer.Option(False, "--full", "-f", help="Show full message text"),
-    json_output: bool = typer.Option(False, "--json", help="Output raw proxy response as JSON"),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Output raw proxy response as JSON (default)"
+    ),
 ):
     """Get channel history through the Centaur API server proxy."""
     import sys
@@ -361,9 +386,11 @@ def thread(
     inclusive: bool = typer.Option(
         True, "--inclusive/--exclusive", help="Include the boundary timestamps"
     ),
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    json_output: bool = typer.Option(True, "--json/--no-json", help="Output as JSON (default)"),
 ):
-    """Get all replies in a thread.
+    """Get all replies through the Centaur API server Slack proxy.
+
+    Use this command for Slack channels. Use thread-direct for Slack DMs.
 
     Examples:
         slack thread "https://slack.com/archives/C01234567/p1234567890123456"
@@ -386,9 +413,9 @@ def thread(
             latest=latest,
             inclusive=inclusive,
         )
-    except (RuntimeError, ValueError) as error:
-        stderr_console.print(f"[red]Error: {error}[/]")
-        raise typer.Exit(1) from error
+    except (RuntimeError, ValueError) as e:
+        stderr_console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
 
     messages = page.get("messages", [])
 
@@ -434,9 +461,11 @@ def thread_direct(
     inclusive: bool = typer.Option(
         True, "--inclusive/--exclusive", help="Include the boundary timestamps"
     ),
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    json_output: bool = typer.Option(True, "--json/--no-json", help="Output as JSON (default)"),
 ):
-    """Get all replies in a thread directly with the Slack SDK.
+    """Get all replies directly with the Slack SDK.
+
+    Use this command for Slack DMs. Use thread for Slack channels.
 
     Examples:
         slack thread-direct "https://slack.com/archives/C01234567/p1234567890123456"
@@ -514,7 +543,9 @@ def sync_history(
         "--latest",
         help="Override the latest boundary: Slack ts, epoch, ISO datetime, or YYYY-MM-DD",
     ),
-    json_output: bool = typer.Option(False, "--json", help="Output the sync payload as JSON"),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Output the sync payload as JSON (default)"
+    ),
 ):
     """Run an incremental channel-history sync suitable for ETL jobs."""
     from pathlib import Path
@@ -594,19 +625,11 @@ def _render_channels(results: list[dict], title: str, include_access: bool = Fal
 def channels(
     limit: int = typer.Option(100, "--limit", "-n", help="Max channels"),
     query: str = typer.Option(None, "--query", "-q", help="Filter by name"),
-    bot_member_only: bool = typer.Option(
-        False,
-        "--bot-member-only",
-        help="Only list JWT-authorized channels with history access",
-    ),
 ):
-    """List Slack channels authorized by the Centaur API server proxy JWT."""
+    """List bot-readable public and explicitly granted channels from the proxy."""
     from .client import list_channels_proxy
 
-    results = list_channels_proxy(limit=limit, history_only=bot_member_only)
-
-    if query:
-        results = [c for c in results if query.lower() in c["name"].lower()]
+    results = list_channels_proxy(limit=limit, query=query)
 
     _render_channels(results, f"Channels ({len(results)})", include_access=True)
 
@@ -1072,7 +1095,9 @@ def file_info(
     channel_id: str = typer.Argument(
         ..., help="Slack channel/conversation ID that the file is shared in"
     ),
-    json_output: bool = typer.Option(False, "--json", help="Output raw metadata as JSON"),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Output raw metadata as JSON (default)"
+    ),
 ):
     """Fetch Slack file metadata through the Centaur API server Slack proxy."""
     import sys
@@ -1334,7 +1359,9 @@ def download(
         ..., help="Slack channel/conversation ID that the file is shared in"
     ),
     output: str = typer.Option(".", "--output", "-o", help="Output directory for downloads"),
-    json_output: bool = typer.Option(False, "--json", help="Print metadata as JSON"),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Print downloaded file metadata as JSON (default)"
+    ),
 ):
     """Download a Slack file through the Centaur API server Slack proxy."""
     import base64
@@ -1349,278 +1376,19 @@ def download(
         console.print(f"[red]Error downloading Slack file: {e}[/]")
         raise typer.Exit(1) from e
 
-    if json_output:
-        metadata = {key: value for key, value in result.items() if key != "content_base64"}
-        print(json.dumps(metadata, indent=2, ensure_ascii=False), file=sys.stdout)
-        raise typer.Exit()
-
     output_dir = Path(output)
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / result["filename"]
     out_path.write_bytes(base64.b64decode(result["content_base64"]))
+
+    if json_output:
+        metadata = {key: value for key, value in result.items() if key != "content_base64"}
+        metadata["output_path"] = str(out_path.absolute())
+        print(json.dumps(metadata, indent=2, ensure_ascii=False), file=sys.stdout)
+        return
+
     console.print(f"[green]✓ Downloaded {result['filename']}[/] ({result['size_bytes']} bytes)")
     console.print(f"[dim]{out_path.absolute()}[/]")
-
-
-# === Feedback Commands ===
-
-
-@app.command()
-def feedback(
-    action: str = typer.Argument(
-        "collect",
-        help="Action: collect, backfill, digest, show, update-status, improve, loop",
-    ),
-    channels: str = typer.Option(
-        "test-bot",
-        "--channels",
-        "-c",
-        help="Comma-separated channel names to scan",
-    ),
-    since_days: int = typer.Option(
-        None,
-        "--since-days",
-        "-d",
-        help="Override checkpoint, scan last N days",
-    ),
-    limit: int = typer.Option(200, "--limit", "-n", help="Max threads per channel"),
-    status: str = typer.Option(
-        None, "--status", "-s", help="Filter by status (new, triaged, fixed)"
-    ),
-    category: str = typer.Option(None, "--category", help="Filter by category"),
-    severity: str = typer.Option(None, "--severity", help="Min severity (low, medium, high)"),
-    item_id: int = typer.Option(None, "--id", help="Feedback item ID (for show/update-status)"),
-    new_status: str = typer.Option(None, "--new-status", help="New status for update-status"),
-    output: str = typer.Option(None, "--output", "-o", help="Output file path"),
-    max_items: int = typer.Option(
-        8, "--max-items", help="Max actionable feedback items per improvement run"
-    ),
-    persona: str = typer.Option(
-        "eng", "--persona", help="Persona to use for auto-improvement runs"
-    ),
-    harness: str = typer.Option(
-        "amp", "--harness", help="Harness to use for auto-improvement runs"
-    ),
-    interval_sec: int = typer.Option(
-        900, "--interval-sec", help="Sleep interval between loop iterations"
-    ),
-    iterations: int = typer.Option(
-        0, "--iterations", help="Number of loop iterations to run; 0 means forever"
-    ),
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Build the improvement prompt without dispatching an agent run"
-    ),
-):
-    """Collect and analyze feedback from bot interactions.
-
-    Actions:
-      collect  - Scan channels for new feedback (incremental)
-      backfill - Scan historical feedback ignoring the usual per-channel cap
-      digest   - Generate markdown digest of feedback
-      show     - Show details of a specific feedback item
-      update-status - Update status of a feedback item
-      improve  - Collect feedback and dispatch a background agent improvement run
-      loop     - Repeatedly run the improvement cycle
-
-    Examples:
-        slack feedback collect -c test-bot
-        slack feedback backfill -c test-bot --since-days 30 --limit 0
-        slack feedback collect -c test-bot,eng-ai --since-days 7
-        slack feedback digest --severity medium
-        slack feedback digest --status new -o /tmp/digest.md
-        slack feedback update-status --id 42 --new-status triaged
-        slack feedback improve --persona eng --harness amp
-        slack feedback loop --iterations 1 --interval-sec 300
-    """
-    import json
-    import time
-
-    from .feedback import (
-        backfill_feedback,
-        collect_feedback,
-        format_digest_markdown,
-        get_feedback_digest,
-        init_db,
-        run_improvement_cycle,
-        update_feedback_status,
-    )
-
-    channel_list = [c.strip() for c in channels.split(",")]
-    limit_per_channel = None if limit <= 0 else limit
-
-    if action == "collect":
-        console.print(f"[bold]Collecting feedback from: {', '.join(channel_list)}[/]")
-        stats = collect_feedback(
-            channels=channel_list,
-            limit_per_channel=limit_per_channel,
-            since_days=since_days,
-        )
-        console.print("\n[green]✓ Collection complete[/]")
-        console.print(f"  Channels scanned: {stats['channels_scanned']}")
-        console.print(f"  Threads analyzed: {stats['threads_analyzed']}")
-        console.print(f"  Feedback items created: {stats['feedback_items_created']}")
-        console.print(f"  Feedback items updated: {stats['feedback_items_updated']}")
-        if stats["by_category"]:
-            console.print(f"  By category: {stats['by_category']}")
-        if stats["by_severity"]:
-            console.print(f"  By severity: {stats['by_severity']}")
-
-    elif action == "backfill":
-        lookback_days = since_days or 30
-        backfill_limit = None if limit == 200 else limit_per_channel
-        console.print(f"[bold]Backfilling feedback from: {', '.join(channel_list)}[/]")
-        stats = backfill_feedback(
-            channels=channel_list,
-            since_days=lookback_days,
-            limit_per_channel=backfill_limit,
-        )
-        console.print("\n[green]✓ Backfill complete[/]")
-        console.print(f"  Lookback days: {lookback_days}")
-        console.print(f"  Channels scanned: {stats['channels_scanned']}")
-        console.print(f"  Threads analyzed: {stats['threads_analyzed']}")
-        console.print(f"  Feedback items created: {stats['feedback_items_created']}")
-        console.print(f"  Feedback items updated: {stats['feedback_items_updated']}")
-        if stats["by_category"]:
-            console.print(f"  By category: {stats['by_category']}")
-        if stats["by_severity"]:
-            console.print(f"  By severity: {stats['by_severity']}")
-
-    elif action == "digest":
-        items = get_feedback_digest(
-            since_days=since_days or 7,
-            status=status,
-            category=category,
-            min_severity=severity,
-        )
-        md = format_digest_markdown(items)
-
-        if output:
-            from pathlib import Path
-
-            Path(output).write_text(md)
-            console.print(f"[green]✓ Digest written to {output}[/]")
-        else:
-            print(md)
-
-    elif action == "show":
-        if not item_id:
-            console.print("[red]Error: --id required for show action[/]")
-            raise typer.Exit(1)
-
-        conn = init_db()
-        row = conn.execute("SELECT * FROM feedback_items WHERE id = ?", (item_id,)).fetchone()
-        conn.close()
-
-        if not row:
-            console.print(f"[red]Error: Feedback item {item_id} not found[/]")
-            raise typer.Exit(1)
-
-        console.print(f"\n[bold]Feedback Item #{row['id']}[/]\n")
-        console.print(f"[cyan]Channel:[/] {row['slack_channel']}")
-        console.print(f"[cyan]Permalink:[/] {row['permalink']}")
-        console.print(f"[cyan]Category:[/] {row['category']}")
-        console.print(f"[cyan]Severity:[/] {row['severity']}")
-        console.print(f"[cyan]Status:[/] {row['status']}")
-        console.print(f"[cyan]Reporter:[/] {row['reporter_user']}")
-        console.print(f"[cyan]CLI:[/] {row['cli_involved'] or 'none'}")
-        if row["amp_thread_id"]:
-            console.print(
-                f"[cyan]Amp Thread:[/] https://ampcode.com/threads/{row['amp_thread_id']}"
-            )
-        console.print(f"\n[cyan]Summary:[/]\n{row['summary']}")
-        console.print(f"\n[cyan]Evidence:[/]\n{json.dumps(json.loads(row['evidence']), indent=2)}")
-
-    elif action == "update-status":
-        if not item_id or not new_status:
-            console.print("[red]Error: --id and --new-status required[/]")
-            raise typer.Exit(1)
-
-        valid_statuses = ["new", "triaged", "in_progress", "fixed", "wontfix"]
-        if new_status not in valid_statuses:
-            console.print(f"[red]Error: Status must be one of: {valid_statuses}[/]")
-            raise typer.Exit(1)
-
-        if update_feedback_status(item_id, new_status):
-            console.print(f"[green]✓ Updated item {item_id} to status: {new_status}[/]")
-        else:
-            console.print(f"[red]Error: Item {item_id} not found[/]")
-            raise typer.Exit(1)
-
-    elif action == "improve":
-        console.print("[bold]Running auto-improvement cycle...[/]\n")
-        result = run_improvement_cycle(
-            channels=channel_list,
-            since_days=since_days or 7,
-            limit_per_channel=limit_per_channel,
-            max_items=max_items,
-            min_severity=severity or "medium",
-            harness=harness,
-            persona_id=persona,
-            dry_run=dry_run,
-        )
-
-        collect_stats = result["collect_stats"]
-        console.print(
-            f"[dim]Collected: +{collect_stats['feedback_items_created']} new, {collect_stats['feedback_items_updated']} updated[/]"
-        )
-
-        if result["actionable_items"] == 0:
-            console.print("\n[green]✓ No actionable feedback found![/]")
-            console.print("[dim]All recent interactions were successful or low severity.[/]")
-            return
-
-        console.print(f"[cyan]Actionable items:[/] {result['actionable_items']}")
-        console.print(f"[cyan]Item IDs:[/] {result['item_ids']}")
-        if dry_run:
-            print(result["prompt"])
-            return
-
-        console.print("\n[green]✓ Improvement agent dispatched[/]")
-        console.print(f"  Thread key: {result['thread_key']}")
-        console.print(f"  Execution id: {result['execution_id']}")
-
-    elif action == "loop":
-        console.print("[bold]Starting auto-improvement loop...[/]")
-        cycle = 0
-        while iterations == 0 or cycle < iterations:
-            cycle += 1
-            console.print(f"\n[bold]Cycle {cycle}[/]")
-            result = run_improvement_cycle(
-                channels=channel_list,
-                since_days=since_days or 7,
-                limit_per_channel=limit_per_channel,
-                max_items=max_items,
-                min_severity=severity or "medium",
-                harness=harness,
-                persona_id=persona,
-                dry_run=dry_run,
-            )
-            collect_stats = result["collect_stats"]
-            console.print(
-                f"  Collected: +{collect_stats['feedback_items_created']} new, {collect_stats['feedback_items_updated']} updated"
-            )
-            console.print(f"  Actionable: {result['actionable_items']}")
-            if result["dispatched"]:
-                console.print(f"  Execution id: {result['execution_id']}")
-                console.print(f"  Thread key: {result['thread_key']}")
-            elif dry_run and result["actionable_items"]:
-                print(result["prompt"])
-
-            if iterations != 0 and cycle >= iterations:
-                break
-            console.print(f"[dim]Sleeping for {interval_sec}s...[/]")
-            try:
-                time.sleep(interval_sec)
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Loop interrupted[/]")
-                break
-
-    else:
-        console.print(f"[red]Unknown action: {action}[/]")
-        console.print(
-            "Valid actions: collect, backfill, digest, show, update-status, improve, loop"
-        )
-        raise typer.Exit(1)
 
 
 @app.command("channel-emails")

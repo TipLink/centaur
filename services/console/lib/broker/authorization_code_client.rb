@@ -1,5 +1,5 @@
-require "net/http"
 require "json"
+require "base64"
 require "uri"
 
 module Broker
@@ -18,10 +18,6 @@ module Broker
     # absent -- the provider strategy decides whether that is fatal). response is
     # the parsed provider response for provider-specific metadata.
     Result = Data.define(:access_token, :refresh_token, :expires_in, :scope, :id_token, :response)
-
-    # The minimal HTTP response shape consumed, so tests can inject a double
-    # without Net::HTTP.
-    Response = Data.define(:status, :body)
 
     DEFAULT_TIMEOUT = 30
     MAX_BODY_BYTES = 64 * 1024
@@ -42,7 +38,8 @@ module Broker
     # the app is misconfigured. The console-login flow passes false: it requests no
     # offline access and only needs the id_token to identify the operator.
     def exchange(token_endpoint:, client_id:, client_secret:, code:, redirect_uri:,
-                 code_verifier:, timeout: DEFAULT_TIMEOUT, require_refresh_token: true)
+                 code_verifier:, client_auth_method: "client_secret_post",
+                 timeout: DEFAULT_TIMEOUT, require_refresh_token: true)
       raise ArgumentError, "token endpoint is required" if token_endpoint.blank?
       raise ArgumentError, "client_id is required" if client_id.blank?
       raise ArgumentError, "code is required" if code.blank?
@@ -50,13 +47,12 @@ module Broker
       form = {
         "grant_type" => "authorization_code",
         "code" => code,
-        "client_id" => client_id,
         "redirect_uri" => redirect_uri
       }
-      form["client_secret"] = client_secret if client_secret.present?
+      headers = client_auth(client_auth_method, client_id, client_secret, form)
       form["code_verifier"] = code_verifier if code_verifier.present?
 
-      response = perform(token_endpoint, form, timeout)
+      response = perform(token_endpoint, form, headers, timeout)
 
       classify_error(response.status, response.body) if response.status / 100 != 2
 
@@ -65,24 +61,37 @@ module Broker
 
     private
 
-    def perform(url, form, timeout)
+    def client_auth(method, client_id, client_secret, form)
+      case method
+      when "client_secret_post"
+        form["client_id"] = client_id
+        form["client_secret"] = client_secret if client_secret.present?
+        {}
+      when "client_secret_basic"
+        raise ArgumentError, "client_secret is required for client_secret_basic" if client_secret.blank?
+
+        credentials = [ client_id, client_secret ].map { |value| URI.encode_www_form_component(value) }.join(":")
+        { "Authorization" => "Basic #{Base64.strict_encode64(credentials)}" }
+      else
+        raise ArgumentError, "unsupported client authentication method: #{method}"
+      end
+    end
+
+    def perform(url, form, headers, timeout)
       if @http
-        return @http.call(url: url, form: form, headers: {}, timeout: timeout)
+        return @http.call(url: url, form: form, headers: headers, timeout: timeout)
       end
 
-      uri = URI.parse(url)
-      req = Net::HTTP::Post.new(uri)
-      req.set_form_data(form)
-      req["Content-Type"] = "application/x-www-form-urlencoded"
-      req["Accept"] = "application/json"
-
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = uri.scheme == "https"
-      http.open_timeout = timeout
-      http.read_timeout = timeout
-
-      res = http.request(req)
-      Response.new(status: res.code.to_i, body: res.body.to_s.byteslice(0, MAX_BODY_BYTES))
+      response = HttpClient.new(
+        open_timeout: timeout,
+        read_timeout: timeout,
+        max_body_bytes: MAX_BODY_BYTES
+      ).post(
+        url,
+        form: form,
+        headers: headers
+      )
+      response
     rescue StandardError => e
       raise ExchangeError.new("token endpoint request failed: #{e.class}", stage: "network")
     end

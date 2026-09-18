@@ -36,9 +36,6 @@ const DEFAULT_MATCH_HEADERS: &[&str] = &[
     "X-CB-ACCESS-SIGNATURE",
     "/^x-[a-z0-9-]*(api-key|apikey|secret|token|auth|key)$/",
 ];
-const HTTP_METHODS: &[&str] = &[
-    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "*",
-];
 
 #[derive(Clone, Debug, Default)]
 pub struct ToolDiscoveryConfig {
@@ -173,70 +170,21 @@ pub fn discover_persona_registry(
 
 pub(crate) fn discover_tool_catalog(
     tool_dirs: &[PathBuf],
-    tool_allowlist: Option<&str>,
-    tool_blocklist: Option<&str>,
 ) -> Result<DiscoveredToolCatalog, ToolDiscoveryError> {
-    let allowlist = parse_tool_name_filter(tool_allowlist);
-    let blocklist = parse_tool_name_filter(tool_blocklist);
-    let mut tools = BTreeMap::new();
-
-    // Match services/sandbox/install_tool_shims.py: scan TOOL_DIRS in order,
-    // filter by package-directory, project, or script name, and let the last
-    // package that declares a script name own that script.
-    for base_dir in tool_dirs {
-        if !base_dir.exists() {
-            continue;
-        }
-        for tool_dir in candidate_tool_dirs(base_dir)? {
-            let pyproject_path = tool_dir.join("pyproject.toml");
-            let Some(LoadedPluginMeta::Tool(tool)) =
-                load_plugin_meta(base_dir, &tool_dir, &pyproject_path)?
-            else {
-                continue;
-            };
-            let identifiers = tool_identifiers(&tool);
-            if !allowlist.is_empty() && identifiers.is_disjoint(&allowlist) {
-                continue;
-            }
-            if !identifiers.is_disjoint(&blocklist) {
-                continue;
-            }
-            for script_name in tool.script_names {
-                if blocklist.contains(&script_name) {
-                    continue;
-                }
-                tools.insert(
-                    script_name.clone(),
-                    DiscoveredTool {
-                        name: script_name,
-                        package: tool.package.clone(),
-                        description: tool.description.clone(),
-                        client_module: tool.client_module.clone(),
-                        project_dir: tool.dir.clone(),
-                    },
-                );
-            }
+    let mut tools = Vec::new();
+    for tool in collect_plugin_metadata(tool_dirs)?.tools {
+        for script_name in tool.script_names {
+            tools.push(DiscoveredTool {
+                name: script_name,
+                package: tool.package.clone(),
+                description: tool.description.clone(),
+                client_module: tool.client_module.clone(),
+                project_dir: tool.dir.clone(),
+            });
         }
     }
-    Ok(DiscoveredToolCatalog {
-        tools: tools.into_values().collect(),
-    })
-}
-
-fn parse_tool_name_filter(value: Option<&str>) -> BTreeSet<String> {
-    value
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn tool_identifiers(tool: &LoadedToolMeta) -> BTreeSet<String> {
-    let mut identifiers = BTreeSet::from([tool.name.clone(), tool.package.clone()]);
-    identifiers.extend(tool.script_names.iter().cloned());
-    identifiers
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(DiscoveredToolCatalog { tools })
 }
 
 fn split_tool_dirs(value: &str) -> Vec<PathBuf> {
@@ -557,7 +505,7 @@ fn load_plugin_meta(
     })?;
     let prompt_hash = {
         let digest = Sha256::digest(prompt.as_bytes());
-        format!("sha256:{digest:x}")
+        format!("sha256:{}", hex::encode(digest))
     };
     Ok(Some(LoadedPluginMeta::Persona(PersonaDefinition {
         id,
@@ -614,7 +562,8 @@ fn load_tool_meta(
             names.sort();
             names
         })
-        .unwrap_or_default();
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| vec![name.clone()]);
     let default_hosts = string_array(tool_conf.get("hosts"));
     let labels = tool_labels(&name, &overlay_name_for_root(source_root));
     let secrets = match parse_secret_list(tool_conf.get("secrets"), &default_hosts, &labels)
@@ -664,8 +613,6 @@ struct HttpSecret {
     labels: BTreeMap<String, String>,
     mode: HttpSecretMode,
     hosts: Vec<String>,
-    methods: Vec<String>,
-    paths: Vec<String>,
     replacer: String,
     match_headers: Vec<String>,
     match_path: bool,
@@ -786,8 +733,6 @@ fn parse_secret(
             labels: labels.clone(),
             mode: HttpSecretMode::Replace,
             hosts: default_hosts.to_vec(),
-            methods: Vec::new(),
-            paths: Vec::new(),
             replacer: name,
             match_headers: DEFAULT_MATCH_HEADERS
                 .iter()
@@ -840,8 +785,6 @@ fn parse_http_secret(
              iron-proxy"
         )));
     }
-    let methods = request_methods(table, &name)?;
-    let paths = request_paths(table, &name)?;
     let mode = optional_str(table, "mode").unwrap_or("replace");
     match mode {
         "replace" => {
@@ -861,8 +804,6 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Replace,
                 hosts,
-                methods,
-                paths,
                 replacer,
                 match_headers,
                 match_path,
@@ -898,8 +839,6 @@ fn parse_http_secret(
                 labels: labels.clone(),
                 mode: HttpSecretMode::Inject,
                 hosts,
-                methods,
-                paths,
                 replacer: String::new(),
                 match_headers: Vec::new(),
                 match_path: false,
@@ -913,63 +852,6 @@ fn parse_http_secret(
             "unknown HTTP secret mode {other:?}"
         ))),
     }
-}
-
-fn request_methods(table: &toml::Table, name: &str) -> Result<Vec<String>, ToolDiscoveryError> {
-    if table.contains_key("methods") && table.contains_key("http_methods") {
-        return Err(ToolDiscoveryError::Invalid(format!(
-            "HTTP secret {name:?} must declare only one of methods or http_methods"
-        )));
-    }
-    let (key, raw) = if table.contains_key("methods") {
-        ("methods", optional_string_array(table.get("methods"))?)
-    } else {
-        (
-            "http_methods",
-            optional_string_array(table.get("http_methods"))?,
-        )
-    };
-    let raw = match raw {
-        Some(raw) if raw.is_empty() => {
-            return Err(ToolDiscoveryError::Invalid(format!(
-                "HTTP secret {name:?} {key:?} must not be empty"
-            )));
-        }
-        Some(raw) => raw,
-        None => Vec::new(),
-    };
-    raw.into_iter()
-        .map(|method| {
-            let method = method.to_ascii_uppercase();
-            if HTTP_METHODS.contains(&method.as_str()) {
-                Ok(method)
-            } else {
-                Err(ToolDiscoveryError::Invalid(format!(
-                    "HTTP secret {name:?} method {method:?} must be one of {HTTP_METHODS:?}"
-                )))
-            }
-        })
-        .collect()
-}
-
-fn request_paths(table: &toml::Table, name: &str) -> Result<Vec<String>, ToolDiscoveryError> {
-    let paths = match optional_string_array(table.get("paths"))? {
-        Some(paths) if paths.is_empty() => {
-            return Err(ToolDiscoveryError::Invalid(format!(
-                "HTTP secret {name:?} 'paths' must not be empty"
-            )));
-        }
-        Some(paths) => paths,
-        None => Vec::new(),
-    };
-    for path in &paths {
-        if !path.starts_with('/') {
-            return Err(ToolDiscoveryError::Invalid(format!(
-                "HTTP secret {name:?} path {path:?} must start with '/'"
-            )));
-        }
-    }
-    Ok(paths)
 }
 
 fn parse_oauth_token_secret(
@@ -1102,14 +984,28 @@ fn parse_pg_dsn_setting_value_from(
     })?;
     let principal_label = optional_str(table, "principal_label").map(ToOwned::to_owned);
     let principal_field = optional_str(table, "principal_field").map(ToOwned::to_owned);
-    if principal_label.is_none() && principal_field.is_none() {
+    let requester_principal_field =
+        optional_str(table, "requester_principal_field").map(ToOwned::to_owned);
+    let proxy_label = optional_str(table, "proxy_label").map(ToOwned::to_owned);
+    let declared = [
+        principal_label.as_ref(),
+        principal_field.as_ref(),
+        requester_principal_field.as_ref(),
+        proxy_label.as_ref(),
+    ]
+    .into_iter()
+    .filter(|value| value.is_some())
+    .count();
+    if declared != 1 {
         return Err(ToolDiscoveryError::Invalid(
-            "pg_dsn setting value_from must declare principal_label or principal_field".to_owned(),
+            "pg_dsn setting value_from must declare exactly one of principal_label, principal_field, requester_principal_field, or proxy_label".to_owned(),
         ));
     }
     Ok(Some(PgDsnSettingValueFrom {
         principal_label,
         principal_field,
+        requester_principal_field,
+        proxy_label,
     }))
 }
 
@@ -1216,7 +1112,7 @@ fn http_secret_transform(secrets: &[ToolSecret]) -> Result<Option<Transform>, To
         let mut entry = Secret {
             id: Some(key.name.clone()),
             source: Some(yaml_map([("placeholder", yaml_string(&key.secret_ref))])?),
-            rules: scoped_host_rules(hosts, &key.methods, &key.paths)?,
+            rules: host_rules(hosts)?,
             ..Default::default()
         };
         entry.extra.insert("labels".to_owned(), yaml_value(labels)?);
@@ -1269,8 +1165,6 @@ struct HttpSecretKey {
     match_headers: Vec<String>,
     match_path: bool,
     match_query: bool,
-    methods: Vec<String>,
-    paths: Vec<String>,
     inject_header: String,
     inject_formatter: String,
     inject_query_param: String,
@@ -1286,8 +1180,6 @@ impl From<&HttpSecret> for HttpSecretKey {
             match_headers: secret.match_headers.clone(),
             match_path: secret.match_path,
             match_query: secret.match_query,
-            methods: secret.methods.clone(),
-            paths: secret.paths.clone(),
             inject_header: secret.inject_header.clone(),
             inject_formatter: secret.inject_formatter.clone(),
             inject_query_param: secret.inject_query_param.clone(),
@@ -1569,30 +1461,9 @@ fn oauth_field_source(source: &OAuthFieldSource) -> Result<YamlValue, ToolDiscov
 }
 
 fn host_rules(hosts: BTreeSet<String>) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
-    scoped_host_rules(hosts, &[], &[])
-}
-
-fn scoped_host_rules(
-    hosts: BTreeSet<String>,
-    methods: &[String],
-    paths: &[String],
-) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
     hosts
         .into_iter()
-        .map(|host| {
-            let mut rule = serde_yaml::Mapping::new();
-            rule.insert(YamlValue::String("host".to_owned()), yaml_string(&host));
-            if !methods.is_empty() {
-                rule.insert(
-                    YamlValue::String("methods".to_owned()),
-                    yaml_value(methods)?,
-                );
-            }
-            if !paths.is_empty() {
-                rule.insert(YamlValue::String("paths".to_owned()), yaml_value(paths)?);
-            }
-            Ok(YamlValue::Mapping(rule))
-        })
+        .map(|host| yaml_map([("host", yaml_string(&host))]))
         .collect()
 }
 
@@ -1754,89 +1625,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_catalog_matches_sandbox_filters_and_script_precedence() {
-        let temp = temp_dir("api-rs-tool-catalog");
-        let base = temp.join("base");
-        let overlay = temp.join("overlay");
-        write_tool(
-            &base.join("category").join("alpha-dir"),
-            r#"
-[project]
-name = "alpha-project"
-
-[project.scripts]
-alpha = "alpha:main"
-shared = "alpha:main"
-"#,
-        );
-        write_tool(
-            &base.join("category").join("beta-dir"),
-            r#"
-[project]
-name = "beta-project"
-
-[project.scripts]
-beta = "beta:main"
-"#,
-        );
-        write_tool(
-            &base.join("category").join("blocked-dir"),
-            r#"
-[project]
-name = "blocked-project"
-
-[project.scripts]
-blocked = "blocked:main"
-safe-sibling = "blocked:main"
-"#,
-        );
-        write_tool(
-            &base.join("category").join("phantom"),
-            r#"
-[project]
-name = "phantom-project"
-"#,
-        );
-        write_tool(
-            &overlay.join("category").join("replacement"),
-            r#"
-[project]
-name = "overlay-project"
-
-[project.scripts]
-overlay = "overlay:main"
-shared = "overlay:main"
-"#,
-        );
-
-        let catalog = discover_tool_catalog(
-            &[base.clone(), overlay.clone()],
-            Some("alpha-dir,beta-project,overlay,blocked-dir,phantom"),
-            Some("blocked"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            catalog
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["alpha", "beta", "overlay", "shared"]
-        );
-        let shared = catalog
-            .tools
-            .iter()
-            .find(|tool| tool.name == "shared")
-            .expect("shared script");
-        assert_eq!(shared.package, "overlay-project");
-        assert_eq!(shared.project_dir, overlay.join("category/replacement"));
-        assert!(catalog.tools.iter().all(|tool| tool.name != "safe-sibling"));
-
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
     fn postgres_listeners_retain_sandbox_env_name_and_database() {
         // api-rs bakes the sandbox PG DSNs from `sandbox_env`, so the listener
         // must carry the tool's declared env var name and database verbatim.
@@ -1845,15 +1633,54 @@ shared = "overlay:main"
             secret_ref: "RESHIFT_DSN".to_owned(),
             labels: tool_labels("company_context", "centaur"),
             database: "warehouse".to_owned(),
-            role: Some("centaur_slack_reader".to_owned()),
-            settings: vec![PgDsnSetting {
-                name: "centaur.slack_channel_id".to_owned(),
-                value: None,
-                value_from: Some(PgDsnSettingValueFrom {
-                    principal_label: Some("slack_channel_id".to_owned()),
-                    principal_field: None,
-                }),
-            }],
+            role: Some("centaur_company_context_reader".to_owned()),
+            settings: vec![
+                PgDsnSetting {
+                    name: "centaur.slack_channel_id".to_owned(),
+                    value: None,
+                    value_from: Some(PgDsnSettingValueFrom {
+                        principal_label: None,
+                        principal_field: Some("slack_channel_id".to_owned()),
+                        requester_principal_field: None,
+                        proxy_label: None,
+                    }),
+                },
+                PgDsnSetting {
+                    name: "centaur.slack_user_id".to_owned(),
+                    value: None,
+                    value_from: Some(PgDsnSettingValueFrom {
+                        principal_label: None,
+                        principal_field: None,
+                        requester_principal_field: None,
+                        proxy_label: Some("centaur.slack_user_id".to_owned()),
+                    }),
+                },
+                PgDsnSetting {
+                    name: "centaur.slack_history_channel_ids".to_owned(),
+                    value: None,
+                    value_from: Some(PgDsnSettingValueFrom {
+                        principal_label: None,
+                        principal_field: Some("slack_history_channel_ids".to_owned()),
+                        requester_principal_field: None,
+                        proxy_label: None,
+                    }),
+                },
+                PgDsnSetting {
+                    name: "centaur.requester_slack_user_id".to_owned(),
+                    value: None,
+                    value_from: Some(PgDsnSettingValueFrom {
+                        principal_label: None,
+                        principal_field: None,
+                        requester_principal_field: Some("slack_user_id".to_owned()),
+                        proxy_label: None,
+                    }),
+                },
+                PgDsnSetting {
+                    name: "centaur.slack_include_public".to_owned(),
+                    value: Some("true".to_owned()),
+                    value_from: None,
+                },
+            ],
         })])
         .unwrap();
 
@@ -1862,10 +1689,62 @@ shared = "overlay:main"
         assert_eq!(sandbox_env.database.as_deref(), Some("warehouse"));
         assert_eq!(
             listeners[0].extra.get("role").and_then(YamlValue::as_str),
-            Some("centaur_slack_reader")
+            Some("centaur_company_context_reader")
         );
-        assert_eq!(listeners[0].settings.len(), 1);
+        assert_eq!(listeners[0].settings.len(), 5);
         assert_eq!(listeners[0].settings[0].name, "centaur.slack_channel_id");
+        assert_eq!(listeners[0].settings[1].name, "centaur.slack_user_id");
+        assert_eq!(
+            listeners[0].settings[1]
+                .value_from
+                .as_ref()
+                .and_then(|value_from| value_from.proxy_label.as_deref()),
+            Some("centaur.slack_user_id")
+        );
+        assert_eq!(
+            listeners[0].settings[2].name,
+            "centaur.slack_history_channel_ids"
+        );
+        assert_eq!(
+            listeners[0].settings[2]
+                .value_from
+                .as_ref()
+                .and_then(|value_from| value_from.principal_field.as_deref()),
+            Some("slack_history_channel_ids")
+        );
+        assert_eq!(
+            listeners[0].settings[3]
+                .value_from
+                .as_ref()
+                .and_then(|value_from| value_from.requester_principal_field.as_deref()),
+            Some("slack_user_id")
+        );
+        assert_eq!(listeners[0].settings[4].value.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn rejects_pg_dsn_value_from_with_multiple_selectors() {
+        let value: TomlValue = toml::from_str(
+            r#"
+database = "warehouse"
+settings = [
+  { name = "centaur.slack_user_id", value_from = { principal_field = "slack_user_id", requester_principal_field = "slack_user_id" } }
+]
+"#,
+        )
+        .unwrap();
+        let err = parse_pg_dsn_secret(
+            value.as_table().unwrap(),
+            "RESHIFT_DSN".to_owned(),
+            "RESHIFT_DSN".to_owned(),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("must declare exactly one"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1890,7 +1769,7 @@ secrets = [{type = "http", name = "BASE_TOKEN", match_headers = ["Authorization"
 description = "overlay alpha"
 
 [tool.centaur]
-secrets = [{type = "http", name = "OVERLAY_TOKEN", match_query = true, hosts = ["api.overlay.test"], methods = ["POST"], paths = ["/api/search.messages"]}]
+secrets = [{type = "http", name = "OVERLAY_TOKEN", match_query = true, hosts = ["api.overlay.test"]}]
 "#,
         );
         write_tool(
@@ -1913,27 +1792,6 @@ secrets = [
         let secrets = discovered.fragment.transforms[0].config.secrets.clone();
         assert_eq!(secrets.len(), 1);
         assert_eq!(secrets[0].id.as_deref(), Some("OVERLAY_TOKEN"));
-        let rules = secrets[0].rules.as_slice();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0]["host"].as_str(), Some("api.overlay.test"));
-        assert_eq!(
-            rules[0]["methods"]
-                .as_sequence()
-                .unwrap()
-                .iter()
-                .filter_map(YamlValue::as_str)
-                .collect::<Vec<_>>(),
-            vec!["POST"]
-        );
-        assert_eq!(
-            rules[0]["paths"]
-                .as_sequence()
-                .unwrap()
-                .iter()
-                .filter_map(YamlValue::as_str)
-                .collect::<Vec<_>>(),
-            vec!["/api/search.messages"]
-        );
         let labels = secrets[0]
             .extra
             .get("labels")
@@ -1975,21 +1833,24 @@ secrets = [
         let registry =
             discover_persona_registry(&[base.clone(), overlay.clone()], Some("eng".to_owned()))
                 .unwrap();
-        let personas = registry.summaries();
+        let registry = serde_json::to_value(registry).unwrap();
+        let personas = registry["personas"].as_object().unwrap();
 
         assert_eq!(personas.len(), 2);
-        let eng = personas
-            .iter()
-            .find(|persona| persona.id == "eng")
-            .expect("eng persona");
-        assert_eq!(eng.source_root, overlay.display().to_string());
-        assert!(eng.source_path.ends_with("personas/eng"));
+        let eng = personas.get("eng").expect("eng persona");
+        assert_eq!(eng["source_root"], overlay.display().to_string());
+        assert!(
+            eng["source_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("personas/eng")
+        );
         assert_ne!(
-            eng.prompt_hash,
+            eng["prompt_hash"],
             "sha256:c41ac32f8b086eecbd1c70d06689eb428de2a2c740d086640851985f26c4e2fc"
         );
         assert_eq!(
-            eng.prompt_hash,
+            eng["prompt_hash"],
             "sha256:af70f573f4496a1cf92865966cb522c2c142a5789e075660a56bea66080bc738"
         );
         assert!(
@@ -1998,32 +1859,6 @@ secrets = [
         );
 
         let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn rejects_explicit_empty_http_request_scope() {
-        for scope in ["methods = []", "http_methods = []", "paths = []"] {
-            let pyproject = parse_toml(
-                std::path::Path::new("pyproject.toml"),
-                &format!(
-                    r#"
-[project]
-description = "bad scope"
-
-[tool.centaur]
-secrets = [{{type = "http", name = "TOK", mode = "inject", inject_header = "Authorization", hosts = ["slack.com"], {scope}}}]
-"#
-                ),
-            )
-            .unwrap();
-            let labels = tool_labels("slack", "centaur");
-            let centaur = pyproject
-                .get("tool")
-                .and_then(|value| value.get("centaur"))
-                .expect("tool.centaur metadata");
-            let err = parse_secret_list(centaur.get("secrets"), &[], &labels).unwrap_err();
-            assert!(err.to_string().contains("must not be empty"), "{err}");
-        }
     }
 
     #[test]
