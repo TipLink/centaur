@@ -14,7 +14,8 @@
 # A provider is offered on the login page only when both are present.
 #
 # SSO email domains are optional. When configured, every SSO login must use an
-# email address under one of these domains:
+# email address under one of these domains. Google also requires a verified
+# email and, when restricted, a hosted-domain claim in the same allowlist:
 #   CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS="acme.com example.org"
 #
 # Password login is a break-glass fallback and can be disabled for public
@@ -62,6 +63,19 @@ module ConsoleAuth
 
     domain = email.to_s.strip.downcase.split("@", 2).last
     domains.include?(domain)
+  end
+
+  def sso_identity_allowed?(provider:, identity:)
+    return false unless sso_email_allowed?(identity[:email])
+    return true unless provider.to_s == "google"
+    return false unless identity[:email_verified] == true
+
+    domains = sso_email_domains
+    return true if domains.empty?
+
+    # An email suffix alone does not establish Google Workspace membership.
+    hosted_domain = identity[:hosted_domain]
+    hosted_domain.is_a?(String) && domains.include?(hosted_domain.strip.downcase)
   end
 
   def sso_email_domains

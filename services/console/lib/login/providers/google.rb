@@ -21,7 +21,9 @@ module Login
       def token_endpoint_auth_method = "client_secret_post"
 
       def identity_from(result, client_id:, nonce: nil)
-        Login::IdToken.identity(result.id_token, client_id: client_id, valid_issuers: VALID_ISSUERS)
+        identity = Login::IdToken.identity(result.id_token, client_id: client_id, valid_issuers: VALID_ISSUERS)
+        claims = Login::IdToken.decode_claims(result.id_token)
+        identity.merge(hosted_domain: claims["hd"])
       end
     end
   end

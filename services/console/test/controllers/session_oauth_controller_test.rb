@@ -43,12 +43,12 @@ class SessionOauthControllerTest < ActionDispatch::IntegrationTest
     "h.#{Base64.urlsafe_encode64(claims.to_json, padding: false)}.s"
   end
 
-  def token_body(sub:, email:, email_verified: true, name: "Test User",
+  def token_body(sub:, email:, email_verified: true, hd: nil, name: "Test User",
                  aud: GOOGLE_CLIENT_ID, iss: "https://accounts.google.com")
     {
       access_token: "AT",
       id_token: id_token({ "aud" => aud, "iss" => iss, "sub" => sub,
-                           "email" => email, "email_verified" => email_verified, "name" => name })
+                           "email" => email, "email_verified" => email_verified, "hd" => hd, "name" => name }.compact)
     }.to_json
   end
 
@@ -233,9 +233,9 @@ class SessionOauthControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "callback provisions a user inside the configured SSO domain allowlist" do
-    ENV["CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS"] = "example.com acme.example"
+    ENV["CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS"] = " EXAMPLE.COM, acme.example "
     assert_difference -> { User.count }, 1 do
-      run_callback(sub: "allowed-sub", email: "newcomer@example.com")
+      run_callback(sub: "allowed-sub", email: "newcomer@example.com", hd: "Example.COM")
     end
     assert_redirected_to console_threads_path
     assert_equal User.find_by!(email: "newcomer@example.com").id, session[:user_id]
@@ -245,12 +245,30 @@ class SessionOauthControllerTest < ActionDispatch::IntegrationTest
     ENV["CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS"] = "acme.example"
     assert_no_difference -> { User.count } do
       assert_no_difference -> { UserIdentity.count } do
-        run_callback(sub: "outside-sub", email: "newcomer@example.com")
+        run_callback(sub: "outside-sub", email: "newcomer@example.com", hd: "acme.example")
       end
     end
     assert_redirected_to login_path
-    assert_equal "That email domain is not allowed to access the console.", flash[:alert]
+    assert_equal "That identity is not allowed to access the console.", flash[:alert]
     assert_nil session[:user_id]
+  end
+
+  [ nil, "", " ", "other.example", "sub.acme.example", "acme.example.attacker.test", [ "acme.example" ] ].each do |hd|
+    test "callback rejects an allowlisted Google email with hosted domain #{hd.inspect}" do
+      ENV["CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS"] = "acme.example"
+      assert_no_difference [ "User.count", "UserIdentity.count" ] do
+        run_callback(sub: "unmanaged-sub", email: "worker@acme.example", hd: hd)
+      end
+      assert_redirected_to login_path
+      assert_nil session[:user_id]
+    end
+  end
+
+  test "callback accepts verified Gmail without a domain restriction" do
+    ENV.delete("CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS")
+    run_callback(sub: "gmail-sub", email: "operator@gmail.com")
+    assert_redirected_to console_threads_path
+    assert_equal User.find_by!(email: "operator@gmail.com").id, session[:user_id]
   end
 
   test "callback makes a bootstrap-allowlisted email active and admin" do
@@ -283,13 +301,14 @@ class SessionOauthControllerTest < ActionDispatch::IntegrationTest
     assert_nil session[:user_id]
   end
 
-  test "callback creates an active user for an unverified, unrecognized email" do
-    assert_difference -> { User.count }, 1 do
-      run_callback(sub: "unv-sub", email: "stranger@example.com", email_verified: false)
+  [ false, nil, "true", 1 ].each do |verified|
+    test "callback rejects an unknown Google email with verified claim #{verified.inspect}" do
+      assert_no_difference [ "User.count", "UserIdentity.count" ] do
+        run_callback(sub: "unv-sub", email: "stranger@example.com", email_verified: verified)
+      end
+      assert_redirected_to login_path
+      assert_nil session[:user_id]
     end
-    user = User.find_by(email: "stranger@example.com")
-    assert user.active?
-    assert_not user.user_identities.first.email_verified
   end
 
   test "callback signs a returning identity into the same user" do
@@ -301,6 +320,28 @@ class SessionOauthControllerTest < ActionDispatch::IntegrationTest
     end
     assert_redirected_to console_principals_path
     assert_equal identity.user_id, session[:user_id]
+  end
+
+  test "callback cannot bypass Google Workspace admission with an existing linked user" do
+    ENV["CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS"] = "acme.example"
+    identity = user_identities(:acme_admin_google)
+    before = identity.attributes
+    assert_no_difference [ "User.count", "UserIdentity.count" ] do
+      run_callback(sub: identity.subject, email: identity.email)
+    end
+    assert_redirected_to login_path
+    assert_nil session[:user_id]
+    assert_equal before, identity.reload.attributes
+  end
+
+  test "callback cannot sign in a disabled Google user with valid Workspace claims" do
+    ENV["CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS"] = "acme.example"
+    identity = user_identities(:acme_admin_google)
+    identity.user.update!(status: :disabled)
+    run_callback(sub: identity.subject, email: identity.email, hd: "acme.example")
+    assert_redirected_to login_path
+    assert_nil session[:user_id]
+    assert identity.user.reload.disabled?
   end
 
   # --- callback: rejections --------------------------------------------------

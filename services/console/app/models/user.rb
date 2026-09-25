@@ -1,5 +1,5 @@
 class User < ApplicationRecord
-  class SsoEmailDomainNotAllowed < StandardError; end
+  class SsoIdentityNotAllowed < StandardError; end
 
   oid_prefix "usr"
 
@@ -50,9 +50,9 @@ class User < ApplicationRecord
   # only when the IdP-verified email matches -- an unverified email must never
   # adopt an account -- otherwise a new active user is created (admin when the
   # verified email is on the bootstrap allowlist). +identity+ is the provider
-  # strategy's { subject:, email:, email_verified:, name: } hash.
+  # strategy's identity hash, including Google's hosted_domain when present.
   def self.link_or_provision(provider:, identity:)
-    raise SsoEmailDomainNotAllowed unless ConsoleAuth.sso_email_allowed?(identity[:email])
+    raise SsoIdentityNotAllowed unless ConsoleAuth.sso_identity_allowed?(provider:, identity:)
 
     transaction do
       user =

@@ -8,10 +8,10 @@ require "uri"
 # encrypted flow cookie binding the callback to the browser that started it), but
 # it produces a console session instead of a BrokerCredential.
 #
-# Provisioning (find_or_provision_user): a returning identity matches by
+# Provisioning: after the SSO admission check, a returning identity matches by
 # (provider, subject); a new identity whose verified email matches an existing
-# user links to that user; otherwise a new user is created -- active + admin when
-# the email is on the bootstrap allowlist, pending otherwise.
+# user links to that user; otherwise a new active user is created, with admin
+# access only when the verified email is on the bootstrap allowlist.
 #
 # SECURITY: never logs codes, tokens, or response bodies -- only provider keys and
 # error codes, like the Broker/Oauth subsystem. Account linking is gated on
@@ -79,9 +79,9 @@ class SessionOauthController < ApplicationController
   rescue Broker::ExchangeError => e
     Rails.logger.error { "console login exchange failed (#{@key}): #{e.reason}" }
     redirect_to login_path, alert: "Sign in failed. Please try again."
-  rescue User::SsoEmailDomainNotAllowed
-    Rails.logger.warn { "console login rejected by SSO email domain allowlist (#{@key})" }
-    redirect_to login_path, alert: "That email domain is not allowed to access the console."
+  rescue User::SsoIdentityNotAllowed
+    Rails.logger.warn { "console login rejected by SSO admission policy (#{@key})" }
+    redirect_to login_path, alert: "That identity is not allowed to access the console."
   rescue ActiveRecord::RecordInvalid => e
     Rails.logger.error { "console login provisioning failed: #{e.record.errors.full_messages.to_sentence}" }
     redirect_to login_path, alert: "Sign in failed while setting up your account."

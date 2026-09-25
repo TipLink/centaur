@@ -129,7 +129,7 @@ class UserTest < ActiveSupport::TestCase
   test "link_or_provision rejects SSO emails outside the configured domain allowlist" do
     ENV["CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS"] = "acme.example example.org"
     assert_no_difference [ "User.count", "UserIdentity.count" ] do
-      assert_raises(User::SsoEmailDomainNotAllowed) do
+      assert_raises(User::SsoIdentityNotAllowed) do
         User.link_or_provision(provider: "google",
                               identity: identity(subject: "outside-sub", email: "newcomer@example.com"))
       end
@@ -143,7 +143,8 @@ class UserTest < ActiveSupport::TestCase
     user = nil
     assert_difference -> { User.count }, 1 do
       user = User.link_or_provision(provider: "google",
-                                    identity: identity(subject: "inside-sub", email: "worker@acme.example"))
+                                    identity: identity(subject: "inside-sub", email: "worker@acme.example",
+                                                       hosted_domain: "acme.example"))
     end
     assert user.active?
   ensure
@@ -164,13 +165,41 @@ class UserTest < ActiveSupport::TestCase
     ENV["CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS"] = "globex.example"
     existing = user_identities(:acme_admin_google)
     assert_no_difference [ "User.count", "UserIdentity.count" ] do
-      assert_raises(User::SsoEmailDomainNotAllowed) do
+      assert_raises(User::SsoIdentityNotAllowed) do
         User.link_or_provision(provider: existing.provider,
                               identity: identity(subject: existing.subject, email: existing.email))
       end
     end
   ensure
     ENV.delete("CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS")
+  end
+
+  [ { email_verified: false }, { hosted_domain: nil }, { hosted_domain: "other.example" } ].each do |claims|
+    test "link_or_provision checks Google admission before updating a linked pending user: #{claims.inspect}" do
+      with_env("CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS" => "acme.example") do
+        existing = user_identities(:acme_admin_google)
+        existing.user.update!(status: :pending)
+        before = existing.attributes
+        assert_no_difference [ "User.count", "UserIdentity.count" ] do
+          assert_raises(User::SsoIdentityNotAllowed) do
+            User.link_or_provision(provider: "google", identity: identity(
+              subject: existing.subject, email: existing.email, hosted_domain: "acme.example"
+            ).merge(claims))
+          end
+        end
+        assert_equal before, existing.reload.attributes
+        assert existing.user.reload.pending?
+      end
+    end
+  end
+
+  %w[slack okta].each do |provider|
+    test "link_or_provision does not require Google's hosted domain for #{provider}" do
+      with_env("CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS" => "example.com") do
+        user = User.link_or_provision(provider: provider, identity: identity)
+        assert user.active?
+      end
+    end
   end
 
   test "link_or_provision links a new identity to an existing user by verified email" do
@@ -214,11 +243,13 @@ class UserTest < ActiveSupport::TestCase
 
   test "link_or_provision does not bootstrap admin from an unverified email" do
     ENV["CENTAUR_CONSOLE_BOOTSTRAP_ADMINS"] = "boss@example.com"
-    user = User.link_or_provision(provider: "google",
-                                  identity: identity(subject: "boss-sub", email: "boss@example.com",
-                                                     email_verified: false))
-    assert user.active?
-    assert_not user.admin?
+    assert_no_difference [ "User.count", "UserIdentity.count" ] do
+      assert_raises(User::SsoIdentityNotAllowed) do
+        User.link_or_provision(provider: "google",
+                              identity: identity(subject: "boss-sub", email: "boss@example.com",
+                                                 email_verified: false))
+      end
+    end
   ensure
     ENV.delete("CENTAUR_CONSOLE_BOOTSTRAP_ADMINS")
   end
