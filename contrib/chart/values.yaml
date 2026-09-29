@@ -631,8 +631,6 @@ apiRs:
     periodSeconds: 10
     timeoutSeconds: 5
   terminationGracePeriodSeconds: 35
-  # Optional CENTAUR_TOOL_APPROVAL_POLICIES JSON. Empty/unset denies all actions.
-  # See services/api-rs/rfcs/0006-tool-approvals.md for credential isolation.
   extraEnv: {}
   resources: {}
   # PriorityClass for the api-rs control plane pod itself. Pair with
@@ -717,8 +715,6 @@ slackbotv2:
   extraEnv: {}
   resources: {}
 
-# Tool approval delivery is opt-in via
-# slackbotv2.extraEnv.SLACKBOTV2_TOOL_APPROVALS_ENABLED="true".
 # Chat SDK Linear bot — Linear agent (actor=app) ingress. Receives
 # AgentSessionEvent webhooks on /api/webhooks/linear, forwards sessions to the
 # api-rs control plane (:8080), and renders runs as Linear agent activities.
