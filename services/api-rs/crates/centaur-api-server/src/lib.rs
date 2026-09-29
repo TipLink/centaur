@@ -5,6 +5,7 @@ mod error;
 mod mcp;
 mod routes;
 mod slack_proxy;
+mod tool_approvals;
 mod tool_discovery;
 pub mod types;
 
@@ -55,6 +56,19 @@ mod tests {
 
     fn test_auth() -> ApiAuthConfig {
         ApiAuthConfig::testing("test-secret")
+    }
+
+    pub(crate) fn approval_test_state(pool: PgPool) -> AppState {
+        AppState::ready_with_pool(
+            centaur_session_runtime::SessionRuntime::new(
+                PgSessionStore::new(pool.clone()),
+                SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+                TestSessionPrincipalRegistrar,
+            ),
+            None,
+            Some(pool),
+            test_auth_with_slack(),
+        )
     }
 
     fn test_auth_with_slack() -> ApiAuthConfig {
@@ -164,6 +178,53 @@ mod tests {
             PgSessionStore::new(pool),
             SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
         );
+    }
+
+    #[tokio::test]
+    async fn approval_routes_separate_sandbox_attestation_and_slack_decisions() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        for (path, permitted) in [
+            ("/api/tool-approvals/context".to_owned(), console_token()),
+            ("/api/tool-approvals/request".to_owned(), console_token()),
+            (format!("/api/tool-approvals/{id}/read"), console_token()),
+            (
+                format!("/api/tool-approvals/{id}/decide"),
+                "test-slackbot-key".into(),
+            ),
+            (
+                "/api/tool-approvals/delivery/claim".to_owned(),
+                "test-slackbot-key".into(),
+            ),
+            (
+                format!("/api/tool-approvals/{id}/delivered"),
+                "test-slackbot-key".into(),
+            ),
+        ] {
+            for token in [
+                principal_token("prn_source"),
+                console_token(),
+                "test-slackbot-key".into(),
+            ] {
+                let response =
+                    build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                        .oneshot(
+                            Request::builder()
+                                .method(Method::POST)
+                                .uri(&path)
+                                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from("{}"))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                if token == permitted {
+                    assert_ne!(response.status(), StatusCode::FORBIDDEN, "{path}");
+                } else {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+                }
+            }
+        }
     }
 
     #[tokio::test]

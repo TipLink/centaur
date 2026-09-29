@@ -125,6 +125,12 @@ describe('Slackbot extensions', () => {
       actionIds: ['centaur.workflow.action:run:approve']
     }, '/overlay/reserved/index.mjs')).toThrow('reserved by Centaur')
     expect(() => claims.claim({
+      id: 'reserved-approval', actionIds: ['centaur.tool-approval:request:approved']
+    }, '/overlay/reserved-approval/index.mjs')).toThrow('reserved by Centaur')
+    expect(() => claims.claim({
+      id: 'reserved-approval-prefix', actionIdPrefixes: ['centaur.tool-approval:']
+    }, '/overlay/reserved-approval-prefix/index.mjs')).toThrow("overlaps Centaur's reserved prefix")
+    expect(() => claims.claim({
       id: 'reserved-prefix',
       actionIdPrefixes: ['centaur.workflow.']
     }, '/overlay/reserved-prefix/index.mjs')).toThrow("overlaps Centaur's reserved prefix")

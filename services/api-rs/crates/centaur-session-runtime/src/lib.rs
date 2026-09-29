@@ -388,6 +388,9 @@ pub struct InterruptExecutionOutcome {
 
 #[derive(Debug)]
 pub struct ToolHostCallInput {
+    /// A durable caller may supply a stable call ID to correlate/replay the same
+    /// invocation. Never reuse it for different tool arguments.
+    pub idempotency_key: Option<String>,
     pub principal_id: String,
     pub console_user_email: Option<String>,
     pub console_user_name: Option<String>,
@@ -1271,6 +1274,7 @@ impl SessionRuntime {
         sandbox_capabilities: SessionSandboxCapabilities,
     ) -> Result<ToolHostCallOutput, ToolHostCallError> {
         let ToolHostCallInput {
+            idempotency_key,
             principal_id,
             console_user_email,
             console_user_name,
@@ -1287,7 +1291,8 @@ impl SessionRuntime {
         )
         .await?;
 
-        let request_id = format!("mcp-call-{}", Uuid::new_v4().simple());
+        let request_id =
+            idempotency_key.unwrap_or_else(|| format!("mcp-call-{}", Uuid::new_v4().simple()));
         let method = invocation.method().to_owned();
         let request = ToolHostRequest {
             id: request_id.clone(),

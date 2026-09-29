@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { TOOL_APPROVAL_ACTION_PREFIX } from './tool-approvals'
 import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
 import { Hono, type Context } from 'hono'
@@ -504,6 +505,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     if (extensionClaims.ownsAction(event.actionId)) return
     const payload = slackBlockActionPayload(event)
     const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
+      || payload.action_id.startsWith(TOOL_APPROVAL_ACTION_PREFIX)
     // Workflow starts deduplicate durably using the Slack click identity.
     // A temporary ingress lease must never acknowledge a lost click.
     const dedupeKey = workflowAction ? undefined : slackBlockActionDedupeKey(payload)
@@ -719,7 +721,8 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         && Array.isArray(interaction.actions)
         && interaction.actions.some(action => isJsonObject(action)
           && typeof action.action_id === 'string'
-          && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
+          && (action.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
+            || action.action_id.startsWith(TOOL_APPROVAL_ACTION_PREFIX)))
       const extensionInteraction = isExtensionInteraction(interaction, extensionClaims)
       const slashCommand = typeof interaction?.command === 'string'
         ? interaction.command
@@ -1135,6 +1138,8 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
   const messageTs = stringValue(message.ts) ?? stringValue(container.message_ts)
   const messageId = event.messageId.startsWith('ephemeral:') ? (messageTs ?? '') : event.messageId
   return removeUndefinedValues({
+    ...(event.actionId.startsWith(TOOL_APPROVAL_ACTION_PREFIX) && Array.isArray(message.blocks)
+      ? { approval_message_blocks: message.blocks } : {}),
     ...(event.actionId.startsWith(WORKFLOW_ACTION_PREFIX) && Array.isArray(message.blocks)
       ? { workflow_message: { text: stringValue(message.text) ?? '', blocks: message.blocks } }
       : {}),

@@ -1,4 +1,5 @@
 import { createSlackbotV2, type SlackbotV2Options } from './index'
+import { startToolApprovalDelivery } from './tool-approvals'
 import { parseChannelDefaults } from './channel-defaults'
 import { resolveSlackHomeTeamId } from './session-api'
 import { resolveSlackBotUserId } from './slack-user'
@@ -110,6 +111,7 @@ const options: SlackbotV2Options = {
   logger: consoleLogger
 }
 options.slackHomeTeamId = await resolveSlackHomeTeamId(options)
+if (booleanEnv('SLACKBOTV2_TOOL_APPROVALS_ENABLED', false)) startToolApprovalDelivery(options)
 
 const { app, initialize, loadExtensions } = createSlackbotV2(options)
 const extensionModules = parseSlackbotExtensionModules(

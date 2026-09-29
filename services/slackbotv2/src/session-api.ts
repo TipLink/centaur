@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { dispatchToolApproval, TOOL_APPROVAL_ACTION_PREFIX } from './tool-approvals'
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import { isRetryableCodexErrorNotification } from '@centaur/rendering'
 import type { Attachment, LinkPreview, Message } from 'chat'
@@ -559,6 +560,7 @@ export async function dispatchSlackBlockAction(
   options: SlackbotV2Options,
   payload: SlackbotV2BlockActionPayload
 ): Promise<JsonObject | undefined> {
+  if (payload.action_id.startsWith(TOOL_APPROVAL_ACTION_PREFIX)) return dispatchToolApproval(options, payload)
   const action = `dispatch Slack block action ${payload.action_id}`
   const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
   let body: JsonObject = { event_name: `slack.block_action.${payload.action_id}`, payload }

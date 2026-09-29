@@ -560,7 +560,7 @@ function assertActionClaimAvailable(
   actionIds: Map<string, string>,
   actionPrefixes: Map<string, string>
 ): void {
-  if (actionId.startsWith(reservedPrefix)) {
+  if (actionId.startsWith(reservedPrefix) || actionId.startsWith('centaur.tool-approval:')) {
     throw new Error(
       `Slackbot extension action ID ${JSON.stringify(actionId)} in ${modulePath} is reserved by Centaur`
     )
@@ -588,7 +588,8 @@ function assertActionPrefixAvailable(
   actionIds: Map<string, string>,
   actionPrefixes: Map<string, string>
 ): void {
-  if (prefix.startsWith(reservedPrefix) || reservedPrefix.startsWith(prefix)) {
+  if (prefix.startsWith(reservedPrefix) || reservedPrefix.startsWith(prefix)
+    || prefix.startsWith('centaur.tool-approval:') || 'centaur.tool-approval:'.startsWith(prefix)) {
     throw new Error(
       `Slackbot extension action ID prefix ${JSON.stringify(prefix)} in ${modulePath} overlaps Centaur's reserved prefix`
     )

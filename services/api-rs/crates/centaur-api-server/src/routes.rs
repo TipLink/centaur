@@ -73,6 +73,7 @@ pub struct AppState {
     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
     metrics: PrometheusHandle,
     auth: ApiAuthConfig,
+    approval_policies: Arc<crate::tool_approvals::Policies>,
 }
 
 #[derive(Clone)]
@@ -89,6 +90,8 @@ impl AppState {
             initialized: Arc::new(RwLock::new(None)),
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             auth,
+            approval_policies: crate::tool_approvals::policies_from_env()
+                .expect("invalid CENTAUR_TOOL_APPROVAL_POLICIES"),
         }
     }
 
@@ -188,13 +191,30 @@ impl AppState {
             .ok_or_else(|| ApiError::BadRequest("workflow runtime is not enabled".to_owned()))
     }
 
-    fn pool(&self) -> Result<PgPool, ApiError> {
+    pub(crate) fn pool(&self) -> Result<PgPool, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
         initialized.pool.ok_or_else(|| {
             ApiError::BadRequest("database-backed admin routes are not enabled".to_owned())
         })
+    }
+
+    pub(crate) fn approval_policies(&self) -> Arc<crate::tool_approvals::Policies> {
+        self.approval_policies.clone()
+    }
+
+    pub fn start_tool_approval_worker(&self) {
+        crate::tool_approvals::spawn_worker(self.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_approval_policies(
+        mut self,
+        policies: crate::tool_approvals::Policies,
+    ) -> Self {
+        self.approval_policies = Arc::new(policies);
+        self
     }
 }
 
@@ -260,6 +280,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route("/api/session/{thread_key}/events", get(stream_events))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .merge(slack_proxy_router())
+        .merge(crate::tool_approvals::router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
             "/api/workflows/runs",
@@ -446,6 +467,8 @@ async fn metrics(State(state): State<AppState>) -> Response {
 
 #[derive(Clone, Copy)]
 enum RouteAccess {
+    ConsoleOnly,
+    SlackIngressOnly,
     Capability(Capability),
     PrincipalOnly,
     ArchiveDownload,
@@ -483,6 +506,10 @@ async fn authorize_api_request(
     };
 
     let allowed = match access {
+        RouteAccess::ConsoleOnly => caller.class() == CallerClass::Console,
+        RouteAccess::SlackIngressOnly => {
+            caller.class() == CallerClass::Ingress && caller.identity() == "slackbot"
+        }
         RouteAccess::Capability(capability) => caller.has_capability(capability),
         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
         RouteAccess::ArchiveDownload => {
@@ -537,6 +564,14 @@ async fn authorize_api_request(
 fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
+        (&Method::POST, "/api/tool-approvals/context")
+        | (&Method::POST, "/api/tool-approvals/request")
+        | (&Method::POST, "/api/tool-approvals/{id}/read") => Some(RouteAccess::ConsoleOnly),
+        (&Method::POST, "/api/tool-approvals/{id}/decide")
+        | (&Method::POST, "/api/tool-approvals/delivery/claim")
+        | (&Method::POST, "/api/tool-approvals/{id}/delivered") => {
+            Some(RouteAccess::SlackIngressOnly)
+        }
         (&Method::GET, "/api/session/{thread_key}")
         | (&Method::GET, "/api/session/{thread_key}/events") => {
             capability(Capability::SessionsRead)
