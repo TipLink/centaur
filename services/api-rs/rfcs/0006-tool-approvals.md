@@ -138,87 +138,20 @@ explicit publication policy, **not a secret scanner**: only select fields that
 reviewed executor code guarantees are non-secret. The field list is displayed
 on the approval card and bound into both the payload and policy hashes.
 
-### Credential-free hello-world test
+### Deployment-owned executors
 
-`workflows/approval_hello_world.py` is an approval-only executor that accepts
-exactly `{}` and returns `{"message":"Hello world!"}`. It calls no tools or
-external services and needs no provider credential grants. It has no schedule
-or webhook. Without a configured action policy it cannot be requested, and
-the runtime marker check rejects ordinary/older workflow hosts.
+Core supplies the approval protocol, not a catalog of deployable executors.
+Keep executor implementations, including credential-free smoke-test handlers,
+in a deployment-owned workflow source. Load them through the existing
+`overlays.sources` / `workflowsSubdir` mechanism; use immutable source revisions
+and the same bundle for discovery and sandbox execution. Keep executor-specific
+unit and host-integration tests beside that source.
 
-To enable it on a reviewed test deployment:
-
-1. Install the approval-capable core and this workflow in the workflow-host
-   image/source bundle. Keep workflow-host sandboxing enabled. If using
-   `WORKFLOW_ENABLE_MODE=allowlist`, add `approval_hello_world` to the existing
-   `WORKFLOW_ALLOWED_NAMES` value without removing other entries.
-2. Discover/register the workflow's dedicated `workflow-approval-hello-world`
-   principal; no manual executor OID lookup is needed. Do not give it provider
-   secrets or ordinary-agent access. The requester
-   OID is the principal assigned to the bot session's sandbox, not the human
-   Slack user ID.
-3. Merge the following action into `CENTAUR_TOOL_APPROVAL_POLICIES`, replacing
-   every placeholder with the reviewed deployment values. Roll out the API
-   configuration so every replica starts with the same policy.
-
-```json
-{
-  "hello-world": {
-    "workflow": "approval_hello_world",
-    "requester_principals": ["prn_Conversation"],
-    "team_id": "TEXAMPLE",
-    "approver_user_ids": ["UREVIEWER"],
-    "allow_self_approval": false,
-    "expires_seconds": 600,
-    "timeout_seconds": 60,
-    "implementation_revision": "reviewed-immutable-release",
-    "public_result_fields": ["message"]
-  }
-}
-```
-
-From a running bot session in a Slack thread:
-
-```sh
-centaur-console approvals call hello-world --arguments '{}'
-```
-
-Or ask the bot: “Run the `hello-world` approval test with empty arguments and
-tell me the returned message after approval.” An allowlisted reviewer other
-than the requester clicks Accept. The final Slack card then includes
-`{"message":"Hello world!"}`, and the command returns
-`{"outcome":"succeeded","output":{"message":"Hello world!"}}` inside
-`result`. For a deliberately single-person test, explicitly set
-`allow_self_approval: true` and include that person's Slack ID; never silently
-relax the default. Decline, expiry and unauthorized clicks must not produce a
-greeting or execute the handler.
-
-The command waits by default. If the agent turn ends or its wait times out,
-the request remains durable; inspect it with `centaur-console approvals status <id>`
-from the same sandbox instead of resubmitting. Approval completion updates
-Slack, but does not automatically start a new agent turn.
-
-This tests the existing Centaur approval path only. It does not provision AWS
-resources or implement external execution services or signed approval grants.
-
-Test checklist (use a fresh request for each decision):
-
-- Run `centaur-console approvals actions` from the active Slack bot execution and check
-  that `hello-world` is listed. Do not run the command from an ordinary laptop
-  shell; it needs the sandbox's proxy entitlement and active Slack execution.
-- Before approval, the card must show `{}` and `public_result_fields: ["message"]`,
-  but no completed greeting. Accept as an allowlisted reviewer and verify both
-  the final card and CLI result contain `Hello world!`.
-- Decline a fresh request: it must finish as `declined` with no greeting.
-- Have someone outside the approver list click Accept: the request must remain
-  pending and must not run. An allowed reviewer can still decide it.
-- Submit with `--no-wait`, then call `centaur-console approvals cancel <id>` before
-  approval: status must become `cancelled` and later clicks must not execute it.
-- To test expiry quickly, configure `expires_seconds: 30` before submitting a
-  fresh request. Leave it untouched and allow another 30 seconds for the
-  durable expiry check. It must become `expired` without a greeting.
-- Repeated status reads or duplicate decision deliveries must not execute the
-  handler again. Direct generic starts of `approval_hello_world` must be rejected.
+Deployment configuration owns action policies, workflow/tool allowlists,
+approver identities, target settings, credential grants and release pins.
+Those settings must not be baked into the shared approval engine. Test the
+credential-free round trip before granting a provider capability, then prove
+both the permitted path and ordinary-sandbox bypass rejection.
 
 ## Recovery and cancellation
 
