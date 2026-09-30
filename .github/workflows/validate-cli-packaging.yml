@@ -2,14 +2,14 @@ name: Validate CLI Packaging
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, release/aws-core]
     paths:
       - .github/workflows/validate-cli-packaging.yml
       - scripts/validate_cli_packaging.py
       - tools/**
   merge_group:
   push:
-    branches: [main]
+    branches: [main, release/aws-core]
     paths:
       - .github/workflows/validate-cli-packaging.yml
       - scripts/validate_cli_packaging.py

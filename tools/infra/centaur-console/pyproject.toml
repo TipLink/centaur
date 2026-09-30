@@ -1,6 +1,6 @@
 [project]
 name = "centaur-console"
-description = "Inspect Centaur Console permissions and manage scheduled tasks"
+description = "Inspect Console permissions, manage scheduled tasks and request guarded actions"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [

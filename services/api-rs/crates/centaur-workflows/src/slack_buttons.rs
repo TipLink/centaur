@@ -34,6 +34,32 @@ pub struct Invocation {
     pub message: Option<Value>,
 }
 
+/// Provenance that cannot be deserialized from caller-supplied workflow input.
+pub struct VerifiedButton {
+    pub(crate) request: CreateWorkflowRunRequest,
+    pub(crate) message: Option<Value>,
+}
+
+impl VerifiedButton {
+    pub fn workflow_name(&self) -> &str {
+        &self.request.workflow_name
+    }
+    pub fn into_request(self) -> CreateWorkflowRunRequest {
+        self.request
+    }
+}
+
+pub fn verify_button(
+    invocation: Invocation,
+    secret: &[u8],
+) -> Result<VerifiedButton, &'static str> {
+    let message = invocation.message.clone();
+    Ok(VerifiedButton {
+        request: verify(invocation, secret)?,
+        message,
+    })
+}
+
 fn button_mac(secret: &[u8]) -> Hmac<Sha256> {
     let mut derive = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
     derive.update(b"centaur:workflow-buttons:v1");
