@@ -1063,7 +1063,6 @@ async fn run_mcp_tool_host(
     let output = match runtime
         .run_tool_host_call(
             ToolHostCallInput {
-                idempotency_key: None,
                 principal_id: principal.principal_id.clone(),
                 console_user_email: principal.console_user_email.clone(),
                 console_user_name: principal.console_user_name.clone(),

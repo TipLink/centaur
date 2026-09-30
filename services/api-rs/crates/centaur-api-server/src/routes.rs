@@ -73,7 +73,6 @@ pub struct AppState {
     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
     metrics: PrometheusHandle,
     auth: ApiAuthConfig,
-    approval_policies: Arc<crate::tool_approvals::Policies>,
 }
 
 #[derive(Clone)]
@@ -90,8 +89,6 @@ impl AppState {
             initialized: Arc::new(RwLock::new(None)),
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             auth,
-            approval_policies: crate::tool_approvals::policies_from_env()
-                .expect("invalid CENTAUR_TOOL_APPROVAL_POLICIES"),
         }
     }
 
@@ -182,7 +179,7 @@ impl AppState {
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
     }
 
-    fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
+    pub(crate) fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -198,23 +195,6 @@ impl AppState {
         initialized.pool.ok_or_else(|| {
             ApiError::BadRequest("database-backed admin routes are not enabled".to_owned())
         })
-    }
-
-    pub(crate) fn approval_policies(&self) -> Arc<crate::tool_approvals::Policies> {
-        self.approval_policies.clone()
-    }
-
-    pub fn start_tool_approval_worker(&self) {
-        crate::tool_approvals::spawn_worker(self.clone());
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_approval_policies(
-        mut self,
-        policies: crate::tool_approvals::Policies,
-    ) -> Self {
-        self.approval_policies = Arc::new(policies);
-        self
     }
 }
 
@@ -468,7 +448,6 @@ async fn metrics(State(state): State<AppState>) -> Response {
 #[derive(Clone, Copy)]
 enum RouteAccess {
     ConsoleOnly,
-    SlackIngressOnly,
     Capability(Capability),
     PrincipalOnly,
     ArchiveDownload,
@@ -507,9 +486,6 @@ async fn authorize_api_request(
 
     let allowed = match access {
         RouteAccess::ConsoleOnly => caller.class() == CallerClass::Console,
-        RouteAccess::SlackIngressOnly => {
-            caller.class() == CallerClass::Ingress && caller.identity() == "slackbot"
-        }
         RouteAccess::Capability(capability) => caller.has_capability(capability),
         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
         RouteAccess::ArchiveDownload => {
@@ -566,12 +542,8 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     match (method, route) {
         (&Method::POST, "/api/tool-approvals/context")
         | (&Method::POST, "/api/tool-approvals/request")
-        | (&Method::POST, "/api/tool-approvals/{id}/read") => Some(RouteAccess::ConsoleOnly),
-        (&Method::POST, "/api/tool-approvals/{id}/decide")
-        | (&Method::POST, "/api/tool-approvals/delivery/claim")
-        | (&Method::POST, "/api/tool-approvals/{id}/delivered") => {
-            Some(RouteAccess::SlackIngressOnly)
-        }
+        | (&Method::POST, "/api/tool-approvals/{id}/read")
+        | (&Method::POST, "/api/tool-approvals/{id}/cancel") => Some(RouteAccess::ConsoleOnly),
         (&Method::GET, "/api/session/{thread_key}")
         | (&Method::GET, "/api/session/{thread_key}/events") => {
             capability(Capability::SessionsRead)
@@ -2880,14 +2852,24 @@ async fn ingest_google_docs_sync_batch(
 
 async fn invoke_workflow_button(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Json(request): Json<centaur_workflows::slack_buttons::Invocation>,
 ) -> Result<Json<Value>, ApiError> {
     let feedback =
         centaur_workflows::slack_button_feedback::ButtonFeedback::from_invocation(&request);
     let request = state.auth.verify_workflow_button(request)?;
-    let run = workflow_runtime(&state)?
-        .create_button_run(request, feedback)
-        .await?;
+    let run = if request.workflow_name() == centaur_workflows::approvals::DECISION_WORKFLOW {
+        if caller.class() != CallerClass::Ingress || caller.identity() != "slackbot" {
+            return Err(ApiError::Forbidden(
+                "approval decisions require Slack ingress".into(),
+            ));
+        }
+        workflow_runtime(&state)?.decide_approval(request).await?
+    } else {
+        workflow_runtime(&state)?
+            .create_button_run(request.into_request(), feedback)
+            .await?
+    };
     Ok(Json(serde_json::to_value(run)?))
 }
 

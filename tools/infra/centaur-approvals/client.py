@@ -74,6 +74,10 @@ class ApprovalsClient:
                 raise TimeoutError(f"Still pending: {request_id}. Use status; do not resubmit.")
             time.sleep(2)
 
+    def cancel(self, request_id: str) -> dict[str, Any]:
+        """Cancel pending/approved work; cannot undo execution already claimed."""
+        return self._request("POST", PATH + "/" + str(UUID(request_id)) + "/cancel")
+
     def close(self) -> None:
         self._http.close()
 

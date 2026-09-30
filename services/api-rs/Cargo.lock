@@ -1137,6 +1137,7 @@ dependencies = [
  "chrono-tz",
  "cron",
  "futures-util",
+ "hex",
  "hmac 0.13.0",
  "reqwest",
  "serde",

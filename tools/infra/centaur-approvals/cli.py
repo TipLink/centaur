@@ -30,7 +30,7 @@ def call(
     ),
     wait: bool = typer.Option(True, "--wait/--no-wait"),
 ) -> None:
-    """Request an action once; wait for approval and the tool result by default."""
+    """Request once; await approval, outcome, and any explicitly public result fields."""
     client = ApprovalsClient()
     try:
         request = client.request(action, json.loads(arguments), idempotency_key)
@@ -49,5 +49,15 @@ def status(request_id: str) -> None:
     client = ApprovalsClient()
     try:
         typer.echo(json.dumps(client.status(request_id), indent=2))
+    finally:
+        client.close()
+
+
+@app.command()
+def cancel(request_id: str) -> None:
+    """Cancel before execution is claimed; never undo an external side effect."""
+    client = ApprovalsClient()
+    try:
+        typer.echo(json.dumps(client.cancel(request_id), indent=2))
     finally:
         client.close()

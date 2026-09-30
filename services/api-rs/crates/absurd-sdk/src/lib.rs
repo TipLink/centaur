@@ -614,6 +614,21 @@ impl Client {
         params: P,
         options: SpawnOptions,
     ) -> Result<SpawnResult> {
+        self.spawn_with_executor(task_name, params, options, &self.pool)
+            .await
+    }
+
+    /// Atomically enqueue a task with application state in the same transaction.
+    pub async fn spawn_with_executor<'e, P: Serialize, E>(
+        &self,
+        task_name: &str,
+        params: P,
+        options: SpawnOptions,
+        executor: E,
+    ) -> Result<SpawnResult>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         let params_value = serde_json::to_value(params)?;
         let (queue, effective_options) = self.resolve_spawn(task_name, options)?;
         let effective_options = if let Some(hook) = &self.hooks.before_spawn {
@@ -638,7 +653,7 @@ impl Client {
         .bind(task_name)
         .bind(Json(params_value))
         .bind(Json(Value::Object(payload)))
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await?;
 
         spawn_result_from_row(row)

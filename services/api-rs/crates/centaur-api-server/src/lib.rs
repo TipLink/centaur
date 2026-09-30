@@ -58,19 +58,6 @@ mod tests {
         ApiAuthConfig::testing("test-secret")
     }
 
-    pub(crate) fn approval_test_state(pool: PgPool) -> AppState {
-        AppState::ready_with_pool(
-            centaur_session_runtime::SessionRuntime::new(
-                PgSessionStore::new(pool.clone()),
-                SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
-                TestSessionPrincipalRegistrar,
-            ),
-            None,
-            Some(pool),
-            test_auth_with_slack(),
-        )
-    }
-
     fn test_auth_with_slack() -> ApiAuthConfig {
         ApiAuthConfig::testing_with_slack_ingress("test-slackbot-key", "test-secret")
     }
@@ -187,18 +174,7 @@ mod tests {
             ("/api/tool-approvals/context".to_owned(), console_token()),
             ("/api/tool-approvals/request".to_owned(), console_token()),
             (format!("/api/tool-approvals/{id}/read"), console_token()),
-            (
-                format!("/api/tool-approvals/{id}/decide"),
-                "test-slackbot-key".into(),
-            ),
-            (
-                "/api/tool-approvals/delivery/claim".to_owned(),
-                "test-slackbot-key".into(),
-            ),
-            (
-                format!("/api/tool-approvals/{id}/delivered"),
-                "test-slackbot-key".into(),
-            ),
+            (format!("/api/tool-approvals/{id}/cancel"), console_token()),
         ] {
             for token in [
                 principal_token("prn_source"),
@@ -548,6 +524,36 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_approval_buttons_require_slack_actor_attestation() {
+        let mut message = json!({"channel":"C1","blocks":[{"type":"actions","elements":[{
+            "type":"button","action_id":"centaur.workflow.action:00000000-0000-4000-8000-000000000001:approved",
+            "value":json!({"workflow_name":centaur_workflows::approvals::DECISION_WORKFLOW,"input":{"approval_id":"00000000-0000-4000-8000-000000000001"}}).to_string()
+        }]}]});
+        centaur_workflows::slack_buttons::sign_message(&mut message, b"test-secret").unwrap();
+        let body = json!({"button":message["blocks"][0]["elements"][0]["value"],"idempotency_key":"click",
+            "click":{"id":"00000000-0000-4000-8000-000000000001","action":"approved","channel_id":"C1","user_id":"U1"}});
+        for (token, status) in [
+            (console_token(), StatusCode::FORBIDDEN),
+            (principal_token("prn_sandbox"), StatusCode::FORBIDDEN),
+            ("test-slackbot-key".into(), StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/workflows/actions/invoke")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
         }
     }
 

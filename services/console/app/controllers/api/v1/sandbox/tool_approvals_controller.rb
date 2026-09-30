@@ -33,6 +33,13 @@ module Api
           render json: { data: api.read_tool_approval(params[:id], identity) }
         end
 
+        def cancel
+          unless /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/.match?(params[:id].to_s)
+            return render_error(status: :not_found, message: "tool approval not found")
+          end
+          render json: { data: api.cancel_tool_approval(params[:id], identity) }
+        end
+
         private
 
         def identity

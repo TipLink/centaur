@@ -140,6 +140,10 @@ class CentaurApiClient
     post("/api/tool-approvals/#{escape_path(id)}/read", identity)
   end
 
+  def cancel_tool_approval(id, identity)
+    post("/api/tool-approvals/#{escape_path(id)}/cancel", identity)
+  end
+
   private
 
   def get(path, params = {})

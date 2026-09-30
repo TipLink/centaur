@@ -131,7 +131,6 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
         iron_control.workflow_host_principal,
     );
     info!("centaur api-rs runtime initialized");
-    app_state.start_tool_approval_worker();
     Ok(())
 }
 
