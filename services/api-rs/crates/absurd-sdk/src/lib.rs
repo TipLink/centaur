@@ -614,6 +614,21 @@ impl Client {
         params: P,
         options: SpawnOptions,
     ) -> Result<SpawnResult> {
+        self.spawn_with_executor(task_name, params, options, &self.pool)
+            .await
+    }
+
+    /// Atomically enqueue a task with application state in the same transaction.
+    pub async fn spawn_with_executor<'e, P: Serialize, E>(
+        &self,
+        task_name: &str,
+        params: P,
+        options: SpawnOptions,
+        executor: E,
+    ) -> Result<SpawnResult>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         let params_value = serde_json::to_value(params)?;
         let (queue, effective_options) = self.resolve_spawn(task_name, options)?;
         let effective_options = if let Some(hook) = &self.hooks.before_spawn {
@@ -638,7 +653,7 @@ impl Client {
         .bind(task_name)
         .bind(Json(params_value))
         .bind(Json(Value::Object(payload)))
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await?;
 
         spawn_result_from_row(row)
@@ -650,6 +665,21 @@ impl Client {
         payload: P,
         queue_name: Option<&str>,
     ) -> Result<()> {
+        self.emit_event_with_executor(event_name, payload, queue_name, &self.pool)
+            .await
+    }
+
+    /// Commit an event and the application decision that produced it together.
+    pub async fn emit_event_with_executor<'e, P: Serialize, E>(
+        &self,
+        event_name: &str,
+        payload: P,
+        queue_name: Option<&str>,
+        executor: E,
+    ) -> Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         if event_name.is_empty() {
             return Err(Error::InvalidOptions(
                 "event_name must be a non-empty string".to_string(),
@@ -660,7 +690,7 @@ impl Client {
             .bind(&queue)
             .bind(event_name)
             .bind(Json(serde_json::to_value(payload)?))
-            .execute(&self.pool)
+            .execute(executor)
             .await?;
         Ok(())
     }

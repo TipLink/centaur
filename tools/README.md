@@ -63,8 +63,11 @@ The open-source tool inventory lives in this `tools/` tree and changes over time
 
 - `centaur_investigator`: parse Centaur Slack thread references and enrich them
   with best-effort vlogs/vmetrics context without exposing message context.
-- `centaur-console`: inspect sandbox permissions and configured OAuth apps, and
-  manage the linked user's scheduled tasks.
+- `centaur-console`: inspect sandbox permissions and configured OAuth apps,
+  manage the linked user's scheduled tasks, and use `approvals` to request
+  configured guarded actions with complete payloads and Accept/Decline in Slack.
+  Approvals use the sandbox's Console entitlement, not provider secrets.
+  `centaur-approvals` remains a compatibility command from this same package.
 - `centaur-skills`: discover merged repository and overlay skills alongside
   private and public Console-authored skills, and manage Console skills.
 - `datadog`: query Datadog logs, metrics, monitors, hosts, and dashboards

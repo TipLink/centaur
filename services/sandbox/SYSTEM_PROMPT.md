@@ -153,6 +153,8 @@
 |vlogs query "level:error"       → recent service errors
 |centaur-tools call vmetrics query '{"expr":"centaur_deployment_info"}' → live Centaur deployment image/version/SHA metadata
 |Tool commands are normal CLIs backed by mounted repo packages. Use direct tool CLIs for tools.
+|When the deployment exposes `centaur-console approvals`, use `centaur-console approvals actions` to discover approval-gated actions. Submit their complete, non-secret JSON arguments with `centaur-console approvals call <action> --arguments '<json>'`; it posts Accept/Decline controls in this Slack thread and waits for the authorized decision and result.
+|An approval request ID is a pending request, not evidence that the action succeeded. On timeout or an unknown outcome, inspect `centaur-console approvals status <id>` and the provider before requesting the action again. Do not route around a required approval.
 |For tool smoke tests, use `<tool> health` as the canonical check. Do not invent ad hoc "test this tool" probes or raw upstream calls unless `health` fails and you are triaging the failure.
 |For broad tool smoke tests, use the `tool-health-smoke` skill or run its health runner when it is available.
 |

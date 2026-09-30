@@ -144,6 +144,7 @@ impl SessionPrincipalRegistrar for SessionRegistrar {
 
 #[derive(Clone)]
 pub struct SessionRuntime {
+    workflow_only_principals: Arc<DashSet<String>>,
     store: PgSessionStore,
     sandbox_runtime: SandboxRuntime,
     sandbox_pipes: SessionPipeMap,
@@ -964,6 +965,7 @@ impl SessionRuntime {
         Self {
             store,
             sandbox_runtime,
+            workflow_only_principals: Arc::new(DashSet::new()),
             sandbox_pipes: Arc::new(DashMap::new()),
             sandbox_pipe_open_locks: Arc::new(DashMap::new()),
             tool_host_call_locks: Arc::new(DashMap::new()),
@@ -978,6 +980,41 @@ impl SessionRuntime {
             stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Approval-only credentials must never be assigned to an agent or generic
+    /// tool host. Reservations are shared by clones and monotonic per process.
+    pub fn reserve_workflow_principal(&self, principal_id: &str) {
+        self.workflow_only_principals
+            .insert(principal_id.to_owned());
+    }
+
+    fn ensure_unreserved_principal(&self, principal_id: &str) -> Result<(), SessionRuntimeError> {
+        if self.workflow_only_principals.contains(principal_id) {
+            return Err(SessionRuntimeError::BadRequest(
+                "principal is reserved for an approval-only workflow".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_unreserved_record(&self, principal: &Principal) -> Result<(), SessionRuntimeError> {
+        self.ensure_unreserved_principal(&principal.id)?;
+        if let Some(reference) = &principal.foreign_id {
+            self.ensure_unreserved_principal(reference)?;
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_unreserved_principal_reference(
+        &self,
+        reference: &str,
+    ) -> Result<(), SessionRuntimeError> {
+        if self.workflow_only_principals.is_empty() {
+            return Ok(());
+        }
+        self.ensure_unreserved_principal(reference)?;
+        self.ensure_unreserved_record(&self.iron_control.get_principal(reference).await?)
     }
 
     pub fn with_session_title_generator<F, Fut>(mut self, generator: F) -> Self
@@ -1052,6 +1089,14 @@ impl SessionRuntime {
         policy: ToolHostCallPolicy,
     ) -> Result<ToolHostCallOutput, ToolHostCallError> {
         let principal_id = input.principal_id.trim().to_owned();
+        if !self.workflow_only_principals.is_empty() {
+            let principal = self
+                .iron_control
+                .get_principal(&principal_id)
+                .await
+                .map_err(SessionRuntimeError::from)?;
+            self.ensure_unreserved_record(&principal)?;
+        }
         let tool_name = input.tool_name.trim().to_owned();
         let invocation = match input.invocation {
             ToolHostInvocation::V1 { method, arguments } => ToolHostInvocation::V1 {
@@ -1732,6 +1777,7 @@ impl SessionRuntime {
                 }
             };
             let desired_capabilities = sandbox_capabilities_from_principal(&registered_principal);
+            self.ensure_unreserved_record(&registered_principal)?;
             // A session's persona is fixed by the first successful create.
             // Use the stored persona before the requested one so later persona
             // flags cannot change or invalidate an existing thread. Its
@@ -2238,6 +2284,9 @@ impl SessionRuntime {
             );
             let session = self.store.get_session(thread_key).await?;
             correlation_sandbox_id = session.sandbox_id.clone();
+            if let Some(principal) = session.iron_control_principal.as_deref() {
+                self.ensure_unreserved_principal_reference(principal).await?;
+            }
             let harness_label = session.harness_type.to_string();
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
@@ -3369,6 +3418,7 @@ impl SessionRuntime {
             return Ok(SessionSandboxCapabilities::default_enabled());
         };
         let principal = self.iron_control.get_principal(principal_id).await?;
+        self.ensure_unreserved_record(&principal)?;
         Ok(sandbox_capabilities_from_principal(&principal))
     }
 
@@ -9651,6 +9701,66 @@ mod adoption_tests {
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
             TestSessionPrincipalRegistrar,
         )
+    }
+
+    #[tokio::test]
+    async fn approval_principals_cannot_escape_through_agent_or_tool_hosts() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+        let store = PgSessionStore::new(pool);
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        let policy = runtime
+            .resolve_tool_host_call_policy("prn_executor")
+            .await
+            .unwrap();
+        runtime.clone().reserve_workflow_principal("prn_executor");
+        assert!(
+            runtime
+                .resolve_tool_host_call_policy("prn_executor")
+                .await
+                .is_err()
+        );
+        let error = runtime
+            .create_or_get_session_with_principal(
+                &ThreadKey::parse("slack:C1:1.000").unwrap(),
+                &HarnessType::Codex,
+                None,
+                Some(json!({"click":{"user_id":"UAPPROVER"}})),
+                HarnessConflictPolicy::Reject,
+                Some("prn_executor"),
+            )
+            .await;
+        assert!(matches!(error, Err(SessionRuntimeError::BadRequest(_))));
+        assert!(
+            runtime
+                .run_tool_host_call(
+                    ToolHostCallInput {
+                        principal_id: "prn_executor".into(),
+                        console_user_email: None,
+                        console_user_name: None,
+                        token_id: None,
+                        tool_name: "protected".into(),
+                        invocation: ToolHostInvocation::V1 {
+                            method: "start".into(),
+                            arguments: json!({})
+                        },
+                        timeout: Duration::from_secs(1),
+                    },
+                    policy
+                )
+                .await
+                .is_err()
+        );
+        // The test registrar gives every record the foreign ID "test".
+        runtime.reserve_workflow_principal("test");
+        assert!(
+            runtime
+                .ensure_unreserved_principal_reference("prn_alias_target")
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.open_count.load(Ordering::SeqCst), 0);
+        assert!(backend.created_specs.lock().unwrap().is_empty());
     }
 
     fn runtime_with_personas(store: &PgSessionStore, backend: Arc<MockBackend>) -> SessionRuntime {

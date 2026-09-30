@@ -37,7 +37,7 @@ serde_yaml.workspace = true
 sha2.workspace = true
 standardwebhooks.workspace = true
 subtle.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["uuid"] }
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }

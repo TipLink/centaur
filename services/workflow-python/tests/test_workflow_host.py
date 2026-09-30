@@ -634,6 +634,26 @@ class WorkflowHostTests(unittest.TestCase):
         assert registered is not None
         self.assertEqual(host.normalize_principal(registered), True)
 
+    def test_approval_marker_requires_a_scoped_principal_and_boolean(self) -> None:
+        host = load_workflow_host()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "protected.py"
+            path.write_text(
+                "WORKFLOW_NAME = 'protected'\n"
+                "WORKFLOW_PRINCIPAL = True\n"
+                "WORKFLOW_REQUIRES_APPROVAL = True\n"
+                "def handler(inp, ctx):\n"
+                "    return None\n"
+            )
+            workflow = host.load_workflow_file(path)
+        self.assertTrue(host.normalize_requires_approval(workflow))
+        workflow.principal = None
+        with self.assertRaises(ValueError):
+            host.normalize_requires_approval(workflow)
+        workflow.requires_approval = "true"
+        with self.assertRaises(TypeError):
+            host.normalize_requires_approval(workflow)
+
     def test_load_workflow_file_reads_workflow_principal_reference(self) -> None:
         host = load_workflow_host()
         with tempfile.TemporaryDirectory() as tmp:

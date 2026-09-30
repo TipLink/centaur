@@ -12,9 +12,11 @@ load_dotenv()
 
 app = typer.Typer(
     name="centaur-console",
-    help="Inspect Console permissions and manage the current user's scheduled tasks",
+    help="Inspect Console permissions, manage scheduled tasks and request guarded actions",
 )
 console = Console()
+approvals = typer.Typer(help="Request and inspect approval-gated actions in this Slack thread.")
+app.add_typer(approvals, name="approvals")
 
 
 def get_client(
@@ -24,6 +26,46 @@ def get_client(
     from .client import ConsoleClient
 
     return ConsoleClient(url=url, bearer_token=bearer_token)
+
+
+@approvals.command("actions")
+def approval_actions() -> None:
+    """List permitted actions as JSON."""
+    with get_client() as client:
+        typer.echo(json.dumps(client.approval_actions(), indent=2))
+
+
+@approvals.command("call")
+def request_approval(
+    action: str,
+    arguments: str = typer.Option(
+        ..., "--arguments", help="Complete non-secret JSON shown in Slack."
+    ),
+    idempotency_key: str | None = typer.Option(None, "--idempotency-key"),
+    wait: bool = typer.Option(True, "--wait/--no-wait"),
+) -> None:
+    """Request once and await the authorized decision and public result."""
+    with get_client() as client:
+        request = client.request_approval(action, json.loads(arguments), idempotency_key)
+        typer.echo(f"Approval request: {request['id']}", err=True)
+        result = client.wait_for_approval(request["id"]) if wait else request
+        typer.echo(json.dumps(result, indent=2))
+        if wait and result["status"] != "succeeded":
+            raise typer.Exit(1)
+
+
+@approvals.command("status")
+def approval_status(request_id: str) -> None:
+    """Read an owned request without executing it again."""
+    with get_client() as client:
+        typer.echo(json.dumps(client.approval_status(request_id), indent=2))
+
+
+@approvals.command("cancel")
+def cancel_approval(request_id: str) -> None:
+    """Cancel only before execution is claimed."""
+    with get_client() as client:
+        typer.echo(json.dumps(client.cancel_approval(request_id), indent=2))
 
 
 @app.command("permissions")

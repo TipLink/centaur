@@ -19,11 +19,12 @@ chrono-tz.workspace = true
 cron.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
+hex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["uuid"] }
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }
