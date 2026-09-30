@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-mod repository;
+pub(super) mod repository;
 mod runner;
 use repository::Repository;
 pub(super) use runner::run;
@@ -21,6 +21,8 @@ pub fn is_reserved(name: &str) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct ActionPolicy {
     pub workflow: String,
+    /// Optional compatibility pin. Admission always freezes the registry OID.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub executor_principal: String,
     pub requester_principals: Vec<String>,
     pub team_id: String,
@@ -44,7 +46,7 @@ pub fn parse_policies(raw: &str) -> Result<Policies, WorkflowRuntimeError> {
         if !identifier(name)
             || !identifier(&p.workflow)
             || is_reserved(&p.workflow)
-            || !p.executor_principal.starts_with("prn_")
+            || (!p.executor_principal.is_empty() && !p.executor_principal.starts_with("prn_"))
             || p.requester_principals.is_empty()
             || p.requester_principals
                 .iter()
@@ -84,6 +86,63 @@ pub fn parse_policies(raw: &str) -> Result<Policies, WorkflowRuntimeError> {
 
 pub fn policies_from_env() -> Result<Policies, WorkflowRuntimeError> {
     parse_policies(&env::var("CENTAUR_TOOL_APPROVAL_POLICIES").unwrap_or_else(|_| "{}".into()))
+}
+
+/// Resolve at each boundary; a changed registry binding changes the policy hash
+/// and invalidates outstanding requests. Missing/disabled/mismatched executors
+/// are unavailable, never a fallback to a shared workflow principal.
+pub(super) fn resolve_policies(
+    policies: &Policies,
+    sandbox: Option<&WorkflowHostSandboxRuntime>,
+) -> Policies {
+    let Some(sandbox) = sandbox else {
+        return Policies::new();
+    };
+    let Ok(enablement) = WorkflowEnablement::from_env() else {
+        return Policies::new();
+    };
+    let registry = sandbox
+        .workflow_principals
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    resolve_registry_policies(policies, &registry, &enablement)
+}
+
+fn resolve_registry_policies(
+    policies: &Policies,
+    registry: &WorkflowPrincipalAssignments,
+    enablement: &WorkflowEnablement,
+) -> Policies {
+    policies
+        .iter()
+        .filter_map(|(name, policy)| {
+            if !enablement.is_enabled(&policy.workflow)
+                || !registry.approval_required.contains(&policy.workflow)
+            {
+                return None;
+            }
+            let principal = registry.registered.get(&policy.workflow)?;
+            bind_policy(policy, principal, policies).map(|p| (name.clone(), p))
+        })
+        .collect()
+}
+
+fn bind_policy(
+    policy: &ActionPolicy,
+    principal: &str,
+    policies: &Policies,
+) -> Option<ActionPolicy> {
+    if !principal.starts_with("prn_")
+        || (!policy.executor_principal.is_empty() && policy.executor_principal != principal)
+        || policies
+            .values()
+            .any(|p| p.requester_principals.iter().any(|id| id == principal))
+    {
+        return None;
+    }
+    let mut resolved = policy.clone();
+    resolved.executor_principal = principal.into();
+    Some(resolved)
 }
 
 pub(super) fn unavailable() -> WorkflowRuntimeError {
@@ -213,26 +272,19 @@ impl WorkflowRuntime {
     fn approval_repository(&self) -> Repository {
         Repository {
             pool: self.inner.client.pool().clone(),
-            policies: self.inner.approval_policies.clone(),
+            policies: Arc::new(resolve_policies(
+                &self.inner.approval_policies,
+                self.inner.workflow_host_sandbox.as_ref(),
+            )),
         }
     }
 
     pub(super) fn ensure_public_workflow(&self, name: &str) -> Result<(), WorkflowRuntimeError> {
-        if is_reserved(name)
-            || self
-                .inner
-                .approval_policies
-                .values()
-                .any(|p| p.workflow == name)
-            || self
-                .inner
-                .workflow_host_sandbox
-                .as_ref()
-                .is_some_and(|s| s.requires_approval(name))
-        {
-            return Err(unavailable());
-        }
-        Ok(())
+        access::ensure_public(
+            name,
+            &self.inner.approval_policies,
+            self.inner.workflow_host_sandbox.as_ref(),
+        )
     }
 
     pub async fn approval_context(
@@ -243,15 +295,10 @@ impl WorkflowRuntime {
     }
 
     pub async fn request_approval(&self, request: Request) -> Result<Value, WorkflowRuntimeError> {
-        let p = self
-            .inner
-            .approval_policies
-            .get(&request.action)
-            .ok_or_else(unavailable)?;
+        let repo = self.approval_repository();
+        let p = repo.policies.get(&request.action).ok_or_else(unavailable)?;
         runner::validate_executor(p, self.inner.workflow_host_sandbox.as_ref())?;
-        self.approval_repository()
-            .request(request, &self.inner.client)
-            .await
+        repo.request(request, &self.inner.client).await
     }
 
     pub async fn read_approval(

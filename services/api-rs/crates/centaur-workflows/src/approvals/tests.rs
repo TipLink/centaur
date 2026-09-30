@@ -1,6 +1,95 @@
 use super::*;
 mod postgres;
 
+#[test]
+fn registry_resolution_freezes_identity_and_fails_closed() {
+    let mut p = policy();
+    p.executor_principal.clear();
+    let raw = serde_json::to_value(&p).unwrap();
+    assert!(raw.get("executor_principal").is_none());
+    let policies = parse_policies(&json!({"action": raw}).to_string()).unwrap();
+    let mut registry = WorkflowPrincipalAssignments {
+        registered: BTreeMap::from([("guarded_action".into(), "prn_executor".into())]),
+        required: BTreeSet::from(["guarded_action".into()]),
+        approval_required: BTreeSet::from(["guarded_action".into()]),
+    };
+    let resolved = resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all());
+    assert_eq!(resolved["action"].executor_principal, "prn_executor");
+    assert_eq!(hash(&resolved["action"]), hash(&policy())); // Existing pins keep their binding.
+    registry
+        .registered
+        .insert("guarded_action".into(), "prn_replacement".into());
+    let changed = resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all());
+    assert_ne!(hash(&resolved["action"]), hash(&changed["action"]));
+    let pinned = BTreeMap::from([("action".into(), policy())]);
+    assert!(resolve_registry_policies(&pinned, &registry, &WorkflowEnablement::all()).is_empty());
+    assert!(
+        resolve_registry_policies(&policies, &registry, &WorkflowEnablement::allowlist(""))
+            .is_empty()
+    );
+    registry
+        .registered
+        .insert("guarded_action".into(), "prn_requester".into());
+    assert!(resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all()).is_empty());
+    registry.registered.clear();
+    assert!(resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all()).is_empty());
+    registry
+        .registered
+        .insert("guarded_action".into(), "prn_executor".into());
+    registry.approval_required.clear();
+    assert!(resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all()).is_empty());
+}
+
+#[tokio::test]
+async fn child_admission_uses_the_same_access_gate_without_enqueuing() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://localhost/unused")
+        .unwrap();
+    let client = Client::from_pool_with_options(pool, ClientOptions::default()).unwrap();
+    let policies = Arc::new(BTreeMap::from([("action".into(), policy())]));
+    let clients = WorkflowQueueClients {
+        approval_policies: policies.clone(),
+        workflow_host_sandbox: None,
+        standard: client.clone(),
+        slack_live: client.clone(),
+        etl: client.clone(),
+        etl_backfill: client,
+    };
+    let parent = WorkflowTaskInput {
+        workflow_name: "ordinary".into(),
+        input: json!({}),
+        harness_type: HarnessType::Codex,
+        slack_button_feedback: None,
+    };
+    assert_eq!(
+        access::classify("ordinary", &policies, None),
+        access::WorkflowAccess::Ordinary
+    );
+    assert_eq!(
+        access::classify("guarded_action", &policies, None),
+        access::WorkflowAccess::ApprovalRequired
+    );
+    assert_eq!(
+        access::classify(DRIVER_WORKFLOW, &policies, None),
+        access::WorkflowAccess::Internal
+    );
+    for name in [
+        "guarded_action",
+        DRIVER_WORKFLOW,
+        DECISION_WORKFLOW,
+        "centaur_approval_future",
+    ] {
+        assert!(clients.ensure_public_workflow(name).is_err());
+        let result = start_python_child_workflow(
+            &json!({"workflow_name":name,"input":{}}),
+            &parent,
+            &clients,
+        )
+        .await;
+        assert!(matches!(result, Err(WorkflowRuntimeError::Disabled(_))));
+    }
+}
+
 fn policy() -> ActionPolicy {
     ActionPolicy {
         workflow: "guarded_action".into(),

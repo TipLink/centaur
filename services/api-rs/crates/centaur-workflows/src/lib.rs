@@ -36,6 +36,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+mod access;
 pub mod approvals;
 pub mod slack_button_feedback;
 pub mod slack_buttons;
@@ -217,6 +218,7 @@ fn parse_workflow_allowed_names(raw: &str) -> BTreeSet<String> {
 
 #[derive(Clone)]
 struct WorkflowQueueClients {
+    workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
     approval_policies: Arc<approvals::Policies>,
     standard: Client,
     slack_live: Client,
@@ -633,15 +635,10 @@ impl WorkflowRuntime {
             .await?;
         let approval_policies = Arc::new(approvals::policies_from_env()?);
         for policy in approval_policies.values() {
-            session_runtime.reserve_workflow_principal(&policy.executor_principal);
+            if !policy.executor_principal.is_empty() {
+                session_runtime.reserve_workflow_principal(&policy.executor_principal);
+            }
         }
-        let workflow_clients = WorkflowQueueClients {
-            approval_policies: approval_policies.clone(),
-            standard: client.clone(),
-            slack_live: slack_live_client.clone(),
-            etl: etl_client.clone(),
-            etl_backfill: etl_backfill_client.clone(),
-        };
 
         let discovery = discover_python_workflow_metadata().await?;
         let enablement = WorkflowEnablement::from_env()?;
@@ -656,6 +653,15 @@ impl WorkflowRuntime {
             &enablement,
         )
         .await?;
+        let workflow_clients = WorkflowQueueClients {
+            workflow_host_sandbox: workflow_host_sandbox.clone(),
+            approval_policies: approval_policies.clone(),
+            standard: client.clone(),
+            slack_live: slack_live_client.clone(),
+            etl: etl_client.clone(),
+            etl_backfill: etl_backfill_client.clone(),
+        };
+        approvals::repository::reconcile_lifecycle(store.pool(), None).await?;
         let schedule_registry = Arc::new(RwLock::new(build_schedule_registry(
             &discovery,
             &enablement,
@@ -1038,7 +1044,21 @@ impl WorkflowRuntime {
             (WORKFLOW_ETL_BACKFILL_QUEUE, &self.inner.etl_backfill_client),
         ] {
             if let Some(run) = self.get_run_for_queue(queue_name, run_id).await? {
+                // Release native run/task locks before touching application
+                // state: decision emission locks the approval before waking a
+                // run. A crash between commits is repaired from durable state.
                 client.cancel_task(&run.task_id, None).await?;
+                if queue_name == WORKFLOW_QUEUE {
+                    let approval_id = sqlx::query_scalar::<_, uuid::Uuid>(
+                        "select id from tool_approvals where workflow_task_id=$1::uuid",
+                    )
+                    .bind(&run.task_id)
+                    .fetch_optional(client.pool())
+                    .await?;
+                    if let Some(id) = approval_id {
+                        approvals::repository::reconcile_lifecycle(client.pool(), Some(id)).await?;
+                    }
+                }
                 return Ok(());
             }
         }
@@ -2011,6 +2031,14 @@ fn spawn_workflow_metadata_reconciler(
         ticker.tick().await;
         loop {
             ticker.tick().await;
+            // Independent of Python discovery success. Durable native terminal
+            // state repairs approval records after cancellation/crash/retry exhaustion.
+            if let Err(error) =
+                approvals::repository::reconcile_lifecycle(workflow_clients.standard.pool(), None)
+                    .await
+            {
+                warn!(%error, "failed to reconcile workflow approvals");
+            }
             match reconcile_workflow_metadata_once(
                 &schedule_client,
                 &webhook_registry,
@@ -2473,6 +2501,9 @@ async fn run_schedule_tick(
             }));
         }
     };
+    workflow_clients
+        .ensure_public_workflow(&schedule.workflow_name)
+        .map_err(absurd_error)?;
     let fire_key = format!(
         "schedule:{}:{}",
         schedule.schedule_id,
@@ -2743,17 +2774,9 @@ async fn run_centaur_workflow_inner(
         )
         .await;
     }
-    if approvals::is_reserved(&input.workflow_name)
-        || workflow_clients
-            .approval_policies
-            .values()
-            .any(|p| p.workflow == input.workflow_name)
-        || workflow_host_sandbox
-            .as_ref()
-            .is_some_and(|s| s.requires_approval(&input.workflow_name))
-    {
-        return Err(absurd_error(approvals::unavailable()));
-    }
+    workflow_clients
+        .ensure_public_workflow(&input.workflow_name)
+        .map_err(absurd_error)?;
     WorkflowEnablement::from_env()
         .and_then(|enablement| enablement.ensure_enabled(&input.workflow_name))
         .map_err(absurd_error)?;
@@ -3159,7 +3182,18 @@ async fn run_python_workflow_host_in_sandbox(
     workflow_clients: WorkflowQueueClients,
     approval: Option<(Duration, String)>,
 ) -> Result<Value, WorkflowRuntimeError> {
-    if sandbox.requires_approval(&input.workflow_name) != approval.is_some() {
+    let expected = if approval.is_some() {
+        access::WorkflowAccess::ApprovalRequired
+    } else {
+        access::WorkflowAccess::Ordinary
+    };
+    if access::classify(
+        &input.workflow_name,
+        &workflow_clients.approval_policies,
+        Some(&sandbox),
+    ) != expected
+        || (approval.is_some() && !sandbox.requires_approval(&input.workflow_name))
+    {
         return Err(approvals::unavailable());
     }
     let mut spec = sandbox.spec_for_workflow(&input.workflow_name)?;
@@ -3615,10 +3649,11 @@ async fn handle_python_context_request(
             }
         }
         Some("ctx.call_tool")
-            if workflow_clients
-                .approval_policies
-                .values()
-                .any(|p| p.workflow == input.workflow_name) =>
+            if access::classify(
+                &input.workflow_name,
+                &workflow_clients.approval_policies,
+                workflow_clients.workflow_host_sandbox.as_ref(),
+            ) != access::WorkflowAccess::Ordinary =>
         {
             Err("approval executors require the sandbox-local centaur-tools shim".into())
         }
@@ -3674,6 +3709,7 @@ async fn start_python_child_workflow(
                 "ctx.workflow.start requires a non-empty workflow_name".to_owned(),
             )
         })?;
+    workflow_clients.ensure_public_workflow(workflow_name)?;
     WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
     let child_input = message.get("input").cloned().unwrap_or_else(|| json!({}));
     if !child_input.is_object() {

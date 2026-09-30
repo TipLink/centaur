@@ -1,13 +1,13 @@
 use super::*;
 use sqlx::Row;
 
-pub(super) struct Repository {
+pub(crate) struct Repository {
     pub pool: PgPool,
     pub policies: Arc<Policies>,
 }
 
 #[derive(sqlx::FromRow)]
-pub(super) struct Record {
+pub(crate) struct Record {
     pub id: Uuid,
     pub action: String,
     pub policy_hash: String,
@@ -123,7 +123,8 @@ impl Repository {
     }
 
     pub async fn read(&self, id: Uuid, identity: Identity) -> Result<Value, WorkflowRuntimeError> {
-        sqlx::query_scalar("select jsonb_build_object('id',id,'status',status,'payload_hash',payload_hash,'decided_by',decided_by,'expires_at',expires_at,'result',result)
+        reconcile_lifecycle(&self.pool, Some(id)).await?;
+        sqlx::query_scalar("select jsonb_build_object('id',id,'status',status,'payload_hash',payload_hash,'decided_by',decided_by,'expires_at',expires_at,'result',result,'workflow_task_id',workflow_task_id,'workflow_run_id',workflow_run_id)
             from tool_approvals where id=$1 and sandbox_id=$2 and principal_id=$3")
             .bind(id).bind(identity.sandbox_id).bind(identity.principal_id).fetch_optional(&self.pool)
             .await?.ok_or_else(unavailable)
@@ -157,7 +158,7 @@ impl Repository {
         let changed = sqlx::query("update tool_approvals set status='cancelled' where id=$1 and sandbox_id=$2 and principal_id=$3 and status in ('pending','approved')")
             .bind(id).bind(&identity.sandbox_id).bind(&identity.principal_id).execute(&mut *tx).await?.rows_affected();
         if changed > 0 {
-            wake(&mut tx, id).await?;
+            wake(&self.pool, &mut tx, id).await?;
         }
         tx.commit().await?;
         self.read(id, identity).await
@@ -175,6 +176,7 @@ impl Repository {
             .as_str()
             .and_then(|s| Uuid::parse_str(s).ok())
             .ok_or_else(unavailable)?;
+        reconcile_lifecycle(&self.pool, Some(id)).await?;
         let mut tx = self.pool.begin().await?;
         let row =
             sqlx::query_as::<_, Record>("select * from tool_approvals where id=$1 for update")
@@ -192,7 +194,7 @@ impl Repository {
             return Err(unavailable());
         }
         if changed > 0 {
-            wake(&mut tx, id).await?;
+            wake(&self.pool, &mut tx, id).await?;
         }
         tx.commit().await?;
         Ok(CreateWorkflowRunResponse {
@@ -218,6 +220,7 @@ impl Repository {
         id: Uuid,
         policy: Option<&ActionPolicy>,
     ) -> Result<(), WorkflowRuntimeError> {
+        reconcile_lifecycle(&self.pool, Some(id)).await?;
         sqlx::query("update tool_approvals set status=case when expires_at<=now() then 'expired' else 'cancelled' end where id=$1 and status in ('pending','approved') and (expires_at<=now() or policy_hash<>$2)")
             .bind(id).bind(policy.map(hash).unwrap_or_default()).execute(&self.pool).await?;
         Ok(())
@@ -228,8 +231,27 @@ impl Repository {
         id: Uuid,
         policy: &ActionPolicy,
     ) -> Result<bool, WorkflowRuntimeError> {
-        Ok(sqlx::query("update tool_approvals set status='executing',execution_deadline=now()+make_interval(secs=>$2) where id=$1 and status='approved' and expires_at>now() and policy_hash=$3")
-            .bind(id).bind(f64::from(policy.timeout_seconds)).bind(hash(policy)).execute(&self.pool).await?.rows_affected()==1)
+        let mut tx = self.pool.begin().await?;
+        // Serialize with decisions/cancellation before locking the native task.
+        // Native cancellation commits its run/task changes before reconciling
+        // the approval, avoiding an inverted application/native lock order.
+        sqlx::query("select id from tool_approvals where id=$1 for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        // A cancelled/exhausted task must not win a late execution claim.
+        let state: Option<String> = sqlx::query_scalar(
+            "select t.state from absurd.t_centaur_workflows t join tool_approvals a on a.workflow_task_id=t.task_id where a.id=$1 for update of t"
+        ).bind(id).fetch_optional(&mut *tx).await?;
+        reconcile_lifecycle(&mut *tx, Some(id)).await?;
+        let claimed = if matches!(state.as_deref(), Some("pending" | "running" | "sleeping")) {
+            sqlx::query("update tool_approvals set status='executing',execution_deadline=now()+make_interval(secs=>$2) where id=$1 and status='approved' and expires_at>now() and policy_hash=$3")
+                .bind(id).bind(f64::from(policy.timeout_seconds)).bind(hash(policy)).execute(&mut *tx).await?.rows_affected()==1
+        } else {
+            false
+        };
+        tx.commit().await?;
+        Ok(claimed)
     }
 
     pub async fn recover(&self, id: Uuid) -> Result<(), WorkflowRuntimeError> {
@@ -274,14 +296,42 @@ fn validate_decision(
 }
 
 async fn wake(
+    pool: &PgPool,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
 ) -> Result<(), WorkflowRuntimeError> {
-    sqlx::query("select absurd.emit_event($1,$2,$3::jsonb)")
-        .bind(WORKFLOW_QUEUE)
-        .bind(format!("{EVENT_PREFIX}{id}"))
-        .bind(json!({}))
-        .execute(&mut **tx)
+    // The SDK owns queue SQL; the application owns the decision transaction.
+    let client = Client::from_pool_with_options(
+        pool.clone(),
+        ClientOptions {
+            queue_name: WORKFLOW_QUEUE.into(),
+            ..Default::default()
+        },
+    )?;
+    client
+        .emit_event_with_executor(&format!("{EVENT_PREFIX}{id}"), json!({}), None, &mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Reconcile from durable task state, never from an in-process completion hook.
+/// Preserve known outcomes; uncertainty can never restore execution authority.
+pub(crate) async fn reconcile_lifecycle<'e, E>(
+    executor: E,
+    id: Option<Uuid>,
+) -> Result<(), WorkflowRuntimeError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query("update tool_approvals a set
+        status=case when a.status='executing' then 'unknown' else 'cancelled' end,
+        result=case when a.status='executing' then '{\"outcome\":\"unknown\"}'::jsonb else null end
+        where a.workflow_task_id is not null and ($1::uuid is null or a.id=$1)
+        and a.status in ('pending','approved','executing')
+        and (not exists(select 1 from absurd.t_centaur_workflows t
+                        where t.task_id=a.workflow_task_id and t.state in ('pending','running','sleeping'))
+             or (a.status='executing' and a.execution_deadline<=now()))")
+        .bind(id).execute(executor)
         .await?;
     Ok(())
 }

@@ -5,7 +5,7 @@ Status: Implemented, opt-in; credentialed end-to-end proof required before activ
 ## Boundary
 
 This is an explicit guarded-action API, not interception of arbitrary tool or
-outbound HTTP calls. An ordinary sandbox uses `centaur-approvals`; only the
+outbound HTTP calls. An ordinary sandbox uses `centaur-console approvals`; only the
 approval-only workflow executor has the provider credential grant. Hiding a
 tool or putting an instruction in the prompt is not enforcement.
 
@@ -87,7 +87,6 @@ Default `CENTAUR_TOOL_APPROVAL_POLICIES={}` grants no actions. Example:
 {
   "tickets-create": {
     "workflow": "guarded_ticket_create",
-    "executor_principal": "prn_Executor",
     "requester_principals": ["prn_Conversation"],
     "team_id": "TEXAMPLE",
     "approver_user_ids": ["UREVIEWER"],
@@ -99,9 +98,14 @@ Default `CENTAUR_TOOL_APPROVAL_POLICIES={}` grants no actions. Example:
 }
 ```
 
-The executor principal must exactly match the OID registered from the workflow's
-`WORKFLOW_PRINCIPAL`. Never reuse it for ordinary sessions or unrelated
-workflows. Remove the provider mutation capability from ordinary principals,
+Admission resolves the executor OID from the workflow's `WORKFLOW_PRINCIPAL`
+registry entry and freezes it in the payload and policy hash. Missing registry
+entries, disabled workflows and requester/executor overlap fail closed. An
+optional `executor_principal` field can pin the expected OID for compatibility;
+a mismatched pin is unavailable. A changed registry binding invalidates pending
+approvals rather than transferring them to the new principal. Never reuse an
+executor principal for ordinary sessions or unrelated workflows.
+Remove the provider mutation capability from ordinary principals,
 default roles, requester OAuth grants and alternate usable routes. Grant only
 the required provider host/path/method/key to the executor. Keep Slack bot tokens
 in infrastructure, not either sandbox.
@@ -149,9 +153,8 @@ To enable it on a reviewed test deployment:
    `WORKFLOW_ENABLE_MODE=allowlist`, add `approval_hello_world` to the existing
    `WORKFLOW_ALLOWED_NAMES` value without removing other entries.
 2. Discover/register the workflow's dedicated `workflow-approval-hello-world`
-   principal. Resolve its real `prn_...` OID; do not give it provider secrets or
-   ordinary-agent access. An authenticated Console operator can look it up at
-   `GET /api/v1/principals/lookup/workflow-approval-hello-world`. The requester
+   principal; no manual executor OID lookup is needed. Do not give it provider
+   secrets or ordinary-agent access. The requester
    OID is the principal assigned to the bot session's sandbox, not the human
    Slack user ID.
 3. Merge the following action into `CENTAUR_TOOL_APPROVAL_POLICIES`, replacing
@@ -162,7 +165,6 @@ To enable it on a reviewed test deployment:
 {
   "hello-world": {
     "workflow": "approval_hello_world",
-    "executor_principal": "prn_ResolvedHelloExecutor",
     "requester_principals": ["prn_Conversation"],
     "team_id": "TEXAMPLE",
     "approver_user_ids": ["UREVIEWER"],
@@ -178,7 +180,7 @@ To enable it on a reviewed test deployment:
 From a running bot session in a Slack thread:
 
 ```sh
-centaur-approvals call hello-world --arguments '{}'
+centaur-console approvals call hello-world --arguments '{}'
 ```
 
 Or ask the bot: “Run the `hello-world` approval test with empty arguments and
@@ -192,7 +194,7 @@ relax the default. Decline, expiry and unauthorized clicks must not produce a
 greeting or execute the handler.
 
 The command waits by default. If the agent turn ends or its wait times out,
-the request remains durable; inspect it with `centaur-approvals status <id>`
+the request remains durable; inspect it with `centaur-console approvals status <id>`
 from the same sandbox instead of resubmitting. Approval completion updates
 Slack, but does not automatically start a new agent turn.
 
@@ -201,7 +203,7 @@ resources or implement external execution services or signed approval grants.
 
 Test checklist (use a fresh request for each decision):
 
-- Run `centaur-approvals actions` from the active Slack bot execution and check
+- Run `centaur-console approvals actions` from the active Slack bot execution and check
   that `hello-world` is listed. Do not run the command from an ordinary laptop
   shell; it needs the sandbox's proxy entitlement and active Slack execution.
 - Before approval, the card must show `{}` and `public_result_fields: ["message"]`,
@@ -210,7 +212,7 @@ Test checklist (use a fresh request for each decision):
 - Decline a fresh request: it must finish as `declined` with no greeting.
 - Have someone outside the approver list click Accept: the request must remain
   pending and must not run. An allowed reviewer can still decide it.
-- Submit with `--no-wait`, then call `centaur-approvals cancel <id>` before
+- Submit with `--no-wait`, then call `centaur-console approvals cancel <id>` before
   approval: status must become `cancelled` and later clicks must not execute it.
 - To test expiry quickly, configure `expires_seconds: 30` before submitting a
   fresh request. Leave it untouched and allow another 30 seconds for the
@@ -223,7 +225,7 @@ Test checklist (use a fresh request for each decision):
 Requests remain pending after the originating agent turn ends. Only admission
 requires an active execution. Request ownership for status/cancel remains
 sandbox/principal-scoped; losing that sandbox may require operator inspection.
-`centaur-approvals cancel <id>` cancels pending or approved requests. Cancellation
+`centaur-console approvals cancel <id>` cancels pending or approved requests. Cancellation
 after the execution claim cannot undo the external operation.
 
 Pending/approved requests expire or cancel on changed/removed policy. Native
@@ -236,11 +238,28 @@ available; this protocol does not promise exactly-once external effects.
 
 Slack post/checkpoint failure can leave a duplicate card. Only the recorded
 original message/card can authorize the request. Final-message delivery retries
-do not invoke the executor again. If the workflow task itself is cancelled or
-exhausts retries, operators must reconcile its approval record; do not replay
-the executor. Retain request rows and the linked native workflow task/run IDs
-for audit. Only explicitly published result fields are returned to Slack or
-the requester; raw executor output/errors are not.
+do not invoke the executor again.
+
+Approval status includes `workflow_task_id` and `workflow_run_id` for the native
+workflow history. Cancelling that native run also reconciles its approval:
+unclaimed requests become `cancelled`, claimed requests become `unknown`, and
+known terminal outcomes are preserved. Native cancellation commits first;
+reconciliation is recoverable if the process dies between commits. The execution
+claim checks and locks native task state, so already-cancelled tasks cannot
+obtain execution authority.
+
+Startup, the existing workflow maintenance loop, status reads, decision handling
+and execution claims reconcile from persisted task state. Exhausted/removed
+tasks and elapsed execution deadlines cannot leave a request actionable forever.
+If `WORKFLOW_RECONCILE_INTERVAL_SECS=0`, startup and request-path reconciliation
+still operate, but there is no periodic background repair. Reconciliation never
+replays an executor or replaces a known result. A force-cancelled/failed native
+driver cannot deliver its final Slack edit; its card may be stale, but subsequent
+clicks are rejected and the status API reports the reconciled outcome. Use the
+approval-specific cancel command when possible so the driver can deliver its
+normal final card. Retain request rows and linked native IDs for audit.
+Only explicitly published result fields are returned to Slack or the requester;
+raw executor output/errors are not.
 
 Migration 0056 supersedes the earlier draft's delivery/claim columns and cancels
 old pending/approved records; old executing records become unknown. Stop the
@@ -249,11 +268,17 @@ versions are not supported. Never replay those old requests automatically.
 
 ## Payload and CLI
 
+Approvals are part of the existing `centaur-console` tool package and client.
+Install/allowlist `centaur-console`; there is no separate approval package.
+The legacy `centaur-approvals` command is a compatibility entry point to the same
+command group, not a second implementation. Refresh installed tool shims on
+upgrade to replace the old standalone package's command.
+
 ```sh
-centaur-approvals actions
-centaur-approvals call tickets-create --arguments '{"title":"Example","body":"Complete content"}'
-centaur-approvals status <request-uuid>
-centaur-approvals cancel <request-uuid>
+centaur-console approvals actions
+centaur-console approvals call tickets-create --arguments '{"title":"Example","body":"Complete content"}'
+centaur-console approvals status <request-uuid>
+centaur-console approvals cancel <request-uuid>
 ```
 
 The CLI prints an ID and waits by default. `--no-wait` returns after admission.

@@ -131,10 +131,7 @@ async fn run_inner(
         .as_str()
         .and_then(|s| Uuid::parse_str(s).ok())
         .ok_or_else(unavailable)?;
-    let repo = Repository {
-        pool: clients.standard.pool().clone(),
-        policies: clients.approval_policies.clone(),
-    };
+    let repo = clients.approval_repository();
     let mut row = repo.load(id, ctx.task_id()).await?;
     // A committed execution claim is never retried. A restarted driver can only
     // report uncertainty; the external provider may already have accepted it.

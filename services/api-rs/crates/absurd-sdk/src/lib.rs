@@ -665,6 +665,21 @@ impl Client {
         payload: P,
         queue_name: Option<&str>,
     ) -> Result<()> {
+        self.emit_event_with_executor(event_name, payload, queue_name, &self.pool)
+            .await
+    }
+
+    /// Commit an event and the application decision that produced it together.
+    pub async fn emit_event_with_executor<'e, P: Serialize, E>(
+        &self,
+        event_name: &str,
+        payload: P,
+        queue_name: Option<&str>,
+        executor: E,
+    ) -> Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         if event_name.is_empty() {
             return Err(Error::InvalidOptions(
                 "event_name must be a non-empty string".to_string(),
@@ -675,7 +690,7 @@ impl Client {
             .bind(&queue)
             .bind(event_name)
             .bind(Json(serde_json::to_value(payload)?))
-            .execute(&self.pool)
+            .execute(executor)
             .await?;
         Ok(())
     }

@@ -83,6 +83,37 @@ async fn native_admission_decision_claim_and_recovery() {
     .await
     .unwrap();
     assert_eq!(count, 0);
+    let event = format!("rollback:{}", Uuid::new_v4());
+    let mut tx = pool.begin().await.unwrap();
+    client
+        .emit_event_with_executor(&event, json!({"decision":"approved"}), None, &mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from absurd.e_centaur_workflows where event_name=$1")
+            .bind(&event)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    let mut tx = pool.begin().await.unwrap();
+    client
+        .emit_event_with_executor(&event, json!({"decision":"approved"}), None, &mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    client
+        .emit_event(&event, json!({"decision":"declined"}), None)
+        .await
+        .unwrap();
+    let emitted: Value =
+        sqlx::query_scalar("select payload from absurd.e_centaur_workflows where event_name=$1")
+            .bind(&event)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(emitted, json!({"decision":"approved"}));
     sqlx::query("insert into sessions(thread_key,sandbox_id,harness_type,status,iron_control_principal) values('slack:C1:1.000','sandbox-test','codex','active','prn_requester')").execute(&pool).await.unwrap();
     sqlx::query("insert into session_executions(execution_id,thread_key,status,metadata) values('exe_test','slack:C1:1.000','running',$1)")
         .bind(json!({"source":"slackbotv2","platform":"slack","slack_team_id":"T1","slack_home_team_id":"T1","slack_channel_id":"C1","slack_user_id":"U2"})).execute(&pool).await.unwrap();
@@ -270,7 +301,65 @@ async fn native_admission_decision_claim_and_recovery() {
         assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
         assert!(repo.decide(button("U1", "approved")).await.is_err());
     }
-    client.cancel_task(&task, None).await.unwrap();
+    // Repair uses durable native terminal state, including when the worker
+    // never ran again. Known results are preserved and no authority is restored.
+    for native in ["cancelled", "failed", "completed"] {
+        sqlx::query("update absurd.t_centaur_workflows set state=$2 where task_id=$1::uuid")
+            .bind(&task)
+            .bind(native)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (state, expected) in [
+            ("pending", "cancelled"),
+            ("approved", "cancelled"),
+            ("executing", "unknown"),
+            ("succeeded", "succeeded"),
+            ("declined", "declined"),
+        ] {
+            sqlx::query("update tool_approvals set status=$2,expires_at=now()+interval '1 hour',execution_deadline=now()+interval '1 hour' where id=$1")
+                .bind(id).bind(state).execute(&pool).await.unwrap();
+            repository::reconcile_lifecycle(&pool, None).await.unwrap();
+            assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
+            assert!(!repo.claim(id, &p).await.unwrap());
+        }
+    }
+    sqlx::query("update absurd.t_centaur_workflows set state='pending' where task_id=$1::uuid")
+        .bind(&task)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("update tool_approvals set status='executing',execution_deadline=now()-interval '1 second' where id=$1")
+        .bind(id).execute(&pool).await.unwrap();
+    assert_eq!(
+        repo.read(id, identity()).await.unwrap()["status"],
+        "unknown"
+    );
+    repo.finish(id, &p, hello()).await.unwrap();
+    assert_eq!(
+        repo.read(id, identity()).await.unwrap()["status"],
+        "unknown"
+    );
+    // Race the native cancellation against the one-use execution claim.
+    sqlx::query("update tool_approvals set status='approved' where id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (claim, cancelled) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(repo.claim(id, &p), client.cancel_task(&task, None))
+    })
+    .await
+    .unwrap();
+    cancelled.unwrap();
+    let expected = if claim.unwrap() {
+        "unknown"
+    } else {
+        "cancelled"
+    };
+    assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
+    assert!(repo.decide(button("U1", "approved")).await.is_err());
+    assert!(!repo.claim(id, &p).await.unwrap());
     pool.close().await;
     sqlx::query(&format!("drop schema {schema} cascade"))
         .execute(&admin)
