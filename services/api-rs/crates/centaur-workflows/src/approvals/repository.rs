@@ -138,7 +138,10 @@ impl Repository {
     ) -> Result<(), WorkflowRuntimeError> {
         let (status, result) = runner::executor_outcome(policy, result);
         sqlx::query(
-            "update tool_approvals set status=$2,result=$3 where id=$1 and status='executing' and policy_hash=$4",
+            "update tool_approvals set
+             status=case when execution_deadline>statement_timestamp() then $2 else 'unknown' end,
+             result=case when execution_deadline>statement_timestamp() then $3 else '{\"outcome\":\"unknown\"}'::jsonb end
+             where id=$1 and status='executing' and policy_hash=$4",
         )
         .bind(id)
         .bind(status)
@@ -231,7 +234,7 @@ impl Repository {
         &self,
         id: Uuid,
         policy: &ActionPolicy,
-    ) -> Result<bool, WorkflowRuntimeError> {
+    ) -> Result<Option<super::execution::Deadline>, WorkflowRuntimeError> {
         let mut tx = self.pool.begin().await?;
         // Serialize with decisions/cancellation before locking the native task.
         // Native cancellation commits its run/task changes before reconciling
@@ -245,14 +248,20 @@ impl Repository {
             "select t.state from absurd.t_centaur_workflows t join tool_approvals a on a.workflow_task_id=t.task_id where a.id=$1 for update of t"
         ).bind(id).fetch_optional(&mut *tx).await?;
         reconcile_lifecycle(&mut *tx, Some(id)).await?;
-        let claimed = if matches!(state.as_deref(), Some("pending" | "running" | "sleeping")) {
-            sqlx::query("update tool_approvals set status='executing',execution_deadline=now()+make_interval(secs=>$2) where id=$1 and status='approved' and expires_at>now() and policy_hash=$3")
-                .bind(id).bind(f64::from(policy.timeout_seconds)).bind(hash(policy)).execute(&mut *tx).await?.rows_affected()==1
+        // Anchor before the query, not after its response or commit. The server's
+        // remaining budget is therefore conservative even with latency or clock skew.
+        let started = tokio::time::Instant::now();
+        let remaining: Option<f64> = if matches!(
+            state.as_deref(),
+            Some("pending" | "running" | "sleeping")
+        ) {
+            sqlx::query_scalar("update tool_approvals set status='executing',execution_deadline=clock_timestamp()+make_interval(secs=>$2) where id=$1 and status='approved' and expires_at>clock_timestamp() and policy_hash=$3 returning greatest(0,extract(epoch from execution_deadline-clock_timestamp()))::double precision")
+                .bind(id).bind(f64::from(policy.timeout_seconds)).bind(hash(policy)).fetch_optional(&mut *tx).await?
         } else {
-            false
+            None
         };
         tx.commit().await?;
-        Ok(claimed)
+        Ok(remaining.map(|seconds| super::execution::Deadline::from_remaining(started, seconds)))
     }
 
     pub async fn recover(&self, id: Uuid) -> Result<(), WorkflowRuntimeError> {

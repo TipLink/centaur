@@ -138,6 +138,7 @@ require_workflow_check() {
   fi
 }
 
+require_workflow_check "Validate upstream patch source" ".github/workflows/validate-patches.yml"
 require_workflow_check "CI success" ".github/workflows/ci.yml"
 require_workflow_check "Console CI success" ".github/workflows/console-ci.yml"
 require_workflow_check "Validate CLI pyproject packaging" ".github/workflows/validate-cli-packaging.yml"

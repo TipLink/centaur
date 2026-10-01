@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub(super) mod execution;
 pub(super) mod repository;
 mod runner;
 use repository::Repository;

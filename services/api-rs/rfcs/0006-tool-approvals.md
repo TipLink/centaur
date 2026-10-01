@@ -166,6 +166,16 @@ event waits wake at most every 30 seconds to recheck. A committed execution clai
 is never retried. If the driver resumes after a crash with status `executing`,
 it records `unknown`. Timeouts, executor failures and ambiguous provider
 responses also become `unknown`. Inspect the provider before resubmitting.
+The execution budget starts with the database claim. Core maps the database's
+remaining budget to a conservative monotonic deadline before waiting for the
+claim commit; transport and commit delays cannot grant extra execution time.
+Provisioning and protocol execution share that deadline, with another check
+before sending `workflow.start`. A late-created sandbox is cleaned up without
+starting the executor. Core persists the redacted outcome before shutdown and
+waits for cleanup only within the remaining budget; cancellation or expiry
+leaves best-effort cleanup running. Completion received after the database
+deadline becomes `unknown`, even before lifecycle reconciliation runs.
+
 Use stable provider request/workflow IDs and reject duplicate operations where
 available; this protocol does not promise exactly-once external effects.
 

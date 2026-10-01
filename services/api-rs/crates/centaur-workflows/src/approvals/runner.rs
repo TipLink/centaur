@@ -199,7 +199,7 @@ async fn run_inner(
             .execute(&repo.pool)
             .await?;
         } else {
-            if repo.claim(id, policy).await? {
+            if let Some(deadline) = repo.claim(id, policy).await? {
                 // Arguments are exclusively the frozen DB payload. No click data
                 // or caller-supplied principal is forwarded into the executor.
                 let execution = WorkflowTaskInput {
@@ -214,13 +214,15 @@ async fn run_inner(
                     session_runtime,
                     sandbox.ok_or_else(unavailable)?,
                     clients.clone(),
-                    Some((
-                        Duration::from_secs(u64::from(policy.timeout_seconds)),
-                        policy.executor_principal.clone(),
-                    )),
+                    Some(execution::ClaimedExecution {
+                        repo: &repo,
+                        id,
+                        policy,
+                        deadline,
+                    }),
                 )
                 .await;
-                repo.finish(id, policy, result).await?;
+                result?;
             }
         }
     }

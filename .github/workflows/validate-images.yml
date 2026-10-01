@@ -4,6 +4,10 @@ on:
   pull_request:
     branches: [main, release/aws-core]
     paths:
+      - .github/actions/prepare-patched-core/**
+      - .github/core-patches/**
+      - .github/scripts/prepare-centaur-core.py
+      - .github/scripts/verify-core-patch-source.py
       - .github/workflows/validate-images.yml
       - .github/workflows/publish-images.yml
       - .github/scripts/resolve-runnable-image-digest.sh
@@ -121,7 +125,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Prepare official upstream with reviewed patches
+        id: core
+        uses: ./.github/actions/prepare-patched-core
 
       - name: Reclaim runner disk for the agent image
         if: matrix.service == 'agent' && matrix.platform == 'linux/amd64'
@@ -143,8 +152,8 @@ jobs:
       - name: Build ${{ matrix.image }} without registry credentials
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
+          context: _core/${{ matrix.context }}
+          file: _core/${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
           push: false

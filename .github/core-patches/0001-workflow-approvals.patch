@@ -1,0 +1,4188 @@
+diff --git a/crates/absurd-sdk/src/lib.rs b/crates/absurd-sdk/src/lib.rs
+index 7282c793..ee6a86ed 100644
+--- a/crates/absurd-sdk/src/lib.rs
++++ b/crates/absurd-sdk/src/lib.rs
+@@ -627,6 +627,21 @@ impl Client {
+         params: P,
+         options: SpawnOptions,
+     ) -> Result<SpawnResult> {
++        self.spawn_with_executor(task_name, params, options, &self.pool)
++            .await
++    }
++
++    /// Atomically enqueue a task with application state in the same transaction.
++    pub async fn spawn_with_executor<'e, P: Serialize, E>(
++        &self,
++        task_name: &str,
++        params: P,
++        options: SpawnOptions,
++        executor: E,
++    ) -> Result<SpawnResult>
++    where
++        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
++    {
+         let params_value = serde_json::to_value(params)?;
+         let (queue, effective_options) = self.resolve_spawn(task_name, options)?;
+         let effective_options = if let Some(hook) = &self.hooks.before_spawn {
+@@ -651,7 +666,7 @@ impl Client {
+         .bind(task_name)
+         .bind(Json(params_value))
+         .bind(Json(Value::Object(payload)))
+-        .fetch_one(&self.pool)
++        .fetch_one(executor)
+         .await?;
+ 
+         spawn_result_from_row(row)
+@@ -663,6 +678,21 @@ impl Client {
+         payload: P,
+         queue_name: Option<&str>,
+     ) -> Result<()> {
++        self.emit_event_with_executor(event_name, payload, queue_name, &self.pool)
++            .await
++    }
++
++    /// Commit an event and the application decision that produced it together.
++    pub async fn emit_event_with_executor<'e, P: Serialize, E>(
++        &self,
++        event_name: &str,
++        payload: P,
++        queue_name: Option<&str>,
++        executor: E,
++    ) -> Result<()>
++    where
++        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
++    {
+         if event_name.is_empty() {
+             return Err(Error::InvalidOptions(
+                 "event_name must be a non-empty string".to_string(),
+@@ -673,7 +703,7 @@ impl Client {
+             .bind(&queue)
+             .bind(event_name)
+             .bind(Json(serde_json::to_value(payload)?))
+-            .execute(&self.pool)
++            .execute(executor)
+             .await?;
+         Ok(())
+     }
+diff --git a/services/api-rs/Cargo.lock b/services/api-rs/Cargo.lock
+index ecd98c23..984425ae 100644
+--- a/services/api-rs/Cargo.lock
++++ b/services/api-rs/Cargo.lock
+@@ -1129,6 +1129,7 @@ name = "centaur-workflows"
+ version = "0.1.0"
+ dependencies = [
+  "absurd-sdk",
++ "async-trait",
+  "base64 0.23.1",
+  "centaur-iron-control",
+  "centaur-sandbox-core",
+@@ -1140,6 +1141,7 @@ dependencies = [
+  "chrono-tz",
+  "cron",
+  "futures-util",
++ "hex",
+  "hmac 0.13.0",
+  "reqwest",
+  "serde",
+@@ -4841,6 +4843,7 @@ dependencies = [
+  "tokio-stream",
+  "tracing",
+  "url",
++ "uuid",
+  "webpki-roots 0.26.11",
+ ]
+ 
+@@ -4923,6 +4926,7 @@ dependencies = [
+  "thiserror 2.0.21",
+  "time",
+  "tracing",
++ "uuid",
+  "whoami",
+ ]
+ 
+@@ -4962,6 +4966,7 @@ dependencies = [
+  "thiserror 2.0.21",
+  "time",
+  "tracing",
++ "uuid",
+  "whoami",
+ ]
+ 
+@@ -4989,6 +4994,7 @@ dependencies = [
+  "time",
+  "tracing",
+  "url",
++ "uuid",
+ ]
+ 
+ [[package]]
+diff --git a/services/api-rs/crates/centaur-api-server/Cargo.toml b/services/api-rs/crates/centaur-api-server/Cargo.toml
+index 9a70c298..72e08168 100644
+--- a/services/api-rs/crates/centaur-api-server/Cargo.toml
++++ b/services/api-rs/crates/centaur-api-server/Cargo.toml
+@@ -37,7 +37,7 @@ serde_yaml.workspace = true
+ sha2.workspace = true
+ standardwebhooks.workspace = true
+ subtle.workspace = true
+-sqlx.workspace = true
++sqlx = { workspace = true, features = ["uuid"] }
+ thiserror.workspace = true
+ time.workspace = true
+ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+diff --git a/services/api-rs/crates/centaur-api-server/src/auth.rs b/services/api-rs/crates/centaur-api-server/src/auth.rs
+index df8d2de1..c5de2a2a 100644
+--- a/services/api-rs/crates/centaur-api-server/src/auth.rs
++++ b/services/api-rs/crates/centaur-api-server/src/auth.rs
+@@ -191,8 +191,8 @@ impl ApiAuthConfig {
+     pub(crate) fn verify_workflow_button(
+         &self,
+         request: centaur_workflows::slack_buttons::Invocation,
+-    ) -> Result<centaur_workflows::CreateWorkflowRunRequest, ApiError> {
+-        centaur_workflows::slack_buttons::verify(request, self.jwt_secret.as_bytes())
++    ) -> Result<centaur_workflows::slack_buttons::VerifiedButton, ApiError> {
++        centaur_workflows::slack_buttons::verify_button(request, self.jwt_secret.as_bytes())
+             .map_err(|error| ApiError::Forbidden(error.into()))
+     }
+ 
+diff --git a/services/api-rs/crates/centaur-api-server/src/lib.rs b/services/api-rs/crates/centaur-api-server/src/lib.rs
+index a1d62b82..a1ef20ce 100644
+--- a/services/api-rs/crates/centaur-api-server/src/lib.rs
++++ b/services/api-rs/crates/centaur-api-server/src/lib.rs
+@@ -5,6 +5,7 @@ mod error;
+ mod mcp;
+ mod routes;
+ mod slack_proxy;
++mod tool_approvals;
+ mod tool_discovery;
+ pub mod types;
+ 
+@@ -168,6 +169,42 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn approval_routes_separate_sandbox_attestation_and_slack_decisions() {
++        let id = "00000000-0000-4000-8000-000000000001";
++        for (path, permitted) in [
++            ("/api/tool-approvals/context".to_owned(), console_token()),
++            ("/api/tool-approvals/request".to_owned(), console_token()),
++            (format!("/api/tool-approvals/{id}/read"), console_token()),
++            (format!("/api/tool-approvals/{id}/cancel"), console_token()),
++        ] {
++            for token in [
++                principal_token("prn_source"),
++                console_token(),
++                "test-slackbot-key".into(),
++            ] {
++                let response =
++                    build_router_with_app_state(AppState::unready(test_auth_with_slack()))
++                        .oneshot(
++                            Request::builder()
++                                .method(Method::POST)
++                                .uri(&path)
++                                .header(header::AUTHORIZATION, format!("Bearer {token}"))
++                                .header(header::CONTENT_TYPE, "application/json")
++                                .body(Body::from("{}"))
++                                .unwrap(),
++                        )
++                        .await
++                        .unwrap();
++                if token == permitted {
++                    assert_ne!(response.status(), StatusCode::FORBIDDEN, "{path}");
++                } else {
++                    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
++                }
++            }
++        }
++    }
++
+     #[tokio::test]
+     async fn metrics_endpoint_renders_http_request_metrics() {
+         let pool =
+@@ -492,6 +529,36 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn signed_approval_buttons_require_slack_actor_attestation() {
++        let mut message = json!({"channel":"C1","blocks":[{"type":"actions","elements":[{
++            "type":"button","action_id":"centaur.workflow.action:00000000-0000-4000-8000-000000000001:approved",
++            "value":json!({"workflow_name":centaur_workflows::approvals::DECISION_WORKFLOW,"input":{"approval_id":"00000000-0000-4000-8000-000000000001"}}).to_string()
++        }]}]});
++        centaur_workflows::slack_buttons::sign_message(&mut message, b"test-secret").unwrap();
++        let body = json!({"button":message["blocks"][0]["elements"][0]["value"],"idempotency_key":"click",
++            "click":{"id":"00000000-0000-4000-8000-000000000001","action":"approved","channel_id":"C1","user_id":"U1"}});
++        for (token, status) in [
++            (console_token(), StatusCode::FORBIDDEN),
++            (principal_token("prn_sandbox"), StatusCode::FORBIDDEN),
++            ("test-slackbot-key".into(), StatusCode::SERVICE_UNAVAILABLE),
++        ] {
++            let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
++                .oneshot(
++                    Request::builder()
++                        .method(Method::POST)
++                        .uri("/api/workflows/actions/invoke")
++                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
++                        .header(header::CONTENT_TYPE, "application/json")
++                        .body(Body::from(body.to_string()))
++                        .unwrap(),
++                )
++                .await
++                .unwrap();
++            assert_eq!(response.status(), status);
++        }
++    }
++
+     #[tokio::test]
+     async fn principal_jwt_is_capability_scoped_and_archive_exception_is_subject_scoped() {
+         let principal = principal_token("prn_sandbox");
+diff --git a/services/api-rs/crates/centaur-api-server/src/routes.rs b/services/api-rs/crates/centaur-api-server/src/routes.rs
+index 996bfda4..91ddb32f 100644
+--- a/services/api-rs/crates/centaur-api-server/src/routes.rs
++++ b/services/api-rs/crates/centaur-api-server/src/routes.rs
+@@ -179,7 +179,7 @@ impl AppState {
+             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
+     }
+ 
+-    fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
++    pub(crate) fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
+         let initialized = self
+             .initialized()
+             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
+@@ -188,7 +188,7 @@ impl AppState {
+             .ok_or_else(|| ApiError::BadRequest("workflow runtime is not enabled".to_owned()))
+     }
+ 
+-    fn pool(&self) -> Result<PgPool, ApiError> {
++    pub(crate) fn pool(&self) -> Result<PgPool, ApiError> {
+         let initialized = self
+             .initialized()
+             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
+@@ -260,6 +260,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
+         .route("/api/session/{thread_key}/events", get(stream_events))
+         .route("/api/sandboxes/drain", post(drain_sandboxes))
+         .merge(slack_proxy_router())
++        .merge(crate::tool_approvals::router())
+         .route("/api/workflows/schedules", get(list_workflow_schedules))
+         .route(
+             "/api/workflows/runs",
+@@ -446,6 +447,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
+ 
+ #[derive(Clone, Copy)]
+ enum RouteAccess {
++    ConsoleOnly,
+     Capability(Capability),
+     PrincipalOnly,
+     ArchiveDownload,
+@@ -483,6 +485,7 @@ async fn authorize_api_request(
+     };
+ 
+     let allowed = match access {
++        RouteAccess::ConsoleOnly => caller.class() == CallerClass::Console,
+         RouteAccess::Capability(capability) => caller.has_capability(capability),
+         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
+         RouteAccess::ArchiveDownload => {
+@@ -537,6 +540,10 @@ async fn authorize_api_request(
+ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
+     let capability = |capability| Some(RouteAccess::Capability(capability));
+     match (method, route) {
++        (&Method::POST, "/api/tool-approvals/context")
++        | (&Method::POST, "/api/tool-approvals/request")
++        | (&Method::POST, "/api/tool-approvals/{id}/read")
++        | (&Method::POST, "/api/tool-approvals/{id}/cancel") => Some(RouteAccess::ConsoleOnly),
+         (&Method::GET, "/api/session/{thread_key}")
+         | (&Method::GET, "/api/session/{thread_key}/events") => {
+             capability(Capability::SessionsRead)
+@@ -2858,14 +2865,24 @@ async fn ingest_google_docs_sync_batch(
+ 
+ async fn invoke_workflow_button(
+     State(state): State<AppState>,
++    Extension(caller): Extension<AuthenticatedCaller>,
+     Json(request): Json<centaur_workflows::slack_buttons::Invocation>,
+ ) -> Result<Json<Value>, ApiError> {
+     let feedback =
+         centaur_workflows::slack_button_feedback::ButtonFeedback::from_invocation(&request);
+     let request = state.auth.verify_workflow_button(request)?;
+-    let run = workflow_runtime(&state)?
+-        .create_button_run(request, feedback)
+-        .await?;
++    let run = if request.workflow_name() == centaur_workflows::approvals::DECISION_WORKFLOW {
++        if caller.class() != CallerClass::Ingress || caller.identity() != "slackbot" {
++            return Err(ApiError::Forbidden(
++                "approval decisions require Slack ingress".into(),
++            ));
++        }
++        workflow_runtime(&state)?.decide_approval(request).await?
++    } else {
++        workflow_runtime(&state)?
++            .create_button_run(request.into_request(), feedback)
++            .await?
++    };
+     Ok(Json(serde_json::to_value(run)?))
+ }
+ 
+diff --git a/services/api-rs/crates/centaur-api-server/src/tool_approvals.rs b/services/api-rs/crates/centaur-api-server/src/tool_approvals.rs
+new file mode 100644
+index 00000000..78e2b9f0
+--- /dev/null
++++ b/services/api-rs/crates/centaur-api-server/src/tool_approvals.rs
+@@ -0,0 +1,46 @@
++//! Thin Console-attested ingress for workflow-native approvals.
++use crate::{ApiError, AppState};
++use axum::{
++    Json, Router,
++    extract::{Path, State},
++    routing::post,
++};
++use centaur_workflows::approvals::{Identity, Request};
++use serde_json::Value;
++use uuid::Uuid;
++
++pub fn router() -> Router<AppState> {
++    Router::new()
++        .route("/api/tool-approvals/context", post(context))
++        .route("/api/tool-approvals/request", post(request))
++        .route("/api/tool-approvals/{id}/read", post(read))
++        .route("/api/tool-approvals/{id}/cancel", post(cancel))
++}
++async fn context(
++    State(state): State<AppState>,
++    Json(identity): Json<Identity>,
++) -> Result<Json<Value>, ApiError> {
++    Ok(Json(state.workflows()?.approval_context(identity).await?))
++}
++async fn request(
++    State(state): State<AppState>,
++    Json(request): Json<Request>,
++) -> Result<Json<Value>, ApiError> {
++    Ok(Json(state.workflows()?.request_approval(request).await?))
++}
++async fn read(
++    State(state): State<AppState>,
++    Path(id): Path<Uuid>,
++    Json(identity): Json<Identity>,
++) -> Result<Json<Value>, ApiError> {
++    Ok(Json(state.workflows()?.read_approval(id, identity).await?))
++}
++async fn cancel(
++    State(state): State<AppState>,
++    Path(id): Path<Uuid>,
++    Json(identity): Json<Identity>,
++) -> Result<Json<Value>, ApiError> {
++    Ok(Json(
++        state.workflows()?.cancel_approval(id, identity).await?,
++    ))
++}
+diff --git a/services/api-rs/crates/centaur-session-runtime/src/lib.rs b/services/api-rs/crates/centaur-session-runtime/src/lib.rs
+index 55f49344..52175a99 100644
+--- a/services/api-rs/crates/centaur-session-runtime/src/lib.rs
++++ b/services/api-rs/crates/centaur-session-runtime/src/lib.rs
+@@ -160,6 +160,7 @@ impl SessionPrincipalAdmission {
+ 
+ #[derive(Clone)]
+ pub struct SessionRuntime {
++    workflow_only_principals: Arc<DashSet<String>>,
+     store: PgSessionStore,
+     sandbox_runtime: SandboxRuntime,
+     sandbox_pipes: SessionPipeMap,
+@@ -748,6 +749,7 @@ impl SessionRuntime {
+         Self {
+             store,
+             sandbox_runtime,
++            workflow_only_principals: Arc::new(DashSet::new()),
+             sandbox_pipes: Arc::new(DashMap::new()),
+             sandbox_pipe_open_locks: Arc::new(DashMap::new()),
+             tool_host_call_locks: Arc::new(DashMap::new()),
+@@ -774,6 +776,41 @@ impl SessionRuntime {
+         self
+     }
+ 
++    /// Approval-only credentials must never be assigned to an agent or generic
++    /// tool host. Reservations are shared by clones and monotonic per process.
++    pub fn reserve_workflow_principal(&self, principal_id: &str) {
++        self.workflow_only_principals
++            .insert(principal_id.to_owned());
++    }
++
++    fn ensure_unreserved_principal(&self, principal_id: &str) -> Result<(), SessionRuntimeError> {
++        if self.workflow_only_principals.contains(principal_id) {
++            return Err(SessionRuntimeError::BadRequest(
++                "principal is reserved for an approval-only workflow".into(),
++            ));
++        }
++        Ok(())
++    }
++
++    fn ensure_unreserved_record(&self, principal: &Principal) -> Result<(), SessionRuntimeError> {
++        self.ensure_unreserved_principal(&principal.id)?;
++        if let Some(reference) = &principal.foreign_id {
++            self.ensure_unreserved_principal(reference)?;
++        }
++        Ok(())
++    }
++
++    pub async fn ensure_unreserved_principal_reference(
++        &self,
++        reference: &str,
++    ) -> Result<(), SessionRuntimeError> {
++        if self.workflow_only_principals.is_empty() {
++            return Ok(());
++        }
++        self.ensure_unreserved_principal(reference)?;
++        self.ensure_unreserved_record(&self.iron_control.get_principal(reference).await?)
++    }
++
+     pub fn with_session_title_generator<F, Fut>(mut self, generator: F) -> Self
+     where
+         F: Fn(String) -> Fut + Send + Sync + 'static,
+@@ -846,6 +883,14 @@ impl SessionRuntime {
+         policy: ToolHostCallPolicy,
+     ) -> Result<ToolHostCallOutput, ToolHostCallError> {
+         let principal_id = input.principal_id.trim().to_owned();
++        if !self.workflow_only_principals.is_empty() {
++            let principal = self
++                .iron_control
++                .get_principal(&principal_id)
++                .await
++                .map_err(SessionRuntimeError::from)?;
++            self.ensure_unreserved_record(&principal)?;
++        }
+         let tool_name = input.tool_name.trim().to_owned();
+         let invocation = match input.invocation {
+             ToolHostInvocation::V1 { method, arguments } => ToolHostInvocation::V1 {
+@@ -1578,6 +1623,7 @@ impl SessionRuntime {
+                 }
+             };
+             let desired_capabilities = sandbox_capabilities_from_principal(&registered_principal);
++            self.ensure_unreserved_record(&registered_principal)?;
+             // A session's persona is fixed by the first successful create.
+             // Use the stored persona before the requested one so later persona
+             // flags cannot change or invalidate an existing thread. Its
+@@ -2097,6 +2143,9 @@ impl SessionRuntime {
+             );
+             let session = self.store.get_session(thread_key).await?;
+             correlation_sandbox_id = session.sandbox_id.clone();
++            if let Some(principal) = session.iron_control_principal.as_deref() {
++                self.ensure_unreserved_principal_reference(principal).await?;
++            }
+             let harness_label = session.harness_type.to_string();
+             validate_input_lines(&input_lines)?;
+             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
+@@ -3234,6 +3283,7 @@ impl SessionRuntime {
+             return Ok(SessionSandboxCapabilities::default_enabled());
+         };
+         let principal = self.iron_control.get_principal(principal_id).await?;
++        self.ensure_unreserved_record(&principal)?;
+         Ok(sandbox_capabilities_from_principal(&principal))
+     }
+ 
+@@ -4128,7 +4178,19 @@ impl SandboxRuntime {
+         spec: SandboxSpec,
+     ) -> Result<(SandboxId, centaur_sandbox_core::SandboxIoParts), SessionRuntimeError> {
+         let handle = self.manager.create_running(spec).await?;
+-        let io = self.manager.open_io(&handle.id).await?.into_parts();
++        let io = match self.manager.open_io(&handle.id).await {
++            Ok(io) => io.into_parts(),
++            Err(error) => {
++                let manager = self.manager.clone();
++                let sandbox_id = handle.id.clone();
++                tokio::spawn(async move {
++                    if let Err(error) = manager.stop(&sandbox_id).await {
++                        warn!(sandbox_id = %sandbox_id.as_str(), %error, "failed to stop sandbox after I/O setup failure");
++                    }
++                });
++                return Err(error.into());
++            }
++        };
+         Ok((handle.id, io))
+     }
+ 
+@@ -9622,6 +9684,66 @@ mod adoption_tests {
+         )
+     }
+ 
++    #[tokio::test]
++    async fn approval_principals_cannot_escape_through_agent_or_tool_hosts() {
++        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
++        let store = PgSessionStore::new(pool);
++        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
++        let runtime = runtime_with(&store, backend.clone());
++        let policy = runtime
++            .resolve_tool_host_call_policy("prn_executor")
++            .await
++            .unwrap();
++        runtime.clone().reserve_workflow_principal("prn_executor");
++        assert!(
++            runtime
++                .resolve_tool_host_call_policy("prn_executor")
++                .await
++                .is_err()
++        );
++        let error = runtime
++            .create_or_get_session_with_principal(
++                &ThreadKey::parse("slack:C1:1.000").unwrap(),
++                &HarnessType::Codex,
++                None,
++                Some(json!({"click":{"user_id":"UAPPROVER"}})),
++                HarnessConflictPolicy::Reject,
++                Some("prn_executor"),
++            )
++            .await;
++        assert!(matches!(error, Err(SessionRuntimeError::BadRequest(_))));
++        assert!(
++            runtime
++                .run_tool_host_call(
++                    ToolHostCallInput {
++                        principal_id: "prn_executor".into(),
++                        console_user_email: None,
++                        console_user_name: None,
++                        token_id: None,
++                        tool_name: "protected".into(),
++                        invocation: ToolHostInvocation::V1 {
++                            method: "start".into(),
++                            arguments: json!({})
++                        },
++                        timeout: Duration::from_secs(1),
++                    },
++                    policy
++                )
++                .await
++                .is_err()
++        );
++        // The test registrar gives every record the foreign ID "test".
++        runtime.reserve_workflow_principal("test");
++        assert!(
++            runtime
++                .ensure_unreserved_principal_reference("prn_alias_target")
++                .await
++                .is_err()
++        );
++        assert_eq!(backend.open_count.load(Ordering::SeqCst), 0);
++        assert!(backend.created_specs.lock().unwrap().is_empty());
++    }
++
+     fn runtime_with_personas(store: &PgSessionStore, backend: Arc<MockBackend>) -> SessionRuntime {
+         let definitions = ["old", "eng"].map(|persona_id| PersonaDefinition {
+             id: persona_id.to_owned(),
+diff --git a/services/api-rs/crates/centaur-session-sqlx/migrations/0056_tool_approvals.sql b/services/api-rs/crates/centaur-session-sqlx/migrations/0056_tool_approvals.sql
+new file mode 100644
+index 00000000..5776d76c
+--- /dev/null
++++ b/services/api-rs/crates/centaur-session-sqlx/migrations/0056_tool_approvals.sql
+@@ -0,0 +1,41 @@
++-- Approval is a one-shot authorization for immutable tool arguments. The
++-- executor claim is never reclaimed: an uncertain outcome requires inspection.
++create table tool_approvals (
++    id uuid primary key,
++    execution_id text not null references session_executions(execution_id) on delete cascade,
++    thread_key text not null references sessions(thread_key) on delete cascade,
++    sandbox_id text not null,
++    principal_id text not null,
++    executor_principal text not null,
++    idempotency_key uuid not null,
++    action text not null,
++    policy_hash text not null,
++    payload jsonb not null,
++    payload_json text not null check (octet_length(payload_json) <= 12000),
++    payload_hash text not null,
++    team_id text not null,
++    channel_id text not null,
++    thread_ts text not null,
++    requester_id text not null,
++    status text not null default 'pending' check (status in
++        ('pending', 'approved', 'declined', 'expired', 'cancelled', 'executing', 'succeeded', 'failed', 'unknown')),
++    decided_by text,
++    decided_at timestamptz,
++    created_at timestamptz not null default now(),
++    expires_at timestamptz not null,
++    execution_deadline timestamptz,
++    result jsonb,
++    revision bigint not null default 1,
++    message_ts text,
++    message_blocks jsonb,
++    delivered_revision bigint not null default 0,
++    delivery_token uuid,
++    delivery_until timestamptz,
++    unique (execution_id, idempotency_key),
++    check (octet_length(payload::text) <= 20000)
++);
++create index tool_approvals_work on tool_approvals(status, created_at);
++create unique index tool_approvals_one_executing_per_executor
++    on tool_approvals(executor_principal) where status = 'executing';
++create index tool_approvals_delivery on tool_approvals(team_id, created_at)
++    where delivered_revision < revision;
+diff --git a/services/api-rs/crates/centaur-session-sqlx/migrations/0057_workflow_native_approvals.sql b/services/api-rs/crates/centaur-session-sqlx/migrations/0057_workflow_native_approvals.sql
+new file mode 100644
+index 00000000..1857c468
+--- /dev/null
++++ b/services/api-rs/crates/centaur-session-sqlx/migrations/0057_workflow_native_approvals.sql
+@@ -0,0 +1,12 @@
++-- Supersede the opt-in tool-host prototype without replaying any old request.
++update tool_approvals set status = case when status = 'executing' then 'unknown' else 'cancelled' end
++where status in ('pending', 'approved', 'executing');
++alter table tool_approvals
++    add column workflow_task_id uuid,
++    add column workflow_run_id uuid,
++    drop column delivery_token,
++    drop column delivery_until,
++    drop column delivered_revision,
++    drop column revision;
++drop index tool_approvals_one_executing_per_executor;
++create unique index tool_approvals_workflow_task on tool_approvals(workflow_task_id);
+diff --git a/services/api-rs/crates/centaur-workflows/Cargo.toml b/services/api-rs/crates/centaur-workflows/Cargo.toml
+index bfb84e62..949966a8 100644
+--- a/services/api-rs/crates/centaur-workflows/Cargo.toml
++++ b/services/api-rs/crates/centaur-workflows/Cargo.toml
+@@ -19,16 +19,21 @@ chrono-tz.workspace = true
+ cron.workspace = true
+ futures-util.workspace = true
+ hmac.workspace = true
++hex.workspace = true
+ reqwest.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ sha2.workspace = true
+-sqlx.workspace = true
++sqlx = { workspace = true, features = ["uuid"] }
+ thiserror.workspace = true
+ time.workspace = true
+ tokio = { workspace = true, features = ["io-util", "process"] }
+ tracing.workspace = true
+ uuid.workspace = true
+ 
++[dev-dependencies]
++async-trait.workspace = true
++tokio = { workspace = true, features = ["test-util"] }
++
+ [lints]
+ workspace = true
+diff --git a/services/api-rs/crates/centaur-workflows/src/access.rs b/services/api-rs/crates/centaur-workflows/src/access.rs
+new file mode 100644
+index 00000000..3516ab5a
+--- /dev/null
++++ b/services/api-rs/crates/centaur-workflows/src/access.rs
+@@ -0,0 +1,57 @@
++//! One classification shared by submission, child starts and host dispatch.
++//! Checking admission does not replace checking again at execution time.
++use super::*;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum WorkflowAccess {
++    Ordinary,
++    ApprovalRequired,
++    Internal,
++}
++
++pub(crate) fn classify(
++    name: &str,
++    policies: &approvals::Policies,
++    sandbox: Option<&WorkflowHostSandboxRuntime>,
++) -> WorkflowAccess {
++    if approvals::is_reserved(name) {
++        WorkflowAccess::Internal
++    } else if policies.values().any(|p| p.workflow == name)
++        || sandbox.is_some_and(|s| s.requires_approval(name))
++    {
++        WorkflowAccess::ApprovalRequired
++    } else {
++        WorkflowAccess::Ordinary
++    }
++}
++
++pub(crate) fn ensure_public(
++    name: &str,
++    policies: &approvals::Policies,
++    sandbox: Option<&WorkflowHostSandboxRuntime>,
++) -> Result<(), WorkflowRuntimeError> {
++    if classify(name, policies, sandbox) != WorkflowAccess::Ordinary {
++        return Err(approvals::unavailable());
++    }
++    Ok(())
++}
++
++impl WorkflowQueueClients {
++    pub(super) fn ensure_public_workflow(&self, name: &str) -> Result<(), WorkflowRuntimeError> {
++        ensure_public(
++            name,
++            &self.approval_policies,
++            self.workflow_host_sandbox.as_ref(),
++        )
++    }
++
++    pub(super) fn approval_repository(&self) -> approvals::repository::Repository {
++        approvals::repository::Repository {
++            pool: self.standard.pool().clone(),
++            policies: Arc::new(approvals::resolve_policies(
++                &self.approval_policies,
++                self.workflow_host_sandbox.as_ref(),
++            )),
++        }
++    }
++}
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals.rs b/services/api-rs/crates/centaur-workflows/src/approvals.rs
+new file mode 100644
+index 00000000..5dd59a72
+--- /dev/null
++++ b/services/api-rs/crates/centaur-workflows/src/approvals.rs
+@@ -0,0 +1,332 @@
++//! One-shot authorization; scheduling, Slack transport and execution use workflows.
++use super::*;
++use sha2::{Digest, Sha256};
++use sqlx::PgPool;
++use uuid::Uuid;
++
++pub(super) mod execution;
++pub(super) mod repository;
++mod runner;
++use repository::Repository;
++pub(super) use runner::run;
++
++pub const DRIVER_WORKFLOW: &str = "centaur_approval_request";
++pub const DECISION_WORKFLOW: &str = "centaur_approval_decision";
++pub const EVENT_PREFIX: &str = "centaur.approval:";
++
++pub fn is_reserved(name: &str) -> bool {
++    name.starts_with("centaur_approval_")
++}
++
++#[derive(Clone, Debug, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct ActionPolicy {
++    pub workflow: String,
++    /// Optional compatibility pin. Admission always freezes the registry OID.
++    #[serde(default, skip_serializing_if = "String::is_empty")]
++    pub executor_principal: String,
++    pub requester_principals: Vec<String>,
++    pub team_id: String,
++    pub approver_user_ids: Vec<String>,
++    pub allow_self_approval: bool,
++    pub expires_seconds: u32,
++    pub timeout_seconds: u32,
++    pub implementation_revision: String,
++    /// Reviewed, non-secret top-level string fields intentionally returned to
++    /// the requester and Slack. All other executor output remains private.
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub public_result_fields: Vec<String>,
++}
++
++pub type Policies = BTreeMap<String, ActionPolicy>;
++
++pub fn parse_policies(raw: &str) -> Result<Policies, WorkflowRuntimeError> {
++    let policies: Policies = serde_json::from_str(raw)
++        .map_err(|_| WorkflowRuntimeError::BadRequest("invalid approval policy JSON".into()))?;
++    for (name, p) in &policies {
++        if !identifier(name)
++            || !identifier(&p.workflow)
++            || is_reserved(&p.workflow)
++            || (!p.executor_principal.is_empty() && !p.executor_principal.starts_with("prn_"))
++            || p.requester_principals.is_empty()
++            || p.requester_principals
++                .iter()
++                .any(|s| !s.starts_with("prn_") || s == &p.executor_principal)
++            || !slack_id(&p.team_id, 'T')
++            || p.approver_user_ids.is_empty()
++            || p.approver_user_ids
++                .iter()
++                .any(|s| !slack_id(s, 'U') && !slack_id(s, 'W'))
++            || !(30..=86400).contains(&p.expires_seconds)
++            || !(1..=300).contains(&p.timeout_seconds)
++            || p.implementation_revision.trim().is_empty()
++            || p.public_result_fields.len() > 8
++            || p.public_result_fields
++                .iter()
++                .enumerate()
++                .any(|(index, field)| {
++                    !identifier(field) || p.public_result_fields[..index].contains(field)
++                })
++        {
++            return Err(WorkflowRuntimeError::BadRequest(format!(
++                "invalid approval policy for {name}"
++            )));
++        }
++    }
++    if policies.values().any(|p| {
++        policies
++            .values()
++            .any(|q| q.requester_principals.contains(&p.executor_principal))
++    }) {
++        return Err(WorkflowRuntimeError::BadRequest(
++            "approval executor is also a requester".into(),
++        ));
++    }
++    Ok(policies)
++}
++
++pub fn policies_from_env() -> Result<Policies, WorkflowRuntimeError> {
++    parse_policies(&env::var("CENTAUR_TOOL_APPROVAL_POLICIES").unwrap_or_else(|_| "{}".into()))
++}
++
++/// Resolve at each boundary; a changed registry binding changes the policy hash
++/// and invalidates outstanding requests. Missing/disabled/mismatched executors
++/// are unavailable, never a fallback to a shared workflow principal.
++pub(super) fn resolve_policies(
++    policies: &Policies,
++    sandbox: Option<&WorkflowHostSandboxRuntime>,
++) -> Policies {
++    let Some(sandbox) = sandbox else {
++        return Policies::new();
++    };
++    let Ok(enablement) = WorkflowEnablement::from_env() else {
++        return Policies::new();
++    };
++    let registry = sandbox
++        .workflow_principals
++        .read()
++        .unwrap_or_else(|p| p.into_inner());
++    resolve_registry_policies(policies, &registry, &enablement)
++}
++
++fn resolve_registry_policies(
++    policies: &Policies,
++    registry: &WorkflowPrincipalAssignments,
++    enablement: &WorkflowEnablement,
++) -> Policies {
++    policies
++        .iter()
++        .filter_map(|(name, policy)| {
++            if !enablement.is_enabled(&policy.workflow)
++                || !registry.approval_required.contains(&policy.workflow)
++            {
++                return None;
++            }
++            let principal = registry.registered.get(&policy.workflow)?;
++            bind_policy(policy, principal, policies).map(|p| (name.clone(), p))
++        })
++        .collect()
++}
++
++fn bind_policy(
++    policy: &ActionPolicy,
++    principal: &str,
++    policies: &Policies,
++) -> Option<ActionPolicy> {
++    if !principal.starts_with("prn_")
++        || (!policy.executor_principal.is_empty() && policy.executor_principal != principal)
++        || policies
++            .values()
++            .any(|p| p.requester_principals.iter().any(|id| id == principal))
++    {
++        return None;
++    }
++    let mut resolved = policy.clone();
++    resolved.executor_principal = principal.into();
++    Some(resolved)
++}
++
++pub(super) fn unavailable() -> WorkflowRuntimeError {
++    WorkflowRuntimeError::Disabled("approval unavailable".into())
++}
++
++fn identifier(s: &str) -> bool {
++    !s.is_empty()
++        && s.len() <= 80
++        && s.bytes()
++            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
++}
++
++fn slack_id(s: &str, prefix: char) -> bool {
++    s.starts_with(prefix)
++        && (2..=32).contains(&s.len())
++        && s.bytes()
++            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
++}
++
++fn timestamp(s: &str) -> bool {
++    s.split_once('.').is_some_and(|(a, b)| {
++        !a.is_empty()
++            && !b.is_empty()
++            && s.len() <= 32
++            && a.bytes().chain(b.bytes()).all(|c| c.is_ascii_digit())
++    })
++}
++
++fn hash(value: &impl Serialize) -> String {
++    hex::encode(Sha256::digest(
++        serde_json::to_vec(value).expect("JSON serializable"),
++    ))
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Identity {
++    pub sandbox_id: String,
++    pub principal_id: String,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Request {
++    pub sandbox_id: String,
++    pub principal_id: String,
++    pub execution_id: String,
++    pub idempotency_key: Uuid,
++    pub action: String,
++    pub arguments: Value,
++}
++
++#[derive(sqlx::FromRow, Serialize)]
++struct Context {
++    execution_id: String,
++    thread_key: String,
++    team_id: String,
++    channel_id: String,
++    requester_id: String,
++}
++
++fn thread_timestamp(ctx: &Context) -> Result<String, WorkflowRuntimeError> {
++    let qualified = format!("slack:{}:{}:", ctx.team_id, ctx.channel_id);
++    let legacy = format!("slack:{}:", ctx.channel_id);
++    let ts = ctx
++        .thread_key
++        .strip_prefix(&qualified)
++        .or_else(|| ctx.thread_key.strip_prefix(&legacy))
++        .ok_or_else(unavailable)?;
++    if !timestamp(ts) {
++        return Err(unavailable());
++    }
++    Ok(ts.into())
++}
++
++fn payload(p: &ActionPolicy, arguments: Value) -> Result<(Value, String), WorkflowRuntimeError> {
++    if !arguments.is_object() {
++        return Err(WorkflowRuntimeError::BadRequest(
++            "arguments must be a JSON object".into(),
++        ));
++    }
++    let mut payload = json!({"workflow":p.workflow,"arguments":arguments,
++        "executor_principal":p.executor_principal,"implementation_revision":p.implementation_revision});
++    if !p.public_result_fields.is_empty() {
++        payload["public_result_fields"] = json!(p.public_result_fields);
++    }
++    let display = display_json(&payload)?;
++    if display.len() > 12000 {
++        return Err(WorkflowRuntimeError::BadRequest(
++            "approval display exceeds 12000 bytes".into(),
++        ));
++    }
++    Ok((payload, display))
++}
++
++fn display_json(value: &Value) -> Result<String, WorkflowRuntimeError> {
++    let mut display = String::new();
++    for ch in serde_json::to_string_pretty(value)?.chars() {
++        if !ch.is_ascii() || matches!(ch, '<' | '>' | '&') {
++            for unit in ch.encode_utf16(&mut [0; 2]) {
++                display.push_str(&format!("\\u{unit:04x}"));
++            }
++        } else {
++            display.push(ch);
++        }
++    }
++    Ok(display)
++}
++
++fn visible_blocks(value: &Value) -> Value {
++    match value {
++        Value::Array(items) => Value::Array(items.iter().map(visible_blocks).collect()),
++        Value::Object(map) => Value::Object(
++            map.iter()
++                .filter(|(k, v)| {
++                    k.as_str() != "block_id" && !(k.as_str() == "emoji" && **v == Value::Bool(true))
++                })
++                .map(|(k, v)| (k.clone(), visible_blocks(v)))
++                .collect(),
++        ),
++        _ => value.clone(),
++    }
++}
++
++impl WorkflowRuntime {
++    fn approval_repository(&self) -> Repository {
++        Repository {
++            pool: self.inner.client.pool().clone(),
++            policies: Arc::new(resolve_policies(
++                &self.inner.approval_policies,
++                self.inner.workflow_host_sandbox.as_ref(),
++            )),
++        }
++    }
++
++    pub(super) fn ensure_public_workflow(&self, name: &str) -> Result<(), WorkflowRuntimeError> {
++        access::ensure_public(
++            name,
++            &self.inner.approval_policies,
++            self.inner.workflow_host_sandbox.as_ref(),
++        )
++    }
++
++    pub async fn approval_context(
++        &self,
++        identity: Identity,
++    ) -> Result<Value, WorkflowRuntimeError> {
++        self.approval_repository().context(identity).await
++    }
++
++    pub async fn request_approval(&self, request: Request) -> Result<Value, WorkflowRuntimeError> {
++        let repo = self.approval_repository();
++        let p = repo.policies.get(&request.action).ok_or_else(unavailable)?;
++        runner::validate_executor(p, self.inner.workflow_host_sandbox.as_ref())?;
++        repo.request(request, &self.inner.client).await
++    }
++
++    pub async fn read_approval(
++        &self,
++        id: Uuid,
++        identity: Identity,
++    ) -> Result<Value, WorkflowRuntimeError> {
++        self.approval_repository().read(id, identity).await
++    }
++
++    pub async fn cancel_approval(
++        &self,
++        id: Uuid,
++        identity: Identity,
++    ) -> Result<Value, WorkflowRuntimeError> {
++        self.approval_repository().cancel(id, identity).await
++    }
++
++    /// Only accepts a native signature-verified button. The API additionally
++    /// requires the Slack ingress identity; ordinary workflow input is never used.
++    pub async fn decide_approval(
++        &self,
++        button: slack_buttons::VerifiedButton,
++    ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
++        self.approval_repository().decide(button).await
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/execution.rs b/services/api-rs/crates/centaur-workflows/src/approvals/execution.rs
+new file mode 100644
+index 00000000..443e0630
+--- /dev/null
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/execution.rs
+@@ -0,0 +1,147 @@
++//! One claim budget for provisioning and dispatch, with durable completion before cleanup.
++use super::*;
++use centaur_sandbox_core::{SandboxId, SandboxIoParts};
++use centaur_session_runtime::SessionRuntimeError;
++use tokio::time::Instant;
++
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Deadline(Instant);
++
++impl Deadline {
++    pub(super) fn from_remaining(started: Instant, seconds: f64) -> Self {
++        Self(started + Duration::from_secs_f64(seconds.max(0.0)))
++    }
++
++    pub(crate) fn check(self) -> Result<(), WorkflowRuntimeError> {
++        if Instant::now() >= self.0 {
++            return Err(uncertain());
++        }
++        Ok(())
++    }
++
++    pub(crate) async fn run<T>(
++        self,
++        future: impl Future<Output = Result<T, WorkflowRuntimeError>>,
++    ) -> Result<T, WorkflowRuntimeError> {
++        self.check()?;
++        let result = tokio::select! {
++            biased;
++            _ = tokio::time::sleep_until(self.0) => return Err(uncertain()),
++            result = future => result,
++        };
++        // Also reject a future that completed without yielding across the deadline.
++        self.check()?;
++        result
++    }
++
++    async fn cleanup(self, future: impl Future<Output = ()>) {
++        tokio::select! {
++            biased;
++            _ = tokio::time::sleep_until(self.0) => {},
++            () = future => {},
++        }
++    }
++}
++
++fn uncertain() -> WorkflowRuntimeError {
++    WorkflowRuntimeError::Upstream("approved workflow outcome uncertain".into())
++}
++
++pub(crate) struct ClaimedExecution<'a> {
++    pub repo: &'a Repository,
++    pub id: Uuid,
++    pub policy: &'a ActionPolicy,
++    pub deadline: Deadline,
++}
++
++impl ClaimedExecution<'_> {
++    pub(crate) async fn complete(
++        self,
++        result: Result<Value, WorkflowRuntimeError>,
++        cleanup: impl Future<Output = ()>,
++    ) -> Result<Value, WorkflowRuntimeError> {
++        // Never let slow shutdown hide a known result from lifecycle reconciliation.
++        // The database independently rejects success persisted after its deadline.
++        let saved = self.repo.finish(self.id, self.policy, result).await;
++        self.deadline.cleanup(cleanup).await;
++        saved?;
++        Ok(Value::Null)
++    }
++}
++
++type Startup = JoinHandle<Result<(SandboxId, SandboxIoParts), SessionRuntimeError>>;
++
++/// Keep ownership of startup even if the caller's deadline expires. A late
++/// sandbox is stopped without ever receiving workflow.start. Dropping a backend
++/// create future could otherwise lose its ID and leak the privileged sandbox.
++pub(crate) struct HostSandbox {
++    runtime: SandboxRuntime,
++    startup: Option<Startup>,
++    id: Option<SandboxId>,
++}
++
++impl HostSandbox {
++    pub(crate) fn new(runtime: SandboxRuntime) -> Self {
++        Self {
++            runtime,
++            startup: None,
++            id: None,
++        }
++    }
++
++    pub(crate) async fn start(
++        &mut self,
++        spec: SandboxSpec,
++    ) -> Result<SandboxIoParts, WorkflowRuntimeError> {
++        let runtime = self.runtime.clone();
++        self.startup = Some(tokio::spawn(async move {
++            runtime.create_running_io(spec).await
++        }));
++        let result = self.startup.as_mut().expect("startup task installed").await;
++        self.startup = None;
++        let (id, io) = result.map_err(|error| {
++            WorkflowRuntimeError::Internal(format!("workflow sandbox startup failed: {error}"))
++        })??;
++        self.id = Some(id);
++        Ok(io)
++    }
++
++    fn spawn_cleanup(&mut self) -> Option<JoinHandle<()>> {
++        let startup = self.startup.take();
++        let id = self.id.take();
++        if startup.is_none() && id.is_none() {
++            return None;
++        }
++        let runtime = self.runtime.clone();
++        Some(tokio::spawn(async move {
++            let id = match (id, startup) {
++                (Some(id), _) => id,
++                (_, Some(startup)) => match startup.await {
++                    Ok(Ok((id, io))) => {
++                        drop(io);
++                        id
++                    }
++                    _ => return,
++                },
++                _ => return,
++            };
++            if let Err(error) = runtime.stop_sandbox(&id).await {
++                warn!(sandbox_id = %id.as_str(), %error, "failed to stop workflow host sandbox");
++            }
++        }))
++    }
++
++    pub(crate) async fn cleanup(&mut self) {
++        if let Some(task) = self.spawn_cleanup() {
++            // Dropping this join handle at the deadline leaves cleanup running.
++            let _ = task.await;
++        }
++    }
++}
++
++impl Drop for HostSandbox {
++    fn drop(&mut self) {
++        // Also covers cancellation during setup, protocol execution, or persistence.
++        self.spawn_cleanup();
++    }
++}
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs b/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs
+new file mode 100644
+index 00000000..c51c7efc
+--- /dev/null
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs
+@@ -0,0 +1,368 @@
++use super::*;
++use sqlx::Row;
++
++pub(crate) struct Repository {
++    pub pool: PgPool,
++    pub policies: Arc<Policies>,
++}
++
++#[derive(sqlx::FromRow)]
++pub(crate) struct Record {
++    pub id: Uuid,
++    pub action: String,
++    pub policy_hash: String,
++    pub payload: Value,
++    pub payload_hash: String,
++    pub payload_json: String,
++    pub team_id: String,
++    pub channel_id: String,
++    pub thread_ts: String,
++    pub requester_id: String,
++    pub status: String,
++    pub result: Option<Value>,
++    pub message_ts: Option<String>,
++    pub message_blocks: Option<Value>,
++    pub workflow_task_id: Option<Uuid>,
++    pub workflow_run_id: Option<Uuid>,
++    pub decided_by: Option<String>,
++    pub expires_at: DateTime<Utc>,
++}
++
++impl Repository {
++    pub async fn context(&self, identity: Identity) -> Result<Value, WorkflowRuntimeError> {
++        let ctx = resolve_context(&self.pool, &identity).await?;
++        let actions: Vec<_> = self
++            .policies
++            .iter()
++            .filter(|(_, p)| {
++                p.team_id == ctx.team_id && p.requester_principals.contains(&identity.principal_id)
++            })
++            .map(|(name, p)| json!({"action":name,"workflow":p.workflow}))
++            .collect();
++        Ok(json!({"execution_id":ctx.execution_id,"actions":actions}))
++    }
++
++    pub async fn request(
++        &self,
++        req: Request,
++        client: &Client,
++    ) -> Result<Value, WorkflowRuntimeError> {
++        let identity = Identity {
++            sandbox_id: req.sandbox_id,
++            principal_id: req.principal_id,
++        };
++        let ctx = resolve_context(&self.pool, &identity).await?;
++        let p = self.policies.get(&req.action).ok_or_else(unavailable)?;
++        if ctx.execution_id != req.execution_id
++            || p.team_id != ctx.team_id
++            || !p.requester_principals.contains(&identity.principal_id)
++        {
++            return Err(unavailable());
++        }
++        let (payload, display) = payload(p, req.arguments)?;
++        let payload_hash = hash(&payload);
++        let policy_hash = hash(p);
++        let mut tx = self.pool.begin().await?;
++        let active: Option<String> = sqlx::query_scalar("select e.execution_id from session_executions e join sessions s using(thread_key) where e.execution_id=$1 and e.status='running' and s.sandbox_id=$2 and s.iron_control_principal=$3 for update of e,s")
++            .bind(&ctx.execution_id).bind(&identity.sandbox_id).bind(&identity.principal_id)
++            .fetch_optional(&mut *tx).await?;
++        if active.is_none() {
++            return Err(unavailable());
++        }
++        let old = sqlx::query("select id,payload_hash,policy_hash,action from tool_approvals where execution_id=$1 and idempotency_key=$2")
++            .bind(&ctx.execution_id).bind(req.idempotency_key).fetch_optional(&mut *tx).await?;
++        if let Some(old) = old {
++            if old.get::<String, _>("payload_hash") != payload_hash
++                || old.get::<String, _>("policy_hash") != policy_hash
++                || old.get::<String, _>("action") != req.action
++            {
++                return Err(WorkflowRuntimeError::BadRequest(
++                    "idempotency key already used for different arguments or policy".into(),
++                ));
++            }
++            return Ok(json!({"id":old.get::<Uuid,_>("id")}));
++        }
++        let count: i64 =
++            sqlx::query_scalar("select count(*) from tool_approvals where execution_id=$1")
++                .bind(&ctx.execution_id)
++                .fetch_one(&mut *tx)
++                .await?;
++        if count >= 20 {
++            return Err(WorkflowRuntimeError::BadRequest(
++                "approval request limit reached".into(),
++            ));
++        }
++        let id = Uuid::new_v4();
++        let task = client
++            .spawn_with_executor(
++                WORKFLOW_TASK,
++                WorkflowTaskInput {
++                    workflow_name: DRIVER_WORKFLOW.into(),
++                    input: json!({"approval_id":id}),
++                    harness_type: HarnessType::Codex,
++                    slack_button_feedback: None,
++                },
++                SpawnOptions {
++                    queue: Some(WORKFLOW_QUEUE.into()),
++                    max_attempts: Some(100),
++                    idempotency_key: Some(format!("approval:{id}")),
++                    ..Default::default()
++                },
++                &mut *tx,
++            )
++            .await?;
++        sqlx::query("insert into tool_approvals (id,execution_id,thread_key,sandbox_id,principal_id,idempotency_key,action,policy_hash,payload,payload_hash,team_id,channel_id,thread_ts,requester_id,expires_at,payload_json,executor_principal,workflow_task_id,workflow_run_id)
++            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now()+make_interval(secs=>$15),$16,$17,$18::uuid,$19::uuid)")
++            .bind(id).bind(&ctx.execution_id).bind(&ctx.thread_key).bind(&identity.sandbox_id).bind(&identity.principal_id)
++            .bind(req.idempotency_key).bind(&req.action).bind(policy_hash).bind(payload).bind(payload_hash)
++            .bind(&ctx.team_id).bind(&ctx.channel_id).bind(thread_timestamp(&ctx)?).bind(&ctx.requester_id)
++            .bind(f64::from(p.expires_seconds)).bind(display).bind(&p.executor_principal)
++            .bind(&task.task_id).bind(&task.run_id).execute(&mut *tx).await?;
++        tx.commit().await?;
++        Ok(json!({"id":id}))
++    }
++
++    pub async fn read(&self, id: Uuid, identity: Identity) -> Result<Value, WorkflowRuntimeError> {
++        reconcile_lifecycle(&self.pool, Some(id)).await?;
++        sqlx::query_scalar("select jsonb_build_object('id',id,'status',status,'payload_hash',payload_hash,'decided_by',decided_by,'expires_at',expires_at,'result',result,'workflow_task_id',workflow_task_id,'workflow_run_id',workflow_run_id)
++            from tool_approvals where id=$1 and sandbox_id=$2 and principal_id=$3")
++            .bind(id).bind(identity.sandbox_id).bind(identity.principal_id).fetch_optional(&self.pool)
++            .await?.ok_or_else(unavailable)
++    }
++
++    pub async fn finish(
++        &self,
++        id: Uuid,
++        policy: &ActionPolicy,
++        result: Result<Value, WorkflowRuntimeError>,
++    ) -> Result<(), WorkflowRuntimeError> {
++        let (status, result) = runner::executor_outcome(policy, result);
++        sqlx::query(
++            "update tool_approvals set
++             status=case when execution_deadline>statement_timestamp() then $2 else 'unknown' end,
++             result=case when execution_deadline>statement_timestamp() then $3 else '{\"outcome\":\"unknown\"}'::jsonb end
++             where id=$1 and status='executing' and policy_hash=$4",
++        )
++        .bind(id)
++        .bind(status)
++        .bind(result)
++        .bind(hash(policy))
++        .execute(&self.pool)
++        .await?;
++        Ok(())
++    }
++
++    pub async fn cancel(
++        &self,
++        id: Uuid,
++        identity: Identity,
++    ) -> Result<Value, WorkflowRuntimeError> {
++        let mut tx = self.pool.begin().await?;
++        let changed = sqlx::query("update tool_approvals set status='cancelled' where id=$1 and sandbox_id=$2 and principal_id=$3 and status in ('pending','approved')")
++            .bind(id).bind(&identity.sandbox_id).bind(&identity.principal_id).execute(&mut *tx).await?.rows_affected();
++        if changed > 0 {
++            wake(&self.pool, &mut tx, id).await?;
++        }
++        tx.commit().await?;
++        self.read(id, identity).await
++    }
++
++    pub async fn decide(
++        &self,
++        button: slack_buttons::VerifiedButton,
++    ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
++        if button.request.workflow_name != DECISION_WORKFLOW {
++            return Err(unavailable());
++        }
++        let input = button.request.input;
++        let id = input["approval_id"]
++            .as_str()
++            .and_then(|s| Uuid::parse_str(s).ok())
++            .ok_or_else(unavailable)?;
++        reconcile_lifecycle(&self.pool, Some(id)).await?;
++        let mut tx = self.pool.begin().await?;
++        let row =
++            sqlx::query_as::<_, Record>("select * from tool_approvals where id=$1 for update")
++                .bind(id)
++                .fetch_optional(&mut *tx)
++                .await?
++                .ok_or_else(unavailable)?;
++        let p = self.policies.get(&row.action).ok_or_else(unavailable)?;
++        validate_decision(p, &row, &input, button.message.as_ref())?;
++        let user = input["click"]["user_id"].as_str().ok_or_else(unavailable)?;
++        let decision = input["click"]["action"].as_str().ok_or_else(unavailable)?;
++        let changed = sqlx::query("update tool_approvals set status=$2,decided_by=$3,decided_at=now() where id=$1 and status='pending' and expires_at>now()")
++            .bind(id).bind(decision).bind(user).execute(&mut *tx).await?.rows_affected();
++        if changed == 0 && !(row.status == decision && row.decided_by.as_deref() == Some(user)) {
++            return Err(unavailable());
++        }
++        if changed > 0 {
++            wake(&self.pool, &mut tx, id).await?;
++        }
++        tx.commit().await?;
++        Ok(CreateWorkflowRunResponse {
++            ok: true,
++            run_id: row.workflow_run_id.ok_or_else(unavailable)?.to_string(),
++            initial_run_id: row.workflow_run_id.ok_or_else(unavailable)?.to_string(),
++            task_id: row.workflow_task_id.ok_or_else(unavailable)?.to_string(),
++            status: decision.into(),
++            created: changed > 0,
++        })
++    }
++
++    pub async fn load(&self, id: Uuid, task_id: &str) -> Result<Record, WorkflowRuntimeError> {
++        sqlx::query_as("select * from tool_approvals where id=$1 and workflow_task_id=$2::uuid")
++            .bind(id)
++            .bind(task_id)
++            .fetch_optional(&self.pool)
++            .await?
++            .ok_or_else(unavailable)
++    }
++
++    pub async fn refresh(
++        &self,
++        id: Uuid,
++        policy: Option<&ActionPolicy>,
++    ) -> Result<(), WorkflowRuntimeError> {
++        reconcile_lifecycle(&self.pool, Some(id)).await?;
++        sqlx::query("update tool_approvals set status=case when expires_at<=now() then 'expired' else 'cancelled' end where id=$1 and status in ('pending','approved') and (expires_at<=now() or policy_hash<>$2)")
++            .bind(id).bind(policy.map(hash).unwrap_or_default()).execute(&self.pool).await?;
++        Ok(())
++    }
++
++    pub async fn claim(
++        &self,
++        id: Uuid,
++        policy: &ActionPolicy,
++    ) -> Result<Option<super::execution::Deadline>, WorkflowRuntimeError> {
++        let mut tx = self.pool.begin().await?;
++        // Serialize with decisions/cancellation before locking the native task.
++        // Native cancellation commits its run/task changes before reconciling
++        // the approval, avoiding an inverted application/native lock order.
++        sqlx::query("select id from tool_approvals where id=$1 for update")
++            .bind(id)
++            .fetch_optional(&mut *tx)
++            .await?;
++        // A cancelled/exhausted task must not win a late execution claim.
++        let state: Option<String> = sqlx::query_scalar(
++            "select t.state from absurd.t_centaur_workflows t join tool_approvals a on a.workflow_task_id=t.task_id where a.id=$1 for update of t"
++        ).bind(id).fetch_optional(&mut *tx).await?;
++        reconcile_lifecycle(&mut *tx, Some(id)).await?;
++        // Anchor before the query, not after its response or commit. The server's
++        // remaining budget is therefore conservative even with latency or clock skew.
++        let started = tokio::time::Instant::now();
++        let remaining: Option<f64> = if matches!(
++            state.as_deref(),
++            Some("pending" | "running" | "sleeping")
++        ) {
++            sqlx::query_scalar("update tool_approvals set status='executing',execution_deadline=clock_timestamp()+make_interval(secs=>$2) where id=$1 and status='approved' and expires_at>clock_timestamp() and policy_hash=$3 returning greatest(0,extract(epoch from execution_deadline-clock_timestamp()))::double precision")
++                .bind(id).bind(f64::from(policy.timeout_seconds)).bind(hash(policy)).fetch_optional(&mut *tx).await?
++        } else {
++            None
++        };
++        tx.commit().await?;
++        Ok(remaining.map(|seconds| super::execution::Deadline::from_remaining(started, seconds)))
++    }
++
++    pub async fn recover(&self, id: Uuid) -> Result<(), WorkflowRuntimeError> {
++        sqlx::query(
++            "update tool_approvals set status='unknown' where id=$1 and status='executing'",
++        )
++        .bind(id)
++        .execute(&self.pool)
++        .await?;
++        Ok(())
++    }
++}
++
++fn validate_decision(
++    p: &ActionPolicy,
++    row: &Record,
++    input: &Value,
++    message: Option<&Value>,
++) -> Result<(), WorkflowRuntimeError> {
++    let click = &input["click"];
++    let user = click["user_id"].as_str().unwrap_or_default();
++    if hash(p) != row.policy_hash
++        || p.team_id != row.team_id
++        || click["team_id"] != row.team_id
++        || !p.approver_user_ids.iter().any(|s| s == user)
++        || (!p.allow_self_approval && row.requester_id == user)
++        || !matches!(click["action"].as_str(), Some("approved" | "declined"))
++        || click["id"] != row.id.to_string()
++        || click["channel_id"] != row.channel_id
++        || row.message_ts.as_deref() != click["message_ts"].as_str()
++        || row.message_ts.is_none()
++        || input["payload_hash"] != row.payload_hash
++        || row.message_blocks.as_ref().is_none_or(|blocks| {
++            message.is_none_or(|m| {
++                !m["blocks"].is_array() || visible_blocks(blocks) != visible_blocks(&m["blocks"])
++            })
++        })
++    {
++        return Err(unavailable());
++    }
++    Ok(())
++}
++
++async fn wake(
++    pool: &PgPool,
++    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
++    id: Uuid,
++) -> Result<(), WorkflowRuntimeError> {
++    // The SDK owns queue SQL; the application owns the decision transaction.
++    let client = Client::from_pool_with_options(
++        pool.clone(),
++        ClientOptions {
++            queue_name: WORKFLOW_QUEUE.into(),
++            ..Default::default()
++        },
++    )?;
++    client
++        .emit_event_with_executor(&format!("{EVENT_PREFIX}{id}"), json!({}), None, &mut **tx)
++        .await?;
++    Ok(())
++}
++
++/// Reconcile from durable task state, never from an in-process completion hook.
++/// Preserve known outcomes; uncertainty can never restore execution authority.
++pub(crate) async fn reconcile_lifecycle<'e, E>(
++    executor: E,
++    id: Option<Uuid>,
++) -> Result<(), WorkflowRuntimeError>
++where
++    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
++{
++    sqlx::query("update tool_approvals a set
++        status=case when a.status='executing' then 'unknown' else 'cancelled' end,
++        result=case when a.status='executing' then '{\"outcome\":\"unknown\"}'::jsonb else null end
++        where a.workflow_task_id is not null and ($1::uuid is null or a.id=$1)
++        and a.status in ('pending','approved','executing')
++        and (not exists(select 1 from absurd.t_centaur_workflows t
++                        where t.task_id=a.workflow_task_id and t.state in ('pending','running','sleeping'))
++             or (a.status='executing' and a.execution_deadline<=now()))")
++        .bind(id).execute(executor)
++        .await?;
++    Ok(())
++}
++
++async fn resolve_context(
++    pool: &PgPool,
++    identity: &Identity,
++) -> Result<Context, WorkflowRuntimeError> {
++    let mut rows = sqlx::query_as::<_, Context>(
++        "select e.execution_id, s.thread_key, e.metadata->>'slack_team_id' as team_id,
++         e.metadata->>'slack_channel_id' as channel_id, e.metadata->>'slack_user_id' as requester_id
++         from sessions s join session_executions e using(thread_key)
++         where s.sandbox_id=$1 and s.iron_control_principal=$2 and e.status='running'
++         and e.metadata->>'source'='slackbotv2' and e.metadata->>'platform'='slack'
++         and e.metadata->>'slack_home_team_id'=e.metadata->>'slack_team_id'
++         and e.metadata->>'slack_user_id' is not null and e.metadata->>'slack_channel_id' is not null")
++        .bind(&identity.sandbox_id).bind(&identity.principal_id).fetch_all(pool).await?;
++    if rows.len() != 1 {
++        return Err(unavailable());
++    }
++    let ctx = rows.remove(0);
++    thread_timestamp(&ctx)?;
++    Ok(ctx)
++}
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs b/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
+new file mode 100644
+index 00000000..f1dc8caf
+--- /dev/null
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
+@@ -0,0 +1,254 @@
++use super::repository::Record;
++use super::*;
++
++const MAX_PUBLIC_OUTPUT_BYTES: usize = 2000;
++
++/// This is an explicit publication allowlist, not an automatic secret scanner.
++/// Malformed/missing/oversized fields suppress the entire public output.
++fn public_output(policy: &ActionPolicy, raw: &Value) -> Option<Value> {
++    let mut selected = serde_json::Map::new();
++    for field in &policy.public_result_fields {
++        let text = raw.as_object()?.get(field)?.as_str()?;
++        if text.len() > MAX_PUBLIC_OUTPUT_BYTES {
++            return None;
++        }
++        selected.insert(field.clone(), json!(text));
++    }
++    let output = Value::Object(selected);
++    (display_json(&output).ok()?.len() <= MAX_PUBLIC_OUTPUT_BYTES).then_some(output)
++}
++
++pub(super) fn executor_outcome(
++    policy: &ActionPolicy,
++    result: Result<Value, WorkflowRuntimeError>,
++) -> (&'static str, Value) {
++    let Ok(raw) = result else {
++        return ("unknown", json!({"outcome":"unknown"}));
++    };
++    let mut result = json!({"outcome":"succeeded"});
++    if !policy.public_result_fields.is_empty() {
++        if let Some(output) = public_output(policy, &raw) {
++            result["output"] = output;
++        } else {
++            // Execution succeeded; missing public output is not a reason to
++            // repeat a potentially side-effecting operation.
++            result["output_omitted"] = json!(true);
++        }
++    }
++    ("succeeded", result)
++}
++
++pub(super) fn final_message(
++    id: Uuid,
++    status: &str,
++    result: Option<&Value>,
++    policy: Option<&ActionPolicy>,
++) -> Value {
++    let mut text = format!("Approval {id}: {status}.");
++    if status == "unknown" {
++        text.push_str(" Inspect the provider outcome before submitting another request.");
++    }
++    let mut blocks = vec![json!({"type":"section","text":{
++        "type":"plain_text","emoji":false,"text":text}})];
++    if status == "succeeded"
++        && let Some(policy) = policy.filter(|p| !p.public_result_fields.is_empty())
++        && let Some(raw) = result.and_then(|value| value.get("output"))
++        && let Some(output) = public_output(policy, raw)
++    {
++        // Only the deliberately published projection is persisted here. Never
++        // use the raw workflow result in a Slack message or fallback text.
++        if let Ok(display) = display_json(&output) {
++            blocks.push(json!({"type":"section","text":{
++                "type":"plain_text","emoji":false,"text":display}}));
++            text.push('\n');
++            text.push_str(&display);
++        }
++    }
++    json!({"text":text,"blocks":blocks,"mrkdwn":false})
++}
++
++pub(super) fn validate_executor(
++    p: &ActionPolicy,
++    sandbox: Option<&WorkflowHostSandboxRuntime>,
++) -> Result<(), WorkflowRuntimeError> {
++    WorkflowEnablement::from_env()?.ensure_enabled(&p.workflow)?;
++    let sandbox = sandbox.ok_or_else(unavailable)?;
++    if !sandbox.requires_approval(&p.workflow)
++        || sandbox
++            .spec_for_workflow(&p.workflow)?
++            .iron_control_principal
++            .as_deref()
++            != Some(&p.executor_principal)
++    {
++        return Err(unavailable());
++    }
++    Ok(())
++}
++
++fn card(row: &Record) -> Value {
++    let mut blocks = vec![
++        json!({"type":"section","text":{"type":"plain_text","emoji":false,
++        "text":format!("Approve action {}? Requested by {}. Expires {}.\nPayload SHA-256: {}",
++            row.action,row.requester_id,row.expires_at,row.payload_hash)}}),
++    ];
++    for chunk in row.payload_json.as_bytes().chunks(2900) {
++        blocks.push(
++            json!({"type":"section","text":{"type":"plain_text","emoji":false,
++            "text":std::str::from_utf8(chunk).expect("display is ASCII")}}),
++        );
++    }
++    let buttons = [("approved", "Accept"), ("declined", "Decline")].map(|(action, label)| {
++        json!({"type":"button","text":{"type":"plain_text","text":label},
++            "action_id":format!("centaur.workflow.action:{}:{action}",row.id),
++            "value":json!({"workflow_name":DECISION_WORKFLOW,
++                "input":{"approval_id":row.id,"payload_hash":row.payload_hash}}).to_string()})
++    });
++    blocks.push(json!({"type":"actions","elements":buttons}));
++    json!({"channel":row.channel_id,"thread_ts":row.thread_ts,"client_msg_id":row.id.to_string(),
++        "text":format!("Approval requested: {}",row.action),"blocks":blocks,"unfurl_links":false,"unfurl_media":false})
++}
++
++pub(crate) async fn run(
++    input: WorkflowTaskInput,
++    ctx: TaskContext,
++    session_runtime: SessionRuntime,
++    sandbox: Option<WorkflowHostSandboxRuntime>,
++    clients: WorkflowQueueClients,
++) -> absurd::Result<WorkflowResult> {
++    run_inner(input, ctx, session_runtime, sandbox, clients)
++        .await
++        .map_err(absurd_error)
++}
++
++async fn run_inner(
++    input: WorkflowTaskInput,
++    ctx: TaskContext,
++    session_runtime: SessionRuntime,
++    sandbox: Option<WorkflowHostSandboxRuntime>,
++    clients: WorkflowQueueClients,
++) -> Result<WorkflowResult, WorkflowRuntimeError> {
++    let id = input.input["approval_id"]
++        .as_str()
++        .and_then(|s| Uuid::parse_str(s).ok())
++        .ok_or_else(unavailable)?;
++    let repo = clients.approval_repository();
++    let mut row = repo.load(id, ctx.task_id()).await?;
++    // A committed execution claim is never retried. A restarted driver can only
++    // report uncertainty; the external provider may already have accepted it.
++    if row.status == "executing" {
++        repo.recover(id).await?;
++    }
++    let p = repo.policies.get(&row.action);
++    repo.refresh(id, p).await?;
++    row = repo.load(id, ctx.task_id()).await?;
++    if row.status == "pending" && row.message_ts.is_none() {
++        let message: Value = ctx
++            .step("approval.card", || async {
++                let mut message = card(&row);
++                let secret = env::var("CENTAUR_JWT_SIGNING_SECRET").unwrap_or_default();
++                slack_buttons::sign_message(&mut message, secret.trim().as_bytes())
++                    .map_err(absurd_error)?;
++                Ok(message)
++            })
++            .await?;
++        let posted: Value = ctx
++            .step("approval.post", || async {
++                send_slack_request("chat.postMessage", message.clone())
++                    .await
++                    .map_err(absurd_error)
++            })
++            .await?;
++        let ts = posted["ts"]
++            .as_str()
++            .filter(|s| timestamp(s))
++            .ok_or_else(|| {
++                WorkflowRuntimeError::Upstream("Slack did not return a message timestamp".into())
++            })?;
++        sqlx::query("update tool_approvals set message_ts=$2,message_blocks=$3 where id=$1 and message_ts is null")
++            .bind(id).bind(ts).bind(&message["blocks"]).execute(&repo.pool).await?;
++    }
++    loop {
++        repo.refresh(id, p).await?;
++        row = repo.load(id, ctx.task_id()).await?;
++        if row.status != "pending" {
++            break;
++        }
++        // Durable native event wait; periodic wake bounds policy/expiry checks.
++        match ctx
++            .await_event::<Value>(
++                &format!("{EVENT_PREFIX}{id}"),
++                AwaitEventOptions {
++                    step_name: Some("approval.decision".into()),
++                    timeout: Some(Duration::from_secs(30)),
++                },
++            )
++            .await
++        {
++            Ok(_) | Err(absurd::Error::Timeout(_)) => {}
++            Err(absurd::Error::Suspend) => return Err(WorkflowRuntimeError::Suspend),
++            Err(error) => return Err(error.into()),
++        }
++    }
++    if row.status == "approved" {
++        let policy = p.ok_or_else(unavailable)?;
++        if validate_executor(policy, sandbox.as_ref()).is_err() {
++            sqlx::query(
++                "update tool_approvals set status='cancelled' where id=$1 and status='approved'",
++            )
++            .bind(id)
++            .execute(&repo.pool)
++            .await?;
++        } else {
++            if let Some(deadline) = repo.claim(id, policy).await? {
++                // Arguments are exclusively the frozen DB payload. No click data
++                // or caller-supplied principal is forwarded into the executor.
++                let execution = WorkflowTaskInput {
++                    workflow_name: policy.workflow.clone(),
++                    input: row.payload["arguments"].clone(),
++                    harness_type: input.harness_type,
++                    slack_button_feedback: None,
++                };
++                let result = run_python_workflow_host_in_sandbox(
++                    execution,
++                    ctx.clone(),
++                    session_runtime,
++                    sandbox.ok_or_else(unavailable)?,
++                    clients.clone(),
++                    Some(execution::ClaimedExecution {
++                        repo: &repo,
++                        id,
++                        policy,
++                        deadline,
++                    }),
++                )
++                .await;
++                result?;
++            }
++        }
++    }
++    repo.refresh(id, p).await?;
++    row = repo.load(id, ctx.task_id()).await?;
++    if let Some(ts) = &row.message_ts {
++        let mut message = final_message(
++            row.id,
++            &row.status,
++            row.result.as_ref(),
++            p.filter(|policy| hash(policy) == row.policy_hash),
++        );
++        message["channel"] = json!(row.channel_id);
++        message["ts"] = json!(ts);
++        ctx.step("approval.final", || async {
++            send_slack_request("chat.update", message)
++                .await
++                .map_err(absurd_error)
++        })
++        .await?;
++    }
++    Ok(WorkflowResult {
++        workflow_name: DRIVER_WORKFLOW.into(),
++        run_id: ctx.run_id().into(),
++        task_id: ctx.task_id().into(),
++        steps: vec!["approval".into()],
++        output: json!({"id":id,"status":row.status}),
++    })
++}
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs b/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
+new file mode 100644
+index 00000000..a59b7ac1
+--- /dev/null
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
+@@ -0,0 +1,266 @@
++use super::*;
++mod execution;
++mod postgres;
++
++#[test]
++fn registry_resolution_freezes_identity_and_fails_closed() {
++    let mut p = policy();
++    p.executor_principal.clear();
++    let raw = serde_json::to_value(&p).unwrap();
++    assert!(raw.get("executor_principal").is_none());
++    let policies = parse_policies(&json!({"action": raw}).to_string()).unwrap();
++    let mut registry = WorkflowPrincipalAssignments {
++        registered: BTreeMap::from([("guarded_action".into(), "prn_executor".into())]),
++        required: BTreeSet::from(["guarded_action".into()]),
++        approval_required: BTreeSet::from(["guarded_action".into()]),
++    };
++    let resolved = resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all());
++    assert_eq!(resolved["action"].executor_principal, "prn_executor");
++    assert_eq!(hash(&resolved["action"]), hash(&policy())); // Existing pins keep their binding.
++    registry
++        .registered
++        .insert("guarded_action".into(), "prn_replacement".into());
++    let changed = resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all());
++    assert_ne!(hash(&resolved["action"]), hash(&changed["action"]));
++    let pinned = BTreeMap::from([("action".into(), policy())]);
++    assert!(resolve_registry_policies(&pinned, &registry, &WorkflowEnablement::all()).is_empty());
++    assert!(
++        resolve_registry_policies(&policies, &registry, &WorkflowEnablement::allowlist(""))
++            .is_empty()
++    );
++    registry
++        .registered
++        .insert("guarded_action".into(), "prn_requester".into());
++    assert!(resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all()).is_empty());
++    registry.registered.clear();
++    assert!(resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all()).is_empty());
++    registry
++        .registered
++        .insert("guarded_action".into(), "prn_executor".into());
++    registry.approval_required.clear();
++    assert!(resolve_registry_policies(&policies, &registry, &WorkflowEnablement::all()).is_empty());
++}
++
++#[tokio::test]
++async fn child_admission_uses_the_same_access_gate_without_enqueuing() {
++    let pool = sqlx::postgres::PgPoolOptions::new()
++        .connect_lazy("postgres://localhost/unused")
++        .unwrap();
++    let client = Client::from_pool_with_options(pool, ClientOptions::default()).unwrap();
++    let policies = Arc::new(BTreeMap::from([("action".into(), policy())]));
++    let clients = WorkflowQueueClients {
++        approval_policies: policies.clone(),
++        workflow_host_sandbox: None,
++        standard: client.clone(),
++        slack_live: client.clone(),
++        etl: client.clone(),
++        etl_backfill: client,
++    };
++    let parent = WorkflowTaskInput {
++        workflow_name: "ordinary".into(),
++        input: json!({}),
++        harness_type: HarnessType::Codex,
++        slack_button_feedback: None,
++    };
++    assert_eq!(
++        access::classify("ordinary", &policies, None),
++        access::WorkflowAccess::Ordinary
++    );
++    assert_eq!(
++        access::classify("guarded_action", &policies, None),
++        access::WorkflowAccess::ApprovalRequired
++    );
++    assert_eq!(
++        access::classify(DRIVER_WORKFLOW, &policies, None),
++        access::WorkflowAccess::Internal
++    );
++    for name in [
++        "guarded_action",
++        DRIVER_WORKFLOW,
++        DECISION_WORKFLOW,
++        "centaur_approval_future",
++    ] {
++        assert!(clients.ensure_public_workflow(name).is_err());
++        let result = start_python_child_workflow(
++            &json!({"workflow_name":name,"input":{}}),
++            &parent,
++            &clients,
++        )
++        .await;
++        assert!(matches!(result, Err(WorkflowRuntimeError::Disabled(_))));
++    }
++}
++
++fn policy() -> ActionPolicy {
++    ActionPolicy {
++        workflow: "guarded_action".into(),
++        executor_principal: "prn_executor".into(),
++        requester_principals: vec!["prn_requester".into()],
++        team_id: "T1".into(),
++        approver_user_ids: vec!["U1".into()],
++        allow_self_approval: false,
++        expires_seconds: 3600,
++        timeout_seconds: 60,
++        implementation_revision: "reviewed-commit".into(),
++        public_result_fields: vec![],
++    }
++}
++
++#[test]
++fn public_result_fields_are_explicit_bounded_and_policy_bound() {
++    let mut p = policy();
++    let original = serde_json::to_value(&p).unwrap();
++    assert!(original.get("public_result_fields").is_none());
++    assert!(
++        parse_policies(&json!({"action":original}).to_string()).unwrap()["action"]
++            .public_result_fields
++            .is_empty()
++    );
++    let old_policy_hash = hash(&p);
++    let old_payload = payload(&p, json!({})).unwrap().0;
++    p.public_result_fields = vec!["message".into()];
++    assert!(parse_policies(&json!({"action":p}).to_string()).is_ok());
++    let (new_payload, display) = payload(&p, json!({})).unwrap();
++    assert_eq!(new_payload["public_result_fields"], json!(["message"]));
++    assert!(display.contains("public_result_fields"));
++    assert_ne!(hash(&p), old_policy_hash);
++    assert_ne!(hash(&new_payload), hash(&old_payload));
++    for fields in [
++        vec!["".into()],
++        vec!["*".into()],
++        vec!["nested.message".into()],
++        vec!["message".into(), "message".into()],
++        vec!["x".repeat(81)],
++        (0..9).map(|i| format!("field{i}")).collect(),
++    ] {
++        p.public_result_fields = fields;
++        assert!(parse_policies(&json!({"action":p}).to_string()).is_err());
++    }
++}
++
++#[test]
++fn executor_output_is_private_by_default_and_errors_are_always_private() {
++    let mut p = policy();
++    let (status, result) = runner::executor_outcome(
++        &p,
++        Ok(json!({"message":"Hello world!","credential":"do-not-publish"})),
++    );
++    assert_eq!(status, "succeeded");
++    assert_eq!(result, json!({"outcome":"succeeded"}));
++    p.public_result_fields = vec!["message".into()];
++    let (status, result) = runner::executor_outcome(
++        &p,
++        Err(WorkflowRuntimeError::Upstream("do-not-publish".into())),
++    );
++    assert_eq!(status, "unknown");
++    assert_eq!(result, json!({"outcome":"unknown"}));
++}
++
++#[test]
++fn hello_world_public_result_reaches_slack_without_unselected_fields() {
++    let mut p = policy();
++    p.public_result_fields = vec!["message".into()];
++    let (status, result) = runner::executor_outcome(
++        &p,
++        Ok(json!({"message":"Hello world!","credential":"do-not-publish"})),
++    );
++    assert_eq!(
++        result,
++        json!({"outcome":"succeeded","output":{"message":"Hello world!"}})
++    );
++    let message = runner::final_message(Uuid::nil(), status, Some(&result), Some(&p));
++    assert!(message["text"].as_str().unwrap().contains("Hello world!"));
++    assert_eq!(message["mrkdwn"], false);
++    assert_eq!(message["blocks"][1]["text"]["type"], "plain_text");
++    assert!(!message.to_string().contains("do-not-publish"));
++    for status in [
++        "pending",
++        "approved",
++        "declined",
++        "expired",
++        "cancelled",
++        "unknown",
++    ] {
++        let message = runner::final_message(Uuid::nil(), status, Some(&result), Some(&p));
++        assert!(!message.to_string().contains("Hello world!"));
++    }
++    for policy in [None, Some(policy())] {
++        let message =
++            runner::final_message(Uuid::nil(), "succeeded", Some(&result), policy.as_ref());
++        assert!(!message.to_string().contains("Hello world!"));
++    }
++}
++
++#[test]
++fn malformed_public_output_is_omitted_without_repeating_successful_execution() {
++    let mut p = policy();
++    p.public_result_fields = vec!["message".into()];
++    for raw in [
++        json!(null),
++        json!("Hello world!"),
++        json!({}),
++        json!({"message":42}),
++        json!({"message":{"credential":"do-not-publish"}}),
++        json!({"message":"x".repeat(2001)}),
++        json!({"message":"🦄".repeat(200)}),
++    ] {
++        let (status, result) = runner::executor_outcome(&p, Ok(raw));
++        assert_eq!(status, "succeeded");
++        assert_eq!(result, json!({"outcome":"succeeded","output_omitted":true}));
++    }
++    p.public_result_fields.push("other".into());
++    let (_, result) = runner::executor_outcome(
++        &p,
++        Ok(json!({"message":"x".repeat(1100),"other":"x".repeat(1100)})),
++    );
++    assert_eq!(result, json!({"outcome":"succeeded","output_omitted":true}));
++}
++
++#[test]
++fn public_output_is_plaintext_and_escaped_in_slack_fallback() {
++    let mut p = policy();
++    p.public_result_fields = vec!["message".into()];
++    let (_, result) = runner::executor_outcome(&p, Ok(json!({"message":"<@U1> & \u{202e}"})));
++    let message = runner::final_message(Uuid::nil(), "succeeded", Some(&result), Some(&p));
++    let text = message["text"].as_str().unwrap();
++    assert!(text.is_ascii());
++    assert!(!text.contains("<@"));
++    assert!(text.contains("\\u202e"));
++    assert_eq!(message["blocks"][1]["text"]["emoji"], false);
++}
++
++#[test]
++fn policies_fail_closed_and_are_disabled_by_default() {
++    assert!(parse_policies("{}").unwrap().is_empty());
++    let mut p = policy();
++    assert!(parse_policies(&json!({"action":p}).to_string()).is_ok());
++    p.requester_principals.push(p.executor_principal.clone());
++    assert!(parse_policies(&json!({"action":p}).to_string()).is_err());
++    let mut p = policy();
++    p.workflow = DRIVER_WORKFLOW.into();
++    assert!(parse_policies(&json!({"action":p}).to_string()).is_err());
++    assert!(parse_policies(&json!({"action":{"workflow":"guarded_action"}}).to_string()).is_err());
++}
++
++#[test]
++fn complete_display_preserves_numbers_and_escapes_invisible_text() {
++    let arguments: Value =
++        serde_json::from_str(r#"{"number":9007199254740993,"text":"<@U1> & \u202e"}"#).unwrap();
++    let (p, display) = payload(&policy(), arguments).unwrap();
++    assert_eq!(serde_json::from_str::<Value>(&display).unwrap(), p);
++    assert!(display.is_ascii());
++    assert!(!display.contains("<@"));
++    assert!(display.contains("9007199254740993"));
++    assert!(payload(&policy(), json!({"data":"x".repeat(12000)})).is_err());
++    assert!(payload(&policy(), json!([])).is_err());
++}
++
++#[test]
++fn slack_generated_fields_are_the_only_ignored_visible_changes() {
++    let expected = json!([{"type":"section","text":{"type":"plain_text","text":"payload"}}]);
++    let generated = json!([{"type":"section","block_id":"generated","text":{"type":"plain_text","text":"payload","emoji":true}}]);
++    assert_eq!(visible_blocks(&expected), visible_blocks(&generated));
++    let mut forged = generated;
++    forged[0]["text"]["text"] = json!("other payload");
++    assert_ne!(visible_blocks(&expected), visible_blocks(&forged));
++}
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/tests/execution.rs b/services/api-rs/crates/centaur-workflows/src/approvals/tests/execution.rs
+new file mode 100644
+index 00000000..a093b430
+--- /dev/null
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/tests/execution.rs
+@@ -0,0 +1,152 @@
++use super::*;
++use crate::approvals::execution::{Deadline, HostSandbox};
++use async_trait::async_trait;
++use centaur_sandbox_core::{
++    ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
++    SandboxResult, SandboxStatus,
++};
++use std::sync::atomic::{AtomicBool, Ordering};
++use tokio::time::Instant;
++
++#[tokio::test(start_paused = true)]
++async fn expired_claim_never_polls_executor() {
++    let started = Instant::now();
++    let deadline = Deadline::from_remaining(started, 1.0);
++    tokio::time::sleep(Duration::from_secs(2)).await; // delayed claim commit/response
++    let polled = AtomicBool::new(false);
++    assert!(
++        deadline
++            .run(async {
++                polled.store(true, Ordering::SeqCst);
++                Ok(())
++            })
++            .await
++            .is_err()
++    );
++    assert!(!polled.load(Ordering::SeqCst));
++}
++
++#[tokio::test(start_paused = true)]
++async fn provisioning_and_protocol_share_one_budget() {
++    let started = Instant::now();
++    let deadline = Deadline::from_remaining(started, 1.0);
++    let result = deadline
++        .run(async {
++            tokio::time::sleep(Duration::from_millis(800)).await;
++            deadline.check()?;
++            tokio::time::sleep(Duration::from_millis(400)).await;
++            Ok(())
++        })
++        .await;
++    assert!(result.is_err());
++    assert_eq!(Instant::now() - started, Duration::from_secs(1));
++}
++
++#[tokio::test(start_paused = true)]
++async fn late_startup_is_stopped_without_dispatch() {
++    let backend = Arc::new(SlowBackend::new(Duration::from_secs(2), false));
++    let runtime = SandboxRuntime::backend(backend.clone(), SandboxSpec::new("fixture"));
++    let mut host = HostSandbox::new(runtime);
++    let deadline = Deadline::from_remaining(Instant::now(), 1.0);
++    let dispatched = AtomicBool::new(false);
++    assert!(
++        deadline
++            .run(async {
++                let _io = host.start(SandboxSpec::new("fixture")).await?;
++                deadline.check()?;
++                dispatched.store(true, Ordering::SeqCst);
++                Ok(())
++            })
++            .await
++            .is_err()
++    );
++    assert!(!dispatched.load(Ordering::SeqCst));
++    drop(host);
++    backend.stopped.notified().await;
++    assert!(!dispatched.load(Ordering::SeqCst));
++}
++
++#[tokio::test(start_paused = true)]
++async fn cancellation_during_startup_retains_cleanup_ownership() {
++    let backend = Arc::new(SlowBackend::new(Duration::from_secs(2), false));
++    let runtime = SandboxRuntime::backend(backend.clone(), SandboxSpec::new("fixture"));
++    let mut host = HostSandbox::new(runtime);
++    assert!(
++        tokio::time::timeout(
++            Duration::from_millis(50),
++            host.start(SandboxSpec::new("fixture"))
++        )
++        .await
++        .is_err()
++    );
++    drop(host);
++    backend.stopped.notified().await;
++}
++
++#[tokio::test(start_paused = true)]
++async fn io_setup_failure_still_stops_created_sandbox() {
++    let backend = Arc::new(SlowBackend::new(Duration::ZERO, true));
++    let runtime = SandboxRuntime::backend(backend.clone(), SandboxSpec::new("fixture"));
++    let mut host = HostSandbox::new(runtime);
++    assert!(host.start(SandboxSpec::new("fixture")).await.is_err());
++    backend.stopped.notified().await;
++}
++
++struct SlowBackend {
++    delay: Duration,
++    fail_io: bool,
++    stopped: tokio::sync::Notify,
++}
++
++impl SlowBackend {
++    fn new(delay: Duration, fail_io: bool) -> Self {
++        Self {
++            delay,
++            fail_io,
++            stopped: tokio::sync::Notify::new(),
++        }
++    }
++}
++
++#[async_trait]
++impl SandboxBackend for SlowBackend {
++    fn name(&self) -> &'static str {
++        "approval-deadline-fixture"
++    }
++    async fn create(&self, _spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
++        tokio::time::sleep(self.delay).await;
++        Ok(SandboxHandle {
++            id: SandboxId::new("fixture"),
++            backend: self.name().into(),
++        })
++    }
++    async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
++        if self.fail_io {
++            return Err(SandboxError::backend("fixture I/O failure"));
++        }
++        Ok(SandboxIo::new(
++            Box::pin(tokio::io::sink()),
++            Box::pin(tokio::io::empty()),
++            Box::pin(tokio::io::empty()),
++        ))
++    }
++    async fn stop(&self, _id: &SandboxId) -> SandboxResult<()> {
++        self.stopped.notify_one();
++        Ok(())
++    }
++    async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
++        unreachable!()
++    }
++    async fn observe(&self, _id: &SandboxId) -> SandboxResult<ObservedSandbox> {
++        unreachable!()
++    }
++    async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
++        unreachable!()
++    }
++    async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
++        unreachable!()
++    }
++    async fn resume(&self, _id: &SandboxId) -> SandboxResult<()> {
++        unreachable!()
++    }
++}
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs b/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs
+new file mode 100644
+index 00000000..ef71af0a
+--- /dev/null
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs
+@@ -0,0 +1,430 @@
++use super::*;
++
++#[tokio::test]
++async fn native_admission_decision_claim_and_recovery() {
++    let Ok(url) = env::var("TOOL_APPROVAL_TEST_DATABASE_URL") else {
++        return;
++    };
++    let admin = PgPool::connect(&url).await.unwrap();
++    let installed: bool =
++        sqlx::query_scalar("select exists(select 1 from pg_namespace where nspname='absurd')")
++            .fetch_one(&admin)
++            .await
++            .unwrap();
++    if !installed {
++        for sql in [
++            include_str!("../../../../centaur-session-sqlx/migrations/0007_absurd_workflows.sql"),
++            include_str!(
++                "../../../../centaur-session-sqlx/migrations/0009_absurd_await_event_task_guard.sql"
++            ),
++        ] {
++            sqlx::raw_sql(sql).execute(&admin).await.unwrap();
++        }
++    }
++    let schema = format!("approval_test_{}", Uuid::new_v4().simple());
++    sqlx::query(&format!("create schema {schema}"))
++        .execute(&admin)
++        .await
++        .unwrap();
++    let search = format!("set search_path to {schema}, public");
++    let pool = sqlx::postgres::PgPoolOptions::new()
++        .max_connections(5)
++        .after_connect(move |conn, _| {
++            let search = search.clone();
++            Box::pin(async move {
++                sqlx::query(&search).execute(conn).await?;
++                Ok(())
++            })
++        })
++        .connect(&url)
++        .await
++        .unwrap();
++    for sql in [
++        include_str!("../../../../centaur-session-sqlx/migrations/0001_session_control_plane.sql"),
++        include_str!(
++            "../../../../centaur-session-sqlx/migrations/0003_session_iron_control_principal.sql"
++        ),
++        include_str!("../../../../centaur-session-sqlx/migrations/0056_tool_approvals.sql"),
++        include_str!(
++            "../../../../centaur-session-sqlx/migrations/0057_workflow_native_approvals.sql"
++        ),
++    ] {
++        sqlx::raw_sql(sql).execute(&pool).await.unwrap();
++    }
++    let client = Client::from_pool_with_options(
++        pool.clone(),
++        ClientOptions {
++            queue_name: WORKFLOW_QUEUE.into(),
++            ..Default::default()
++        },
++    )
++    .unwrap();
++    client.create_queue(None, Default::default()).await.unwrap();
++    // Enqueue participates in the caller's transaction, not a separate commit.
++    let mut tx = pool.begin().await.unwrap();
++    let rolled_back = client
++        .spawn_with_executor(
++            WORKFLOW_TASK,
++            json!({"workflow_name":DRIVER_WORKFLOW}),
++            SpawnOptions {
++                queue: Some(WORKFLOW_QUEUE.into()),
++                ..Default::default()
++            },
++            &mut *tx,
++        )
++        .await
++        .unwrap();
++    tx.rollback().await.unwrap();
++    let count: i64 = sqlx::query_scalar(
++        "select count(*) from absurd.t_centaur_workflows where task_id=$1::uuid",
++    )
++    .bind(rolled_back.task_id)
++    .fetch_one(&pool)
++    .await
++    .unwrap();
++    assert_eq!(count, 0);
++    let event = format!("rollback:{}", Uuid::new_v4());
++    let mut tx = pool.begin().await.unwrap();
++    client
++        .emit_event_with_executor(&event, json!({"decision":"approved"}), None, &mut *tx)
++        .await
++        .unwrap();
++    tx.rollback().await.unwrap();
++    let count: i64 =
++        sqlx::query_scalar("select count(*) from absurd.e_centaur_workflows where event_name=$1")
++            .bind(&event)
++            .fetch_one(&pool)
++            .await
++            .unwrap();
++    assert_eq!(count, 0);
++    let mut tx = pool.begin().await.unwrap();
++    client
++        .emit_event_with_executor(&event, json!({"decision":"approved"}), None, &mut *tx)
++        .await
++        .unwrap();
++    tx.commit().await.unwrap();
++    client
++        .emit_event(&event, json!({"decision":"declined"}), None)
++        .await
++        .unwrap();
++    let emitted: Value =
++        sqlx::query_scalar("select payload from absurd.e_centaur_workflows where event_name=$1")
++            .bind(&event)
++            .fetch_one(&pool)
++            .await
++            .unwrap();
++    assert_eq!(emitted, json!({"decision":"approved"}));
++    sqlx::query("insert into sessions(thread_key,sandbox_id,harness_type,status,iron_control_principal) values('slack:C1:1.000','sandbox-test','codex','active','prn_requester')").execute(&pool).await.unwrap();
++    sqlx::query("insert into session_executions(execution_id,thread_key,status,metadata) values('exe_test','slack:C1:1.000','running',$1)")
++        .bind(json!({"source":"slackbotv2","platform":"slack","slack_team_id":"T1","slack_home_team_id":"T1","slack_channel_id":"C1","slack_user_id":"U2"})).execute(&pool).await.unwrap();
++    let mut p = policy();
++    p.approver_user_ids.push("U3".into());
++    p.public_result_fields = vec!["message".into()];
++    let repo = Repository {
++        pool: pool.clone(),
++        policies: Arc::new(BTreeMap::from([("action".into(), p.clone())])),
++    };
++    let req = |key, arguments| Request {
++        sandbox_id: "sandbox-test".into(),
++        principal_id: "prn_requester".into(),
++        execution_id: "exe_test".into(),
++        action: "action".into(),
++        idempotency_key: key,
++        arguments,
++    };
++    let identity = || Identity {
++        sandbox_id: "sandbox-test".into(),
++        principal_id: "prn_requester".into(),
++    };
++    let key = Uuid::new_v4();
++    let admitted = repo
++        .request(req(key, json!({"frozen":true})), &client)
++        .await
++        .unwrap();
++    let id: Uuid = serde_json::from_value(admitted["id"].clone()).unwrap();
++    assert_eq!(
++        repo.request(req(key, json!({"frozen":true})), &client)
++            .await
++            .unwrap(),
++        admitted
++    );
++    assert!(
++        repo.request(req(key, json!({"frozen":false})), &client)
++            .await
++            .is_err()
++    );
++    assert!(
++        repo.read(
++            id,
++            Identity {
++                sandbox_id: "other".into(),
++                principal_id: "prn_requester".into()
++            }
++        )
++        .await
++        .is_err()
++    );
++    let task: String =
++        sqlx::query_scalar("select workflow_task_id::text from tool_approvals where id=$1")
++            .bind(id)
++            .fetch_one(&pool)
++            .await
++            .unwrap();
++    assert!(repo.load(id, &Uuid::new_v4().to_string()).await.is_err());
++    let row = repo.load(id, &task).await.unwrap();
++    let params: Value =
++        sqlx::query_scalar("select params from absurd.t_centaur_workflows where task_id=$1::uuid")
++            .bind(&task)
++            .fetch_one(&pool)
++            .await
++            .unwrap();
++    assert_eq!(params["input"]["approval_id"], json!(id));
++    let blocks = json!([{"type":"section","text":{"type":"plain_text","text":row.payload_json}}]);
++    sqlx::query("update tool_approvals set message_ts='2.000',message_blocks=$2 where id=$1")
++        .bind(id)
++        .bind(&blocks)
++        .execute(&pool)
++        .await
++        .unwrap();
++    let button = |user: &str, action: &str| slack_buttons::VerifiedButton {
++        request: CreateWorkflowRunRequest {
++            workflow_name: DECISION_WORKFLOW.into(),
++            input: json!({"approval_id":id,"payload_hash":row.payload_hash,"click":{"id":id,"action":action,"channel_id":"C1","message_ts":"2.000","team_id":"T1","user_id":user}}),
++            idempotency_key: Some("test".into()),
++            harness_type: None,
++            max_attempts: None,
++        },
++        message: Some(json!({"blocks":blocks})),
++    };
++    for user in ["U2", "UUNKNOWN"] {
++        assert!(repo.decide(button(user, "approved")).await.is_err());
++    }
++    for field in ["id", "channel_id", "message_ts", "team_id"] {
++        let mut forged = button("U1", "approved");
++        forged.request.input["click"][field] = json!("OTHER");
++        assert!(repo.decide(forged).await.is_err());
++    }
++    let mut forged = button("U1", "approved");
++    forged.message.as_mut().unwrap()["blocks"][0]["text"]["text"] = json!("changed");
++    assert!(repo.decide(forged).await.is_err());
++    // Requests survive the agent turn ending.
++    sqlx::query("update session_executions set status='completed' where execution_id='exe_test'")
++        .execute(&pool)
++        .await
++        .unwrap();
++    let (a, b) = tokio::join!(
++        repo.decide(button("U1", "approved")),
++        repo.decide(button("U3", "declined"))
++    );
++    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
++    if repo.read(id, identity()).await.unwrap()["status"] == "declined" {
++        assert!(repo.claim(id, &p).await.unwrap().is_none());
++        // Independent test setup for the execution claim race.
++        sqlx::query("update tool_approvals set status='approved' where id=$1")
++            .bind(id)
++            .execute(&pool)
++            .await
++            .unwrap();
++    }
++    let (a, b) = tokio::join!(repo.claim(id, &p), repo.claim(id, &p));
++    assert_eq!(
++        usize::from(a.unwrap().is_some()) + usize::from(b.unwrap().is_some()),
++        1
++    );
++    repo.recover(id).await.unwrap();
++    assert_eq!(
++        repo.read(id, identity()).await.unwrap()["status"],
++        "unknown"
++    );
++    assert!(repo.claim(id, &p).await.unwrap().is_none());
++    // Public output is persisted only after the one-shot execution claim.
++    let public_policy = p.clone();
++    let hello = || Ok(json!({"message":"Hello world!","credential":"do-not-publish"}));
++    repo.finish(id, &public_policy, hello()).await.unwrap();
++    assert_eq!(
++        repo.read(id, identity()).await.unwrap()["status"],
++        "unknown"
++    );
++    // Independent setup to exercise completion without rerunning an executor.
++    sqlx::query("update tool_approvals set status='executing' where id=$1")
++        .bind(id)
++        .execute(&pool)
++        .await
++        .unwrap();
++    let mut wrong_policy = public_policy.clone();
++    wrong_policy.public_result_fields.push("credential".into());
++    repo.finish(id, &wrong_policy, hello()).await.unwrap();
++    assert_eq!(
++        repo.read(id, identity()).await.unwrap()["status"],
++        "executing"
++    );
++    repo.finish(id, &public_policy, hello()).await.unwrap();
++    let completed = repo.read(id, identity()).await.unwrap();
++    assert_eq!(completed["status"], "succeeded");
++    assert_eq!(
++        completed["result"],
++        json!({"outcome":"succeeded","output":{"message":"Hello world!"}})
++    );
++    let loaded = repo.load(id, &task).await.unwrap();
++    assert_eq!(loaded.result.as_ref(), Some(&completed["result"]));
++    let message = runner::final_message(
++        id,
++        &loaded.status,
++        loaded.result.as_ref(),
++        Some(&public_policy),
++    );
++    assert!(message["text"].as_str().unwrap().contains("Hello world!"));
++    assert!(!message.to_string().contains("do-not-publish"));
++    assert!(repo.claim(id, &p).await.unwrap().is_none());
++    repo.finish(id, &public_policy, Err(unavailable()))
++        .await
++        .unwrap();
++    assert_eq!(repo.read(id, identity()).await.unwrap(), completed);
++    for (expected, expired, revoked) in [
++        ("cancelled", false, true),
++        ("expired", true, false),
++        ("cancelled", false, false),
++    ] {
++        sqlx::query("update tool_approvals set status='pending',expires_at=now()+interval '1 hour' where id=$1").bind(id).execute(&pool).await.unwrap();
++        if expired {
++            sqlx::query(
++                "update tool_approvals set expires_at=now()-interval '1 second' where id=$1",
++            )
++            .bind(id)
++            .execute(&pool)
++            .await
++            .unwrap();
++        }
++        if !expired && !revoked {
++            repo.cancel(id, identity()).await.unwrap();
++        }
++        repo.refresh(id, if revoked { None } else { Some(&p) })
++            .await
++            .unwrap();
++        assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
++        assert!(repo.decide(button("U1", "approved")).await.is_err());
++    }
++    // Repair uses durable native terminal state, including when the worker
++    // never ran again. Known results are preserved and no authority is restored.
++    for native in ["cancelled", "failed", "completed"] {
++        sqlx::query("update absurd.t_centaur_workflows set state=$2 where task_id=$1::uuid")
++            .bind(&task)
++            .bind(native)
++            .execute(&pool)
++            .await
++            .unwrap();
++        for (state, expected) in [
++            ("pending", "cancelled"),
++            ("approved", "cancelled"),
++            ("executing", "unknown"),
++            ("succeeded", "succeeded"),
++            ("declined", "declined"),
++        ] {
++            sqlx::query("update tool_approvals set status=$2,expires_at=now()+interval '1 hour',execution_deadline=now()+interval '1 hour' where id=$1")
++                .bind(id).bind(state).execute(&pool).await.unwrap();
++            repository::reconcile_lifecycle(&pool, None).await.unwrap();
++            assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
++            assert!(repo.claim(id, &p).await.unwrap().is_none());
++        }
++    }
++    sqlx::query("update absurd.t_centaur_workflows set state='pending' where task_id=$1::uuid")
++        .bind(&task)
++        .execute(&pool)
++        .await
++        .unwrap();
++    sqlx::query("update tool_approvals set status='executing',execution_deadline=now()-interval '1 second' where id=$1")
++        .bind(id).execute(&pool).await.unwrap();
++    assert_eq!(
++        repo.read(id, identity()).await.unwrap()["status"],
++        "unknown"
++    );
++    repo.finish(id, &p, hello()).await.unwrap();
++    assert_eq!(
++        repo.read(id, identity()).await.unwrap()["status"],
++        "unknown"
++    );
++    // Late completion must be uncertain even if reconciliation has not run yet.
++    sqlx::query("update tool_approvals set status='executing',execution_deadline=clock_timestamp()-interval '1 second' where id=$1")
++        .bind(id).execute(&pool).await.unwrap();
++    repo.finish(id, &p, hello()).await.unwrap();
++    let late = repo.load(id, &task).await.unwrap();
++    assert_eq!(late.status, "unknown");
++    assert_eq!(late.result, Some(json!({"outcome":"unknown"})));
++
++    // A delayed claim commit must consume the database budget, not reset it.
++    let mut short_policy = p.clone();
++    short_policy.timeout_seconds = 1;
++    sqlx::query("update tool_approvals set status='approved',policy_hash=$2 where id=$1")
++        .bind(id)
++        .bind(hash(&short_policy))
++        .execute(&pool)
++        .await
++        .unwrap();
++    sqlx::raw_sql("create function delay_approval_claim_commit() returns trigger language plpgsql as $$ begin perform pg_sleep(1.05); return new; end $$;
++        create constraint trigger delayed_approval_claim after update on tool_approvals deferrable initially deferred for each row when (old.status='approved' and new.status='executing') execute function delay_approval_claim_commit();")
++        .execute(&pool).await.unwrap();
++    let delayed_deadline = repo.claim(id, &short_policy).await.unwrap().unwrap();
++    assert!(delayed_deadline.check().is_err());
++    sqlx::raw_sql("drop trigger delayed_approval_claim on tool_approvals; drop function delay_approval_claim_commit();")
++        .execute(&pool).await.unwrap();
++    repo.finish(id, &short_policy, hello()).await.unwrap();
++    assert_eq!(repo.load(id, &task).await.unwrap().status, "unknown");
++    sqlx::query("update tool_approvals set policy_hash=$2 where id=$1")
++        .bind(id)
++        .bind(hash(&p))
++        .execute(&pool)
++        .await
++        .unwrap();
++
++    // Persist before slow shutdown, and stop waiting at the original deadline.
++    sqlx::query("update tool_approvals set status='executing',execution_deadline=clock_timestamp()+interval '1 hour' where id=$1")
++        .bind(id).execute(&pool).await.unwrap();
++    let cleanup_started = std::sync::atomic::AtomicBool::new(false);
++    let deadline =
++        crate::approvals::execution::Deadline::from_remaining(tokio::time::Instant::now(), 0.2);
++    let claim = crate::approvals::execution::ClaimedExecution {
++        repo: &repo,
++        id,
++        policy: &p,
++        deadline,
++    };
++    tokio::time::timeout(Duration::from_secs(2), claim.complete(hello(), async {
++        assert_eq!(repo.load(id, &task).await.unwrap().status, "succeeded");
++        cleanup_started.store(true, std::sync::atomic::Ordering::SeqCst);
++        sqlx::query("update tool_approvals set execution_deadline=clock_timestamp()-interval '1 second' where id=$1")
++            .bind(id).execute(&pool).await.unwrap();
++        repository::reconcile_lifecycle(&pool, Some(id)).await.unwrap();
++        assert_eq!(repo.load(id, &task).await.unwrap().status, "succeeded");
++        std::future::pending::<()>().await;
++    })).await.unwrap().unwrap();
++    assert!(cleanup_started.load(std::sync::atomic::Ordering::SeqCst));
++    assert!(deadline.check().is_err());
++    assert_eq!(repo.load(id, &task).await.unwrap().status, "succeeded");
++
++    // Race the native cancellation against the one-use execution claim.
++    sqlx::query("update tool_approvals set status='approved' where id=$1")
++        .bind(id)
++        .execute(&pool)
++        .await
++        .unwrap();
++    let (claim, cancelled) = tokio::time::timeout(Duration::from_secs(5), async {
++        tokio::join!(repo.claim(id, &p), client.cancel_task(&task, None))
++    })
++    .await
++    .unwrap();
++    cancelled.unwrap();
++    let expected = if claim.unwrap().is_some() {
++        "unknown"
++    } else {
++        "cancelled"
++    };
++    assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
++    assert!(repo.decide(button("U1", "approved")).await.is_err());
++    assert!(repo.claim(id, &p).await.unwrap().is_none());
++    pool.close().await;
++    sqlx::query(&format!("drop schema {schema} cascade"))
++        .execute(&admin)
++        .await
++        .unwrap();
++    admin.close().await;
++}
+diff --git a/services/api-rs/crates/centaur-workflows/src/lib.rs b/services/api-rs/crates/centaur-workflows/src/lib.rs
+index 7d910109..cef02aac 100644
+--- a/services/api-rs/crates/centaur-workflows/src/lib.rs
++++ b/services/api-rs/crates/centaur-workflows/src/lib.rs
+@@ -37,6 +37,8 @@ use tokio::{
+ };
+ use tracing::{info, warn};
+ 
++mod access;
++pub mod approvals;
+ pub mod slack_button_feedback;
+ pub mod slack_buttons;
+ 
+@@ -110,6 +112,8 @@ pub struct WorkflowRuntime {
+ }
+ 
+ struct WorkflowRuntimeInner {
++    approval_policies: Arc<approvals::Policies>,
++    workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
+     client: Client,
+     slack_live_client: Client,
+     etl_client: Client,
+@@ -215,6 +219,8 @@ fn parse_workflow_allowed_names(raw: &str) -> BTreeSet<String> {
+ 
+ #[derive(Clone)]
+ struct WorkflowQueueClients {
++    workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
++    approval_policies: Arc<approvals::Policies>,
+     standard: Client,
+     slack_live: Client,
+     etl: Client,
+@@ -223,6 +229,7 @@ struct WorkflowQueueClients {
+ 
+ #[derive(Clone)]
+ pub struct WorkflowHostSandboxRuntime {
++    session_runtime: Option<SessionRuntime>,
+     runtime: SandboxRuntime,
+     spec: SandboxSpec,
+     workflow_principals: Arc<RwLock<WorkflowPrincipalAssignments>>,
+@@ -230,6 +237,7 @@ pub struct WorkflowHostSandboxRuntime {
+ 
+ #[derive(Clone, Default)]
+ struct WorkflowPrincipalAssignments {
++    approval_required: BTreeSet<String>,
+     required: BTreeSet<String>,
+     registered: BTreeMap<String, String>,
+ }
+@@ -262,6 +270,7 @@ impl WorkflowHostSandboxRuntime {
+         Self {
+             runtime,
+             spec,
++            session_runtime: None,
+             workflow_principals: Arc::new(RwLock::new(WorkflowPrincipalAssignments::default())),
+         }
+     }
+@@ -270,7 +279,15 @@ impl WorkflowHostSandboxRuntime {
+         &self,
+         registered: BTreeMap<String, String>,
+         required: BTreeSet<String>,
++        approval_required: BTreeSet<String>,
+     ) {
++        if let Some(runtime) = &self.session_runtime {
++            for name in &approval_required {
++                if let Some(principal) = registered.get(name) {
++                    runtime.reserve_workflow_principal(principal);
++                }
++            }
++        }
+         let mut current = self
+             .workflow_principals
+             .write()
+@@ -278,6 +295,7 @@ impl WorkflowHostSandboxRuntime {
+         *current = WorkflowPrincipalAssignments {
+             required,
+             registered,
++            approval_required,
+         };
+     }
+ 
+@@ -295,6 +313,14 @@ impl WorkflowHostSandboxRuntime {
+         }
+         Ok(spec)
+     }
++
++    fn requires_approval(&self, workflow_name: &str) -> bool {
++        self.workflow_principals
++            .read()
++            .unwrap_or_else(|p| p.into_inner())
++            .approval_required
++            .contains(workflow_name)
++    }
+ }
+ 
+ #[derive(Clone)]
+@@ -610,15 +636,19 @@ impl WorkflowRuntime {
+         schedule_client
+             .create_queue(Some(WORKFLOW_SCHEDULE_QUEUE), CreateQueueOptions::default())
+             .await?;
+-        let workflow_clients = WorkflowQueueClients {
+-            standard: client.clone(),
+-            slack_live: slack_live_client.clone(),
+-            etl: etl_client.clone(),
+-            etl_backfill: etl_backfill_client.clone(),
+-        };
++        let approval_policies = Arc::new(approvals::policies_from_env()?);
++        for policy in approval_policies.values() {
++            if !policy.executor_principal.is_empty() {
++                session_runtime.reserve_workflow_principal(&policy.executor_principal);
++            }
++        }
+ 
+         let discovery = discover_python_workflow_metadata().await?;
+         let enablement = WorkflowEnablement::from_env()?;
++        let workflow_host_sandbox = workflow_host_sandbox.map(|mut sandbox| {
++            sandbox.session_runtime = Some(session_runtime.clone());
++            sandbox
++        });
+         let workflow_host_sandbox = prepare_workflow_host_sandbox(
+             workflow_host_sandbox,
+             workflow_principal_registrar.clone(),
+@@ -626,6 +656,15 @@ impl WorkflowRuntime {
+             &enablement,
+         )
+         .await?;
++        let workflow_clients = WorkflowQueueClients {
++            workflow_host_sandbox: workflow_host_sandbox.clone(),
++            approval_policies: approval_policies.clone(),
++            standard: client.clone(),
++            slack_live: slack_live_client.clone(),
++            etl: etl_client.clone(),
++            etl_backfill: etl_backfill_client.clone(),
++        };
++        approvals::repository::reconcile_lifecycle(store.pool(), None).await?;
+         let schedule_registry = Arc::new(RwLock::new(build_schedule_registry(
+             &discovery,
+             &enablement,
+@@ -828,6 +867,8 @@ impl WorkflowRuntime {
+ 
+         Ok(Self {
+             inner: Arc::new(WorkflowRuntimeInner {
++                approval_policies,
++                workflow_host_sandbox,
+                 client,
+                 slack_live_client,
+                 etl_client,
+@@ -861,6 +902,7 @@ impl WorkflowRuntime {
+                 "workflow_name must not be empty".to_owned(),
+             ));
+         }
++        self.ensure_public_workflow(workflow_name)?;
+         WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
+         let client = self.client_for_workflow(workflow_name);
+         let spawn = client
+@@ -1050,7 +1092,21 @@ impl WorkflowRuntime {
+             (WORKFLOW_ETL_BACKFILL_QUEUE, &self.inner.etl_backfill_client),
+         ] {
+             if let Some(run) = self.get_run_for_queue(queue_name, run_id).await? {
++                // Release native run/task locks before touching application
++                // state: decision emission locks the approval before waking a
++                // run. A crash between commits is repaired from durable state.
+                 client.cancel_task(&run.task_id, None).await?;
++                if queue_name == WORKFLOW_QUEUE {
++                    let approval_id = sqlx::query_scalar::<_, uuid::Uuid>(
++                        "select id from tool_approvals where workflow_task_id=$1::uuid",
++                    )
++                    .bind(&run.task_id)
++                    .fetch_optional(client.pool())
++                    .await?;
++                    if let Some(id) = approval_id {
++                        approvals::repository::reconcile_lifecycle(client.pool(), Some(id)).await?;
++                    }
++                }
+                 return Ok(());
+             }
+         }
+@@ -1062,6 +1118,9 @@ impl WorkflowRuntime {
+         event_name: &str,
+         payload: Value,
+     ) -> Result<(), WorkflowRuntimeError> {
++        if event_name.starts_with(approvals::EVENT_PREFIX) {
++            return Err(approvals::unavailable());
++        }
+         self.inner
+             .client
+             .emit_event(event_name, payload.clone(), Some(WORKFLOW_QUEUE))
+@@ -1740,6 +1799,8 @@ struct PythonWorkflowDiscovery {
+     schedule: Option<Value>,
+     #[serde(default)]
+     principal: Option<PythonWorkflowPrincipal>,
++    #[serde(default)]
++    requires_approval: bool,
+ }
+ 
+ #[derive(Debug, Deserialize)]
+@@ -1756,6 +1817,7 @@ struct PythonWorkflowDiscoveryPayload {
+ 
+ #[derive(Debug, Default)]
+ struct PythonWorkflowMetadata {
++    approval_required: BTreeSet<String>,
+     webhooks: Vec<RegisteredWorkflowWebhook>,
+     schedules: Vec<Value>,
+     workflow_names: BTreeSet<String>,
+@@ -1767,6 +1829,11 @@ fn metadata_from_discovery_payload(
+ ) -> PythonWorkflowMetadata {
+     let mut metadata = PythonWorkflowMetadata::default();
+     for workflow in payload.workflows {
++        if workflow.requires_approval {
++            metadata
++                .approval_required
++                .insert(workflow.workflow_name.clone());
++        }
+         metadata
+             .workflow_names
+             .insert(workflow.workflow_name.clone());
+@@ -1808,7 +1875,7 @@ async fn prepare_workflow_host_sandbox(
+     enablement: &WorkflowEnablement,
+ ) -> Result<Option<WorkflowHostSandboxRuntime>, WorkflowRuntimeError> {
+     let Some(sandbox) = workflow_host_sandbox else {
+-        if !discovery.principals.is_empty() {
++        if !discovery.principals.is_empty() || !discovery.approval_required.is_empty() {
+             let workflow_names = discovery
+                 .principals
+                 .keys()
+@@ -1838,16 +1905,37 @@ async fn reconcile_workflow_principals(
+     enablement: &WorkflowEnablement,
+ ) -> Result<(), WorkflowRuntimeError> {
+     let mut principals = discovery.principals.clone();
++    if let Some(runtime) = &sandbox.session_runtime {
++        for name in &discovery.approval_required {
++            let reference = match principals.get(name) {
++                Some(WorkflowPrincipalDeclaration::Managed) => {
++                    canonical_workflow_principal_foreign_id(name)
++                }
++                Some(WorkflowPrincipalDeclaration::Existing(reference)) => reference.clone(),
++                None => continue,
++            };
++            runtime.reserve_workflow_principal(&reference);
++        }
++    }
+     principals.retain(|workflow_name, _| enablement.is_enabled(workflow_name));
++    let approval_required = discovery.approval_required.clone();
++    if approval_required
++        .iter()
++        .any(|name| enablement.is_enabled(name) && !principals.contains_key(name))
++    {
++        return Err(WorkflowRuntimeError::BadRequest(
++            "approval-only workflows require WORKFLOW_PRINCIPAL".into(),
++        ));
++    }
+     let required = principals.keys().cloned().collect();
+     let registered = match registrar.register_workflow_principals(&principals).await {
+         Ok(registered) => registered,
+         Err(error) => {
+-            sandbox.update_workflow_principals(BTreeMap::new(), required);
++            sandbox.update_workflow_principals(BTreeMap::new(), required, approval_required);
+             return Err(error);
+         }
+     };
+-    sandbox.update_workflow_principals(registered, required);
++    sandbox.update_workflow_principals(registered, required, approval_required);
+     Ok(())
+ }
+ 
+@@ -1991,6 +2079,14 @@ fn spawn_workflow_metadata_reconciler(
+         ticker.tick().await;
+         loop {
+             ticker.tick().await;
++            // Independent of Python discovery success. Durable native terminal
++            // state repairs approval records after cancellation/crash/retry exhaustion.
++            if let Err(error) =
++                approvals::repository::reconcile_lifecycle(workflow_clients.standard.pool(), None)
++                    .await
++            {
++                warn!(%error, "failed to reconcile workflow approvals");
++            }
+             match reconcile_workflow_metadata_once(
+                 &schedule_client,
+                 &webhook_registry,
+@@ -2283,6 +2379,7 @@ impl RemovedWorkflowReaper {
+         }
+         let run_keyed = active_runs
+             .iter()
++            .filter(|(_, _, name)| name != approvals::DRIVER_WORKFLOW)
+             .map(|(queue, task_id, name)| (format!("{queue}:{task_id}"), name.clone()))
+             .collect::<Vec<_>>();
+         let stale_runs = select_stale_cancellations(
+@@ -2452,6 +2549,9 @@ async fn run_schedule_tick(
+             }));
+         }
+     };
++    workflow_clients
++        .ensure_public_workflow(&schedule.workflow_name)
++        .map_err(absurd_error)?;
+     let fire_key = format!(
+         "schedule:{}:{}",
+         schedule.schedule_id,
+@@ -2739,6 +2839,19 @@ async fn run_centaur_workflow_inner(
+     let _heartbeat_guard = start_workflow_task_heartbeat(ctx.clone())
+         .await
+         .map_err(absurd_error)?;
++    if input.workflow_name == approvals::DRIVER_WORKFLOW {
++        return approvals::run(
++            input,
++            ctx,
++            session_runtime,
++            workflow_host_sandbox,
++            workflow_clients,
++        )
++        .await;
++    }
++    workflow_clients
++        .ensure_public_workflow(&input.workflow_name)
++        .map_err(absurd_error)?;
+     WorkflowEnablement::from_env()
+         .and_then(|enablement| enablement.ensure_enabled(&input.workflow_name))
+         .map_err(absurd_error)?;
+@@ -2984,6 +3097,7 @@ async fn run_python_workflow_host(
+             session_runtime,
+             sandbox,
+             workflow_clients,
++            None,
+         )
+         .await;
+     }
+@@ -3141,50 +3255,112 @@ async fn run_python_workflow_host_in_sandbox(
+     session_runtime: SessionRuntime,
+     sandbox: WorkflowHostSandboxRuntime,
+     workflow_clients: WorkflowQueueClients,
++    approval: Option<approvals::execution::ClaimedExecution<'_>>,
+ ) -> Result<Value, WorkflowRuntimeError> {
+-    let mut spec = sandbox.spec_for_workflow(&input.workflow_name)?;
+-    spec.env
+-        .retain(|entry| entry.name != "CENTAUR_JWT_SIGNING_SECRET");
+-    spec = spec
+-        // Also mask inheritance from the development-only local process backend.
+-        .env("CENTAUR_JWT_SIGNING_SECRET", "")
+-        .env("WORKFLOW_RUN_ID", ctx.run_id())
+-        .env("WORKFLOW_TASK_ID", ctx.task_id())
+-        .env("WORKFLOW_NAME", input.workflow_name.clone());
+-    if env::var_os("WORKFLOW_DIRS").is_none() && !sandbox_spec_has_env(&spec, "WORKFLOW_DIRS") {
+-        spec = spec.env("WORKFLOW_DIRS", default_workflow_dirs());
+-    }
+-    if let Ok(database_url) = env::var("DATABASE_URL")
+-        && !sandbox_spec_has_env(&spec, "DATABASE_URL")
+-    {
+-        spec = spec.env("DATABASE_URL", database_url);
+-    }
+-    let (sandbox_id, io) = sandbox.runtime.create_running_io(spec).await?;
+-    let mut stdin = io.stdin;
+-    let stderr_task = tokio::spawn(async move {
+-        let _guard = io.guard;
+-        let mut lines = BufReader::new(io.stderr).lines();
+-        let mut collected = Vec::new();
+-        while let Ok(Some(line)) = lines.next_line().await {
+-            collected.push(line);
++    let deadline = approval.as_ref().map(|claim| claim.deadline);
++    let mut host = approvals::execution::HostSandbox::new(sandbox.runtime.clone());
++    let execute = async {
++        let expected = if approval.is_some() {
++            access::WorkflowAccess::ApprovalRequired
++        } else {
++            access::WorkflowAccess::Ordinary
++        };
++        if access::classify(
++            &input.workflow_name,
++            &workflow_clients.approval_policies,
++            Some(&sandbox),
++        ) != expected
++            || (approval.is_some() && !sandbox.requires_approval(&input.workflow_name))
++        {
++            return Err(approvals::unavailable());
+         }
+-        collected.join("\n")
+-    });
+-    let result = run_python_workflow_host_protocol(
+-        input,
+-        ctx,
+-        session_runtime,
+-        workflow_clients,
+-        &mut stdin,
+-        io.stdout,
+-        stderr_task,
+-    )
+-    .await;
+-    drop(stdin);
+-    if let Err(error) = sandbox.runtime.stop_sandbox(&sandbox_id).await {
+-        warn!(sandbox_id = %sandbox_id.as_str(), %error, "failed to stop workflow host sandbox");
++        let mut spec = sandbox.spec_for_workflow(&input.workflow_name)?;
++        if approval.is_none()
++            && let (Some(runtime), Some(principal)) =
++                (&sandbox.session_runtime, &spec.iron_control_principal)
++        {
++            runtime
++                .ensure_unreserved_principal_reference(principal)
++                .await?;
++        }
++        if approval.as_ref().is_some_and(|claim| {
++            spec.iron_control_principal.as_ref() != Some(&claim.policy.executor_principal)
++        }) {
++            return Err(approvals::unavailable());
++        }
++        spec.env.retain(|entry| {
++            !matches!(
++                entry.name.as_str(),
++                "CENTAUR_JWT_SIGNING_SECRET" | "CENTAUR_APPROVAL_PROTOCOL"
++            )
++        });
++        spec = spec
++            // Also mask inheritance from the development-only local process backend.
++            .env("CENTAUR_JWT_SIGNING_SECRET", "")
++            .env(
++                "CENTAUR_APPROVAL_PROTOCOL",
++                if approval.is_some() {
++                    "workflow-tool-approvals-v1"
++                } else {
++                    ""
++                },
++            )
++            .env("WORKFLOW_RUN_ID", ctx.run_id())
++            .env("WORKFLOW_TASK_ID", ctx.task_id())
++            .env("WORKFLOW_NAME", input.workflow_name.clone());
++        if env::var_os("WORKFLOW_DIRS").is_none() && !sandbox_spec_has_env(&spec, "WORKFLOW_DIRS") {
++            spec = spec.env("WORKFLOW_DIRS", default_workflow_dirs());
++        }
++        if let Ok(database_url) = env::var("DATABASE_URL")
++            && !sandbox_spec_has_env(&spec, "DATABASE_URL")
++        {
++            spec = spec.env("DATABASE_URL", database_url);
++        }
++        let io = host.start(spec).await?;
++        // Recheck immediately before dispatch: startup never earns a fresh budget.
++        if let Some(deadline) = deadline {
++            deadline.check()?;
++        }
++        let mut stdin = io.stdin;
++        let stderr_task = tokio::spawn(async move {
++            let _guard = io.guard;
++            let mut lines = BufReader::new(io.stderr).lines();
++            let mut collected = Vec::new();
++            while let Ok(Some(line)) = lines.next_line().await {
++                collected.push(line);
++            }
++            collected.join("\n")
++        });
++        let _stderr_guard = AbortWorkflowStderr(stderr_task.abort_handle());
++        run_python_workflow_host_protocol(
++            input,
++            ctx,
++            session_runtime,
++            workflow_clients,
++            &mut stdin,
++            io.stdout,
++            stderr_task,
++        )
++        .await
++    };
++    let result = match deadline {
++        Some(deadline) => deadline.run(execute).await,
++        None => execute.await,
++    };
++    if let Some(approval) = approval {
++        approval.complete(result, host.cleanup()).await
++    } else {
++        host.cleanup().await;
++        result
++    }
++}
++
++struct AbortWorkflowStderr(tokio::task::AbortHandle);
++
++impl Drop for AbortWorkflowStderr {
++    fn drop(&mut self) {
++        self.0.abort();
+     }
+-    result
+ }
+ 
+ fn sandbox_spec_has_env(spec: &SandboxSpec, name: &str) -> bool {
+@@ -3558,6 +3734,15 @@ async fn handle_python_context_request(
+                 Err(error) => Err(error.to_string()),
+             }
+         }
++        Some("ctx.call_tool")
++            if access::classify(
++                &input.workflow_name,
++                &workflow_clients.approval_policies,
++                workflow_clients.workflow_host_sandbox.as_ref(),
++            ) != access::WorkflowAccess::Ordinary =>
++        {
++            Err("approval executors require the sandbox-local centaur-tools shim".into())
++        }
+         Some("ctx.call_tool") => match call_python_workflow_tool(message).await {
+             Ok(value) => Ok(value),
+             Err(error) => Err(error.to_string()),
+@@ -3610,6 +3795,7 @@ async fn start_python_child_workflow(
+                 "ctx.workflow.start requires a non-empty workflow_name".to_owned(),
+             )
+         })?;
++    workflow_clients.ensure_public_workflow(workflow_name)?;
+     WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
+     let child_input = message.get("input").cloned().unwrap_or_else(|| json!({}));
+     if !child_input.is_object() {
+@@ -5349,6 +5535,7 @@ mod tests {
+     #[test]
+     fn required_workflow_principal_fails_closed_when_unregistered() {
+         let assignments = WorkflowPrincipalAssignments {
++            approval_required: BTreeSet::new(),
+             required: BTreeSet::from(["nightly_report".to_owned()]),
+             registered: BTreeMap::new(),
+         };
+diff --git a/services/api-rs/crates/centaur-workflows/src/slack_buttons.rs b/services/api-rs/crates/centaur-workflows/src/slack_buttons.rs
+index b172a2c1..b146dc00 100644
+--- a/services/api-rs/crates/centaur-workflows/src/slack_buttons.rs
++++ b/services/api-rs/crates/centaur-workflows/src/slack_buttons.rs
+@@ -34,6 +34,32 @@ pub struct Invocation {
+     pub message: Option<Value>,
+ }
+ 
++/// Provenance that cannot be deserialized from caller-supplied workflow input.
++pub struct VerifiedButton {
++    pub(crate) request: CreateWorkflowRunRequest,
++    pub(crate) message: Option<Value>,
++}
++
++impl VerifiedButton {
++    pub fn workflow_name(&self) -> &str {
++        &self.request.workflow_name
++    }
++    pub fn into_request(self) -> CreateWorkflowRunRequest {
++        self.request
++    }
++}
++
++pub fn verify_button(
++    invocation: Invocation,
++    secret: &[u8],
++) -> Result<VerifiedButton, &'static str> {
++    let message = invocation.message.clone();
++    Ok(VerifiedButton {
++        request: verify(invocation, secret)?,
++        message,
++    })
++}
++
+ fn button_mac(secret: &[u8]) -> Hmac<Sha256> {
+     let mut derive = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+     derive.update(b"centaur:workflow-buttons:v1");
+diff --git a/services/api-rs/rfcs/0006-tool-approvals.md b/services/api-rs/rfcs/0006-tool-approvals.md
+new file mode 100644
+index 00000000..e668305c
+--- /dev/null
++++ b/services/api-rs/rfcs/0006-tool-approvals.md
+@@ -0,0 +1,254 @@
++# RFC 0006: Workflow-native approvals
++
++Status: Implemented, opt-in; credentialed end-to-end proof required before activation.
++
++## Boundary
++
++This is an explicit guarded-action API, not interception of arbitrary tool or
++outbound HTTP calls. An ordinary sandbox uses `centaur-console approvals`; only the
++approval-only workflow executor has the provider credential grant. Hiding a
++tool or putting an instruction in the prompt is not enforcement.
++
++The implementation reuses native workflow queues, durable event waits, signed
++workflow buttons, Slack transport, workflow-host sandboxes and
++`WORKFLOW_PRINCIPAL`. It adds one durable authorization record, not another
++scheduler, Slack delivery worker or tool-host runtime.
++
++## Lifecycle
++
++1. Console authenticates the current sandbox proxy entitlement and attests its
++   sandbox/principal IDs. API admission resolves exactly one running, home-team
++   Slack execution, its original thread and requester. Callers cannot choose
++   the destination, executor or approving actor.
++2. Core validates the action policy and registered executor. It freezes the full
++   JSON arguments, policy hash and payload hash. Request insertion and enqueue
++   of the native approval driver commit in one PostgreSQL transaction.
++3. The driver posts plaintext payload sections and signed native
++   `centaur.workflow.action:` buttons. It stores the original message timestamp
++   and complete signed card, then suspends on a durable event.
++4. Existing Slack ingress verifies Slack's webhook signature. The native
++   workflow-action endpoint verifies the button signature. Approval decisions
++   additionally require the Slack ingress service identity; ordinary workflow
++   input and its `click.user_id` field are never authority.
++5. Core checks current policy hash, team, channel, original message/card, payload
++   hash, expiry, allowlisted actor and self-approval policy. One locked transition
++   chooses the decision; the update and native wake event are atomic.
++6. Immediately before execution, core verifies enablement, approval-only marker
++   and exact registered principal. One compare-and-set commits
++   `approved -> executing`. The existing workflow host runs the pinned executor
++   with only the frozen arguments and its workflow-scoped proxy credentials.
++7. The driver stores a redacted outcome, optionally including explicitly public
++   result fields, and updates Slack through native checkpoints. `succeeded`
++   means the executor returned successfully, not that an external asynchronous
++   business workflow finished.
++
++Slack authenticates an app webhook containing an actor ID; it does not provide
++a user-held cryptographic signature. See
++[Slack request verification](https://docs.slack.dev/authentication/verifying-requests-from-slack/).
++
++## Executor contract
++
++```python
++WORKFLOW_NAME = "guarded_ticket_create"
++WORKFLOW_PRINCIPAL = True
++WORKFLOW_REQUIRES_APPROVAL = True
++
++async def handler(inp, ctx):
++    return await ctx.call_tool("tickets", "create_ticket", inp)
++```
++
++Direct API, button, schedule and child-workflow starts cannot execute an
++approval-only workflow. Reserved driver names are also blocked from public
++starts, and the driver checks its task ID against the request's owner. A forged
++approval object does not unlock an executor. Marker discovery requires a scoped
++principal and sandboxed workflow hosting. The approved host receives
++`CENTAUR_APPROVAL_PROTOCOL=workflow-tool-approvals-v1`; ordinary hosts receive
++an empty value. Deployment adapters may require this to reject older cores.
++
++Executor principal IDs and declared aliases are reserved across runtime clones,
++including when an approval-only workflow is disabled. Ordinary agent sessions,
++generic tool hosts and other workflow hosts cannot select them. Reservations
++are monotonic per process; removing an action never frees its credential for
++ordinary execution during that process's lifetime. Before activation, remove
++any pre-existing ordinary sessions/proxies using the executor principal.
++
++Install the protected tool and `centaur-tools` shim in the workflow sandbox.
++The privileged path refuses the API-side `WORKFLOW_TOOL_API_URL` fallback.
++Protected executors must be short, single-dispatch workflows, without durable
++sleeps, human waits or arbitrary agents/code execution. A suspension or failure
++after claim is uncertain and is not resumed. Put long-running business work
++behind a provider-side workflow and approve its start operation.
++
++## Policy
++
++Default `CENTAUR_TOOL_APPROVAL_POLICIES={}` grants no actions. Example:
++
++```json
++{
++  "tickets-create": {
++    "workflow": "guarded_ticket_create",
++    "requester_principals": ["prn_Conversation"],
++    "team_id": "TEXAMPLE",
++    "approver_user_ids": ["UREVIEWER"],
++    "allow_self_approval": false,
++    "expires_seconds": 3600,
++    "timeout_seconds": 120,
++    "implementation_revision": "reviewed-immutable-release"
++  }
++}
++```
++
++Admission resolves the executor OID from the workflow's `WORKFLOW_PRINCIPAL`
++registry entry and freezes it in the payload and policy hash. Missing registry
++entries, disabled workflows and requester/executor overlap fail closed. An
++optional `executor_principal` field can pin the expected OID for compatibility;
++a mismatched pin is unavailable. A changed registry binding invalidates pending
++approvals rather than transferring them to the new principal. Never reuse an
++executor principal for ordinary sessions or unrelated workflows.
++Remove the provider mutation capability from ordinary principals,
++default roles, requester OAuth grants and alternate usable routes. Grant only
++the required provider host/path/method/key to the executor. Keep Slack bot tokens
++in infrastructure, not either sandbox.
++
++Pin the executor image, tool code and workflow definitions to reviewed immutable
++revisions. `implementation_revision` is an audit/policy binding, not code
++attestation. Change it whenever the operation changes. Do not hot-reload
++protected code with approvals pending. Policies are startup configuration:
++revocation is effective only after all API replicas use the updated policy.
++
++No new Slackbot flag or interaction prefix is needed. Shared ingress receivers
++must already forward the native workflow action prefix and original signed
++webhook bytes. Configure API policy through the chart's existing extra-env
++facility; no chart default enables this feature.
++
++### Deliberately public results
++
++`public_result_fields` is an optional list of up to eight distinct top-level
++field names. It defaults to `[]`, preserving output redaction for existing
++actions. Each selected value must be a string, and the whole selected object
++must fit in 2,000 ASCII-escaped display bytes. Nested objects, missing fields,
++non-string values and oversized output cause the entire public projection to
++be omitted, with `output_omitted: true`; execution still counts as succeeded
++and must not be repeated merely to recover output.
++
++Selected fields are persisted as `result.output`, returned to the requesting
++bot by the CLI/status API, and displayed as plaintext in the final Slack card.
++All unselected fields and all executor errors remain private. This is an
++explicit publication policy, **not a secret scanner**: only select fields that
++reviewed executor code guarantees are non-secret. The field list is displayed
++on the approval card and bound into both the payload and policy hashes.
++
++### Deployment-owned executors
++
++Core supplies the approval protocol, not a catalog of deployable executors.
++Keep executor implementations, including credential-free smoke-test handlers,
++in a deployment-owned workflow source. Load them through the existing
++`overlays.sources` / `workflowsSubdir` mechanism; use immutable source revisions
++and the same bundle for discovery and sandbox execution. Keep executor-specific
++unit and host-integration tests beside that source.
++
++Deployment configuration owns action policies, workflow/tool allowlists,
++approver identities, target settings, credential grants and release pins.
++Those settings must not be baked into the shared approval engine. Test the
++credential-free round trip before granting a provider capability, then prove
++both the permitted path and ordinary-sandbox bypass rejection.
++
++## Recovery and cancellation
++
++Requests remain pending after the originating agent turn ends. Only admission
++requires an active execution. Request ownership for status/cancel remains
++sandbox/principal-scoped; losing that sandbox may require operator inspection.
++`centaur-console approvals cancel <id>` cancels pending or approved requests. Cancellation
++after the execution claim cannot undo the external operation.
++
++Pending/approved requests expire or cancel on changed/removed policy. Native
++event waits wake at most every 30 seconds to recheck. A committed execution claim
++is never retried. If the driver resumes after a crash with status `executing`,
++it records `unknown`. Timeouts, executor failures and ambiguous provider
++responses also become `unknown`. Inspect the provider before resubmitting.
++The execution budget starts with the database claim. Core maps the database's
++remaining budget to a conservative monotonic deadline before waiting for the
++claim commit; transport and commit delays cannot grant extra execution time.
++Provisioning and protocol execution share that deadline, with another check
++before sending `workflow.start`. A late-created sandbox is cleaned up without
++starting the executor. Core persists the redacted outcome before shutdown and
++waits for cleanup only within the remaining budget; cancellation or expiry
++leaves best-effort cleanup running. Completion received after the database
++deadline becomes `unknown`, even before lifecycle reconciliation runs.
++
++Use stable provider request/workflow IDs and reject duplicate operations where
++available; this protocol does not promise exactly-once external effects.
++
++Slack post/checkpoint failure can leave a duplicate card. Only the recorded
++original message/card can authorize the request. Final-message delivery retries
++do not invoke the executor again.
++
++Approval status includes `workflow_task_id` and `workflow_run_id` for the native
++workflow history. Cancelling that native run also reconciles its approval:
++unclaimed requests become `cancelled`, claimed requests become `unknown`, and
++known terminal outcomes are preserved. Native cancellation commits first;
++reconciliation is recoverable if the process dies between commits. The execution
++claim checks and locks native task state, so already-cancelled tasks cannot
++obtain execution authority.
++
++Startup, the existing workflow maintenance loop, status reads, decision handling
++and execution claims reconcile from persisted task state. Exhausted/removed
++tasks and elapsed execution deadlines cannot leave a request actionable forever.
++If `WORKFLOW_RECONCILE_INTERVAL_SECS=0`, startup and request-path reconciliation
++still operate, but there is no periodic background repair. Reconciliation never
++replays an executor or replaces a known result. A force-cancelled/failed native
++driver cannot deliver its final Slack edit; its card may be stale, but subsequent
++clicks are rejected and the status API reports the reconciled outcome. Use the
++approval-specific cancel command when possible so the driver can deliver its
++normal final card. Retain request rows and linked native IDs for audit.
++Only explicitly published result fields are returned to Slack or the requester;
++raw executor output/errors are not.
++
++Migration 0057 supersedes the earlier draft's delivery/claim columns and cancels
++old pending/approved records; old executing records become unknown. Stop the
++old approval workers before this migration. Mixed old/new approval-worker
++versions are not supported. Never replay those old requests automatically.
++
++## Payload and CLI
++
++Approvals are part of the existing `centaur-console` tool package and client.
++Install/allowlist `centaur-console`; there is no separate approval package.
++Use the `centaur-console approvals` command group. Refresh installed tool shims
++on upgrade to remove the old standalone package's command.
++
++```sh
++centaur-console approvals actions
++centaur-console approvals call tickets-create --arguments '{"title":"Example","body":"Complete content"}'
++centaur-console approvals status <request-uuid>
++centaur-console approvals cancel <request-uuid>
++```
++
++The CLI prints an ID and waits by default. `--no-wait` returns after admission.
++Client timeout does not cancel. Reuse `--idempotency-key <UUID>` only for identical
++admission within the same execution. Admission is capped at 20 requests/execution.
++
++The complete argument object, workflow, executor principal and implementation
++revision must fit in 12,000 displayed JSON bytes; oversized payloads are rejected,
++never truncated. Plaintext sections preserve large integers and use JSON escapes
++for Unicode and Slack delimiters. Everyone in the thread can read the arguments.
++Never include secrets. Do not approve deferred mutable URLs/files/draft IDs;
++snapshot their contents first. The approval covers the reviewed executor's
++semantics, not each HTTP request made by arbitrary downstream code.
++
++## Validation and activation
++
++Unit tests cover policy validation, complete display, native signatures and
++workflow declaration checks. The database test checks atomic native admission,
++idempotency, actor/card/message boundaries, competing decisions, expiry,
++cancellation, execution claims, forged driver ownership and uncertain recovery:
++
++```sh
++TOOL_APPROVAL_TEST_DATABASE_URL=postgres://localhost/disposable \
++  cargo test -p centaur-workflows approvals
++```
++
++Use a disposable database: tests install Absurd and create/drop a unique test
++schema. Before enabling credentials, prove the complete local path through
++Console, real sandbox proxies, Slack, the isolated executor and a controlled
++provider. Include unauthorized clicks, direct-call bypass, duplicates, expiry
++and restart. No production enablement is implied by source or unit-test success.
+diff --git a/services/console/app/controllers/api/v1/sandbox/tool_approvals_controller.rb b/services/console/app/controllers/api/v1/sandbox/tool_approvals_controller.rb
+new file mode 100644
+index 00000000..533caf9b
+--- /dev/null
++++ b/services/console/app/controllers/api/v1/sandbox/tool_approvals_controller.rb
+@@ -0,0 +1,64 @@
++module Api
++  module V1
++    module Sandbox
++      # This boundary attests identity only. api-rs owns approval state and policy.
++      class ToolApprovalsController < Api::SandboxBaseController
++        before_action :disable_caching
++        rescue_from CentaurApiClient::Error, with: :render_api_error
++
++        def context
++          render json: { data: api.tool_approval_context(identity) }
++        end
++
++        def create
++          body = params.require(:data)
++          unless body.is_a?(ActionController::Parameters)
++            return render_error(status: :bad_request, message: "data must be a JSON object")
++          end
++          attributes = body.permit(:execution_id, :idempotency_key, :action).to_h
++          arguments = body[:arguments]
++          unless arguments.is_a?(ActionController::Parameters)
++            return render_error(status: :bad_request, message: "arguments must be a JSON object")
++          end
++          # Arguments are opaque tool input. Identity and destination are never
++          # taken from the request, including nested fields with those names.
++          attributes[:arguments] = arguments.to_unsafe_h
++          render json: { data: api.request_tool_approval(attributes.merge(identity)) }, status: :accepted
++        end
++
++        def show
++          unless /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/.match?(params[:id].to_s)
++            return render_error(status: :not_found, message: "tool approval not found")
++          end
++          render json: { data: api.read_tool_approval(params[:id], identity) }
++        end
++
++        def cancel
++          unless /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/.match?(params[:id].to_s)
++            return render_error(status: :not_found, message: "tool approval not found")
++          end
++          render json: { data: api.cancel_tool_approval(params[:id], identity) }
++        end
++
++        private
++
++        def identity
++          { sandbox_id: current_proxy.name, principal_id: current_proxy.principal.oid }
++        end
++
++        def api
++          @api ||= CentaurApiClient.new(timeout: 2)
++        end
++
++        def disable_caching
++          response.headers["Cache-Control"] = "no-store"
++        end
++
++        def render_api_error(error)
++          status = [ 400, 403, 404, 413 ].include?(error.status) ? error.status : 503
++          render_error(status: status, message: "tool approval request unavailable")
++        end
++      end
++    end
++  end
++end
+diff --git a/services/console/app/services/centaur_api_client.rb b/services/console/app/services/centaur_api_client.rb
+index 6169fb36..dcc72e38 100644
+--- a/services/console/app/services/centaur_api_client.rb
++++ b/services/console/app/services/centaur_api_client.rb
+@@ -128,6 +128,22 @@ class CentaurApiClient
+     post("/api/workflows/runs", payload)
+   end
+ 
++  def tool_approval_context(identity)
++    post("/api/tool-approvals/context", identity)
++  end
++
++  def request_tool_approval(payload)
++    post("/api/tool-approvals/request", payload)
++  end
++
++  def read_tool_approval(id, identity)
++    post("/api/tool-approvals/#{escape_path(id)}/read", identity)
++  end
++
++  def cancel_tool_approval(id, identity)
++    post("/api/tool-approvals/#{escape_path(id)}/cancel", identity)
++  end
++
+   private
+ 
+   def get(path, params = {})
+diff --git a/services/console/config/routes.rb b/services/console/config/routes.rb
+index 4a48a337..5ba167c1 100644
+--- a/services/console/config/routes.rb
++++ b/services/console/config/routes.rb
+@@ -262,6 +262,10 @@ Rails.application.routes.draw do
+       # Called from inside sandboxes through their assigned iron-proxy. The
+       # proxy injects a short-lived sandbox entitlement JWT scoped to these paths.
+       namespace :sandbox do
++        get "tool_approvals/context", to: "tool_approvals#context"
++        resources :tool_approvals, only: %i[create show] do
++          post :cancel, on: :member
++        end
+         resource :permissions, only: :show
+         resources :oauth_apps, only: :index
+         resources :scheduled_tasks, only: %i[index show create update destroy] do
+diff --git a/services/console/test/controllers/api/v1/sandbox_tool_approvals_controller_test.rb b/services/console/test/controllers/api/v1/sandbox_tool_approvals_controller_test.rb
+new file mode 100644
+index 00000000..f5c2a4ad
+--- /dev/null
++++ b/services/console/test/controllers/api/v1/sandbox_tool_approvals_controller_test.rb
+@@ -0,0 +1,45 @@
++require "test_helper"
++
++module Api
++  module V1
++    class SandboxToolApprovalsControllerTest < ActionDispatch::IntegrationTest
++      test "only the verified current proxy supplies request identity" do
++        proxy = proxies(:acme_proxy)
++        captured = nil
++        api = Object.new
++        api.define_singleton_method(:request_tool_approval) do |payload|
++          captured = payload
++          { "id" => "00000000-0000-4000-8000-000000000001" }
++        end
++        with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
++          CentaurApiClient.stub(:new, api) do
++            post "/api/v1/sandbox/tool_approvals", as: :json,
++              headers: { "Authorization" => "Bearer #{SandboxEntitlements::Jwt.encode_for_proxy(proxy)}" },
++              params: { data: { action: "create", execution_id: "exe_test",
++                idempotency_key: "00000000-0000-4000-8000-000000000002",
++                principal_id: "prn_forged", sandbox_id: "forged", team_id: "TFORGED",
++                arguments: { body: "frozen" } } }
++          end
++        end
++        assert_response :accepted
++        assert_equal proxy.name, captured[:sandbox_id]
++        assert_equal proxy.principal.oid, captured[:principal_id]
++        assert_not captured.key?("team_id")
++        assert_equal({ "body" => "frozen" }, captured[:arguments])
++        assert_equal "no-store", response.headers["Cache-Control"]
++      end
++
++      test "missing token and reassigned proxy cannot access approval endpoints" do
++        get "/api/v1/sandbox/tool_approvals/context"
++        assert_response :unauthorized
++        with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
++          proxy = proxies(:acme_proxy)
++          token = SandboxEntitlements::Jwt.encode_for_proxy(proxy)
++          proxy.update!(principal: principals(:globex_user))
++          get "/api/v1/sandbox/tool_approvals/context", headers: { "Authorization" => "Bearer #{token}" }
++        end
++        assert_response :unauthorized
++      end
++    end
++  end
++end
+diff --git a/services/sandbox/SYSTEM_PROMPT.md b/services/sandbox/SYSTEM_PROMPT.md
+index 042e4f12..89957212 100644
+--- a/services/sandbox/SYSTEM_PROMPT.md
++++ b/services/sandbox/SYSTEM_PROMPT.md
+@@ -153,6 +153,8 @@
+ |vlogs query "level:error"       → recent service errors
+ |centaur-tools call vmetrics query '{"expr":"centaur_deployment_info"}' → live Centaur deployment image/version/SHA metadata
+ |Tool commands are normal CLIs backed by mounted repo packages. Use direct tool CLIs for tools.
++|When the deployment exposes `centaur-console approvals`, use `centaur-console approvals actions` to discover approval-gated actions. Submit their complete, non-secret JSON arguments with `centaur-console approvals call <action> --arguments '<json>'`; it posts Accept/Decline controls in this Slack thread and waits for the authorized decision and result.
++|An approval request ID is a pending request, not evidence that the action succeeded. On timeout or an unknown outcome, inspect `centaur-console approvals status <id>` and the provider before requesting the action again. Do not route around a required approval.
+ |For tool smoke tests, use `<tool> health` as the canonical check. Do not invent ad hoc "test this tool" probes or raw upstream calls unless `health` fails and you are triaging the failure.
+ |For broad tool smoke tests, use the `tool-health-smoke` skill or run its health runner when it is available.
+ |
+diff --git a/services/workflow-python/tests/test_workflow_host.py b/services/workflow-python/tests/test_workflow_host.py
+index 51ddeed2..a7888c2a 100644
+--- a/services/workflow-python/tests/test_workflow_host.py
++++ b/services/workflow-python/tests/test_workflow_host.py
+@@ -634,6 +634,26 @@ class WorkflowHostTests(unittest.TestCase):
+         assert registered is not None
+         self.assertEqual(host.normalize_principal(registered), True)
+ 
++    def test_approval_marker_requires_a_scoped_principal_and_boolean(self) -> None:
++        host = load_workflow_host()
++        with tempfile.TemporaryDirectory() as tmp:
++            path = Path(tmp) / "protected.py"
++            path.write_text(
++                "WORKFLOW_NAME = 'protected'\n"
++                "WORKFLOW_PRINCIPAL = True\n"
++                "WORKFLOW_REQUIRES_APPROVAL = True\n"
++                "def handler(inp, ctx):\n"
++                "    return None\n"
++            )
++            workflow = host.load_workflow_file(path)
++        self.assertTrue(host.normalize_requires_approval(workflow))
++        workflow.principal = None
++        with self.assertRaises(ValueError):
++            host.normalize_requires_approval(workflow)
++        workflow.requires_approval = "true"
++        with self.assertRaises(TypeError):
++            host.normalize_requires_approval(workflow)
++
+     def test_load_workflow_file_reads_workflow_principal_reference(self) -> None:
+         host = load_workflow_host()
+         with tempfile.TemporaryDirectory() as tmp:
+diff --git a/services/workflow-python/workflow_host.py b/services/workflow-python/workflow_host.py
+index 9e270ae0..649997a4 100644
+--- a/services/workflow-python/workflow_host.py
++++ b/services/workflow-python/workflow_host.py
+@@ -85,6 +85,7 @@ class RegisteredWorkflow:
+     webhooks: Any
+     schedule: Any
+     principal: Any = None
++    requires_approval: bool = False
+     agent_defaults: dict[str, Any] | None = None
+ 
+ 
+@@ -155,6 +156,7 @@ def load_workflow_file(path: Path) -> RegisteredWorkflow | None:
+         webhooks=getattr(module, "WEBHOOKS", None),
+         schedule=getattr(module, "SCHEDULE", None),
+         principal=getattr(module, "WORKFLOW_PRINCIPAL", None),
++        requires_approval=getattr(module, "WORKFLOW_REQUIRES_APPROVAL", False),
+         agent_defaults=agent_defaults,
+     )
+ 
+@@ -405,6 +407,14 @@ async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any
+             await pool.close()
+ 
+ 
++def normalize_requires_approval(workflow: RegisteredWorkflow) -> bool:
++    if not isinstance(workflow.requires_approval, bool):
++        raise TypeError("WORKFLOW_REQUIRES_APPROVAL must be a boolean")
++    if workflow.requires_approval and not normalize_principal(workflow):
++        raise ValueError("WORKFLOW_REQUIRES_APPROVAL requires WORKFLOW_PRINCIPAL")
++    return workflow.requires_approval
++
++
+ def discovery_payload() -> dict[str, Any]:
+     workflows = discover_workflows()
+     return {
+@@ -416,6 +426,7 @@ def discovery_payload() -> dict[str, Any]:
+                 "webhooks": normalize_webhooks(workflow),
+                 "schedule": normalize_schedule(workflow),
+                 "principal": normalize_principal(workflow),
++                "requires_approval": normalize_requires_approval(workflow),
+             }
+             for workflow in workflows.values()
+         ],
+diff --git a/tools/README.md b/tools/README.md
+index 0f22a5df..a5df6880 100644
+--- a/tools/README.md
++++ b/tools/README.md
+@@ -63,8 +63,10 @@ The open-source tool inventory lives in this `tools/` tree and changes over time
+ 
+ - `centaur_investigator`: parse Centaur Slack thread references and enrich them
+   with best-effort vlogs/vmetrics context without exposing message context.
+-- `centaur-console`: inspect sandbox permissions and configured OAuth apps, and
+-  manage the linked user's scheduled tasks.
++- `centaur-console`: inspect sandbox permissions and configured OAuth apps,
++  manage the linked user's scheduled tasks, and use `approvals` to request
++  configured guarded actions with complete payloads and Accept/Decline in Slack.
++  Approvals use the sandbox's Console entitlement, not provider secrets.
+ - `centaur-skills`: discover merged repository and overlay skills alongside
+   private and public Console-authored skills, and manage Console skills.
+ - `datadog`: query Datadog logs, metrics, monitors, hosts, and dashboards
+diff --git a/tools/infra/centaur-console/cli.py b/tools/infra/centaur-console/cli.py
+index 29352c2f..1409d290 100644
+--- a/tools/infra/centaur-console/cli.py
++++ b/tools/infra/centaur-console/cli.py
+@@ -12,9 +12,11 @@ load_dotenv()
+ 
+ app = typer.Typer(
+     name="centaur-console",
+-    help="Inspect Console permissions and manage the current user's scheduled tasks",
++    help="Inspect Console permissions, manage scheduled tasks and request guarded actions",
+ )
+ console = Console()
++approvals = typer.Typer(help="Request and inspect approval-gated actions in this Slack thread.")
++app.add_typer(approvals, name="approvals")
+ 
+ 
+ def get_client(
+@@ -26,6 +28,46 @@ def get_client(
+     return ConsoleClient(url=url, bearer_token=bearer_token)
+ 
+ 
++@approvals.command("actions")
++def approval_actions() -> None:
++    """List permitted actions as JSON."""
++    with get_client() as client:
++        typer.echo(json.dumps(client.approval_actions(), indent=2))
++
++
++@approvals.command("call")
++def request_approval(
++    action: str,
++    arguments: str = typer.Option(
++        ..., "--arguments", help="Complete non-secret JSON shown in Slack."
++    ),
++    idempotency_key: str | None = typer.Option(None, "--idempotency-key"),
++    wait: bool = typer.Option(True, "--wait/--no-wait"),
++) -> None:
++    """Request once and await the authorized decision and public result."""
++    with get_client() as client:
++        request = client.request_approval(action, json.loads(arguments), idempotency_key)
++        typer.echo(f"Approval request: {request['id']}", err=True)
++        result = client.wait_for_approval(request["id"]) if wait else request
++        typer.echo(json.dumps(result, indent=2))
++        if wait and result["status"] != "succeeded":
++            raise typer.Exit(1)
++
++
++@approvals.command("status")
++def approval_status(request_id: str) -> None:
++    """Read an owned request without executing it again."""
++    with get_client() as client:
++        typer.echo(json.dumps(client.approval_status(request_id), indent=2))
++
++
++@approvals.command("cancel")
++def cancel_approval(request_id: str) -> None:
++    """Cancel only before execution is claimed."""
++    with get_client() as client:
++        typer.echo(json.dumps(client.cancel_approval(request_id), indent=2))
++
++
+ @app.command("permissions")
+ def permissions(
+     url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),
+diff --git a/tools/infra/centaur-console/client.py b/tools/infra/centaur-console/client.py
+index 0aef7679..7886d0a6 100644
+--- a/tools/infra/centaur-console/client.py
++++ b/tools/infra/centaur-console/client.py
+@@ -3,14 +3,20 @@
+ from __future__ import annotations
+ 
+ import os
++import time
+ from typing import Any
+ from urllib.parse import quote
++from uuid import UUID, uuid4
+ 
+ import httpx
+ 
+ SANDBOX_PERMISSIONS_PATH = "/api/v1/sandbox/permissions"
+ SANDBOX_OAUTH_APPS_PATH = "/api/v1/sandbox/oauth_apps"
+ SANDBOX_SCHEDULED_TASKS_PATH = "/api/v1/sandbox/scheduled_tasks"
++SANDBOX_APPROVALS_PATH = "/api/v1/sandbox/tool_approvals"
++APPROVAL_TERMINAL = frozenset(
++    {"succeeded", "failed", "unknown", "declined", "expired", "cancelled"}
++)
+ 
+ 
+ class ConsoleClient:
+@@ -32,7 +38,11 @@ class ConsoleClient:
+     @property
+     def base_url(self) -> str:
+         # Non-secret endpoint config. Sandboxes receive this from api-rs.
+-        url = (self._url or os.getenv("CENTAUR_CONSOLE_URL", "http://centaur-console:3000")).strip().rstrip("/")  # noqa: TID251
++        url = (
++            (self._url or os.getenv("CENTAUR_CONSOLE_URL", "http://centaur-console:3000"))  # noqa: TID251
++            .strip()
++            .rstrip("/")
++        )
+         if url and not url.startswith(("http://", "https://")):
+             url = f"http://{url}"
+         return url
+@@ -76,6 +86,72 @@ class ConsoleClient:
+         """Alias for tool bridge calls."""
+         return self.sandbox_permissions()
+ 
++    def approval_actions(self) -> dict[str, Any]:
++        """List guarded actions for the current running Slack execution."""
++        return self._approval_request("GET", SANDBOX_APPROVALS_PATH + "/context")
++
++    def request_approval(
++        self, action: str, arguments: dict[str, Any], idempotency_key: str | None = None
++    ) -> dict[str, Any]:
++        """Freeze a guarded action for human approval; never execute locally."""
++        if not isinstance(arguments, dict):
++            raise ValueError("arguments must be a JSON object")
++        key = str(UUID(idempotency_key)) if idempotency_key else str(uuid4())
++        context = self.approval_actions()
++        return self._approval_request(
++            "POST",
++            SANDBOX_APPROVALS_PATH,
++            {
++                "data": {
++                    "execution_id": context["execution_id"],
++                    "idempotency_key": key,
++                    "action": action,
++                    "arguments": arguments,
++                }
++            },
++        )
++
++    def approval_status(self, request_id: str) -> dict[str, Any]:
++        """Read an owned approval, its public outcome and linked workflow IDs."""
++        return self._approval_request("GET", SANDBOX_APPROVALS_PATH + "/" + str(UUID(request_id)))
++
++    def wait_for_approval(self, request_id: str, timeout_seconds: int = 1200) -> dict[str, Any]:
++        """Wait without resubmitting. A client timeout does not cancel the request."""
++        deadline = time.monotonic() + timeout_seconds
++        while True:
++            result = self.approval_status(request_id)
++            if result["status"] in APPROVAL_TERMINAL:
++                return result
++            if time.monotonic() >= deadline:
++                raise TimeoutError(
++                    f"Still pending: {request_id}. Use approvals status; do not resubmit."
++                )
++            time.sleep(2)
++
++    def cancel_approval(self, request_id: str) -> dict[str, Any]:
++        """Cancel before execution is claimed; cannot undo an external side effect."""
++        return self._approval_request(
++            "POST", SANDBOX_APPROVALS_PATH + "/" + str(UUID(request_id)) + "/cancel"
++        )
++
++    def _approval_request(self, method: str, path: str, body: dict | None = None) -> dict[str, Any]:
++        # Share transport/lifecycle, not the general client's raw response-body
++        # errors. Provider payloads and credentials must not leak via exceptions.
++        try:
++            response = self.client.request(method, path, json=body, follow_redirects=False)
++        except httpx.RequestError:
++            raise RuntimeError("Approval API request unavailable") from None
++        if not response.is_success:
++            raise RuntimeError(f"Approval API returned HTTP {response.status_code}")
++        try:
++            payload = response.json()
++        except ValueError:
++            raise RuntimeError("Invalid approval response") from None
++        data = payload.get("data") if isinstance(payload, dict) else None
++        if not isinstance(data, dict):
++            raise RuntimeError("Invalid approval response")
++        return data
++
+     def sandbox_oauth_apps(self) -> list[dict[str, Any]]:
+         """Return enabled OAuth apps with user-facing consent start URLs."""
+         response = self.client.get(SANDBOX_OAUTH_APPS_PATH)
+diff --git a/tools/infra/centaur-console/pyproject.toml b/tools/infra/centaur-console/pyproject.toml
+index 2bc7595b..324dfb90 100644
+--- a/tools/infra/centaur-console/pyproject.toml
++++ b/tools/infra/centaur-console/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "centaur-console"
+-description = "Inspect Centaur Console permissions and manage scheduled tasks"
++description = "Inspect Console permissions, manage scheduled tasks and request guarded actions"
+ version = "0.1.0"
+ requires-python = ">=3.11"
+ dependencies = [
+diff --git a/tools/infra/centaur-console/test_approvals.py b/tools/infra/centaur-console/test_approvals.py
+new file mode 100644
+index 00000000..eeaad7c7
+--- /dev/null
++++ b/tools/infra/centaur-console/test_approvals.py
+@@ -0,0 +1,134 @@
++import importlib.util
++import json
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++import httpx
++
++spec = importlib.util.spec_from_file_location("approvals", Path(__file__).with_name("client.py"))
++module = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(module)
++
++
++class ApprovalClientTest(unittest.TestCase):
++    def test_errors_and_redirects_never_expose_response_bodies(self):
++        for response in [
++            httpx.Response(503, text="private-provider-output"),
++            httpx.Response(302, headers={"location": "https://untrusted.invalid/private"}),
++            httpx.Response(200, text="private-invalid-json"),
++            httpx.Response(200, json=["private-invalid-shape"]),
++        ]:
++            calls = []
++
++            def handle(request, calls=calls, response=response):
++                calls.append(request)
++                return response
++
++            with module.ConsoleClient(transport=httpx.MockTransport(handle)) as client:
++                with self.assertRaises(RuntimeError) as error:
++                    client.approval_actions()
++                self.assertNotIn("private", str(error.exception))
++                self.assertEqual(len(calls), 1)
++
++    def test_transport_errors_are_sanitized(self):
++        def handle(request):
++            raise httpx.ConnectError("private-provider-output", request=request)
++
++        with module.ConsoleClient(transport=httpx.MockTransport(handle)) as client:
++            with self.assertRaisesRegex(RuntimeError, "Approval API request unavailable") as error:
++                client.approval_actions()
++            self.assertIsNone(error.exception.__cause__)
++            self.assertTrue(error.exception.__suppress_context__)
++
++    def test_timeout_does_not_cancel_or_resubmit(self):
++        calls = []
++
++        def handle(request):
++            calls.append(request.method)
++            return httpx.Response(200, json={"data": {"status": "pending"}})
++
++        with (
++            module.ConsoleClient(transport=httpx.MockTransport(handle)) as client,
++            self.assertRaisesRegex(TimeoutError, "do not resubmit"),
++        ):
++            client.wait_for_approval("00000000-0000-4000-8000-000000000001", timeout_seconds=0)
++        self.assertEqual(calls, ["GET"])
++
++    def test_request_uses_current_execution_and_same_key_without_actor_fields(self):
++        calls = []
++        key = "00000000-0000-4000-8000-000000000001"
++
++        def handle(request):
++            calls.append(request)
++            if request.url.path.endswith("/context"):
++                return httpx.Response(
++                    200, json={"data": {"execution_id": "exe_current", "actions": []}}
++                )
++            body = json.loads(request.content)["data"]
++            self.assertEqual(
++                body,
++                {
++                    "execution_id": "exe_current",
++                    "idempotency_key": key,
++                    "action": "create",
++                    "arguments": {"body": "hello"},
++                },
++            )
++            self.assertNotIn("authorization", request.headers)
++            return httpx.Response(202, json={"data": {"id": key}})
++
++        client = module.ConsoleClient(transport=httpx.MockTransport(handle))
++        self.assertEqual(client.request_approval("create", {"body": "hello"}, key), {"id": key})
++        self.assertEqual(len(calls), 2)
++        client.close()
++
++    def test_cancel_is_a_scoped_request_not_a_resubmission(self):
++        key = "00000000-0000-4000-8000-000000000001"
++
++        def handle(request):
++            self.assertEqual(request.method, "POST")
++            self.assertEqual(
++                request.url.path, module.SANDBOX_APPROVALS_PATH + "/" + key + "/cancel"
++            )
++            self.assertNotIn("authorization", request.headers)
++            return httpx.Response(200, json={"data": {"status": "cancelled"}})
++
++        client = module.ConsoleClient(transport=httpx.MockTransport(handle))
++        self.assertEqual(client.cancel_approval(key)["status"], "cancelled")
++        client.close()
++
++    def test_decline_and_uncertain_outcome_never_resubmit(self):
++        for status in ["declined", "unknown", "cancelled", "expired"]:
++            calls = []
++
++            def handle(request, calls=calls, status=status):
++                calls.append(request.method)
++                return httpx.Response(200, json={"data": {"status": status}})
++
++            client = module.ConsoleClient(transport=httpx.MockTransport(handle))
++            self.assertEqual(
++                client.wait_for_approval("00000000-0000-4000-8000-000000000001")["status"], status
++            )
++            self.assertEqual(calls, ["GET"])
++            client.close()
++
++    def test_wait_returns_published_hello_world_to_the_requesting_bot(self):
++        calls = []
++        completed = {
++            "status": "succeeded",
++            "result": {"outcome": "succeeded", "output": {"message": "Hello world!"}},
++        }
++        responses = [{"status": "pending"}, {"status": "approved"}, completed]
++
++        def handle(request):
++            calls.append(request.method)
++            return httpx.Response(200, json={"data": responses.pop(0)})
++
++        client = module.ConsoleClient(transport=httpx.MockTransport(handle))
++        with patch.object(module.time, "sleep"):
++            self.assertEqual(
++                client.wait_for_approval("00000000-0000-4000-8000-000000000001"), completed
++            )
++        self.assertEqual(calls, ["GET", "GET", "GET"])
++        client.close()
+diff --git a/tools/infra/centaur-console/test_cli.py b/tools/infra/centaur-console/test_cli.py
+new file mode 100644
+index 00000000..88db045d
+--- /dev/null
++++ b/tools/infra/centaur-console/test_cli.py
+@@ -0,0 +1,69 @@
++import importlib
++import importlib.util
++import json
++import sys
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++from typer.testing import CliRunner
++
++PACKAGE = Path(__file__).parent
++spec = importlib.util.spec_from_file_location(
++    "console_cli_test_package", PACKAGE / "__init__.py", submodule_search_locations=[str(PACKAGE)]
++)
++package = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = package
++spec.loader.exec_module(package)
++cli = importlib.import_module("console_cli_test_package.cli")
++
++
++def test_approval_group_and_compatibility_alias_have_the_same_commands():
++    runner = CliRunner()
++    for app, args in [(cli.app, ["approvals", "--help"]), (cli.approvals, ["--help"])]:
++        result = runner.invoke(app, args)
++        assert result.exit_code == 0
++        for command in ["actions", "call", "status", "cancel"]:
++            assert command in result.output
++
++
++def test_call_waits_once_and_returns_public_output():
++    client = MagicMock()
++    client.__enter__.return_value = client
++    client.request_approval.return_value = {"id": "request-1"}
++    completed = {"status": "succeeded", "result": {"output": {"message": "Hello world!"}}}
++    client.wait_for_approval.return_value = completed
++    with patch.object(cli, "get_client", return_value=client):
++        result = CliRunner().invoke(
++            cli.app, ["approvals", "call", "hello-world", "--arguments", "{}"]
++        )
++    assert result.exit_code == 0
++    assert json.loads(result.stdout) == completed
++    client.request_approval.assert_called_once_with("hello-world", {}, None)
++    client.wait_for_approval.assert_called_once_with("request-1")
++
++
++def test_no_wait_and_decline_never_resubmit():
++    for extra, expected in [(["--no-wait"], 0), ([], 1)]:
++        client = MagicMock()
++        client.__enter__.return_value = client
++        client.request_approval.return_value = {"id": "request-1"}
++        client.wait_for_approval.return_value = {"status": "declined"}
++        with patch.object(cli, "get_client", return_value=client):
++            result = CliRunner().invoke(
++                cli.app, ["approvals", "call", "hello-world", "--arguments", "{}", *extra]
++            )
++        assert result.exit_code == expected
++        client.request_approval.assert_called_once()
++        assert client.wait_for_approval.call_count == (0 if extra else 1)
++
++
++def test_shim_discovery_finds_the_console_command():
++    root = PACKAGE.parents[2]
++    spec = importlib.util.spec_from_file_location(
++        "approval_shim_test", root / "services/sandbox/install_tool_shims.py"
++    )
++    shims = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(shims)
++    with patch.dict("os.environ", {"TOOL_ALLOWLIST": "centaur-console", "TOOL_BLOCKLIST": ""}):
++        scripts = shims._discover_scripts([PACKAGE.parent])
++    assert "centaur-console" in scripts

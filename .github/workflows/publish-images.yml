@@ -27,7 +27,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: tiplink/centaur
-  IMAGE_SOURCE: https://github.com/TipLink/centaur
+  IMAGE_SOURCE: https://github.com/paradigmxyz/centaur
   RUST_BUILD_PROFILE: release
 
 jobs:
@@ -161,7 +161,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Prepare official upstream with reviewed patches
+        id: core
+        uses: ./.github/actions/prepare-patched-core
 
       - name: Reclaim runner disk for the agent image
         if: matrix.service == 'agent' && matrix.platform == 'linux/amd64'
@@ -195,6 +200,10 @@ jobs:
           labels: |
             org.opencontainers.image.title=${{ matrix.image }}
             org.opencontainers.image.source=${{ env.IMAGE_SOURCE }}
+            org.opencontainers.image.revision=${{ steps.core.outputs.revision }}
+            io.centaur.patch-series.sha256=${{ steps.core.outputs.patch_sha256 }}
+            io.centaur.source-tree=${{ steps.core.outputs.source_tree }}
+            io.centaur.publication-revision=${{ github.sha }}
         env:
           DOCKER_METADATA_PR_HEAD_SHA: true
 
@@ -202,8 +211,8 @@ jobs:
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
+          context: _core/${{ matrix.context }}
+          file: _core/${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}

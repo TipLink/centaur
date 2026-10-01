@@ -11,6 +11,7 @@ SCRIPT = Path(__file__).with_name("verify-reviewed-image-release.sh")
 SHA = "a" * 40
 REPOSITORY = "example/centaur"
 CHECKS = [
+    ("Validate upstream patch source", "validate-patches.yml"),
     ("CI success", "ci.yml"),
     ("Console CI success", "console-ci.yml"),
     ("Validate CLI pyproject packaging", "validate-cli-packaging.yml"),
@@ -19,7 +20,7 @@ CHECKS = [
 
 
 class AdmissionTest(unittest.TestCase):
-    def run_gate(self, *, base="main", verified=True, draft=False, conclusion="success", run_sha=SHA):
+    def run_gate(self, *, base="main", verified=True, draft=False, conclusion="success", run_sha=SHA, patch_check=True):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             commit = {"sha": SHA, "verification": {"verified": verified, "reason": "valid"}}
@@ -30,6 +31,8 @@ class AdmissionTest(unittest.TestCase):
             replies = {f"{prefix}/git/commits/{SHA}": commit, f"{prefix}/commits/{SHA}/pulls": [pull]}
             checks = []
             for number, (name, workflow) in enumerate(CHECKS, 1):
+                if name == "Validate upstream patch source" and not patch_check:
+                    continue
                 checks.append({"name": name, "head_sha": SHA, "app": {"slug": "github-actions"},
                                "status": "completed", "conclusion": conclusion,
                                "details_url": f"https://github.com/{REPOSITORY}/actions/runs/{number}/job/1"})
@@ -58,6 +61,9 @@ class AdmissionTest(unittest.TestCase):
             with self.subTest(branch=branch):
                 result = self.run_gate(base=branch)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_patch_reproduction_check_fails(self):
+        self.assertNotEqual(self.run_gate(patch_check=False).returncode, 0)
 
     def test_unreviewed_base_branch_fails(self):
         self.assertNotEqual(self.run_gate(base="unreviewed").returncode, 0)

@@ -3255,101 +3255,112 @@ async fn run_python_workflow_host_in_sandbox(
     session_runtime: SessionRuntime,
     sandbox: WorkflowHostSandboxRuntime,
     workflow_clients: WorkflowQueueClients,
-    approval: Option<(Duration, String)>,
+    approval: Option<approvals::execution::ClaimedExecution<'_>>,
 ) -> Result<Value, WorkflowRuntimeError> {
-    let expected = if approval.is_some() {
-        access::WorkflowAccess::ApprovalRequired
-    } else {
-        access::WorkflowAccess::Ordinary
-    };
-    if access::classify(
-        &input.workflow_name,
-        &workflow_clients.approval_policies,
-        Some(&sandbox),
-    ) != expected
-        || (approval.is_some() && !sandbox.requires_approval(&input.workflow_name))
-    {
-        return Err(approvals::unavailable());
-    }
-    let mut spec = sandbox.spec_for_workflow(&input.workflow_name)?;
-    if approval.is_none()
-        && let (Some(runtime), Some(principal)) =
-            (&sandbox.session_runtime, &spec.iron_control_principal)
-    {
-        runtime
-            .ensure_unreserved_principal_reference(principal)
-            .await?;
-    }
-    if approval
-        .as_ref()
-        .is_some_and(|(_, principal)| spec.iron_control_principal.as_ref() != Some(principal))
-    {
-        return Err(approvals::unavailable());
-    }
-    spec.env.retain(|entry| {
-        !matches!(
-            entry.name.as_str(),
-            "CENTAUR_JWT_SIGNING_SECRET" | "CENTAUR_APPROVAL_PROTOCOL"
-        )
-    });
-    spec = spec
-        // Also mask inheritance from the development-only local process backend.
-        .env("CENTAUR_JWT_SIGNING_SECRET", "")
-        .env(
-            "CENTAUR_APPROVAL_PROTOCOL",
-            if approval.is_some() {
-                "workflow-tool-approvals-v1"
-            } else {
-                ""
-            },
-        )
-        .env("WORKFLOW_RUN_ID", ctx.run_id())
-        .env("WORKFLOW_TASK_ID", ctx.task_id())
-        .env("WORKFLOW_NAME", input.workflow_name.clone());
-    if env::var_os("WORKFLOW_DIRS").is_none() && !sandbox_spec_has_env(&spec, "WORKFLOW_DIRS") {
-        spec = spec.env("WORKFLOW_DIRS", default_workflow_dirs());
-    }
-    if let Ok(database_url) = env::var("DATABASE_URL")
-        && !sandbox_spec_has_env(&spec, "DATABASE_URL")
-    {
-        spec = spec.env("DATABASE_URL", database_url);
-    }
-    let (sandbox_id, io) = sandbox.runtime.create_running_io(spec).await?;
-    let mut stdin = io.stdin;
-    let stderr_task = tokio::spawn(async move {
-        let _guard = io.guard;
-        let mut lines = BufReader::new(io.stderr).lines();
-        let mut collected = Vec::new();
-        while let Ok(Some(line)) = lines.next_line().await {
-            collected.push(line);
+    let deadline = approval.as_ref().map(|claim| claim.deadline);
+    let mut host = approvals::execution::HostSandbox::new(sandbox.runtime.clone());
+    let execute = async {
+        let expected = if approval.is_some() {
+            access::WorkflowAccess::ApprovalRequired
+        } else {
+            access::WorkflowAccess::Ordinary
+        };
+        if access::classify(
+            &input.workflow_name,
+            &workflow_clients.approval_policies,
+            Some(&sandbox),
+        ) != expected
+            || (approval.is_some() && !sandbox.requires_approval(&input.workflow_name))
+        {
+            return Err(approvals::unavailable());
         }
-        collected.join("\n")
-    });
-    let protocol = run_python_workflow_host_protocol(
-        input,
-        ctx,
-        session_runtime,
-        workflow_clients,
-        &mut stdin,
-        io.stdout,
-        stderr_task,
-    );
-    let result = if let Some((timeout, _)) = approval {
-        tokio::time::timeout(timeout, protocol)
-            .await
-            .unwrap_or_else(|_| {
-                Err(WorkflowRuntimeError::Upstream(
-                    "approved workflow outcome uncertain".into(),
-                ))
-            })
-    } else {
-        protocol.await
+        let mut spec = sandbox.spec_for_workflow(&input.workflow_name)?;
+        if approval.is_none()
+            && let (Some(runtime), Some(principal)) =
+                (&sandbox.session_runtime, &spec.iron_control_principal)
+        {
+            runtime
+                .ensure_unreserved_principal_reference(principal)
+                .await?;
+        }
+        if approval.as_ref().is_some_and(|claim| {
+            spec.iron_control_principal.as_ref() != Some(&claim.policy.executor_principal)
+        }) {
+            return Err(approvals::unavailable());
+        }
+        spec.env.retain(|entry| {
+            !matches!(
+                entry.name.as_str(),
+                "CENTAUR_JWT_SIGNING_SECRET" | "CENTAUR_APPROVAL_PROTOCOL"
+            )
+        });
+        spec = spec
+            // Also mask inheritance from the development-only local process backend.
+            .env("CENTAUR_JWT_SIGNING_SECRET", "")
+            .env(
+                "CENTAUR_APPROVAL_PROTOCOL",
+                if approval.is_some() {
+                    "workflow-tool-approvals-v1"
+                } else {
+                    ""
+                },
+            )
+            .env("WORKFLOW_RUN_ID", ctx.run_id())
+            .env("WORKFLOW_TASK_ID", ctx.task_id())
+            .env("WORKFLOW_NAME", input.workflow_name.clone());
+        if env::var_os("WORKFLOW_DIRS").is_none() && !sandbox_spec_has_env(&spec, "WORKFLOW_DIRS") {
+            spec = spec.env("WORKFLOW_DIRS", default_workflow_dirs());
+        }
+        if let Ok(database_url) = env::var("DATABASE_URL")
+            && !sandbox_spec_has_env(&spec, "DATABASE_URL")
+        {
+            spec = spec.env("DATABASE_URL", database_url);
+        }
+        let io = host.start(spec).await?;
+        // Recheck immediately before dispatch: startup never earns a fresh budget.
+        if let Some(deadline) = deadline {
+            deadline.check()?;
+        }
+        let mut stdin = io.stdin;
+        let stderr_task = tokio::spawn(async move {
+            let _guard = io.guard;
+            let mut lines = BufReader::new(io.stderr).lines();
+            let mut collected = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                collected.push(line);
+            }
+            collected.join("\n")
+        });
+        let _stderr_guard = AbortWorkflowStderr(stderr_task.abort_handle());
+        run_python_workflow_host_protocol(
+            input,
+            ctx,
+            session_runtime,
+            workflow_clients,
+            &mut stdin,
+            io.stdout,
+            stderr_task,
+        )
+        .await
     };
-    drop(stdin);
-    if let Err(error) = sandbox.runtime.stop_sandbox(&sandbox_id).await {
-        warn!(sandbox_id = %sandbox_id.as_str(), %error, "failed to stop workflow host sandbox");
+    let result = match deadline {
+        Some(deadline) => deadline.run(execute).await,
+        None => execute.await,
+    };
+    if let Some(approval) = approval {
+        approval.complete(result, host.cleanup()).await
+    } else {
+        host.cleanup().await;
+        result
     }
-    result
+}
+
+struct AbortWorkflowStderr(tokio::task::AbortHandle);
+
+impl Drop for AbortWorkflowStderr {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn sandbox_spec_has_env(spec: &SandboxSpec, name: &str) -> bool {

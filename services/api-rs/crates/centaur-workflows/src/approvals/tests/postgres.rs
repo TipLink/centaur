@@ -218,7 +218,7 @@ async fn native_admission_decision_claim_and_recovery() {
     );
     assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
     if repo.read(id, identity()).await.unwrap()["status"] == "declined" {
-        assert!(!repo.claim(id, &p).await.unwrap());
+        assert!(repo.claim(id, &p).await.unwrap().is_none());
         // Independent test setup for the execution claim race.
         sqlx::query("update tool_approvals set status='approved' where id=$1")
             .bind(id)
@@ -227,13 +227,16 @@ async fn native_admission_decision_claim_and_recovery() {
             .unwrap();
     }
     let (a, b) = tokio::join!(repo.claim(id, &p), repo.claim(id, &p));
-    assert_eq!(usize::from(a.unwrap()) + usize::from(b.unwrap()), 1);
+    assert_eq!(
+        usize::from(a.unwrap().is_some()) + usize::from(b.unwrap().is_some()),
+        1
+    );
     repo.recover(id).await.unwrap();
     assert_eq!(
         repo.read(id, identity()).await.unwrap()["status"],
         "unknown"
     );
-    assert!(!repo.claim(id, &p).await.unwrap());
+    assert!(repo.claim(id, &p).await.unwrap().is_none());
     // Public output is persisted only after the one-shot execution claim.
     let public_policy = p.clone();
     let hello = || Ok(json!({"message":"Hello world!","credential":"do-not-publish"}));
@@ -272,7 +275,7 @@ async fn native_admission_decision_claim_and_recovery() {
     );
     assert!(message["text"].as_str().unwrap().contains("Hello world!"));
     assert!(!message.to_string().contains("do-not-publish"));
-    assert!(!repo.claim(id, &p).await.unwrap());
+    assert!(repo.claim(id, &p).await.unwrap().is_none());
     repo.finish(id, &public_policy, Err(unavailable()))
         .await
         .unwrap();
@@ -321,7 +324,7 @@ async fn native_admission_decision_claim_and_recovery() {
                 .bind(id).bind(state).execute(&pool).await.unwrap();
             repository::reconcile_lifecycle(&pool, None).await.unwrap();
             assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
-            assert!(!repo.claim(id, &p).await.unwrap());
+            assert!(repo.claim(id, &p).await.unwrap().is_none());
         }
     }
     sqlx::query("update absurd.t_centaur_workflows set state='pending' where task_id=$1::uuid")
@@ -340,6 +343,64 @@ async fn native_admission_decision_claim_and_recovery() {
         repo.read(id, identity()).await.unwrap()["status"],
         "unknown"
     );
+    // Late completion must be uncertain even if reconciliation has not run yet.
+    sqlx::query("update tool_approvals set status='executing',execution_deadline=clock_timestamp()-interval '1 second' where id=$1")
+        .bind(id).execute(&pool).await.unwrap();
+    repo.finish(id, &p, hello()).await.unwrap();
+    let late = repo.load(id, &task).await.unwrap();
+    assert_eq!(late.status, "unknown");
+    assert_eq!(late.result, Some(json!({"outcome":"unknown"})));
+
+    // A delayed claim commit must consume the database budget, not reset it.
+    let mut short_policy = p.clone();
+    short_policy.timeout_seconds = 1;
+    sqlx::query("update tool_approvals set status='approved',policy_hash=$2 where id=$1")
+        .bind(id)
+        .bind(hash(&short_policy))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("create function delay_approval_claim_commit() returns trigger language plpgsql as $$ begin perform pg_sleep(1.05); return new; end $$;
+        create constraint trigger delayed_approval_claim after update on tool_approvals deferrable initially deferred for each row when (old.status='approved' and new.status='executing') execute function delay_approval_claim_commit();")
+        .execute(&pool).await.unwrap();
+    let delayed_deadline = repo.claim(id, &short_policy).await.unwrap().unwrap();
+    assert!(delayed_deadline.check().is_err());
+    sqlx::raw_sql("drop trigger delayed_approval_claim on tool_approvals; drop function delay_approval_claim_commit();")
+        .execute(&pool).await.unwrap();
+    repo.finish(id, &short_policy, hello()).await.unwrap();
+    assert_eq!(repo.load(id, &task).await.unwrap().status, "unknown");
+    sqlx::query("update tool_approvals set policy_hash=$2 where id=$1")
+        .bind(id)
+        .bind(hash(&p))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Persist before slow shutdown, and stop waiting at the original deadline.
+    sqlx::query("update tool_approvals set status='executing',execution_deadline=clock_timestamp()+interval '1 hour' where id=$1")
+        .bind(id).execute(&pool).await.unwrap();
+    let cleanup_started = std::sync::atomic::AtomicBool::new(false);
+    let deadline =
+        crate::approvals::execution::Deadline::from_remaining(tokio::time::Instant::now(), 0.2);
+    let claim = crate::approvals::execution::ClaimedExecution {
+        repo: &repo,
+        id,
+        policy: &p,
+        deadline,
+    };
+    tokio::time::timeout(Duration::from_secs(2), claim.complete(hello(), async {
+        assert_eq!(repo.load(id, &task).await.unwrap().status, "succeeded");
+        cleanup_started.store(true, std::sync::atomic::Ordering::SeqCst);
+        sqlx::query("update tool_approvals set execution_deadline=clock_timestamp()-interval '1 second' where id=$1")
+            .bind(id).execute(&pool).await.unwrap();
+        repository::reconcile_lifecycle(&pool, Some(id)).await.unwrap();
+        assert_eq!(repo.load(id, &task).await.unwrap().status, "succeeded");
+        std::future::pending::<()>().await;
+    })).await.unwrap().unwrap();
+    assert!(cleanup_started.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(deadline.check().is_err());
+    assert_eq!(repo.load(id, &task).await.unwrap().status, "succeeded");
+
     // Race the native cancellation against the one-use execution claim.
     sqlx::query("update tool_approvals set status='approved' where id=$1")
         .bind(id)
@@ -352,14 +413,14 @@ async fn native_admission_decision_claim_and_recovery() {
     .await
     .unwrap();
     cancelled.unwrap();
-    let expected = if claim.unwrap() {
+    let expected = if claim.unwrap().is_some() {
         "unknown"
     } else {
         "cancelled"
     };
     assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
     assert!(repo.decide(button("U1", "approved")).await.is_err());
-    assert!(!repo.claim(id, &p).await.unwrap());
+    assert!(repo.claim(id, &p).await.unwrap().is_none());
     pool.close().await;
     sqlx::query(&format!("drop schema {schema} cascade"))
         .execute(&admin)

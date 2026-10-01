@@ -4178,7 +4178,19 @@ impl SandboxRuntime {
         spec: SandboxSpec,
     ) -> Result<(SandboxId, centaur_sandbox_core::SandboxIoParts), SessionRuntimeError> {
         let handle = self.manager.create_running(spec).await?;
-        let io = self.manager.open_io(&handle.id).await?.into_parts();
+        let io = match self.manager.open_io(&handle.id).await {
+            Ok(io) => io.into_parts(),
+            Err(error) => {
+                let manager = self.manager.clone();
+                let sandbox_id = handle.id.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = manager.stop(&sandbox_id).await {
+                        warn!(sandbox_id = %sandbox_id.as_str(), %error, "failed to stop sandbox after I/O setup failure");
+                    }
+                });
+                return Err(error.into());
+            }
+        };
         Ok((handle.id, io))
     }
 
