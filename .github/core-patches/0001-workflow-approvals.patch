@@ -3517,6 +3517,19 @@ index 00000000..e668305c
 +Console, real sandbox proxies, Slack, the isolated executor and a controlled
 +provider. Include unauthorized clicks, direct-call bypass, duplicates, expiry
 +and restart. No production enablement is implied by source or unit-test success.
+diff --git a/services/console/Gemfile.lock b/services/console/Gemfile.lock
+index e115f379..d18d7de2 100644
+--- a/services/console/Gemfile.lock
++++ b/services/console/Gemfile.lock
+@@ -84,7 +84,7 @@ GEM
+     bindex (0.8.1)
+     bootsnap (1.26.0)
+       msgpack (~> 1.5)
+-    brakeman (8.0.6)
++    brakeman (8.1.0)
+       racc
+     builder (3.3.0)
+     bundler-audit (0.9.3)
 diff --git a/services/console/app/controllers/api/v1/sandbox/tool_approvals_controller.rb b/services/console/app/controllers/api/v1/sandbox/tool_approvals_controller.rb
 new file mode 100644
 index 00000000..533caf9b
