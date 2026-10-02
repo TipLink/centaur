@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [main, release/aws-core]
     paths:
+      # Reviewed image publication requires packaging proof for every patch series.
+      - .github/core-patches/**
       - .github/workflows/validate-cli-packaging.yml
       - scripts/validate_cli_packaging.py
       - tools/**
@@ -11,6 +13,7 @@ on:
   push:
     branches: [main, release/aws-core]
     paths:
+      - .github/core-patches/**
       - .github/workflows/validate-cli-packaging.yml
       - scripts/validate_cli_packaging.py
       - tools/**

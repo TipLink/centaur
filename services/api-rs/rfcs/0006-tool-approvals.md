@@ -23,7 +23,7 @@ scheduler, Slack delivery worker or tool-host runtime.
 2. Core validates the action policy and registered executor. It freezes the full
    JSON arguments, policy hash and payload hash. Request insertion and enqueue
    of the native approval driver commit in one PostgreSQL transaction.
-3. The driver posts plaintext payload sections and signed native
+3. The driver posts indented JSON in native preformatted blocks and signed native
    `centaur.workflow.action:` buttons. It stores the original message timestamp
    and complete signed card, then suspends on a durable event.
 4. Existing Slack ingress verifies Slack's webhook signature. The native
@@ -31,8 +31,10 @@ scheduler, Slack delivery worker or tool-host runtime.
    additionally require the Slack ingress service identity; ordinary workflow
    input and its `click.user_id` field are never authority.
 5. Core checks current policy hash, team, channel, original message/card, payload
-   hash, expiry, allowlisted actor and self-approval policy. One locked transition
-   chooses the decision; the update and native wake event are atomic.
+   hash, expiry, allowlisted actor and self-approval policy. Authenticated original-card clicks receive a typed rejection reason for
+   unauthorized actors, self-approval restrictions, changed policy, expiry or an
+   existing decision. Untrusted/mismatched cards remain generically unavailable.
+   One locked transition chooses the decision; the update and native wake event are atomic.
 6. Immediately before execution, core verifies enablement, approval-only marker
    and exact registered principal. One compare-and-set commits
    `approved -> executing`. The existing workflow host runs the pinned executor
@@ -132,7 +134,7 @@ be omitted, with `output_omitted: true`; execution still counts as succeeded
 and must not be repeated merely to recover output.
 
 Selected fields are persisted as `result.output`, returned to the requesting
-bot by the CLI/status API, and displayed as plaintext in the final Slack card.
+bot by the CLI/status API, and displayed as indented, preformatted JSON in the final Slack card.
 All unselected fields and all executor errors remain private. This is an
 explicit publication policy, **not a secret scanner**: only select fields that
 reviewed executor code guarantees are non-secret. The field list is displayed
@@ -181,7 +183,9 @@ available; this protocol does not promise exactly-once external effects.
 
 Slack post/checkpoint failure can leave a duplicate card. Only the recorded
 original message/card can authorize the request. Final-message delivery retries
-do not invoke the executor again.
+do not invoke the executor again. The clicker receives private feedback only
+after the decision commits. Duplicate decisions do not execute again; a declined
+request cannot later be approved. Use a fresh request for each decision test.
 
 Approval status includes `workflow_task_id` and `workflow_run_id` for the native
 workflow history. Cancelling that native run also reconciles its approval:
@@ -229,7 +233,7 @@ admission within the same execution. Admission is capped at 20 requests/executio
 
 The complete argument object, workflow, executor principal and implementation
 revision must fit in 12,000 displayed JSON bytes; oversized payloads are rejected,
-never truncated. Plaintext sections preserve large integers and use JSON escapes
+never truncated. Preformatted text blocks preserve large integers and use JSON escapes
 for Unicode and Slack delimiters. Everyone in the thread can read the arguments.
 Never include secrets. Do not approve deferred mutable URLs/files/draft IDs;
 snapshot their contents first. The approval covers the reviewed executor's

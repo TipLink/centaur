@@ -14,6 +14,23 @@ pub const DRIVER_WORKFLOW: &str = "centaur_approval_request";
 pub const DECISION_WORKFLOW: &str = "centaur_approval_decision";
 pub const EVENT_PREFIX: &str = "centaur.approval:";
 
+/// Safe feedback for an authenticated click on its original approval card.
+/// Untrusted/mismatched buttons still receive the generic unavailable error.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionRejection {
+    NotApprover,
+    SelfApprovalNotAllowed,
+    PolicyChanged,
+    Expired,
+    AlreadyApproved,
+    AlreadyDeclined,
+    Cancelled,
+    Executing,
+    Succeeded,
+    Unknown,
+}
+
 pub fn is_reserved(name: &str) -> bool {
     name.starts_with("centaur_approval_")
 }
@@ -148,6 +165,10 @@ fn bind_policy(
 
 pub(super) fn unavailable() -> WorkflowRuntimeError {
     WorkflowRuntimeError::Disabled("approval unavailable".into())
+}
+
+fn rejected(reason: DecisionRejection) -> WorkflowRuntimeError {
+    WorkflowRuntimeError::ApprovalDecisionRejected(reason)
 }
 
 fn identifier(s: &str) -> bool {

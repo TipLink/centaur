@@ -191,10 +191,19 @@ impl Repository {
         validate_decision(p, &row, &input, button.message.as_ref())?;
         let user = input["click"]["user_id"].as_str().ok_or_else(unavailable)?;
         let decision = input["click"]["action"].as_str().ok_or_else(unavailable)?;
-        let changed = sqlx::query("update tool_approvals set status=$2,decided_by=$3,decided_at=now() where id=$1 and status='pending' and expires_at>now()")
+        let changed = sqlx::query("update tool_approvals set status=$2,decided_by=$3,decided_at=clock_timestamp() where id=$1 and status='pending' and expires_at>clock_timestamp()")
             .bind(id).bind(decision).bind(user).execute(&mut *tx).await?.rows_affected();
         if changed == 0 && !(row.status == decision && row.decided_by.as_deref() == Some(user)) {
-            return Err(unavailable());
+            return Err(rejected(match row.status.as_str() {
+                "pending" | "expired" => DecisionRejection::Expired,
+                "approved" => DecisionRejection::AlreadyApproved,
+                "declined" => DecisionRejection::AlreadyDeclined,
+                "cancelled" => DecisionRejection::Cancelled,
+                "executing" => DecisionRejection::Executing,
+                "succeeded" => DecisionRejection::Succeeded,
+                "unknown" => DecisionRejection::Unknown,
+                _ => return Err(unavailable()),
+            }));
         }
         if changed > 0 {
             wake(&self.pool, &mut tx, id).await?;
@@ -283,11 +292,8 @@ fn validate_decision(
 ) -> Result<(), WorkflowRuntimeError> {
     let click = &input["click"];
     let user = click["user_id"].as_str().unwrap_or_default();
-    if hash(p) != row.policy_hash
-        || p.team_id != row.team_id
+    if p.team_id != row.team_id
         || click["team_id"] != row.team_id
-        || !p.approver_user_ids.iter().any(|s| s == user)
-        || (!p.allow_self_approval && row.requester_id == user)
         || !matches!(click["action"].as_str(), Some("approved" | "declined"))
         || click["id"] != row.id.to_string()
         || click["channel_id"] != row.channel_id
@@ -301,6 +307,17 @@ fn validate_decision(
         })
     {
         return Err(unavailable());
+    }
+    // Reveal actionable reasons only after the original card/message binding
+    // has passed. Non-approvers learn only that they cannot decide this action.
+    if !p.approver_user_ids.iter().any(|s| s == user) {
+        return Err(rejected(DecisionRejection::NotApprover));
+    }
+    if hash(p) != row.policy_hash {
+        return Err(rejected(DecisionRejection::PolicyChanged));
+    }
+    if !p.allow_self_approval && row.requester_id == user {
+        return Err(rejected(DecisionRejection::SelfApprovalNotAllowed));
     }
     Ok(())
 }

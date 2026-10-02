@@ -40,16 +40,37 @@ pub(super) fn executor_outcome(
 
 pub(super) fn final_message(
     id: Uuid,
+    action: &str,
     status: &str,
     result: Option<&Value>,
     policy: Option<&ActionPolicy>,
 ) -> Value {
-    let mut text = format!("Approval {id}: {status}.");
-    if status == "unknown" {
-        text.push_str(" Inspect the provider outcome before submitting another request.");
-    }
-    let mut blocks = vec![json!({"type":"section","text":{
-        "type":"plain_text","emoji":false,"text":text}})];
+    let (label, detail) = match status {
+        "succeeded" => ("Completed", "The action completed successfully."),
+        "declined" => (
+            "Declined",
+            "The action did not run. Start a new request if you want to approve it.",
+        ),
+        "expired" => (
+            "Expired",
+            "The request expired before the action ran. Start a new request to try again.",
+        ),
+        "cancelled" => (
+            "Cancelled",
+            "The action did not run. Start a new request if it is still needed.",
+        ),
+        "unknown" => (
+            "Outcome uncertain",
+            "The action may have run. Inspect the provider outcome before submitting another request.",
+        ),
+        _ => ("Processing", "The request is still being processed."),
+    };
+    let title = format!("{label}: {action}");
+    let mut text = format!("{title}. {detail}");
+    let mut blocks = vec![
+        json!({"type":"header","text":{"type":"plain_text","emoji":false,"text":title}}),
+        json!({"type":"section","text":{"type":"plain_text","emoji":false,"text":detail}}),
+    ];
     if status == "succeeded"
         && let Some(policy) = policy.filter(|p| !p.public_result_fields.is_empty())
         && let Some(raw) = result.and_then(|value| value.get("output"))
@@ -58,13 +79,31 @@ pub(super) fn final_message(
         // Only the deliberately published projection is persisted here. Never
         // use the raw workflow result in a Slack message or fallback text.
         if let Ok(display) = display_json(&output) {
-            blocks.push(json!({"type":"section","text":{
-                "type":"plain_text","emoji":false,"text":display}}));
+            blocks.push(preformatted(&display));
             text.push('\n');
             text.push_str(&display);
         }
     }
+    if status == "succeeded" && result.is_some_and(|r| r["output_omitted"] == true) {
+        let detail = "The result could not be displayed. The action succeeded; do not rerun it just to recover the output.";
+        blocks.push(
+            json!({"type":"section","text":{"type":"plain_text","emoji":false,"text":detail}}),
+        );
+        text.push('\n');
+        text.push_str(detail);
+    }
+    blocks.push(
+        json!({"type":"context","elements":[{"type":"plain_text","emoji":false,
+        "text":format!("Request {id}")}]}),
+    );
     json!({"text":text,"blocks":blocks,"mrkdwn":false})
+}
+
+fn preformatted(text: &str) -> Value {
+    // Native preformatted text preserves indentation without interpreting
+    // markdown, mentions or embedded triple backticks from JSON strings.
+    json!({"type":"rich_text","elements":[{"type":"rich_text_preformatted","border":0,
+        "elements":[{"type":"text","text":text}]}]})
 }
 
 pub(super) fn validate_executor(
@@ -85,27 +124,46 @@ pub(super) fn validate_executor(
     Ok(())
 }
 
-fn card(row: &Record) -> Value {
+pub(super) fn card(row: &Record) -> Value {
+    let requester = if slack_id(&row.requester_id, 'U') || slack_id(&row.requester_id, 'W') {
+        format!("<@{}>", row.requester_id)
+    } else {
+        "Unknown requester".into()
+    };
     let mut blocks = vec![
+        json!({"type":"header","text":{"type":"plain_text","emoji":false,
+            "text":format!("Approval required: {}",row.action)}}),
+        json!({"type":"section","fields":[
+            {"type":"mrkdwn","verbatim":false,"text":format!("*Requested by*\n{requester}")},
+            {"type":"mrkdwn","verbatim":false,"text":format!("*Expires*\n<!date^{}^{{date_short_pretty}} at {{time}}|{} UTC>",
+                row.expires_at.timestamp(),row.expires_at.format("%Y-%m-%d %H:%M"))}
+        ]}),
         json!({"type":"section","text":{"type":"plain_text","emoji":false,
-        "text":format!("Approve action {}? Requested by {}. Expires {}.\nPayload SHA-256: {}",
-            row.action,row.requester_id,row.expires_at,row.payload_hash)}}),
+            "text":"Review the request below, then choose Approve or Decline."}}),
     ];
     for chunk in row.payload_json.as_bytes().chunks(2900) {
-        blocks.push(
-            json!({"type":"section","text":{"type":"plain_text","emoji":false,
-            "text":std::str::from_utf8(chunk).expect("display is ASCII")}}),
-        );
+        blocks.push(preformatted(
+            std::str::from_utf8(chunk).expect("display is ASCII"),
+        ));
     }
-    let buttons = [("approved", "Accept"), ("declined", "Decline")].map(|(action, label)| {
+    let buttons = [
+        ("approved", "Approve", "primary"),
+        ("declined", "Decline", "danger"),
+    ]
+    .map(|(action, label, style)| {
         json!({"type":"button","text":{"type":"plain_text","text":label},
+            "style":style,
             "action_id":format!("centaur.workflow.action:{}:{action}",row.id),
             "value":json!({"workflow_name":DECISION_WORKFLOW,
                 "input":{"approval_id":row.id,"payload_hash":row.payload_hash}}).to_string()})
     });
     blocks.push(json!({"type":"actions","elements":buttons}));
+    blocks.push(
+        json!({"type":"context","elements":[{"type":"plain_text","emoji":false,
+        "text":format!("Request {} · Payload SHA-256: {}",row.id,row.payload_hash)}]}),
+    );
     json!({"channel":row.channel_id,"thread_ts":row.thread_ts,"client_msg_id":row.id.to_string(),
-        "text":format!("Approval requested: {}",row.action),"blocks":blocks,"unfurl_links":false,"unfurl_media":false})
+        "text":format!("Approval requested: {}",row.action),"blocks":blocks,"mrkdwn":false,"unfurl_links":false,"unfurl_media":false})
 }
 
 pub(crate) async fn run(
@@ -231,6 +289,7 @@ async fn run_inner(
     if let Some(ts) = &row.message_ts {
         let mut message = final_message(
             row.id,
+            &row.action,
             &row.status,
             row.result.as_ref(),
             p.filter(|policy| hash(policy) == row.policy_hash),

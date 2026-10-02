@@ -466,6 +466,8 @@ describe('slackbotv2', () => {
         ts: '1700000003.000200', text: 'Approve this release?',
         blocks: [
           { type: 'section', text: { type: 'mrkdwn', text: 'Approve this release?' } },
+          { type: 'rich_text', block_id: 'slack-generated', elements: [{ type: 'rich_text_preformatted',
+            elements: [{ type: 'text', text: '{\n  "message": "``` <@U1>"\n}' }] }] },
           { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Approve' },
             action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
             value: 'v1.opaque-signed-payload.signature' }] }
@@ -511,7 +513,32 @@ describe('slackbotv2', () => {
     expect(codexApi.workflowEvents).toHaveLength(0)
   })
 
-  it('acknowledges a permanently rejected workflow button without retrying it', async () => {
+  const approvalFeedbackCases = [
+    { name: 'untrusted button', status: 403, body: { error: 'invalid or untrusted workflow button' }, expected: 'could not be verified' },
+    ...[
+      ['not_approver', 'You are not an approver'],
+      ['self_approval_not_allowed', 'self-approval is disabled'],
+      ['policy_changed', 'approval settings changed'],
+      ['expired', 'request expired'],
+      ['already_approved', 'already been approved'],
+      ['already_declined', 'already declined'],
+      ['cancelled', 'request was cancelled'],
+      ['executing', 'already running'],
+      ['succeeded', 'already completed'],
+      ['unknown', 'may have run'],
+      ['constructor', 'could not be verified'],
+      ['unrecognized', 'could not be verified']
+    ].map(([reason, expected]) => ({ name: reason, status: 403,
+      body: { code: 'approval_decision_rejected', reason, error: 'do-not-publish <@USECRET>' }, expected })),
+    ...[
+      ['approved', true, 'Approved.'],
+      ['declined', true, 'Declined.'],
+      ['approved', false, 'approval is already recorded'],
+      ['declined', false, 'already declined']
+    ].map(([status, created, expected]) => ({ name: `${status} created=${created}`, status: 200,
+      body: { ok: true, run_id: 'run-approval', task_id: 'task-approval', status, created }, expected }))
+  ]
+  for (const feedbackCase of approvalFeedbackCases) it(`acknowledges ${feedbackCase.name} with private feedback and no retry`, async () => {
     let starts = 0
     const feedback: unknown[] = []
     bot = createTestBot({
@@ -519,7 +546,7 @@ describe('slackbotv2', () => {
         if (String(input).endsWith('/api/workflows/actions/invoke')) {
           starts += 1
           expect(JSON.parse(String(init?.body)).button).toBe('unsigned')
-          return Response.json({ error: 'invalid or untrusted workflow button' }, { status: 403 })
+          return Response.json(feedbackCase.body, { status: feedbackCase.status })
         }
         if (String(input).endsWith('/chat.postEphemeral')) {
           feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
@@ -542,8 +569,11 @@ describe('slackbotv2', () => {
     expect(starts).toBe(1)
     expect(feedback).toEqual([{
       channel: CHANNEL_ID, user: USER_ID, thread_ts: '1700000003.000100',
-      text: 'This request is no longer available.'
+      text: expect.stringContaining(String(feedbackCase.expected))
     }])
+    expect(JSON.stringify(feedback)).not.toContain('do-not-publish')
+    expect(JSON.stringify(feedback)).not.toContain('USECRET')
+    expect(codexApi.workflowEvents).toHaveLength(0)
   })
 
   it('applies the external-org allowlist to Slack block actions', async () => {

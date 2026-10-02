@@ -75,6 +75,9 @@ impl IntoResponse for ApiError {
             )) => StatusCode::FORBIDDEN,
             Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Workflow(WorkflowRuntimeError::Disabled(_)) => StatusCode::FORBIDDEN,
+            Self::Workflow(WorkflowRuntimeError::ApprovalDecisionRejected(_)) => {
+                StatusCode::FORBIDDEN
+            }
             Self::Workflow(WorkflowRuntimeError::NotFound(_)) => StatusCode::NOT_FOUND,
             Self::Workflow(WorkflowRuntimeError::Upstream(_)) => StatusCode::BAD_GATEWAY,
             Self::Internal(_)
@@ -99,6 +102,10 @@ impl IntoResponse for ApiError {
             "ok": false,
             "error": message,
         });
+        if let Self::Workflow(WorkflowRuntimeError::ApprovalDecisionRejected(reason)) = &self {
+            body["code"] = json!("approval_decision_rejected");
+            body["reason"] = json!(reason);
+        }
         // Structured conflict details let clients (e.g. the slackbot) recover by
         // retrying with the session's existing harness instead of parsing the
         // human-readable message.
@@ -159,6 +166,27 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use centaur_iron_control::{IronControlError, PrincipalDerivationError};
+
+    #[tokio::test]
+    async fn approval_rejections_have_a_safe_typed_reason() {
+        let response = ApiError::Workflow(WorkflowRuntimeError::ApprovalDecisionRejected(
+            centaur_workflows::approvals::DecisionRejection::SelfApprovalNotAllowed,
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "approval_decision_rejected");
+        assert_eq!(body["reason"], "self_approval_not_allowed");
+
+        let response = ApiError::Workflow(WorkflowRuntimeError::Disabled(
+            "approval unavailable".into(),
+        ))
+        .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body.get("reason").is_none());
+    }
 
     #[test]
     fn principal_derivation_errors_are_bad_requests() {

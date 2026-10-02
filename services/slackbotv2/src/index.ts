@@ -54,6 +54,7 @@ import {
   sessionStreamError,
   slackApiTimeoutMs,
   WORKFLOW_ACTION_PREFIX,
+  workflowActionFeedback,
   withSlackApiTimeout
 } from './session-api'
 import {
@@ -356,17 +357,17 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     }
     try {
       const result = await dispatchSlackBlockAction(options, payload)
-      // The workflow owns the message and its final button state. Successful
-      // handoff (including redelivery) only needs Slack's native acknowledgment;
-      // a separate success message adds noise before the actual result arrives.
-      if (result?.outcome === 'unavailable' && payload.channel_id) {
+      // Decisions have committed before feedback. The workflow still owns the
+      // shared card and execution result; feedback is private to the clicker.
+      const feedback = workflowActionFeedback(result)
+      if (feedback && payload.channel_id) {
         backgroundWaitUntil(
           withSlackApiTimeout(options, 'post workflow action feedback', () =>
             callSlackApi('chat.postEphemeral', {
               channel: payload.channel_id,
               user: payload.user_id,
               ...(payload.thread_ts ? { thread_ts: payload.thread_ts } : {}),
-              text: 'This request is no longer available.'
+              text: feedback
             }, {
               apiUrl: options.slackApiUrl,
               fetch: options.fetch as typeof globalThis.fetch | undefined,

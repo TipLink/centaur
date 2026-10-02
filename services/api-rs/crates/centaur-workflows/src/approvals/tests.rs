@@ -168,10 +168,23 @@ fn hello_world_public_result_reaches_slack_without_unselected_fields() {
         result,
         json!({"outcome":"succeeded","output":{"message":"Hello world!"}})
     );
-    let message = runner::final_message(Uuid::nil(), status, Some(&result), Some(&p));
+    let message =
+        runner::final_message(Uuid::nil(), "hello-world", status, Some(&result), Some(&p));
     assert!(message["text"].as_str().unwrap().contains("Hello world!"));
     assert_eq!(message["mrkdwn"], false);
-    assert_eq!(message["blocks"][1]["text"]["type"], "plain_text");
+    assert_eq!(
+        message["blocks"][2]["elements"][0]["type"],
+        "rich_text_preformatted"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            message["blocks"][2]["elements"][0]["elements"][0]["text"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap(),
+        json!({"message":"Hello world!"})
+    );
     assert!(!message.to_string().contains("do-not-publish"));
     for status in [
         "pending",
@@ -181,12 +194,18 @@ fn hello_world_public_result_reaches_slack_without_unselected_fields() {
         "cancelled",
         "unknown",
     ] {
-        let message = runner::final_message(Uuid::nil(), status, Some(&result), Some(&p));
+        let message =
+            runner::final_message(Uuid::nil(), "hello-world", status, Some(&result), Some(&p));
         assert!(!message.to_string().contains("Hello world!"));
     }
     for policy in [None, Some(policy())] {
-        let message =
-            runner::final_message(Uuid::nil(), "succeeded", Some(&result), policy.as_ref());
+        let message = runner::final_message(
+            Uuid::nil(),
+            "hello-world",
+            "succeeded",
+            Some(&result),
+            policy.as_ref(),
+        );
         assert!(!message.to_string().contains("Hello world!"));
     }
 }
@@ -217,16 +236,33 @@ fn malformed_public_output_is_omitted_without_repeating_successful_execution() {
 }
 
 #[test]
-fn public_output_is_plaintext_and_escaped_in_slack_fallback() {
+fn public_output_cannot_escape_preformatted_text_or_notify_slack_users() {
     let mut p = policy();
     p.public_result_fields = vec!["message".into()];
-    let (_, result) = runner::executor_outcome(&p, Ok(json!({"message":"<@U1> & \u{202e}"})));
-    let message = runner::final_message(Uuid::nil(), "succeeded", Some(&result), Some(&p));
+    let (_, result) = runner::executor_outcome(&p, Ok(json!({"message":"``` <@U1> & \u{202e}"})));
+    let message = runner::final_message(
+        Uuid::nil(),
+        "hello-world",
+        "succeeded",
+        Some(&result),
+        Some(&p),
+    );
     let text = message["text"].as_str().unwrap();
     assert!(text.is_ascii());
     assert!(!text.contains("<@"));
     assert!(text.contains("\\u202e"));
-    assert_eq!(message["blocks"][1]["text"]["emoji"], false);
+    assert_eq!(
+        message["blocks"][2]["elements"][0]["elements"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        message["blocks"][2]["elements"][0]["elements"][0]["type"],
+        "text"
+    );
+    assert!(!message.to_string().contains("\"type\":\"user\""));
 }
 
 #[test]
@@ -263,4 +299,76 @@ fn slack_generated_fields_are_the_only_ignored_visible_changes() {
     let mut forged = generated;
     forged[0]["text"]["text"] = json!("other payload");
     assert_ne!(visible_blocks(&expected), visible_blocks(&forged));
+}
+
+#[test]
+fn approval_card_formats_the_complete_payload_without_markdown_interpretation() {
+    let mut p = policy();
+    p.public_result_fields = vec!["message".into()];
+    let arguments =
+        json!({"text":format!("``` <@U1> {}", "x".repeat(8000)), "number":9007199254740993_u64});
+    let (payload, payload_json) = payload(&p, arguments).unwrap();
+    let mut row = repository::Record {
+        id: Uuid::nil(),
+        action: "hello-world".into(),
+        policy_hash: hash(&p),
+        payload_hash: hash(&payload),
+        payload,
+        payload_json,
+        team_id: "T1".into(),
+        channel_id: "C1".into(),
+        thread_ts: "1.000".into(),
+        requester_id: "U1".into(),
+        status: "pending".into(),
+        result: None,
+        message_ts: None,
+        message_blocks: None,
+        workflow_task_id: None,
+        workflow_run_id: None,
+        decided_by: None,
+        expires_at: Utc::now(),
+    };
+    let message = runner::card(&row);
+    let blocks = message["blocks"].as_array().unwrap();
+    assert_eq!(blocks[0]["text"]["text"], "Approval required: hello-world");
+    assert!(
+        blocks[1]["fields"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<@U1>")
+    );
+    assert!(
+        blocks[1]["fields"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<!date^")
+    );
+    let mut display = String::new();
+    for block in blocks.iter().filter(|b| b["type"] == "rich_text") {
+        let pre = &block["elements"][0];
+        assert_eq!(pre["type"], "rich_text_preformatted");
+        assert_eq!(pre["elements"].as_array().unwrap().len(), 1);
+        assert_eq!(pre["elements"][0]["type"], "text");
+        let chunk = pre["elements"][0]["text"].as_str().unwrap();
+        assert!(chunk.len() <= 2900);
+        display.push_str(chunk);
+    }
+    assert_eq!(display, row.payload_json);
+    assert_eq!(
+        serde_json::from_str::<Value>(&display).unwrap(),
+        row.payload
+    );
+    assert!(!display.contains("<@"));
+    let buttons = blocks.iter().find(|b| b["type"] == "actions").unwrap();
+    assert_eq!(buttons["elements"][0]["text"]["text"], "Approve");
+    assert_eq!(buttons["elements"][0]["style"], "primary");
+    assert_eq!(buttons["elements"][1]["style"], "danger");
+    row.requester_id = "U1> <!channel".into();
+    let invalid_requester = runner::card(&row);
+    assert_eq!(
+        invalid_requester["blocks"][1]["fields"][0]["text"],
+        "*Requested by*\nUnknown requester"
+    );
+    assert!(!invalid_requester.to_string().contains("<!channel"));
+    assert_eq!(invalid_requester["mrkdwn"], false);
 }
