@@ -308,7 +308,7 @@ fn approval_card_formats_the_complete_payload_without_markdown_interpretation() 
     let arguments =
         json!({"text":format!("``` <@U1> {}", "x".repeat(8000)), "number":9007199254740993_u64});
     let (payload, payload_json) = payload(&p, arguments).unwrap();
-    let row = repository::Record {
+    let mut row = repository::Record {
         id: Uuid::nil(),
         action: "hello-world".into(),
         policy_hash: hash(&p),
@@ -363,4 +363,12 @@ fn approval_card_formats_the_complete_payload_without_markdown_interpretation() 
     assert_eq!(buttons["elements"][0]["text"]["text"], "Approve");
     assert_eq!(buttons["elements"][0]["style"], "primary");
     assert_eq!(buttons["elements"][1]["style"], "danger");
+    row.requester_id = "U1> <!channel".into();
+    let invalid_requester = runner::card(&row);
+    assert_eq!(
+        invalid_requester["blocks"][1]["fields"][0]["text"],
+        "*Requested by*\nUnknown requester"
+    );
+    assert!(!invalid_requester.to_string().contains("<!channel"));
+    assert_eq!(invalid_requester["mrkdwn"], false);
 }

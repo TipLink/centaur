@@ -148,7 +148,7 @@ index c51c7efc..72376ef3 100644
  }
  
 diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs b/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
-index f1dc8caf..abdbbe84 100644
+index f1dc8caf..a92bbba8 100644
 --- a/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
 +++ b/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
 @@ -40,16 +40,37 @@ pub(super) fn executor_outcome(
@@ -231,17 +231,22 @@ index f1dc8caf..abdbbe84 100644
  pub(super) fn validate_executor(
      p: &ActionPolicy,
      sandbox: Option<&WorkflowHostSandboxRuntime>,
-@@ -85,25 +124,39 @@ pub(super) fn validate_executor(
+@@ -85,27 +124,46 @@ pub(super) fn validate_executor(
      Ok(())
  }
  
 -fn card(row: &Record) -> Value {
 +pub(super) fn card(row: &Record) -> Value {
++    let requester = if slack_id(&row.requester_id, 'U') || slack_id(&row.requester_id, 'W') {
++        format!("<@{}>", row.requester_id)
++    } else {
++        "Unknown requester".into()
++    };
      let mut blocks = vec![
 +        json!({"type":"header","text":{"type":"plain_text","emoji":false,
 +            "text":format!("Approval required: {}",row.action)}}),
 +        json!({"type":"section","fields":[
-+            {"type":"mrkdwn","verbatim":false,"text":format!("*Requested by*\n<@{}>",row.requester_id)},
++            {"type":"mrkdwn","verbatim":false,"text":format!("*Requested by*\n{requester}")},
 +            {"type":"mrkdwn","verbatim":false,"text":format!("*Expires*\n<!date^{}^{{date_short_pretty}} at {{time}}|{} UTC>",
 +                row.expires_at.timestamp(),row.expires_at.format("%Y-%m-%d %H:%M"))}
 +        ]}),
@@ -277,9 +282,12 @@ index f1dc8caf..abdbbe84 100644
 +        "text":format!("Request {} · Payload SHA-256: {}",row.id,row.payload_hash)}]}),
 +    );
      json!({"channel":row.channel_id,"thread_ts":row.thread_ts,"client_msg_id":row.id.to_string(),
-         "text":format!("Approval requested: {}",row.action),"blocks":blocks,"unfurl_links":false,"unfurl_media":false})
+-        "text":format!("Approval requested: {}",row.action),"blocks":blocks,"unfurl_links":false,"unfurl_media":false})
++        "text":format!("Approval requested: {}",row.action),"blocks":blocks,"mrkdwn":false,"unfurl_links":false,"unfurl_media":false})
  }
-@@ -231,6 +284,7 @@ async fn run_inner(
+ 
+ pub(crate) async fn run(
+@@ -231,6 +289,7 @@ async fn run_inner(
      if let Some(ts) = &row.message_ts {
          let mut message = final_message(
              row.id,
@@ -288,7 +296,7 @@ index f1dc8caf..abdbbe84 100644
              row.result.as_ref(),
              p.filter(|policy| hash(policy) == row.policy_hash),
 diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs b/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
-index a59b7ac1..7b5c603c 100644
+index a59b7ac1..2a8e7d0c 100644
 --- a/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
 +++ b/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
 @@ -168,10 +168,23 @@ fn hello_world_public_result_reaches_slack_without_unselected_fields() {
@@ -377,7 +385,7 @@ index a59b7ac1..7b5c603c 100644
  }
  
  #[test]
-@@ -264,3 +300,67 @@ fn slack_generated_fields_are_the_only_ignored_visible_changes() {
+@@ -264,3 +300,75 @@ fn slack_generated_fields_are_the_only_ignored_visible_changes() {
      forged[0]["text"]["text"] = json!("other payload");
      assert_ne!(visible_blocks(&expected), visible_blocks(&forged));
  }
@@ -389,7 +397,7 @@ index a59b7ac1..7b5c603c 100644
 +    let arguments =
 +        json!({"text":format!("``` <@U1> {}", "x".repeat(8000)), "number":9007199254740993_u64});
 +    let (payload, payload_json) = payload(&p, arguments).unwrap();
-+    let row = repository::Record {
++    let mut row = repository::Record {
 +        id: Uuid::nil(),
 +        action: "hello-world".into(),
 +        policy_hash: hash(&p),
@@ -444,6 +452,14 @@ index a59b7ac1..7b5c603c 100644
 +    assert_eq!(buttons["elements"][0]["text"]["text"], "Approve");
 +    assert_eq!(buttons["elements"][0]["style"], "primary");
 +    assert_eq!(buttons["elements"][1]["style"], "danger");
++    row.requester_id = "U1> <!channel".into();
++    let invalid_requester = runner::card(&row);
++    assert_eq!(
++        invalid_requester["blocks"][1]["fields"][0]["text"],
++        "*Requested by*\nUnknown requester"
++    );
++    assert!(!invalid_requester.to_string().contains("<!channel"));
++    assert_eq!(invalid_requester["mrkdwn"], false);
 +}
 diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs b/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs
 index ef71af0a..6e931e21 100644

@@ -125,11 +125,16 @@ pub(super) fn validate_executor(
 }
 
 pub(super) fn card(row: &Record) -> Value {
+    let requester = if slack_id(&row.requester_id, 'U') || slack_id(&row.requester_id, 'W') {
+        format!("<@{}>", row.requester_id)
+    } else {
+        "Unknown requester".into()
+    };
     let mut blocks = vec![
         json!({"type":"header","text":{"type":"plain_text","emoji":false,
             "text":format!("Approval required: {}",row.action)}}),
         json!({"type":"section","fields":[
-            {"type":"mrkdwn","verbatim":false,"text":format!("*Requested by*\n<@{}>",row.requester_id)},
+            {"type":"mrkdwn","verbatim":false,"text":format!("*Requested by*\n{requester}")},
             {"type":"mrkdwn","verbatim":false,"text":format!("*Expires*\n<!date^{}^{{date_short_pretty}} at {{time}}|{} UTC>",
                 row.expires_at.timestamp(),row.expires_at.format("%Y-%m-%d %H:%M"))}
         ]}),
@@ -158,7 +163,7 @@ pub(super) fn card(row: &Record) -> Value {
         "text":format!("Request {} · Payload SHA-256: {}",row.id,row.payload_hash)}]}),
     );
     json!({"channel":row.channel_id,"thread_ts":row.thread_ts,"client_msg_id":row.id.to_string(),
-        "text":format!("Approval requested: {}",row.action),"blocks":blocks,"unfurl_links":false,"unfurl_media":false})
+        "text":format!("Approval requested: {}",row.action),"blocks":blocks,"mrkdwn":false,"unfurl_links":false,"unfurl_media":false})
 }
 
 pub(crate) async fn run(

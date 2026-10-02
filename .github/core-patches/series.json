@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "380a26f0bd40e70d651c76cb6b8c2840a9e3dbef",
-  "result_tree": "885445e542877533df6a16e1cb2c7622cce33a16",
+  "result_tree": "90ea5734ab36689dd0aaa6a5d8d4ee592d9e8a67",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -10,7 +10,7 @@
     },
     {
       "file": "0002-approval-slack-ux.patch",
-      "sha256": "da527a6fc74e1d4ea1a3032ce50bf33c141e0655ea07cb91296cd836c78f3031"
+      "sha256": "03c3306c876ea3a9cab448afeb7cf9ec32383d488179abaf92e6461de5d2faee"
     }
   ]
 }
