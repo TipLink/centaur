@@ -39,6 +39,8 @@ permissions:
   contents: read
 
 env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: tiplink/centaur
   RUST_BUILD_PROFILE: debug
 
 jobs:
@@ -161,7 +163,11 @@ jobs:
           tags: ${{ matrix.service == 'agent' && format('{0}:validate-{1}', matrix.image, env.PLATFORM_SLUG) || '' }}
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
-          cache-from: type=gha,scope=validate-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
+          # Reuse the public cache written by reviewed releases. PRs import it
+          # anonymously and only export to their existing GitHub Actions cache.
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.PLATFORM_SLUG }}
+            type=gha,scope=validate-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
           cache-to: type=gha,mode=max,scope=validate-${{ matrix.image }}-${{ env.PLATFORM_SLUG }}
 
       - name: Probe packaged agent harness
