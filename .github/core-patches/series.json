@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "upstream_repository": "paradigmxyz/centaur",
+  "upstream_revision": "380a26f0bd40e70d651c76cb6b8c2840a9e3dbef",
+  "result_tree": "28333f892e65a56bf262d16ab90bb23bcc402170",
+  "patches": [
+    {
+      "file": "0001-workflow-approvals.patch",
+      "sha256": "2e26e37531419c98a208c29b8bfc88891540d50c49956d5549c44e530ca06d09"
+    }
+  ]
+}

@@ -262,6 +262,10 @@ Rails.application.routes.draw do
       # Called from inside sandboxes through their assigned iron-proxy. The
       # proxy injects a short-lived sandbox entitlement JWT scoped to these paths.
       namespace :sandbox do
+        get "tool_approvals/context", to: "tool_approvals#context"
+        resources :tool_approvals, only: %i[create show] do
+          post :cancel, on: :member
+        end
         resource :permissions, only: :show
         resources :oauth_apps, only: :index
         resources :scheduled_tasks, only: %i[index show create update destroy] do

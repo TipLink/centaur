@@ -85,6 +85,7 @@ class RegisteredWorkflow:
     webhooks: Any
     schedule: Any
     principal: Any = None
+    requires_approval: bool = False
     agent_defaults: dict[str, Any] | None = None
 
 
@@ -155,6 +156,7 @@ def load_workflow_file(path: Path) -> RegisteredWorkflow | None:
         webhooks=getattr(module, "WEBHOOKS", None),
         schedule=getattr(module, "SCHEDULE", None),
         principal=getattr(module, "WORKFLOW_PRINCIPAL", None),
+        requires_approval=getattr(module, "WORKFLOW_REQUIRES_APPROVAL", False),
         agent_defaults=agent_defaults,
     )
 
@@ -405,6 +407,14 @@ async def run_workflow(message: dict[str, Any], rpc: RpcClient) -> dict[str, Any
             await pool.close()
 
 
+def normalize_requires_approval(workflow: RegisteredWorkflow) -> bool:
+    if not isinstance(workflow.requires_approval, bool):
+        raise TypeError("WORKFLOW_REQUIRES_APPROVAL must be a boolean")
+    if workflow.requires_approval and not normalize_principal(workflow):
+        raise ValueError("WORKFLOW_REQUIRES_APPROVAL requires WORKFLOW_PRINCIPAL")
+    return workflow.requires_approval
+
+
 def discovery_payload() -> dict[str, Any]:
     workflows = discover_workflows()
     return {
@@ -416,6 +426,7 @@ def discovery_payload() -> dict[str, Any]:
                 "webhooks": normalize_webhooks(workflow),
                 "schedule": normalize_schedule(workflow),
                 "principal": normalize_principal(workflow),
+                "requires_approval": normalize_requires_approval(workflow),
             }
             for workflow in workflows.values()
         ],

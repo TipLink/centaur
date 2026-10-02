@@ -179,7 +179,7 @@ impl AppState {
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
     }
 
-    fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
+    pub(crate) fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -188,7 +188,7 @@ impl AppState {
             .ok_or_else(|| ApiError::BadRequest("workflow runtime is not enabled".to_owned()))
     }
 
-    fn pool(&self) -> Result<PgPool, ApiError> {
+    pub(crate) fn pool(&self) -> Result<PgPool, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -260,6 +260,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route("/api/session/{thread_key}/events", get(stream_events))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .merge(slack_proxy_router())
+        .merge(crate::tool_approvals::router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
             "/api/workflows/runs",
@@ -446,6 +447,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
 
 #[derive(Clone, Copy)]
 enum RouteAccess {
+    ConsoleOnly,
     Capability(Capability),
     PrincipalOnly,
     ArchiveDownload,
@@ -483,6 +485,7 @@ async fn authorize_api_request(
     };
 
     let allowed = match access {
+        RouteAccess::ConsoleOnly => caller.class() == CallerClass::Console,
         RouteAccess::Capability(capability) => caller.has_capability(capability),
         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
         RouteAccess::ArchiveDownload => {
@@ -537,6 +540,10 @@ async fn authorize_api_request(
 fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
+        (&Method::POST, "/api/tool-approvals/context")
+        | (&Method::POST, "/api/tool-approvals/request")
+        | (&Method::POST, "/api/tool-approvals/{id}/read")
+        | (&Method::POST, "/api/tool-approvals/{id}/cancel") => Some(RouteAccess::ConsoleOnly),
         (&Method::GET, "/api/session/{thread_key}")
         | (&Method::GET, "/api/session/{thread_key}/events") => {
             capability(Capability::SessionsRead)
@@ -2858,14 +2865,24 @@ async fn ingest_google_docs_sync_batch(
 
 async fn invoke_workflow_button(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Json(request): Json<centaur_workflows::slack_buttons::Invocation>,
 ) -> Result<Json<Value>, ApiError> {
     let feedback =
         centaur_workflows::slack_button_feedback::ButtonFeedback::from_invocation(&request);
     let request = state.auth.verify_workflow_button(request)?;
-    let run = workflow_runtime(&state)?
-        .create_button_run(request, feedback)
-        .await?;
+    let run = if request.workflow_name() == centaur_workflows::approvals::DECISION_WORKFLOW {
+        if caller.class() != CallerClass::Ingress || caller.identity() != "slackbot" {
+            return Err(ApiError::Forbidden(
+                "approval decisions require Slack ingress".into(),
+            ));
+        }
+        workflow_runtime(&state)?.decide_approval(request).await?
+    } else {
+        workflow_runtime(&state)?
+            .create_button_run(request.into_request(), feedback)
+            .await?
+    };
     Ok(Json(serde_json::to_value(run)?))
 }
 

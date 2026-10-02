@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 from urllib.parse import quote
+from uuid import UUID, uuid4
 
 import httpx
 
 SANDBOX_PERMISSIONS_PATH = "/api/v1/sandbox/permissions"
 SANDBOX_OAUTH_APPS_PATH = "/api/v1/sandbox/oauth_apps"
 SANDBOX_SCHEDULED_TASKS_PATH = "/api/v1/sandbox/scheduled_tasks"
+SANDBOX_APPROVALS_PATH = "/api/v1/sandbox/tool_approvals"
+APPROVAL_TERMINAL = frozenset(
+    {"succeeded", "failed", "unknown", "declined", "expired", "cancelled"}
+)
 
 
 class ConsoleClient:
@@ -32,7 +38,11 @@ class ConsoleClient:
     @property
     def base_url(self) -> str:
         # Non-secret endpoint config. Sandboxes receive this from api-rs.
-        url = (self._url or os.getenv("CENTAUR_CONSOLE_URL", "http://centaur-console:3000")).strip().rstrip("/")  # noqa: TID251
+        url = (
+            (self._url or os.getenv("CENTAUR_CONSOLE_URL", "http://centaur-console:3000"))  # noqa: TID251
+            .strip()
+            .rstrip("/")
+        )
         if url and not url.startswith(("http://", "https://")):
             url = f"http://{url}"
         return url
@@ -75,6 +85,72 @@ class ConsoleClient:
     def permissions(self) -> dict[str, Any]:
         """Alias for tool bridge calls."""
         return self.sandbox_permissions()
+
+    def approval_actions(self) -> dict[str, Any]:
+        """List guarded actions for the current running Slack execution."""
+        return self._approval_request("GET", SANDBOX_APPROVALS_PATH + "/context")
+
+    def request_approval(
+        self, action: str, arguments: dict[str, Any], idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Freeze a guarded action for human approval; never execute locally."""
+        if not isinstance(arguments, dict):
+            raise ValueError("arguments must be a JSON object")
+        key = str(UUID(idempotency_key)) if idempotency_key else str(uuid4())
+        context = self.approval_actions()
+        return self._approval_request(
+            "POST",
+            SANDBOX_APPROVALS_PATH,
+            {
+                "data": {
+                    "execution_id": context["execution_id"],
+                    "idempotency_key": key,
+                    "action": action,
+                    "arguments": arguments,
+                }
+            },
+        )
+
+    def approval_status(self, request_id: str) -> dict[str, Any]:
+        """Read an owned approval, its public outcome and linked workflow IDs."""
+        return self._approval_request("GET", SANDBOX_APPROVALS_PATH + "/" + str(UUID(request_id)))
+
+    def wait_for_approval(self, request_id: str, timeout_seconds: int = 1200) -> dict[str, Any]:
+        """Wait without resubmitting. A client timeout does not cancel the request."""
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            result = self.approval_status(request_id)
+            if result["status"] in APPROVAL_TERMINAL:
+                return result
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Still pending: {request_id}. Use approvals status; do not resubmit."
+                )
+            time.sleep(2)
+
+    def cancel_approval(self, request_id: str) -> dict[str, Any]:
+        """Cancel before execution is claimed; cannot undo an external side effect."""
+        return self._approval_request(
+            "POST", SANDBOX_APPROVALS_PATH + "/" + str(UUID(request_id)) + "/cancel"
+        )
+
+    def _approval_request(self, method: str, path: str, body: dict | None = None) -> dict[str, Any]:
+        # Share transport/lifecycle, not the general client's raw response-body
+        # errors. Provider payloads and credentials must not leak via exceptions.
+        try:
+            response = self.client.request(method, path, json=body, follow_redirects=False)
+        except httpx.RequestError:
+            raise RuntimeError("Approval API request unavailable") from None
+        if not response.is_success:
+            raise RuntimeError(f"Approval API returned HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError:
+            raise RuntimeError("Invalid approval response") from None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise RuntimeError("Invalid approval response")
+        return data
 
     def sandbox_oauth_apps(self) -> list[dict[str, Any]]:
         """Return enabled OAuth apps with user-facing consent start URLs."""

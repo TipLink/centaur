@@ -1,0 +1,43 @@
+name: Prepare patched upstream Centaur
+description: Apply the reviewed patch bundle to an exact official upstream commit
+outputs:
+  revision:
+    value: ${{ steps.source.outputs.revision }}
+    description: Official upstream revision
+  patch_sha256:
+    value: ${{ steps.source.outputs.patch_sha256 }}
+    description: SHA-256 of the reviewed patch manifest
+  source_tree:
+    value: ${{ steps.source.outputs.source_tree }}
+    description: Exact patched Git tree
+runs:
+  using: composite
+  steps:
+    - id: source
+      shell: bash
+      run: |
+        set -euo pipefail
+        IFS=$'\n\t'
+        manifest=.github/core-patches/series.json
+        jq -e '.upstream_repository == "paradigmxyz/centaur"' "$manifest" >/dev/null
+        revision="$(jq -er '.upstream_revision | select(test("^[0-9a-f]{40}$"))' "$manifest")"
+        source_tree="$(jq -er '.result_tree | select(test("^[0-9a-f]{40}$"))' "$manifest")"
+        patch_sha256="$(sha256sum "$manifest" | cut -d' ' -f1)"
+        echo "revision=$revision" >> "$GITHUB_OUTPUT"
+        echo "patch_sha256=$patch_sha256" >> "$GITHUB_OUTPUT"
+        echo "source_tree=$source_tree" >> "$GITHUB_OUTPUT"
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        repository: paradigmxyz/centaur
+        ref: ${{ steps.source.outputs.revision }}
+        path: _core_base
+        fetch-depth: 0
+        persist-credentials: false
+    - shell: bash
+      run: |
+        set -euo pipefail
+        IFS=$'\n\t'
+        git -C _core_base merge-base --is-ancestor HEAD refs/remotes/origin/main
+        python3 .github/scripts/prepare-centaur-core.py \
+          --manifest .github/core-patches/series.json --upstream _core_base --output _core
+        python3 .github/scripts/verify-core-patch-source.py --source . --prepared _core

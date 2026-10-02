@@ -128,6 +128,22 @@ class CentaurApiClient
     post("/api/workflows/runs", payload)
   end
 
+  def tool_approval_context(identity)
+    post("/api/tool-approvals/context", identity)
+  end
+
+  def request_tool_approval(payload)
+    post("/api/tool-approvals/request", payload)
+  end
+
+  def read_tool_approval(id, identity)
+    post("/api/tool-approvals/#{escape_path(id)}/read", identity)
+  end
+
+  def cancel_tool_approval(id, identity)
+    post("/api/tool-approvals/#{escape_path(id)}/cancel", identity)
+  end
+
   private
 
   def get(path, params = {})

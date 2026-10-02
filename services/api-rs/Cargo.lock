@@ -1129,6 +1129,7 @@ name = "centaur-workflows"
 version = "0.1.0"
 dependencies = [
  "absurd-sdk",
+ "async-trait",
  "base64 0.23.1",
  "centaur-iron-control",
  "centaur-sandbox-core",
@@ -1140,6 +1141,7 @@ dependencies = [
  "chrono-tz",
  "cron",
  "futures-util",
+ "hex",
  "hmac 0.13.0",
  "reqwest",
  "serde",
@@ -4841,6 +4843,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
  "webpki-roots 0.26.11",
 ]
 
@@ -4923,6 +4926,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -4962,6 +4966,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -4989,6 +4994,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
