@@ -565,6 +565,41 @@ export async function forwardToSessionApi(
 
 export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
 
+const approvalDecisionMessages: Record<string, string> = {
+  not_approver: 'You are not an approver for this action. Ask a designated approver to review it.',
+  self_approval_not_allowed: 'You requested this action, and self-approval is disabled. Ask another designated approver to decide, or have someone else submit a new request.',
+  policy_changed: 'The approval settings changed after this request was created. Start a new request using the current settings.',
+  expired: 'This approval request expired. The action did not run. Start a new request to try again.',
+  already_approved: 'This request has already been approved. No additional execution was started.',
+  already_declined: 'This request was already declined, so the action did not run. Start a new request if you want to approve it.',
+  cancelled: 'This request was cancelled. The action did not run. Start a new request if it is still needed.',
+  executing: 'This action is already running. Its result will appear in this thread; do not submit it again.',
+  succeeded: 'This action has already completed. Check its result in this thread. It will not run again from this request.',
+  unknown: 'The action may have run, but its outcome could not be confirmed. Inspect the provider outcome before submitting another request.'
+}
+
+export function workflowActionFeedback(result: JsonObject | undefined): string | undefined {
+  if (result?.outcome === 'unavailable') {
+    // Never display arbitrary API error text or unknown reason codes in Slack.
+    if (typeof result.reason === 'string' && Object.hasOwn(approvalDecisionMessages, result.reason)) {
+      return approvalDecisionMessages[result.reason]
+    }
+    return 'This button could not be verified for the original request. Open the original approval card or check the request status.'
+  }
+  if (result?.outcome === 'accepted' || result?.outcome === 'duplicate') {
+    if (result.status === 'approved') {
+      return result.outcome === 'duplicate'
+        ? 'Your approval is already recorded. No additional execution was started.'
+        : 'Approved. The result will appear in this thread.'
+    }
+    if (result.status === 'declined') {
+      return result.outcome === 'duplicate'
+        ? 'You already declined this request. Start a new request if you want to approve it.'
+        : 'Declined. The action will not run. Start a new request if you want to approve it.'
+    }
+  }
+}
+
 export async function dispatchSlackBlockAction(
   options: SlackbotV2Options,
   payload: SlackbotV2BlockActionPayload
@@ -615,8 +650,13 @@ export async function dispatchSlackBlockAction(
     action
   )
   if (workflowAction && response.status === 403) {
-    await response.body?.cancel()
-    return { outcome: 'unavailable' }
+    const rejection: unknown = await response.json().catch(() => undefined)
+    const reason = isJsonObject(rejection)
+      && rejection.code === 'approval_decision_rejected'
+      && typeof rejection.reason === 'string'
+      && Object.hasOwn(approvalDecisionMessages, rejection.reason)
+      ? rejection.reason : undefined
+    return { outcome: 'unavailable', ...(reason ? { reason } : {}) }
   }
   await ensureApiOk(response, action)
   if (workflowAction) {

@@ -1,0 +1,924 @@
+diff --git a/services/api-rs/crates/centaur-api-server/src/error.rs b/services/api-rs/crates/centaur-api-server/src/error.rs
+index 7104b0f7..e6797fdc 100644
+--- a/services/api-rs/crates/centaur-api-server/src/error.rs
++++ b/services/api-rs/crates/centaur-api-server/src/error.rs
+@@ -75,6 +75,9 @@ impl IntoResponse for ApiError {
+             )) => StatusCode::FORBIDDEN,
+             Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
+             Self::Workflow(WorkflowRuntimeError::Disabled(_)) => StatusCode::FORBIDDEN,
++            Self::Workflow(WorkflowRuntimeError::ApprovalDecisionRejected(_)) => {
++                StatusCode::FORBIDDEN
++            }
+             Self::Workflow(WorkflowRuntimeError::NotFound(_)) => StatusCode::NOT_FOUND,
+             Self::Workflow(WorkflowRuntimeError::Upstream(_)) => StatusCode::BAD_GATEWAY,
+             Self::Internal(_)
+@@ -99,6 +102,10 @@ impl IntoResponse for ApiError {
+             "ok": false,
+             "error": message,
+         });
++        if let Self::Workflow(WorkflowRuntimeError::ApprovalDecisionRejected(reason)) = &self {
++            body["code"] = json!("approval_decision_rejected");
++            body["reason"] = json!(reason);
++        }
+         // Structured conflict details let clients (e.g. the slackbot) recover by
+         // retrying with the session's existing harness instead of parsing the
+         // human-readable message.
+@@ -160,6 +167,27 @@ mod tests {
+     use axum::body::to_bytes;
+     use centaur_iron_control::{IronControlError, PrincipalDerivationError};
+ 
++    #[tokio::test]
++    async fn approval_rejections_have_a_safe_typed_reason() {
++        let response = ApiError::Workflow(WorkflowRuntimeError::ApprovalDecisionRejected(
++            centaur_workflows::approvals::DecisionRejection::SelfApprovalNotAllowed,
++        ))
++        .into_response();
++        assert_eq!(response.status(), StatusCode::FORBIDDEN);
++        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
++        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
++        assert_eq!(body["code"], "approval_decision_rejected");
++        assert_eq!(body["reason"], "self_approval_not_allowed");
++
++        let response = ApiError::Workflow(WorkflowRuntimeError::Disabled(
++            "approval unavailable".into(),
++        ))
++        .into_response();
++        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
++        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
++        assert!(body.get("reason").is_none());
++    }
++
+     #[test]
+     fn principal_derivation_errors_are_bad_requests() {
+         let response = ApiError::Runtime(SessionRuntimeError::IronControl(
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals.rs b/services/api-rs/crates/centaur-workflows/src/approvals.rs
+index 5dd59a72..b110be1c 100644
+--- a/services/api-rs/crates/centaur-workflows/src/approvals.rs
++++ b/services/api-rs/crates/centaur-workflows/src/approvals.rs
+@@ -14,6 +14,23 @@ pub const DRIVER_WORKFLOW: &str = "centaur_approval_request";
+ pub const DECISION_WORKFLOW: &str = "centaur_approval_decision";
+ pub const EVENT_PREFIX: &str = "centaur.approval:";
+ 
++/// Safe feedback for an authenticated click on its original approval card.
++/// Untrusted/mismatched buttons still receive the generic unavailable error.
++#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++pub enum DecisionRejection {
++    NotApprover,
++    SelfApprovalNotAllowed,
++    PolicyChanged,
++    Expired,
++    AlreadyApproved,
++    AlreadyDeclined,
++    Cancelled,
++    Executing,
++    Succeeded,
++    Unknown,
++}
++
+ pub fn is_reserved(name: &str) -> bool {
+     name.starts_with("centaur_approval_")
+ }
+@@ -150,6 +167,10 @@ pub(super) fn unavailable() -> WorkflowRuntimeError {
+     WorkflowRuntimeError::Disabled("approval unavailable".into())
+ }
+ 
++fn rejected(reason: DecisionRejection) -> WorkflowRuntimeError {
++    WorkflowRuntimeError::ApprovalDecisionRejected(reason)
++}
++
+ fn identifier(s: &str) -> bool {
+     !s.is_empty()
+         && s.len() <= 80
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs b/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs
+index c51c7efc..72376ef3 100644
+--- a/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs
+@@ -191,10 +191,19 @@ impl Repository {
+         validate_decision(p, &row, &input, button.message.as_ref())?;
+         let user = input["click"]["user_id"].as_str().ok_or_else(unavailable)?;
+         let decision = input["click"]["action"].as_str().ok_or_else(unavailable)?;
+-        let changed = sqlx::query("update tool_approvals set status=$2,decided_by=$3,decided_at=now() where id=$1 and status='pending' and expires_at>now()")
++        let changed = sqlx::query("update tool_approvals set status=$2,decided_by=$3,decided_at=clock_timestamp() where id=$1 and status='pending' and expires_at>clock_timestamp()")
+             .bind(id).bind(decision).bind(user).execute(&mut *tx).await?.rows_affected();
+         if changed == 0 && !(row.status == decision && row.decided_by.as_deref() == Some(user)) {
+-            return Err(unavailable());
++            return Err(rejected(match row.status.as_str() {
++                "pending" | "expired" => DecisionRejection::Expired,
++                "approved" => DecisionRejection::AlreadyApproved,
++                "declined" => DecisionRejection::AlreadyDeclined,
++                "cancelled" => DecisionRejection::Cancelled,
++                "executing" => DecisionRejection::Executing,
++                "succeeded" => DecisionRejection::Succeeded,
++                "unknown" => DecisionRejection::Unknown,
++                _ => return Err(unavailable()),
++            }));
+         }
+         if changed > 0 {
+             wake(&self.pool, &mut tx, id).await?;
+@@ -283,11 +292,8 @@ fn validate_decision(
+ ) -> Result<(), WorkflowRuntimeError> {
+     let click = &input["click"];
+     let user = click["user_id"].as_str().unwrap_or_default();
+-    if hash(p) != row.policy_hash
+-        || p.team_id != row.team_id
++    if p.team_id != row.team_id
+         || click["team_id"] != row.team_id
+-        || !p.approver_user_ids.iter().any(|s| s == user)
+-        || (!p.allow_self_approval && row.requester_id == user)
+         || !matches!(click["action"].as_str(), Some("approved" | "declined"))
+         || click["id"] != row.id.to_string()
+         || click["channel_id"] != row.channel_id
+@@ -302,6 +308,17 @@ fn validate_decision(
+     {
+         return Err(unavailable());
+     }
++    // Reveal actionable reasons only after the original card/message binding
++    // has passed. Non-approvers learn only that they cannot decide this action.
++    if !p.approver_user_ids.iter().any(|s| s == user) {
++        return Err(rejected(DecisionRejection::NotApprover));
++    }
++    if hash(p) != row.policy_hash {
++        return Err(rejected(DecisionRejection::PolicyChanged));
++    }
++    if !p.allow_self_approval && row.requester_id == user {
++        return Err(rejected(DecisionRejection::SelfApprovalNotAllowed));
++    }
+     Ok(())
+ }
+ 
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs b/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
+index f1dc8caf..abdbbe84 100644
+--- a/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
+@@ -40,16 +40,37 @@ pub(super) fn executor_outcome(
+ 
+ pub(super) fn final_message(
+     id: Uuid,
++    action: &str,
+     status: &str,
+     result: Option<&Value>,
+     policy: Option<&ActionPolicy>,
+ ) -> Value {
+-    let mut text = format!("Approval {id}: {status}.");
+-    if status == "unknown" {
+-        text.push_str(" Inspect the provider outcome before submitting another request.");
+-    }
+-    let mut blocks = vec![json!({"type":"section","text":{
+-        "type":"plain_text","emoji":false,"text":text}})];
++    let (label, detail) = match status {
++        "succeeded" => ("Completed", "The action completed successfully."),
++        "declined" => (
++            "Declined",
++            "The action did not run. Start a new request if you want to approve it.",
++        ),
++        "expired" => (
++            "Expired",
++            "The request expired before the action ran. Start a new request to try again.",
++        ),
++        "cancelled" => (
++            "Cancelled",
++            "The action did not run. Start a new request if it is still needed.",
++        ),
++        "unknown" => (
++            "Outcome uncertain",
++            "The action may have run. Inspect the provider outcome before submitting another request.",
++        ),
++        _ => ("Processing", "The request is still being processed."),
++    };
++    let title = format!("{label}: {action}");
++    let mut text = format!("{title}. {detail}");
++    let mut blocks = vec![
++        json!({"type":"header","text":{"type":"plain_text","emoji":false,"text":title}}),
++        json!({"type":"section","text":{"type":"plain_text","emoji":false,"text":detail}}),
++    ];
+     if status == "succeeded"
+         && let Some(policy) = policy.filter(|p| !p.public_result_fields.is_empty())
+         && let Some(raw) = result.and_then(|value| value.get("output"))
+@@ -58,15 +79,33 @@ pub(super) fn final_message(
+         // Only the deliberately published projection is persisted here. Never
+         // use the raw workflow result in a Slack message or fallback text.
+         if let Ok(display) = display_json(&output) {
+-            blocks.push(json!({"type":"section","text":{
+-                "type":"plain_text","emoji":false,"text":display}}));
++            blocks.push(preformatted(&display));
+             text.push('\n');
+             text.push_str(&display);
+         }
+     }
++    if status == "succeeded" && result.is_some_and(|r| r["output_omitted"] == true) {
++        let detail = "The result could not be displayed. The action succeeded; do not rerun it just to recover the output.";
++        blocks.push(
++            json!({"type":"section","text":{"type":"plain_text","emoji":false,"text":detail}}),
++        );
++        text.push('\n');
++        text.push_str(detail);
++    }
++    blocks.push(
++        json!({"type":"context","elements":[{"type":"plain_text","emoji":false,
++        "text":format!("Request {id}")}]}),
++    );
+     json!({"text":text,"blocks":blocks,"mrkdwn":false})
+ }
+ 
++fn preformatted(text: &str) -> Value {
++    // Native preformatted text preserves indentation without interpreting
++    // markdown, mentions or embedded triple backticks from JSON strings.
++    json!({"type":"rich_text","elements":[{"type":"rich_text_preformatted","border":0,
++        "elements":[{"type":"text","text":text}]}]})
++}
++
+ pub(super) fn validate_executor(
+     p: &ActionPolicy,
+     sandbox: Option<&WorkflowHostSandboxRuntime>,
+@@ -85,25 +124,39 @@ pub(super) fn validate_executor(
+     Ok(())
+ }
+ 
+-fn card(row: &Record) -> Value {
++pub(super) fn card(row: &Record) -> Value {
+     let mut blocks = vec![
++        json!({"type":"header","text":{"type":"plain_text","emoji":false,
++            "text":format!("Approval required: {}",row.action)}}),
++        json!({"type":"section","fields":[
++            {"type":"mrkdwn","verbatim":false,"text":format!("*Requested by*\n<@{}>",row.requester_id)},
++            {"type":"mrkdwn","verbatim":false,"text":format!("*Expires*\n<!date^{}^{{date_short_pretty}} at {{time}}|{} UTC>",
++                row.expires_at.timestamp(),row.expires_at.format("%Y-%m-%d %H:%M"))}
++        ]}),
+         json!({"type":"section","text":{"type":"plain_text","emoji":false,
+-        "text":format!("Approve action {}? Requested by {}. Expires {}.\nPayload SHA-256: {}",
+-            row.action,row.requester_id,row.expires_at,row.payload_hash)}}),
++            "text":"Review the request below, then choose Approve or Decline."}}),
+     ];
+     for chunk in row.payload_json.as_bytes().chunks(2900) {
+-        blocks.push(
+-            json!({"type":"section","text":{"type":"plain_text","emoji":false,
+-            "text":std::str::from_utf8(chunk).expect("display is ASCII")}}),
+-        );
++        blocks.push(preformatted(
++            std::str::from_utf8(chunk).expect("display is ASCII"),
++        ));
+     }
+-    let buttons = [("approved", "Accept"), ("declined", "Decline")].map(|(action, label)| {
++    let buttons = [
++        ("approved", "Approve", "primary"),
++        ("declined", "Decline", "danger"),
++    ]
++    .map(|(action, label, style)| {
+         json!({"type":"button","text":{"type":"plain_text","text":label},
++            "style":style,
+             "action_id":format!("centaur.workflow.action:{}:{action}",row.id),
+             "value":json!({"workflow_name":DECISION_WORKFLOW,
+                 "input":{"approval_id":row.id,"payload_hash":row.payload_hash}}).to_string()})
+     });
+     blocks.push(json!({"type":"actions","elements":buttons}));
++    blocks.push(
++        json!({"type":"context","elements":[{"type":"plain_text","emoji":false,
++        "text":format!("Request {} · Payload SHA-256: {}",row.id,row.payload_hash)}]}),
++    );
+     json!({"channel":row.channel_id,"thread_ts":row.thread_ts,"client_msg_id":row.id.to_string(),
+         "text":format!("Approval requested: {}",row.action),"blocks":blocks,"unfurl_links":false,"unfurl_media":false})
+ }
+@@ -231,6 +284,7 @@ async fn run_inner(
+     if let Some(ts) = &row.message_ts {
+         let mut message = final_message(
+             row.id,
++            &row.action,
+             &row.status,
+             row.result.as_ref(),
+             p.filter(|policy| hash(policy) == row.policy_hash),
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs b/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
+index a59b7ac1..7b5c603c 100644
+--- a/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
+@@ -168,10 +168,23 @@ fn hello_world_public_result_reaches_slack_without_unselected_fields() {
+         result,
+         json!({"outcome":"succeeded","output":{"message":"Hello world!"}})
+     );
+-    let message = runner::final_message(Uuid::nil(), status, Some(&result), Some(&p));
++    let message =
++        runner::final_message(Uuid::nil(), "hello-world", status, Some(&result), Some(&p));
+     assert!(message["text"].as_str().unwrap().contains("Hello world!"));
+     assert_eq!(message["mrkdwn"], false);
+-    assert_eq!(message["blocks"][1]["text"]["type"], "plain_text");
++    assert_eq!(
++        message["blocks"][2]["elements"][0]["type"],
++        "rich_text_preformatted"
++    );
++    assert_eq!(
++        serde_json::from_str::<Value>(
++            message["blocks"][2]["elements"][0]["elements"][0]["text"]
++                .as_str()
++                .unwrap()
++        )
++        .unwrap(),
++        json!({"message":"Hello world!"})
++    );
+     assert!(!message.to_string().contains("do-not-publish"));
+     for status in [
+         "pending",
+@@ -181,12 +194,18 @@ fn hello_world_public_result_reaches_slack_without_unselected_fields() {
+         "cancelled",
+         "unknown",
+     ] {
+-        let message = runner::final_message(Uuid::nil(), status, Some(&result), Some(&p));
++        let message =
++            runner::final_message(Uuid::nil(), "hello-world", status, Some(&result), Some(&p));
+         assert!(!message.to_string().contains("Hello world!"));
+     }
+     for policy in [None, Some(policy())] {
+-        let message =
+-            runner::final_message(Uuid::nil(), "succeeded", Some(&result), policy.as_ref());
++        let message = runner::final_message(
++            Uuid::nil(),
++            "hello-world",
++            "succeeded",
++            Some(&result),
++            policy.as_ref(),
++        );
+         assert!(!message.to_string().contains("Hello world!"));
+     }
+ }
+@@ -217,16 +236,33 @@ fn malformed_public_output_is_omitted_without_repeating_successful_execution() {
+ }
+ 
+ #[test]
+-fn public_output_is_plaintext_and_escaped_in_slack_fallback() {
++fn public_output_cannot_escape_preformatted_text_or_notify_slack_users() {
+     let mut p = policy();
+     p.public_result_fields = vec!["message".into()];
+-    let (_, result) = runner::executor_outcome(&p, Ok(json!({"message":"<@U1> & \u{202e}"})));
+-    let message = runner::final_message(Uuid::nil(), "succeeded", Some(&result), Some(&p));
++    let (_, result) = runner::executor_outcome(&p, Ok(json!({"message":"``` <@U1> & \u{202e}"})));
++    let message = runner::final_message(
++        Uuid::nil(),
++        "hello-world",
++        "succeeded",
++        Some(&result),
++        Some(&p),
++    );
+     let text = message["text"].as_str().unwrap();
+     assert!(text.is_ascii());
+     assert!(!text.contains("<@"));
+     assert!(text.contains("\\u202e"));
+-    assert_eq!(message["blocks"][1]["text"]["emoji"], false);
++    assert_eq!(
++        message["blocks"][2]["elements"][0]["elements"]
++            .as_array()
++            .unwrap()
++            .len(),
++        1
++    );
++    assert_eq!(
++        message["blocks"][2]["elements"][0]["elements"][0]["type"],
++        "text"
++    );
++    assert!(!message.to_string().contains("\"type\":\"user\""));
+ }
+ 
+ #[test]
+@@ -264,3 +300,67 @@ fn slack_generated_fields_are_the_only_ignored_visible_changes() {
+     forged[0]["text"]["text"] = json!("other payload");
+     assert_ne!(visible_blocks(&expected), visible_blocks(&forged));
+ }
++
++#[test]
++fn approval_card_formats_the_complete_payload_without_markdown_interpretation() {
++    let mut p = policy();
++    p.public_result_fields = vec!["message".into()];
++    let arguments =
++        json!({"text":format!("``` <@U1> {}", "x".repeat(8000)), "number":9007199254740993_u64});
++    let (payload, payload_json) = payload(&p, arguments).unwrap();
++    let row = repository::Record {
++        id: Uuid::nil(),
++        action: "hello-world".into(),
++        policy_hash: hash(&p),
++        payload_hash: hash(&payload),
++        payload,
++        payload_json,
++        team_id: "T1".into(),
++        channel_id: "C1".into(),
++        thread_ts: "1.000".into(),
++        requester_id: "U1".into(),
++        status: "pending".into(),
++        result: None,
++        message_ts: None,
++        message_blocks: None,
++        workflow_task_id: None,
++        workflow_run_id: None,
++        decided_by: None,
++        expires_at: Utc::now(),
++    };
++    let message = runner::card(&row);
++    let blocks = message["blocks"].as_array().unwrap();
++    assert_eq!(blocks[0]["text"]["text"], "Approval required: hello-world");
++    assert!(
++        blocks[1]["fields"][0]["text"]
++            .as_str()
++            .unwrap()
++            .contains("<@U1>")
++    );
++    assert!(
++        blocks[1]["fields"][1]["text"]
++            .as_str()
++            .unwrap()
++            .contains("<!date^")
++    );
++    let mut display = String::new();
++    for block in blocks.iter().filter(|b| b["type"] == "rich_text") {
++        let pre = &block["elements"][0];
++        assert_eq!(pre["type"], "rich_text_preformatted");
++        assert_eq!(pre["elements"].as_array().unwrap().len(), 1);
++        assert_eq!(pre["elements"][0]["type"], "text");
++        let chunk = pre["elements"][0]["text"].as_str().unwrap();
++        assert!(chunk.len() <= 2900);
++        display.push_str(chunk);
++    }
++    assert_eq!(display, row.payload_json);
++    assert_eq!(
++        serde_json::from_str::<Value>(&display).unwrap(),
++        row.payload
++    );
++    assert!(!display.contains("<@"));
++    let buttons = blocks.iter().find(|b| b["type"] == "actions").unwrap();
++    assert_eq!(buttons["elements"][0]["text"]["text"], "Approve");
++    assert_eq!(buttons["elements"][0]["style"], "primary");
++    assert_eq!(buttons["elements"][1]["style"], "danger");
++}
+diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs b/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs
+index ef71af0a..6e931e21 100644
+--- a/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs
++++ b/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs
+@@ -118,7 +118,7 @@ async fn native_admission_decision_claim_and_recovery() {
+     sqlx::query("insert into session_executions(execution_id,thread_key,status,metadata) values('exe_test','slack:C1:1.000','running',$1)")
+         .bind(json!({"source":"slackbotv2","platform":"slack","slack_team_id":"T1","slack_home_team_id":"T1","slack_channel_id":"C1","slack_user_id":"U2"})).execute(&pool).await.unwrap();
+     let mut p = policy();
+-    p.approver_user_ids.push("U3".into());
++    p.approver_user_ids.extend(["U2".into(), "U3".into()]);
+     p.public_result_fields = vec!["message".into()];
+     let repo = Repository {
+         pool: pool.clone(),
+@@ -196,17 +196,49 @@ async fn native_admission_decision_claim_and_recovery() {
+         },
+         message: Some(json!({"blocks":blocks})),
+     };
+-    for user in ["U2", "UUNKNOWN"] {
+-        assert!(repo.decide(button(user, "approved")).await.is_err());
++    for (user, reason) in [
++        ("U2", DecisionRejection::SelfApprovalNotAllowed),
++        ("UUNKNOWN", DecisionRejection::NotApprover),
++    ] {
++        for decision in ["approved", "declined"] {
++            assert!(matches!(repo.decide(button(user, decision)).await,
++                Err(WorkflowRuntimeError::ApprovalDecisionRejected(actual)) if actual == reason));
++            assert_eq!(
++                repo.read(id, identity()).await.unwrap()["status"],
++                "pending"
++            );
++        }
+     }
+     for field in ["id", "channel_id", "message_ts", "team_id"] {
+         let mut forged = button("U1", "approved");
+         forged.request.input["click"][field] = json!("OTHER");
+-        assert!(repo.decide(forged).await.is_err());
++        assert!(matches!(
++            repo.decide(forged).await,
++            Err(WorkflowRuntimeError::Disabled(_))
++        ));
+     }
++    let mut changed_policy = p.clone();
++    changed_policy.implementation_revision = "new-reviewed-commit".into();
++    let changed_repo = Repository {
++        pool: pool.clone(),
++        policies: Arc::new(BTreeMap::from([("action".into(), changed_policy)])),
++    };
++    assert!(matches!(
++        changed_repo.decide(button("U1", "approved")).await,
++        Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++            DecisionRejection::PolicyChanged
++        ))
++    ));
++    assert_eq!(
++        repo.read(id, identity()).await.unwrap()["status"],
++        "pending"
++    );
+     let mut forged = button("U1", "approved");
+     forged.message.as_mut().unwrap()["blocks"][0]["text"]["text"] = json!("changed");
+-    assert!(repo.decide(forged).await.is_err());
++    assert!(matches!(
++        repo.decide(forged).await,
++        Err(WorkflowRuntimeError::Disabled(_))
++    ));
+     // Requests survive the agent turn ending.
+     sqlx::query("update session_executions set status='completed' where execution_id='exe_test'")
+         .execute(&pool)
+@@ -232,6 +264,12 @@ async fn native_admission_decision_claim_and_recovery() {
+         1
+     );
+     repo.recover(id).await.unwrap();
++    assert!(matches!(
++        repo.decide(button("U1", "approved")).await,
++        Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++            DecisionRejection::Unknown
++        ))
++    ));
+     assert_eq!(
+         repo.read(id, identity()).await.unwrap()["status"],
+         "unknown"
+@@ -269,6 +307,7 @@ async fn native_admission_decision_claim_and_recovery() {
+     assert_eq!(loaded.result.as_ref(), Some(&completed["result"]));
+     let message = runner::final_message(
+         id,
++        &loaded.action,
+         &loaded.status,
+         loaded.result.as_ref(),
+         Some(&public_policy),
+@@ -302,7 +341,13 @@ async fn native_admission_decision_claim_and_recovery() {
+             .await
+             .unwrap();
+         assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
+-        assert!(repo.decide(button("U1", "approved")).await.is_err());
++        let reason = if expired {
++            DecisionRejection::Expired
++        } else {
++            DecisionRejection::Cancelled
++        };
++        assert!(matches!(repo.decide(button("U1", "approved")).await,
++            Err(WorkflowRuntimeError::ApprovalDecisionRejected(actual)) if actual == reason));
+     }
+     // Repair uses durable native terminal state, including when the worker
+     // never ran again. Known results are preserved and no authority is restored.
+@@ -421,6 +466,137 @@ async fn native_admission_decision_claim_and_recovery() {
+     assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
+     assert!(repo.decide(button("U1", "approved")).await.is_err());
+     assert!(repo.claim(id, &p).await.unwrap().is_none());
++
++    // Opting in to self-approval still checks the approver allowlist, binds the
++    // complete signed/preformatted card, and never allows a second decision.
++    sqlx::query("update session_executions set status='running' where execution_id='exe_test'")
++        .execute(&pool)
++        .await
++        .unwrap();
++    let mut self_policy = p.clone();
++    self_policy.allow_self_approval = true;
++    let self_repo = Repository {
++        pool: pool.clone(),
++        policies: Arc::new(BTreeMap::from([("action".into(), self_policy.clone())])),
++    };
++    for decision in ["approved", "declined"] {
++        let admitted = self_repo
++            .request(req(Uuid::new_v4(), json!({})), &client)
++            .await
++            .unwrap();
++        let self_id: Uuid = serde_json::from_value(admitted["id"].clone()).unwrap();
++        let self_row: repository::Record =
++            sqlx::query_as("select * from tool_approvals where id=$1")
++                .bind(self_id)
++                .fetch_one(&pool)
++                .await
++                .unwrap();
++        let mut message = runner::card(&self_row);
++        slack_buttons::sign_message(&mut message, b"test-secret").unwrap();
++        sqlx::query("update tool_approvals set message_ts='3.000',message_blocks=$2 where id=$1")
++            .bind(self_id)
++            .bind(&message["blocks"])
++            .execute(&pool)
++            .await
++            .unwrap();
++        let click = |user: &str, action: &str| {
++            let buttons = message["blocks"]
++                .as_array()
++                .unwrap()
++                .iter()
++                .find(|b| b["type"] == "actions")
++                .unwrap();
++            let button = &buttons["elements"][usize::from(action == "declined")];
++            let mut echoed = message.clone();
++            // Slack adds generated block IDs; visible contents remain bound.
++            for (index, block) in echoed["blocks"]
++                .as_array_mut()
++                .unwrap()
++                .iter_mut()
++                .enumerate()
++            {
++                block["block_id"] = json!(format!("slack-{index}"));
++            }
++            slack_buttons::verify_button(slack_buttons::Invocation {
++                button: button["value"].as_str().unwrap().into(),
++                click: json!({"id":self_id,"action":action,"channel_id":"C1","message_ts":"3.000",
++                    "team_id":"T1","user_id":user,"action_ts":"4.000"}),
++                idempotency_key: "self-approval-click".into(),
++                message: Some(echoed),
++            }, b"test-secret").unwrap()
++        };
++        assert!(matches!(
++            self_repo.decide(click("UUNKNOWN", decision)).await,
++            Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++                DecisionRejection::NotApprover
++            ))
++        ));
++        let accepted = self_repo.decide(click("U2", decision)).await.unwrap();
++        assert!(accepted.created);
++        assert_eq!(accepted.status, decision);
++        assert!(
++            !self_repo
++                .decide(click("U2", decision))
++                .await
++                .unwrap()
++                .created
++        );
++        let opposite = if decision == "approved" {
++            "declined"
++        } else {
++            "approved"
++        };
++        let expected = if decision == "approved" {
++            DecisionRejection::AlreadyApproved
++        } else {
++            DecisionRejection::AlreadyDeclined
++        };
++        assert!(matches!(self_repo.decide(click("U2", opposite)).await,
++            Err(WorkflowRuntimeError::ApprovalDecisionRejected(reason)) if reason == expected));
++        let saved = self_repo.read(self_id, identity()).await.unwrap();
++        assert_eq!(saved["status"], decision);
++        assert_eq!(saved["decided_by"], "U2");
++        if decision == "approved" {
++            assert!(
++                self_repo
++                    .claim(self_id, &self_policy)
++                    .await
++                    .unwrap()
++                    .is_some()
++            );
++            assert!(
++                self_repo
++                    .claim(self_id, &self_policy)
++                    .await
++                    .unwrap()
++                    .is_none()
++            );
++            assert!(matches!(
++                self_repo.decide(click("U2", "approved")).await,
++                Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++                    DecisionRejection::Executing
++                ))
++            ));
++            self_repo
++                .finish(self_id, &self_policy, hello())
++                .await
++                .unwrap();
++            assert!(matches!(
++                self_repo.decide(click("U2", "approved")).await,
++                Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++                    DecisionRejection::Succeeded
++                ))
++            ));
++        } else {
++            assert!(
++                self_repo
++                    .claim(self_id, &self_policy)
++                    .await
++                    .unwrap()
++                    .is_none()
++            );
++        }
++    }
+     pool.close().await;
+     sqlx::query(&format!("drop schema {schema} cascade"))
+         .execute(&admin)
+diff --git a/services/api-rs/crates/centaur-workflows/src/lib.rs b/services/api-rs/crates/centaur-workflows/src/lib.rs
+index cef02aac..cc689495 100644
+--- a/services/api-rs/crates/centaur-workflows/src/lib.rs
++++ b/services/api-rs/crates/centaur-workflows/src/lib.rs
+@@ -4812,6 +4812,10 @@ pub enum WorkflowRuntimeError {
+     /// HTTP 403.
+     #[error("{0}")]
+     Disabled(String),
++    /// An authenticated approval click was rejected. Maps to HTTP 403 with a
++    /// stable reason; no payload or executor error is exposed to the client.
++    #[error("approval decision rejected: {0:?}")]
++    ApprovalDecisionRejected(approvals::DecisionRejection),
+     #[error("workflow run not found: {0}")]
+     NotFound(String),
+     /// Server-side failure (workflow host spawn/protocol, internal dispatch).
+diff --git a/services/api-rs/rfcs/0006-tool-approvals.md b/services/api-rs/rfcs/0006-tool-approvals.md
+index e668305c..5f8d3c3e 100644
+--- a/services/api-rs/rfcs/0006-tool-approvals.md
++++ b/services/api-rs/rfcs/0006-tool-approvals.md
+@@ -23,7 +23,7 @@ scheduler, Slack delivery worker or tool-host runtime.
+ 2. Core validates the action policy and registered executor. It freezes the full
+    JSON arguments, policy hash and payload hash. Request insertion and enqueue
+    of the native approval driver commit in one PostgreSQL transaction.
+-3. The driver posts plaintext payload sections and signed native
++3. The driver posts indented JSON in native preformatted blocks and signed native
+    `centaur.workflow.action:` buttons. It stores the original message timestamp
+    and complete signed card, then suspends on a durable event.
+ 4. Existing Slack ingress verifies Slack's webhook signature. The native
+@@ -31,8 +31,10 @@ scheduler, Slack delivery worker or tool-host runtime.
+    additionally require the Slack ingress service identity; ordinary workflow
+    input and its `click.user_id` field are never authority.
+ 5. Core checks current policy hash, team, channel, original message/card, payload
+-   hash, expiry, allowlisted actor and self-approval policy. One locked transition
+-   chooses the decision; the update and native wake event are atomic.
++   hash, expiry, allowlisted actor and self-approval policy. Authenticated original-card clicks receive a typed rejection reason for
++   unauthorized actors, self-approval restrictions, changed policy, expiry or an
++   existing decision. Untrusted/mismatched cards remain generically unavailable.
++   One locked transition chooses the decision; the update and native wake event are atomic.
+ 6. Immediately before execution, core verifies enablement, approval-only marker
+    and exact registered principal. One compare-and-set commits
+    `approved -> executing`. The existing workflow host runs the pinned executor
+@@ -132,7 +134,7 @@ be omitted, with `output_omitted: true`; execution still counts as succeeded
+ and must not be repeated merely to recover output.
+ 
+ Selected fields are persisted as `result.output`, returned to the requesting
+-bot by the CLI/status API, and displayed as plaintext in the final Slack card.
++bot by the CLI/status API, and displayed as indented, preformatted JSON in the final Slack card.
+ All unselected fields and all executor errors remain private. This is an
+ explicit publication policy, **not a secret scanner**: only select fields that
+ reviewed executor code guarantees are non-secret. The field list is displayed
+@@ -181,7 +183,9 @@ available; this protocol does not promise exactly-once external effects.
+ 
+ Slack post/checkpoint failure can leave a duplicate card. Only the recorded
+ original message/card can authorize the request. Final-message delivery retries
+-do not invoke the executor again.
++do not invoke the executor again. The clicker receives private feedback only
++after the decision commits. Duplicate decisions do not execute again; a declined
++request cannot later be approved. Use a fresh request for each decision test.
+ 
+ Approval status includes `workflow_task_id` and `workflow_run_id` for the native
+ workflow history. Cancelling that native run also reconciles its approval:
+@@ -229,7 +233,7 @@ admission within the same execution. Admission is capped at 20 requests/executio
+ 
+ The complete argument object, workflow, executor principal and implementation
+ revision must fit in 12,000 displayed JSON bytes; oversized payloads are rejected,
+-never truncated. Plaintext sections preserve large integers and use JSON escapes
++never truncated. Preformatted text blocks preserve large integers and use JSON escapes
+ for Unicode and Slack delimiters. Everyone in the thread can read the arguments.
+ Never include secrets. Do not approve deferred mutable URLs/files/draft IDs;
+ snapshot their contents first. The approval covers the reviewed executor's
+diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
+index 3b981c15..58c107ad 100644
+--- a/services/slackbotv2/src/index.ts
++++ b/services/slackbotv2/src/index.ts
+@@ -54,6 +54,7 @@ import {
+   sessionStreamError,
+   slackApiTimeoutMs,
+   WORKFLOW_ACTION_PREFIX,
++  workflowActionFeedback,
+   withSlackApiTimeout
+ } from './session-api'
+ import {
+@@ -356,17 +357,17 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+     }
+     try {
+       const result = await dispatchSlackBlockAction(options, payload)
+-      // The workflow owns the message and its final button state. Successful
+-      // handoff (including redelivery) only needs Slack's native acknowledgment;
+-      // a separate success message adds noise before the actual result arrives.
+-      if (result?.outcome === 'unavailable' && payload.channel_id) {
++      // Decisions have committed before feedback. The workflow still owns the
++      // shared card and execution result; feedback is private to the clicker.
++      const feedback = workflowActionFeedback(result)
++      if (feedback && payload.channel_id) {
+         backgroundWaitUntil(
+           withSlackApiTimeout(options, 'post workflow action feedback', () =>
+             callSlackApi('chat.postEphemeral', {
+               channel: payload.channel_id,
+               user: payload.user_id,
+               ...(payload.thread_ts ? { thread_ts: payload.thread_ts } : {}),
+-              text: 'This request is no longer available.'
++              text: feedback
+             }, {
+               apiUrl: options.slackApiUrl,
+               fetch: options.fetch as typeof globalThis.fetch | undefined,
+diff --git a/services/slackbotv2/src/session-api.ts b/services/slackbotv2/src/session-api.ts
+index 5a44aa0b..fb1d9638 100644
+--- a/services/slackbotv2/src/session-api.ts
++++ b/services/slackbotv2/src/session-api.ts
+@@ -565,6 +565,41 @@ export async function forwardToSessionApi(
+ 
+ export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
+ 
++const approvalDecisionMessages: Record<string, string> = {
++  not_approver: 'You are not an approver for this action. Ask a designated approver to review it.',
++  self_approval_not_allowed: 'You requested this action, and self-approval is disabled. Ask another designated approver to decide, or have someone else submit a new request.',
++  policy_changed: 'The approval settings changed after this request was created. Start a new request using the current settings.',
++  expired: 'This approval request expired. The action did not run. Start a new request to try again.',
++  already_approved: 'This request has already been approved. No additional execution was started.',
++  already_declined: 'This request was already declined, so the action did not run. Start a new request if you want to approve it.',
++  cancelled: 'This request was cancelled. The action did not run. Start a new request if it is still needed.',
++  executing: 'This action is already running. Its result will appear in this thread; do not submit it again.',
++  succeeded: 'This action has already completed. Check its result in this thread. It will not run again from this request.',
++  unknown: 'The action may have run, but its outcome could not be confirmed. Inspect the provider outcome before submitting another request.'
++}
++
++export function workflowActionFeedback(result: JsonObject | undefined): string | undefined {
++  if (result?.outcome === 'unavailable') {
++    // Never display arbitrary API error text or unknown reason codes in Slack.
++    if (typeof result.reason === 'string' && Object.hasOwn(approvalDecisionMessages, result.reason)) {
++      return approvalDecisionMessages[result.reason]
++    }
++    return 'This button could not be verified for the original request. Open the original approval card or check the request status.'
++  }
++  if (result?.outcome === 'accepted' || result?.outcome === 'duplicate') {
++    if (result.status === 'approved') {
++      return result.outcome === 'duplicate'
++        ? 'Your approval is already recorded. No additional execution was started.'
++        : 'Approved. The result will appear in this thread.'
++    }
++    if (result.status === 'declined') {
++      return result.outcome === 'duplicate'
++        ? 'You already declined this request. Start a new request if you want to approve it.'
++        : 'Declined. The action will not run. Start a new request if you want to approve it.'
++    }
++  }
++}
++
+ export async function dispatchSlackBlockAction(
+   options: SlackbotV2Options,
+   payload: SlackbotV2BlockActionPayload
+@@ -615,8 +650,13 @@ export async function dispatchSlackBlockAction(
+     action
+   )
+   if (workflowAction && response.status === 403) {
+-    await response.body?.cancel()
+-    return { outcome: 'unavailable' }
++    const rejection: unknown = await response.json().catch(() => undefined)
++    const reason = isJsonObject(rejection)
++      && rejection.code === 'approval_decision_rejected'
++      && typeof rejection.reason === 'string'
++      && Object.hasOwn(approvalDecisionMessages, rejection.reason)
++      ? rejection.reason : undefined
++    return { outcome: 'unavailable', ...(reason ? { reason } : {}) }
+   }
+   await ensureApiOk(response, action)
+   if (workflowAction) {
+diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+index 89ba12f6..37ffedc8 100644
+--- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
++++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+@@ -466,6 +466,8 @@ describe('slackbotv2', () => {
+         ts: '1700000003.000200', text: 'Approve this release?',
+         blocks: [
+           { type: 'section', text: { type: 'mrkdwn', text: 'Approve this release?' } },
++          { type: 'rich_text', block_id: 'slack-generated', elements: [{ type: 'rich_text_preformatted',
++            elements: [{ type: 'text', text: '{\n  "message": "``` <@U1>"\n}' }] }] },
+           { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Approve' },
+             action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+             value: 'v1.opaque-signed-payload.signature' }] }
+@@ -511,7 +513,32 @@ describe('slackbotv2', () => {
+     expect(codexApi.workflowEvents).toHaveLength(0)
+   })
+ 
+-  it('acknowledges a permanently rejected workflow button without retrying it', async () => {
++  const approvalFeedbackCases = [
++    { name: 'untrusted button', status: 403, body: { error: 'invalid or untrusted workflow button' }, expected: 'could not be verified' },
++    ...[
++      ['not_approver', 'You are not an approver'],
++      ['self_approval_not_allowed', 'self-approval is disabled'],
++      ['policy_changed', 'approval settings changed'],
++      ['expired', 'request expired'],
++      ['already_approved', 'already been approved'],
++      ['already_declined', 'already declined'],
++      ['cancelled', 'request was cancelled'],
++      ['executing', 'already running'],
++      ['succeeded', 'already completed'],
++      ['unknown', 'may have run'],
++      ['constructor', 'could not be verified'],
++      ['unrecognized', 'could not be verified']
++    ].map(([reason, expected]) => ({ name: reason, status: 403,
++      body: { code: 'approval_decision_rejected', reason, error: 'do-not-publish <@USECRET>' }, expected })),
++    ...[
++      ['approved', true, 'Approved.'],
++      ['declined', true, 'Declined.'],
++      ['approved', false, 'approval is already recorded'],
++      ['declined', false, 'already declined']
++    ].map(([status, created, expected]) => ({ name: `${status} created=${created}`, status: 200,
++      body: { ok: true, run_id: 'run-approval', task_id: 'task-approval', status, created }, expected }))
++  ]
++  for (const feedbackCase of approvalFeedbackCases) it(`acknowledges ${feedbackCase.name} with private feedback and no retry`, async () => {
+     let starts = 0
+     const feedback: unknown[] = []
+     bot = createTestBot({
+@@ -519,7 +546,7 @@ describe('slackbotv2', () => {
+         if (String(input).endsWith('/api/workflows/actions/invoke')) {
+           starts += 1
+           expect(JSON.parse(String(init?.body)).button).toBe('unsigned')
+-          return Response.json({ error: 'invalid or untrusted workflow button' }, { status: 403 })
++          return Response.json(feedbackCase.body, { status: feedbackCase.status })
+         }
+         if (String(input).endsWith('/chat.postEphemeral')) {
+           feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
+@@ -542,8 +569,11 @@ describe('slackbotv2', () => {
+     expect(starts).toBe(1)
+     expect(feedback).toEqual([{
+       channel: CHANNEL_ID, user: USER_ID, thread_ts: '1700000003.000100',
+-      text: 'This request is no longer available.'
++      text: expect.stringContaining(String(feedbackCase.expected))
+     }])
++    expect(JSON.stringify(feedback)).not.toContain('do-not-publish')
++    expect(JSON.stringify(feedback)).not.toContain('USECRET')
++    expect(codexApi.workflowEvents).toHaveLength(0)
+   })
+ 
+   it('applies the external-org allowlist to Slack block actions', async () => {

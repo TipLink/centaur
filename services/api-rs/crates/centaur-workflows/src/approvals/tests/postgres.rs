@@ -118,7 +118,7 @@ async fn native_admission_decision_claim_and_recovery() {
     sqlx::query("insert into session_executions(execution_id,thread_key,status,metadata) values('exe_test','slack:C1:1.000','running',$1)")
         .bind(json!({"source":"slackbotv2","platform":"slack","slack_team_id":"T1","slack_home_team_id":"T1","slack_channel_id":"C1","slack_user_id":"U2"})).execute(&pool).await.unwrap();
     let mut p = policy();
-    p.approver_user_ids.push("U3".into());
+    p.approver_user_ids.extend(["U2".into(), "U3".into()]);
     p.public_result_fields = vec!["message".into()];
     let repo = Repository {
         pool: pool.clone(),
@@ -196,17 +196,49 @@ async fn native_admission_decision_claim_and_recovery() {
         },
         message: Some(json!({"blocks":blocks})),
     };
-    for user in ["U2", "UUNKNOWN"] {
-        assert!(repo.decide(button(user, "approved")).await.is_err());
+    for (user, reason) in [
+        ("U2", DecisionRejection::SelfApprovalNotAllowed),
+        ("UUNKNOWN", DecisionRejection::NotApprover),
+    ] {
+        for decision in ["approved", "declined"] {
+            assert!(matches!(repo.decide(button(user, decision)).await,
+                Err(WorkflowRuntimeError::ApprovalDecisionRejected(actual)) if actual == reason));
+            assert_eq!(
+                repo.read(id, identity()).await.unwrap()["status"],
+                "pending"
+            );
+        }
     }
     for field in ["id", "channel_id", "message_ts", "team_id"] {
         let mut forged = button("U1", "approved");
         forged.request.input["click"][field] = json!("OTHER");
-        assert!(repo.decide(forged).await.is_err());
+        assert!(matches!(
+            repo.decide(forged).await,
+            Err(WorkflowRuntimeError::Disabled(_))
+        ));
     }
+    let mut changed_policy = p.clone();
+    changed_policy.implementation_revision = "new-reviewed-commit".into();
+    let changed_repo = Repository {
+        pool: pool.clone(),
+        policies: Arc::new(BTreeMap::from([("action".into(), changed_policy)])),
+    };
+    assert!(matches!(
+        changed_repo.decide(button("U1", "approved")).await,
+        Err(WorkflowRuntimeError::ApprovalDecisionRejected(
+            DecisionRejection::PolicyChanged
+        ))
+    ));
+    assert_eq!(
+        repo.read(id, identity()).await.unwrap()["status"],
+        "pending"
+    );
     let mut forged = button("U1", "approved");
     forged.message.as_mut().unwrap()["blocks"][0]["text"]["text"] = json!("changed");
-    assert!(repo.decide(forged).await.is_err());
+    assert!(matches!(
+        repo.decide(forged).await,
+        Err(WorkflowRuntimeError::Disabled(_))
+    ));
     // Requests survive the agent turn ending.
     sqlx::query("update session_executions set status='completed' where execution_id='exe_test'")
         .execute(&pool)
@@ -232,6 +264,12 @@ async fn native_admission_decision_claim_and_recovery() {
         1
     );
     repo.recover(id).await.unwrap();
+    assert!(matches!(
+        repo.decide(button("U1", "approved")).await,
+        Err(WorkflowRuntimeError::ApprovalDecisionRejected(
+            DecisionRejection::Unknown
+        ))
+    ));
     assert_eq!(
         repo.read(id, identity()).await.unwrap()["status"],
         "unknown"
@@ -269,6 +307,7 @@ async fn native_admission_decision_claim_and_recovery() {
     assert_eq!(loaded.result.as_ref(), Some(&completed["result"]));
     let message = runner::final_message(
         id,
+        &loaded.action,
         &loaded.status,
         loaded.result.as_ref(),
         Some(&public_policy),
@@ -302,7 +341,13 @@ async fn native_admission_decision_claim_and_recovery() {
             .await
             .unwrap();
         assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
-        assert!(repo.decide(button("U1", "approved")).await.is_err());
+        let reason = if expired {
+            DecisionRejection::Expired
+        } else {
+            DecisionRejection::Cancelled
+        };
+        assert!(matches!(repo.decide(button("U1", "approved")).await,
+            Err(WorkflowRuntimeError::ApprovalDecisionRejected(actual)) if actual == reason));
     }
     // Repair uses durable native terminal state, including when the worker
     // never ran again. Known results are preserved and no authority is restored.
@@ -421,6 +466,137 @@ async fn native_admission_decision_claim_and_recovery() {
     assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
     assert!(repo.decide(button("U1", "approved")).await.is_err());
     assert!(repo.claim(id, &p).await.unwrap().is_none());
+
+    // Opting in to self-approval still checks the approver allowlist, binds the
+    // complete signed/preformatted card, and never allows a second decision.
+    sqlx::query("update session_executions set status='running' where execution_id='exe_test'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut self_policy = p.clone();
+    self_policy.allow_self_approval = true;
+    let self_repo = Repository {
+        pool: pool.clone(),
+        policies: Arc::new(BTreeMap::from([("action".into(), self_policy.clone())])),
+    };
+    for decision in ["approved", "declined"] {
+        let admitted = self_repo
+            .request(req(Uuid::new_v4(), json!({})), &client)
+            .await
+            .unwrap();
+        let self_id: Uuid = serde_json::from_value(admitted["id"].clone()).unwrap();
+        let self_row: repository::Record =
+            sqlx::query_as("select * from tool_approvals where id=$1")
+                .bind(self_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut message = runner::card(&self_row);
+        slack_buttons::sign_message(&mut message, b"test-secret").unwrap();
+        sqlx::query("update tool_approvals set message_ts='3.000',message_blocks=$2 where id=$1")
+            .bind(self_id)
+            .bind(&message["blocks"])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let click = |user: &str, action: &str| {
+            let buttons = message["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["type"] == "actions")
+                .unwrap();
+            let button = &buttons["elements"][usize::from(action == "declined")];
+            let mut echoed = message.clone();
+            // Slack adds generated block IDs; visible contents remain bound.
+            for (index, block) in echoed["blocks"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                block["block_id"] = json!(format!("slack-{index}"));
+            }
+            slack_buttons::verify_button(slack_buttons::Invocation {
+                button: button["value"].as_str().unwrap().into(),
+                click: json!({"id":self_id,"action":action,"channel_id":"C1","message_ts":"3.000",
+                    "team_id":"T1","user_id":user,"action_ts":"4.000"}),
+                idempotency_key: "self-approval-click".into(),
+                message: Some(echoed),
+            }, b"test-secret").unwrap()
+        };
+        assert!(matches!(
+            self_repo.decide(click("UUNKNOWN", decision)).await,
+            Err(WorkflowRuntimeError::ApprovalDecisionRejected(
+                DecisionRejection::NotApprover
+            ))
+        ));
+        let accepted = self_repo.decide(click("U2", decision)).await.unwrap();
+        assert!(accepted.created);
+        assert_eq!(accepted.status, decision);
+        assert!(
+            !self_repo
+                .decide(click("U2", decision))
+                .await
+                .unwrap()
+                .created
+        );
+        let opposite = if decision == "approved" {
+            "declined"
+        } else {
+            "approved"
+        };
+        let expected = if decision == "approved" {
+            DecisionRejection::AlreadyApproved
+        } else {
+            DecisionRejection::AlreadyDeclined
+        };
+        assert!(matches!(self_repo.decide(click("U2", opposite)).await,
+            Err(WorkflowRuntimeError::ApprovalDecisionRejected(reason)) if reason == expected));
+        let saved = self_repo.read(self_id, identity()).await.unwrap();
+        assert_eq!(saved["status"], decision);
+        assert_eq!(saved["decided_by"], "U2");
+        if decision == "approved" {
+            assert!(
+                self_repo
+                    .claim(self_id, &self_policy)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                self_repo
+                    .claim(self_id, &self_policy)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                self_repo.decide(click("U2", "approved")).await,
+                Err(WorkflowRuntimeError::ApprovalDecisionRejected(
+                    DecisionRejection::Executing
+                ))
+            ));
+            self_repo
+                .finish(self_id, &self_policy, hello())
+                .await
+                .unwrap();
+            assert!(matches!(
+                self_repo.decide(click("U2", "approved")).await,
+                Err(WorkflowRuntimeError::ApprovalDecisionRejected(
+                    DecisionRejection::Succeeded
+                ))
+            ));
+        } else {
+            assert!(
+                self_repo
+                    .claim(self_id, &self_policy)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
     pool.close().await;
     sqlx::query(&format!("drop schema {schema} cascade"))
         .execute(&admin)

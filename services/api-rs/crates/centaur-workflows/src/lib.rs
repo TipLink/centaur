@@ -4812,6 +4812,10 @@ pub enum WorkflowRuntimeError {
     /// HTTP 403.
     #[error("{0}")]
     Disabled(String),
+    /// An authenticated approval click was rejected. Maps to HTTP 403 with a
+    /// stable reason; no payload or executor error is exposed to the client.
+    #[error("approval decision rejected: {0:?}")]
+    ApprovalDecisionRejected(approvals::DecisionRejection),
     #[error("workflow run not found: {0}")]
     NotFound(String),
     /// Server-side failure (workflow host spawn/protocol, internal dispatch).
