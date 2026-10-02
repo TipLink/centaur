@@ -595,12 +595,14 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 
     async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+        let started = Instant::now();
         let id = SandboxId::new(next_sandbox_name());
         let mut spec = spec;
         let resolved_iron_proxy = self.resolve_iron_proxy(&id, &spec).await?;
         if let Some(resolved) = &resolved_iron_proxy {
             iron_proxy::apply_proxy_env(&mut spec, resolved);
         }
+        let resolved_at = Instant::now();
         if let Err(err) = self
             .create_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
             .await
@@ -608,6 +610,7 @@ impl SandboxBackend for AgentSandboxBackend {
             self.unwind_iron_proxy_resources(&id).await;
             return Err(err);
         }
+        let proxy_ready_at = Instant::now();
         if let Err(error) = self.create_sandbox_files_config_map(&id, &spec).await {
             self.unwind_iron_proxy_resources(&id).await;
             return Err(error);
@@ -649,10 +652,23 @@ impl SandboxBackend for AgentSandboxBackend {
                 "failed to set ownerReference on sandbox files config map"
             );
         }
+        let resources_created_at = Instant::now();
         if let Err(err) = self.wait_until_running(&id).await {
             let _ = self.stop(&id).await;
             return Err(err);
         }
+        tracing::info!(
+            event = "sandbox_startup_phases_completed",
+            sandbox_id = id.as_str(),
+            config_resolution_ms = resolved_at.duration_since(started).as_millis() as u64,
+            proxy_startup_ms = proxy_ready_at.duration_since(resolved_at).as_millis() as u64,
+            sandbox_resource_creation_ms = resources_created_at
+                .duration_since(proxy_ready_at)
+                .as_millis() as u64,
+            sandbox_pod_readiness_ms = resources_created_at.elapsed().as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "sandbox startup phases completed"
+        );
         Ok(SandboxHandle::new(id, BACKEND_NAME))
     }
 

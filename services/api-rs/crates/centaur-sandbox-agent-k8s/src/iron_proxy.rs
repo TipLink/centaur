@@ -350,8 +350,10 @@ impl AgentSandboxBackend {
         let (Some(resolved), Some(iron_proxy)) = (resolved, self.config.iron_proxy.as_ref()) else {
             return Ok(());
         };
+        let started = Instant::now();
         self.delete_iron_proxy_resources(id).await?;
         let sync = self.register_sync_proxy(id, resolved).await?;
+        let registered_at = Instant::now();
         self.services()
             .create(
                 &PostParams::default(),
@@ -396,13 +398,27 @@ impl AgentSandboxBackend {
             )
             .await
             .map_err(|err| map_kube_error("create iron-proxy pod", err))?;
+        let resources_created_at = Instant::now();
         self.wait_until_proxy_running(resolved).await?;
+        let ready_at = Instant::now();
         self.wait_for_cold_proxy_principal_applied(
             id,
             &resolved.principal_id,
             sync.config_hash.as_deref(),
         )
         .await;
+        tracing::info!(
+            event = "proxy_startup_completed",
+            sandbox_id = id.as_str(),
+            registration_ms = registered_at.duration_since(started).as_millis() as u64,
+            resource_creation_ms = resources_created_at
+                .duration_since(registered_at)
+                .as_millis() as u64,
+            pod_readiness_ms = ready_at.duration_since(resources_created_at).as_millis() as u64,
+            acknowledgement_ms = ready_at.elapsed().as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "proxy startup phases completed"
+        );
         Ok(())
     }
 
@@ -1038,7 +1054,7 @@ impl AgentSandboxBackend {
                 "failed to build iron-proxy management client",
             ));
         };
-        Ok(wait_for_proxy_ack(
+        let report = wait_for_proxy_ack(
             &client,
             &endpoint,
             principal_id,
@@ -1047,7 +1063,31 @@ impl AgentSandboxBackend {
             PROXY_ACK_PROBE_WINDOW,
             PROXY_ACK_POLL_INTERVAL,
         )
-        .await)
+        .await;
+        let observed = report.last_status.as_ref();
+        tracing::info!(
+            event = "proxy_ack_completed",
+            sandbox_id = id.as_str(),
+            barrier,
+            outcome = ?report.outcome,
+            elapsed_ms = report.elapsed_ms,
+            status_attempts = report.status_attempts,
+            sync_requested = report.sync_requested,
+            sync_http_status = report.sync_http_status,
+            sync_error = report.sync_error,
+            management_confirmed = report.management_confirmed,
+            last_http_status = report.last_http_status,
+            last_status_error = report.last_status_error,
+            expected_principal = safe_principal_id(principal_id),
+            observed_principal = observed.and_then(|status| safe_principal_id(&status.principal_id)),
+            expected_config_hash = config_hash.and_then(safe_config_hash),
+            observed_config_hash = observed.and_then(|status| status.config_hash.as_deref()).and_then(safe_config_hash),
+            synced_once = observed.map(|status| status.synced_once),
+            principal_matches = observed.map(|status| status.principal_id == principal_id),
+            config_hash_matches = observed.map(|status| proxy_config_hash_matches(status, config_hash)),
+            "proxy configuration acknowledgement completed"
+        );
+        Ok(report.outcome)
     }
 
     /// Locate the management API of the sandbox's running proxy pod. The
@@ -1259,6 +1299,43 @@ fn proxy_fallback_delay_remaining(elapsed: Duration) -> Duration {
     PROXY_REASSIGN_FALLBACK_DELAY.saturating_sub(elapsed)
 }
 
+/// Bounded metadata for one acknowledgement attempt; never a response body.
+struct ProxyAckReport {
+    outcome: ProxyAck,
+    elapsed_ms: u64,
+    status_attempts: u64,
+    sync_requested: bool,
+    sync_http_status: Option<u16>,
+    sync_error: Option<&'static str>,
+    management_confirmed: bool,
+    last_http_status: Option<u16>,
+    // Stable classifications only: reqwest errors can contain URLs or headers.
+    last_status_error: Option<&'static str>,
+    last_status: Option<ProxyManagedStatus>,
+}
+
+fn proxy_config_hash_matches(status: &ProxyManagedStatus, expected: Option<&str>) -> bool {
+    status
+        .config_hash
+        .as_deref()
+        .is_none_or(|applied| expected.is_none_or(|hash| applied == hash))
+}
+
+// Only recognized metadata formats may enter logs. Never print arbitrary status
+// bodies or unvalidated strings from the management endpoint.
+fn safe_principal_id(value: &str) -> Option<&str> {
+    let suffix = value
+        .strip_prefix("prn_")
+        .or_else(|| value.strip_prefix("prin_"))?;
+    (!suffix.is_empty() && suffix.len() <= 64 && suffix.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then_some(value)
+}
+
+fn safe_config_hash(value: &str) -> Option<&str> {
+    let hash = value.strip_prefix("sha256:")?;
+    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(value)
+}
+
 /// Poll the proxy's management API until it reports `principal_id`'s config
 /// applied. `probe_window` bounds how long an entirely-unresponsive
 /// management API is probed before concluding the image predates managed
@@ -1272,53 +1349,86 @@ async fn wait_for_proxy_ack(
     ack_timeout: Duration,
     probe_window: Duration,
     poll_interval: Duration,
-) -> ProxyAck {
+) -> ProxyAckReport {
     let started = Instant::now();
-    let mut poked = false;
-    let mut management_confirmed = false;
+    let mut report = ProxyAckReport {
+        outcome: ProxyAck::TimedOut,
+        elapsed_ms: 0,
+        status_attempts: 0,
+        sync_requested: false,
+        sync_http_status: None,
+        sync_error: None,
+        management_confirmed: false,
+        last_http_status: None,
+        last_status_error: None,
+        last_status: None,
+    };
     loop {
-        // Poke an immediate out-of-band sync so the barrier does not ride the
-        // proxy's 5s poll cadence; retried until it lands (the status poll
-        // below still converges without it, just slower).
-        if !poked {
-            poked = matches!(
-                client
-                    .post(format!("{}/v1/sync", endpoint.base_url))
-                    .bearer_auth(&endpoint.api_key)
-                    .send()
-                    .await,
-                Ok(response) if response.status().is_success()
-            );
+        // Preserve the immediate sync request, readiness predicates, and budgets.
+        if !report.sync_requested {
+            match client
+                .post(format!("{}/v1/sync", endpoint.base_url))
+                .bearer_auth(&endpoint.api_key)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    report.sync_http_status = Some(response.status().as_u16());
+                    report.sync_requested = response.status().is_success();
+                    report.sync_error = (!report.sync_requested).then_some("http_status");
+                }
+                Err(_) => {
+                    report.sync_http_status = None;
+                    report.sync_error = Some("transport");
+                }
+            }
         }
-        let status = client
+        report.status_attempts += 1;
+        match client
             .get(format!("{}/v1/status", endpoint.base_url))
             .bearer_auth(&endpoint.api_key)
             .send()
-            .await;
-        if let Ok(response) = status
-            && response.status().is_success()
+            .await
         {
-            management_confirmed = true;
-            if let Ok(status) = response.json::<ProxyManagedStatus>().await
-                && status.synced_once
-                && status.principal_id == principal_id
-                && status
-                    .config_hash
-                    .as_deref()
-                    .is_none_or(|applied_hash| config_hash.is_none_or(|hash| applied_hash == hash))
-            {
-                return ProxyAck::Applied;
+            Ok(response) => {
+                report.last_http_status = Some(response.status().as_u16());
+                if response.status().is_success() {
+                    report.management_confirmed = true;
+                    match response.json::<ProxyManagedStatus>().await {
+                        Ok(status) => {
+                            let applied = status.synced_once
+                                && status.principal_id == principal_id
+                                && proxy_config_hash_matches(&status, config_hash);
+                            report.last_status = Some(status);
+                            report.last_status_error = None;
+                            if applied {
+                                report.outcome = ProxyAck::Applied;
+                                break;
+                            }
+                        }
+                        Err(_) => report.last_status_error = Some("invalid_status_json"),
+                    }
+                } else {
+                    report.last_status_error = Some("http_status");
+                }
+            }
+            Err(_) => {
+                report.last_http_status = None;
+                report.last_status_error = Some("transport");
             }
         }
         let elapsed = started.elapsed();
-        if !management_confirmed && elapsed >= probe_window {
-            return ProxyAck::ManagementUnavailable;
+        if !report.management_confirmed && elapsed >= probe_window {
+            report.outcome = ProxyAck::ManagementUnavailable;
+            break;
         }
         if elapsed >= ack_timeout {
-            return ProxyAck::TimedOut;
+            break;
         }
         sleep(poll_interval).await;
     }
+    report.elapsed_ms = started.elapsed().as_millis() as u64;
+    report
 }
 
 /// The management endpoint advertised by a running proxy pod: pod IP plus the
@@ -3215,6 +3325,7 @@ mod tests {
     async fn spawn_management_stub(
         api_key: &str,
         mismatches: usize,
+        status_override: Option<&str>,
     ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -3229,6 +3340,7 @@ mod tests {
         let sync_calls = Arc::new(AtomicUsize::new(0));
         let status_calls = Arc::new(AtomicUsize::new(0));
         let auth = format!("authorization: bearer {}", api_key.to_lowercase());
+        let status_override = status_override.map(str::to_owned);
         let handle = tokio::spawn({
             let sync_calls = sync_calls.clone();
             async move {
@@ -3259,9 +3371,9 @@ mod tests {
                         };
                         (
                             "200 OK",
-                            format!(
+                            status_override.clone().unwrap_or_else(|| format!(
                                 r#"{{"config_hash":"h","principal_id":"{principal}","principal_status":"active","synced_once":true,"last_sync_at":"2026-06-12T00:00:00Z"}}"#
-                            ),
+                            )),
                         )
                     } else {
                         ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
@@ -3289,7 +3401,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_ack_waits_until_claimed_principal_is_applied() {
-        let (base_url, sync_calls, server) = spawn_management_stub("test-key", 2).await;
+        let (base_url, sync_calls, server) = spawn_management_stub("test-key", 2, None).await;
         let endpoint = ProxyManagementEndpoint {
             base_url,
             api_key: "test-key".to_owned(),
@@ -3306,7 +3418,15 @@ mod tests {
         )
         .await;
 
-        assert_eq!(ack, ProxyAck::Applied);
+        assert_eq!(ack.outcome, ProxyAck::Applied);
+        assert!(ack.management_confirmed);
+        assert!(ack.sync_requested);
+        assert!(ack.status_attempts >= 3);
+        assert_eq!(ack.last_http_status, Some(200));
+        assert_eq!(
+            ack.last_status.as_ref().unwrap().principal_id,
+            "prin_claimed"
+        );
         assert!(
             sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "the barrier should poke an immediate out-of-band sync"
@@ -3316,7 +3436,8 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_ack_times_out_when_principal_never_applies() {
-        let (base_url, _sync_calls, server) = spawn_management_stub("test-key", usize::MAX).await;
+        let (base_url, _sync_calls, server) =
+            spawn_management_stub("test-key", usize::MAX, None).await;
         let endpoint = ProxyManagementEndpoint {
             base_url,
             api_key: "test-key".to_owned(),
@@ -3333,13 +3454,18 @@ mod tests {
         )
         .await;
 
-        assert_eq!(ack, ProxyAck::TimedOut);
+        assert_eq!(ack.outcome, ProxyAck::TimedOut);
+        assert!(ack.elapsed_ms >= 400);
+        assert_eq!(
+            ack.last_status.as_ref().unwrap().principal_id,
+            "prin_bootstrap"
+        );
         server.abort();
     }
 
     #[tokio::test]
     async fn proxy_ack_rejects_matching_principal_with_stale_config_hash() {
-        let (base_url, _sync_calls, server) = spawn_management_stub("test-key", 0).await;
+        let (base_url, _sync_calls, server) = spawn_management_stub("test-key", 0, None).await;
         let endpoint = ProxyManagementEndpoint {
             base_url,
             api_key: "test-key".to_owned(),
@@ -3356,7 +3482,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(ack, ProxyAck::TimedOut);
+        assert_eq!(ack.outcome, ProxyAck::TimedOut);
+        let observed = ack.last_status.as_ref().unwrap();
+        assert!(observed.synced_once);
+        assert_eq!(observed.principal_id, "prin_claimed");
+        assert!(!proxy_config_hash_matches(
+            observed,
+            Some("sha256:expected")
+        ));
         server.abort();
     }
 
@@ -3383,7 +3516,101 @@ mod tests {
         )
         .await;
 
-        assert_eq!(ack, ProxyAck::ManagementUnavailable);
+        assert_eq!(ack.outcome, ProxyAck::ManagementUnavailable);
+        assert!(!ack.management_confirmed);
+        assert!(!ack.sync_requested);
+        assert!(ack.last_status.is_none());
+        assert_eq!(ack.last_status_error, Some("transport"));
+    }
+
+    #[tokio::test]
+    async fn proxy_ack_reports_unsynchronized_and_malformed_status() {
+        for (body, error, synced_once) in [
+            (
+                r#"{"principal_id":"prin_claimed","synced_once":false}"#,
+                None,
+                Some(false),
+            ),
+            (
+                r#"{"token":"do-not-log","synced_once":"invalid"}"#,
+                Some("invalid_status_json"),
+                None,
+            ),
+        ] {
+            let (base_url, _, server) = spawn_management_stub("test-key", 0, Some(body)).await;
+            let endpoint = ProxyManagementEndpoint {
+                base_url,
+                api_key: "test-key".into(),
+            };
+            let report = wait_for_proxy_ack(
+                &barrier_client(),
+                &endpoint,
+                "prin_claimed",
+                None,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(10),
+            )
+            .await;
+            assert_eq!(report.outcome, ProxyAck::TimedOut);
+            assert_eq!(report.last_status_error, error);
+            assert_eq!(
+                report.last_status.as_ref().map(|status| status.synced_once),
+                synced_once
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_ack_reports_http_errors_without_response_bodies() {
+        let (base_url, _, server) = spawn_management_stub("test-key", 0, None).await;
+        let endpoint = ProxyManagementEndpoint {
+            base_url,
+            api_key: "wrong-key".into(),
+        };
+        let report = wait_for_proxy_ack(
+            &barrier_client(),
+            &endpoint,
+            "prin_claimed",
+            None,
+            Duration::from_millis(200),
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(report.outcome, ProxyAck::ManagementUnavailable);
+        assert_eq!(report.sync_http_status, Some(401));
+        assert_eq!(report.sync_error, Some("http_status"));
+        assert_eq!(report.last_http_status, Some(401));
+        assert_eq!(report.last_status_error, Some("http_status"));
+        assert!(report.last_status.is_none());
+        server.abort();
+    }
+
+    #[test]
+    fn proxy_ack_log_metadata_rejects_arbitrary_response_content() {
+        assert_eq!(safe_principal_id("prn_Example123"), Some("prn_Example123"));
+        for value in [
+            "Bearer secret",
+            "prn_",
+            "prn_foo\nsecret",
+            "xoxb-do-not-log",
+        ] {
+            assert_eq!(safe_principal_id(value), None);
+        }
+        let hash = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(safe_config_hash(&hash), Some(hash.as_str()));
+        for value in ["secret", "sha256:secret", "sha256:invalid"] {
+            assert_eq!(safe_config_hash(value), None);
+        }
+        // Diagnostics must not change the existing optional-hash compatibility.
+        let status = ProxyManagedStatus {
+            principal_id: "prin_claimed".into(),
+            config_hash: None,
+            synced_once: true,
+        };
+        assert!(proxy_config_hash_matches(&status, Some(&hash)));
     }
 
     #[test]
