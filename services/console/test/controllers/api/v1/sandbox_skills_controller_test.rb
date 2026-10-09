@@ -309,6 +309,7 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
       end
     end
     assert_response :forbidden
+    assert_equal "sandbox principal is not linked to an active Console user", json_body.dig("error", "message")
   end
 
   test "duplicate-name create races return a validation response" do
@@ -345,7 +346,156 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
     assert_response :unauthorized
   end
 
+  test "shared channel turn authors, edits and archives skills as its linked requester" do
+    @channel_proxy.update!(requester_principal: requester_principal(users(:member_user), "U0000000001"))
+
+    with_token(@channel_proxy) do |headers|
+      post "/api/v1/sandbox/skills",
+           params: {
+             data: {
+               name: "channel-authored",
+               description: "Saved from a shared channel.",
+               instructions: "# Instructions\n\nInitial instructions."
+             }
+           },
+           headers: headers,
+           as: :json
+    end
+    assert_response :created
+    skill = Skill.find_by!(name: "channel-authored")
+    assert_equal users(:member_user), skill.user
+    assert skill.shared?
+    assert_equal users(:member_user).email, json_body.dig("data", "author")
+
+    with_token(@channel_proxy) do |headers|
+      patch "/api/v1/sandbox/skills/#{skill.oid}",
+            params: {
+              data: {
+                name: "channel-authored",
+                description: "Updated from a shared channel.",
+                instructions: "# Instructions\n\nUpdated instructions.",
+                lock_version: skill.lock_version
+              }
+            },
+            headers: headers,
+            as: :json
+    end
+    assert_response :ok
+    assert_equal "Updated from a shared channel.", skill.reload.description
+
+    with_token(@channel_proxy) do |headers|
+      delete "/api/v1/sandbox/skills/#{skill.oid}", headers: headers
+    end
+    assert_response :no_content
+    assert_not_nil skill.reload.archived_at
+  end
+
+  test "a different requester cannot change a skill another user authored in the same channel" do
+    owner = requester_principal(users(:member_user), "U0000000001")
+    other = requester_principal(users(:acme_admin), "U0000000002")
+    skill = users(:member_user).skills.create!(
+      name: "owned-in-channel",
+      description: "Owned by the first requester.",
+      content: "# Instructions\n\nOriginal."
+    )
+    @channel_proxy.update!(requester_principal: other)
+
+    with_token(@channel_proxy) do |headers|
+      patch "/api/v1/sandbox/skills/#{skill.oid}",
+            params: { data: { description: "Hijacked.", lock_version: skill.lock_version } },
+            headers: headers,
+            as: :json
+    end
+    assert_response :not_found
+
+    with_token(@channel_proxy) do |headers|
+      delete "/api/v1/sandbox/skills/#{skill.oid}", headers: headers
+    end
+    assert_response :not_found
+    assert_equal "Owned by the first requester.", skill.reload.description
+    assert_nil skill.archived_at
+
+    @channel_proxy.update!(requester_principal: owner)
+    with_token(@channel_proxy) do |headers|
+      delete "/api/v1/sandbox/skills/#{skill.oid}", headers: headers
+    end
+    assert_response :no_content
+  end
+
+  test "a requester binding does not widen what a shared channel can read" do
+    @channel_proxy.update!(requester_principal: requester_principal(users(:member_user), "U0000000001"))
+
+    with_token(@channel_proxy) do |headers|
+      get "/api/v1/sandbox/skills", headers: headers
+    end
+    assert_response :ok
+    assert_equal [ skills(:admin_shared).oid ], json_body.fetch("data").map { |skill| skill.fetch("id") }
+
+    with_token(@channel_proxy) do |headers|
+      get "/api/v1/sandbox/skills/#{skills(:member_private).oid}", headers: headers
+    end
+    assert_response :not_found
+  end
+
+  test "a requester without an active Console user cannot author and does not fall back" do
+    unlinked = requester_principal(nil, "U0000000003")
+    disabled = requester_principal(users(:disabled_user), "U0000000004")
+
+    [ [ @channel_proxy, unlinked ], [ @member_proxy, unlinked ], [ @channel_proxy, disabled ] ].each do |proxy, requester|
+      proxy.update!(requester_principal: requester)
+
+      assert_no_difference("Skill.count") do
+        with_token(proxy) do |headers|
+          post "/api/v1/sandbox/skills",
+               params: {
+                 data: {
+                   name: "forbidden-skill",
+                   description: "Must not be created.",
+                   instructions: "# Instructions"
+                 }
+               },
+               headers: headers,
+               as: :json
+        end
+      end
+      assert_response :forbidden
+      assert_equal "requesting user is not linked to an active Console user", json_body.dig("error", "message")
+    end
+  end
+
+  test "a linked requester takes precedence over a linked conversation principal" do
+    @member_proxy.update!(requester_principal: requester_principal(users(:acme_admin), "U0000000002"))
+
+    with_token(@member_proxy) do |headers|
+      post "/api/v1/sandbox/skills",
+           params: {
+             data: {
+               name: "requester-wins",
+               description: "Authored for the requester.",
+               instructions: "# Instructions"
+             }
+           },
+           headers: headers,
+           as: :json
+    end
+    assert_response :created
+    assert_equal users(:acme_admin), Skill.find_by!(name: "requester-wins").user
+  end
+
   private
+
+  def requester_principal(user, slack_user_id)
+    Principal.create!(
+      foreign_id: "slack-user-t0123456789-#{slack_user_id.downcase}",
+      name: "Slack DM #{slack_user_id}",
+      kind: :slack_dm,
+      slack_user_id: slack_user_id,
+      slack_team_id: "T0123456789",
+      console_user: user,
+      labels: {},
+      created_by: users(:member_user)
+    )
+  end
 
   def with_token(proxy)
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do

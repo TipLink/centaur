@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "380a26f0bd40e70d651c76cb6b8c2840a9e3dbef",
-  "result_tree": "f97ba379f4cb4738889a10ecdd0051b5b88ac328",
+  "result_tree": "0adbbba88bdbeae0030827b664b080301e3c2994",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -15,6 +15,10 @@
     {
       "file": "0003-proxy-ack-diagnostics.patch",
       "sha256": "d2bfd6cf8d76712fa02c66d07a23fac680d01635a9a8ee6ce4a9feb672baa8da"
+    },
+    {
+      "file": "0004-skills-requester-authoring.patch",
+      "sha256": "eef8b19f011e6bea132e5670e6d699f9aebeac0add83c02468d7f2138d7a6e48"
     }
   ]
 }
