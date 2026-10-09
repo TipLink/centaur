@@ -110,6 +110,13 @@ edits to public skills are visible to agents immediately. `delete` archives an
 owned skill by OID, removing it from the active catalog without deleting its
 stored record.
 
+A turn started from a shared channel, such as a Slack thread, runs the write
+commands as the person whose message started the turn, provided that person's
+principal is linked to an active Console user. The channel principal stays
+unowned, so a requester can only change skills they own or edit. Reads still use
+the channel's own visibility, which means a requester's private skills are never
+listed or read there. A requester without an active Console user is refused.
+
 ## Verify Builtin Skills
 
 Start an agent with the overlay loaded and ask it to inspect available skills.

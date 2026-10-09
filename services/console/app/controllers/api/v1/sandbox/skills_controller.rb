@@ -89,7 +89,15 @@ module Api
         def require_authoring_user!
           return if authoring_user
 
-          render_error(status: :forbidden, message: "sandbox principal is not linked to an active Console user")
+          render_error(status: :forbidden, message: authoring_denied_message)
+        end
+
+        def authoring_denied_message
+          if current_proxy.requester_principal
+            "requesting user is not linked to an active Console user"
+          else
+            "sandbox principal is not linked to an active Console user"
+          end
         end
 
         def visible_skills
@@ -107,8 +115,17 @@ module Api
           user if user&.active?
         end
 
+        # Writes run as the requesting user when the turn has one, so a skill
+        # saved from a shared channel belongs to the person who asked, not to
+        # the unowned channel principal. A requester without an active Console
+        # user is refused rather than falling back to the conversation
+        # principal. Reads keep using the conversation principal, so a bound
+        # requester never exposes their private skills to the channel.
         def authoring_user
-          @authoring_user ||= linked_console_user
+          return @authoring_user if defined?(@authoring_user)
+
+          user = (current_proxy.requester_principal || current_proxy.principal).console_user
+          @authoring_user = user&.active? ? user : nil
         end
 
         def owned_skill
