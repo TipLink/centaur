@@ -1,3 +1,16 @@
+diff --git a/e2e/tests/workflows.test.ts b/e2e/tests/workflows.test.ts
+index 8e84bdc0..975c865f 100644
+--- a/e2e/tests/workflows.test.ts
++++ b/e2e/tests/workflows.test.ts
+@@ -282,7 +282,7 @@ test('a workflow button click starts its target once, for the person who clicked
+   // clicker is told so.
+   expect((await slack.click(CHANNEL, posted.ts, approve, { value: 'v1.forged.signature' })).status).toBe(200)
+   await eventually('the refusal to reach the clicker', 30_000, async () =>
+-    (await slack.ephemeral(USER)).some(ephemeral => ephemeral.text === 'This request is no longer available.')
++    (await slack.ephemeral(USER)).some(ephemeral => ephemeral.text.startsWith('This button could not be verified'))
+       ? true
+       : undefined
+   )
 diff --git a/services/api-rs/crates/centaur-api-server/src/error.rs b/services/api-rs/crates/centaur-api-server/src/error.rs
 index 7104b0f7..e6797fdc 100644
 --- a/services/api-rs/crates/centaur-api-server/src/error.rs
@@ -703,7 +716,7 @@ index ef71af0a..6e931e21 100644
      sqlx::query(&format!("drop schema {schema} cascade"))
          .execute(&admin)
 diff --git a/services/api-rs/crates/centaur-workflows/src/lib.rs b/services/api-rs/crates/centaur-workflows/src/lib.rs
-index cef02aac..cc689495 100644
+index 90247f83..bb399c4d 100644
 --- a/services/api-rs/crates/centaur-workflows/src/lib.rs
 +++ b/services/api-rs/crates/centaur-workflows/src/lib.rs
 @@ -4812,6 +4812,10 @@ pub enum WorkflowRuntimeError {
@@ -773,10 +786,10 @@ index e668305c..5f8d3c3e 100644
  Never include secrets. Do not approve deferred mutable URLs/files/draft IDs;
  snapshot their contents first. The approval covers the reviewed executor's
 diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
-index 3b981c15..58c107ad 100644
+index ce2a79ae..42c4c4f8 100644
 --- a/services/slackbotv2/src/index.ts
 +++ b/services/slackbotv2/src/index.ts
-@@ -54,6 +54,7 @@ import {
+@@ -55,6 +55,7 @@ import {
    sessionStreamError,
    slackApiTimeoutMs,
    WORKFLOW_ACTION_PREFIX,
@@ -784,7 +797,7 @@ index 3b981c15..58c107ad 100644
    withSlackApiTimeout
  } from './session-api'
  import {
-@@ -356,17 +357,17 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+@@ -359,17 +360,17 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
      }
      try {
        const result = await dispatchSlackBlockAction(options, payload)
@@ -808,10 +821,10 @@ index 3b981c15..58c107ad 100644
                apiUrl: options.slackApiUrl,
                fetch: options.fetch as typeof globalThis.fetch | undefined,
 diff --git a/services/slackbotv2/src/session-api.ts b/services/slackbotv2/src/session-api.ts
-index 5a44aa0b..fb1d9638 100644
+index 15945139..e2765022 100644
 --- a/services/slackbotv2/src/session-api.ts
 +++ b/services/slackbotv2/src/session-api.ts
-@@ -565,6 +565,41 @@ export async function forwardToSessionApi(
+@@ -569,6 +569,41 @@ export async function forwardToSessionApi(
  
  export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
  
@@ -853,7 +866,7 @@ index 5a44aa0b..fb1d9638 100644
  export async function dispatchSlackBlockAction(
    options: SlackbotV2Options,
    payload: SlackbotV2BlockActionPayload
-@@ -615,8 +650,13 @@ export async function dispatchSlackBlockAction(
+@@ -619,8 +654,13 @@ export async function dispatchSlackBlockAction(
      action
    )
    if (workflowAction && response.status === 403) {
@@ -870,10 +883,10 @@ index 5a44aa0b..fb1d9638 100644
    await ensureApiOk(response, action)
    if (workflowAction) {
 diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
-index 89ba12f6..37ffedc8 100644
+index cd692641..956a571a 100644
 --- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
 +++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
-@@ -466,6 +466,8 @@ describe('slackbotv2', () => {
+@@ -325,6 +325,8 @@ describe('slackbotv2', () => {
          ts: '1700000003.000200', text: 'Approve this release?',
          blocks: [
            { type: 'section', text: { type: 'mrkdwn', text: 'Approve this release?' } },
@@ -882,11 +895,10 @@ index 89ba12f6..37ffedc8 100644
            { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Approve' },
              action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
              value: 'v1.opaque-signed-payload.signature' }] }
-@@ -511,7 +513,32 @@ describe('slackbotv2', () => {
+@@ -370,6 +372,69 @@ describe('slackbotv2', () => {
      expect(codexApi.workflowEvents).toHaveLength(0)
    })
  
--  it('acknowledges a permanently rejected workflow button without retrying it', async () => {
 +  const approvalFeedbackCases = [
 +    { name: 'untrusted button', status: 403, body: { error: 'invalid or untrusted workflow button' }, expected: 'could not be verified' },
 +    ...[
@@ -913,28 +925,43 @@ index 89ba12f6..37ffedc8 100644
 +      body: { ok: true, run_id: 'run-approval', task_id: 'task-approval', status, created }, expected }))
 +  ]
 +  for (const feedbackCase of approvalFeedbackCases) it(`acknowledges ${feedbackCase.name} with private feedback and no retry`, async () => {
-     let starts = 0
-     const feedback: unknown[] = []
-     bot = createTestBot({
-@@ -519,7 +546,7 @@ describe('slackbotv2', () => {
-         if (String(input).endsWith('/api/workflows/actions/invoke')) {
-           starts += 1
-           expect(JSON.parse(String(init?.body)).button).toBe('unsigned')
--          return Response.json({ error: 'invalid or untrusted workflow button' }, { status: 403 })
++    let starts = 0
++    const feedback: unknown[] = []
++    bot = createTestBot({
++      fetch: async (input, init) => {
++        if (String(input).endsWith('/api/workflows/actions/invoke')) {
++          starts += 1
++          expect(JSON.parse(String(init?.body)).button).toBe('unsigned')
 +          return Response.json(feedbackCase.body, { status: feedbackCase.status })
-         }
-         if (String(input).endsWith('/chat.postEphemeral')) {
-           feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
-@@ -542,8 +569,11 @@ describe('slackbotv2', () => {
-     expect(starts).toBe(1)
-     expect(feedback).toEqual([{
-       channel: CHANNEL_ID, user: USER_ID, thread_ts: '1700000003.000100',
--      text: 'This request is no longer available.'
++        }
++        if (String(input).endsWith('/chat.postEphemeral')) {
++          feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
++          return Response.json({ ok: true })
++        }
++        return globalThis.fetch(input, init)
++      }
++    })
++    const payload = {
++      type: 'block_actions', team: { id: TEAM_ID },
++      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
++      channel: { id: CHANNEL_ID }, message: { ts: '1700000003.000200', thread_ts: '1700000003.000100' },
++      actions: [{ type: 'button', action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
++        action_ts: '1700000004.000200', value: 'unsigned' }]
++    }
++    const waits: Promise<unknown>[] = []
++    const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
++    expect(response.status).toBe(200)
++    await Promise.all(waits)
++    expect(starts).toBe(1)
++    expect(feedback).toEqual([{
++      channel: CHANNEL_ID, user: USER_ID, thread_ts: '1700000003.000100',
 +      text: expect.stringContaining(String(feedbackCase.expected))
-     }])
++    }])
 +    expect(JSON.stringify(feedback)).not.toContain('do-not-publish')
 +    expect(JSON.stringify(feedback)).not.toContain('USECRET')
 +    expect(codexApi.workflowEvents).toHaveLength(0)
-   })
- 
++  })
++
    it('applies the external-org allowlist to Slack block actions', async () => {
+     const interaction = signedSlackInteraction({
+       type: 'block_actions',

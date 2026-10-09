@@ -30,6 +30,7 @@ import {
   type RendererEvent
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
+import { CitationTextFilter, stripUnresolvedCitations } from './citation-text'
 import { resolveHarnessRollout } from './harness-rollout'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import {
@@ -70,6 +71,8 @@ import { resolveChannelDefault } from './channel-defaults'
 import {
   extractMessageOverrides,
   extractPersonaOverride,
+  isHarnessEnabled,
+  validateStrategyOverrides,
   type HarnessOverrides
 } from './overrides'
 import { createFlagMessageOverridesStrategy } from './message-overrides-strategy'
@@ -604,7 +607,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
           return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
         }
       }
-      const lateFileTask = lateSlackFiles.repairFromWebhook(rawBody)
+      const lateFileTask = response.ok ? lateSlackFiles.repairFromWebhook(rawBody) : null
       if (lateFileTask) waitUntil(c, lateFileTask)
       outcome = response.ok ? 'success' : 'error'
       return new globalThis.Response(await response.text(), {
@@ -1274,6 +1277,30 @@ async function syncThreadMessageToSession(
   // (unlike it) ridden on the input line to take effect. harness/model/provider
   // are sticky (effectiveOverrides); reasoning is per-turn.
   const channelDefault = resolveChannelDefault(input.options.channelDefaults, thread.id)
+  const selectedHarnessType =
+    effectiveOverrides.harnessType ?? channelDefault?.harnessType ??
+    input.options.defaultHarnessType ?? 'codex'
+  const modelHarness = validateStrategyOverrides({
+    model: stickyOverrideRaw(state, stickyOverridesUpdate, 'model') === null
+      ? undefined : effectiveOverrides.model ?? channelDefault?.model
+  }).harnessType ?? selectedHarnessType
+  if (!isHarnessEnabled(selectedHarnessType, input.options.enabledHarnesses) ||
+    !isHarnessEnabled(modelHarness, input.options.enabledHarnesses)) {
+    const fallbackHarness = input.options.defaultHarnessType ?? 'codex'
+    stickyOverridesUpdate = {
+      ...stickyOverridesUpdate,
+      harnessType: fallbackHarness,
+      model: null,
+      provider: null
+    }
+    effectiveOverrides.harnessType = fallbackHarness
+    effectiveOverrides.model = undefined
+    effectiveOverrides.provider = undefined
+    traceLog(input.options, 'slackbotv2_disabled_harness_reset', trace, {
+      disabled_harness: selectedHarnessType,
+      fallback_harness: fallbackHarness
+    })
+  }
   const resolvedHarnessType = effectiveOverrides.harnessType ?? channelDefault?.harnessType
   // A `null` sticky model/provider is a tombstone from a harness switch: honor
   // it, don't re-pair a stale channel default with the new harness. Only
@@ -1286,6 +1313,22 @@ async function syncThreadMessageToSession(
     stickyOverrideRaw(state, stickyOverridesUpdate, 'provider') === null
       ? undefined
       : effectiveOverrides.provider ?? channelDefault?.provider
+  // A `null` sticky persona means the session was created without one; it is
+  // pinned, so a channel default added later must not apply.
+  const resolvedPersonaId =
+    stickyOverrideRaw(state, stickyOverridesUpdate, 'personaId') === null
+      ? undefined
+      : effectiveOverrides.personaId ?? channelDefault?.personaId
+  // Where the persona sent on session creation came from, for tracing. A pinned
+  // thread persona overrides any later flag (see preservePinnedPersona).
+  const personaSource =
+    resolvedPersonaId === undefined
+      ? undefined
+      : Object.prototype.hasOwnProperty.call(state, 'personaId')
+        ? 'thread'
+        : overrides.personaId
+          ? 'flag'
+          : 'channel'
   const effectiveHarnessType = resolvedHarnessType ?? input.options.defaultHarnessType ?? 'codex'
   // Without an explicit override or channel default the harness runs its
   // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
@@ -1299,7 +1342,9 @@ async function syncThreadMessageToSession(
   const harnessRollout = resolveHarnessRollout({
     modelOverride,
     requestedHarness: effectiveHarnessType,
-    rolloutPercent: input.options.codexNanocodexRolloutPercent ?? 0,
+    rolloutPercent: isHarnessEnabled('nanocodex', input.options.enabledHarnesses)
+      ? input.options.codexNanocodexRolloutPercent ?? 0
+      : 0,
     threadId: thread.id
   })
   const rolloutSelected = harnessRollout.assignment !== undefined
@@ -1330,6 +1375,12 @@ async function syncThreadMessageToSession(
       persona_id: overrides.personaId,
       provider: overrides.provider,
       reasoning: overrides.reasoning
+    })
+  }
+  if (shouldStartExecution && personaSource) {
+    traceLog(input.options, 'slackbotv2_forward_persona_resolved', trace, {
+      persona_id: resolvedPersonaId,
+      persona_source: personaSource
     })
   }
   traceLog(input.options, 'slackbotv2_forward_message_serialized', trace, {
@@ -1408,7 +1459,7 @@ async function syncThreadMessageToSession(
     messages: messagesToAppend,
     model: shouldStartExecution ? resolvedModel : undefined,
     metadataModel: shouldStartExecution ? effectiveModel : undefined,
-    personaId: shouldStartExecution ? effectiveOverrides.personaId : undefined,
+    personaId: shouldStartExecution ? resolvedPersonaId : undefined,
     provider: shouldStartExecution ? resolvedProvider : undefined,
     reasoning: resolvedReasoning,
     restartOnHarnessConflict:
@@ -1575,6 +1626,7 @@ async function syncThreadMessageToSession(
           if (requestedPersonaId !== undefined && outcome.personaId !== requestedPersonaId) {
             traceLog(input.options, 'slackbotv2_session_persona_reconciled', trace, {
               requested_persona_id: requestedPersonaId,
+              requested_persona_source: personaSource,
               resolved_persona_id: outcome.personaId,
               unavailable_requested_persona_id: outcome.unavailableRequestedPersonaId
             })
@@ -2839,7 +2891,7 @@ class SlackRenderFallback {
   }
 
   text(): string {
-    const terminalText = this.terminalText.trim()
+    const terminalText = stripUnresolvedCitations(this.terminalText).trim()
     const markdownText = this.markdownText.trim()
     if (this.interrupted && !terminalText && markdownText === EMPTY_FINAL_ANSWER_TEXT) return ''
     return terminalText || markdownText
@@ -2884,9 +2936,17 @@ class SlackRenderFallback {
 async function* slackSafeChatSdkStream(
   stream: AsyncIterable<ChatSDKStreamChunk>
 ): AsyncIterable<ChatSDKStreamChunk> {
+  const citations = new CitationTextFilter()
   for await (const chunk of stream) {
+    if (chunk.type === 'markdown_text') {
+      const text = citations.append(chunk.text)
+      if (text) yield { ...chunk, text }
+      continue
+    }
     yield slackSafeChatSdkChunk(chunk)
   }
+  const text = citations.finish()
+  if (text) yield { type: 'markdown_text', text }
 }
 
 type SlackStreamTaskDisplayMode = NonNullable<SlackbotV2Options['streamTaskDisplayMode']>

@@ -1,5 +1,5 @@
 diff --git a/crates/absurd-sdk/src/lib.rs b/crates/absurd-sdk/src/lib.rs
-index 7282c793..ee6a86ed 100644
+index dba1fd2a..b9114fa7 100644
 --- a/crates/absurd-sdk/src/lib.rs
 +++ b/crates/absurd-sdk/src/lib.rs
 @@ -627,6 +627,21 @@ impl Client {
@@ -65,10 +65,18 @@ index 7282c793..ee6a86ed 100644
          Ok(())
      }
 diff --git a/services/api-rs/Cargo.lock b/services/api-rs/Cargo.lock
-index ecd98c23..984425ae 100644
+index b7297a36..bbbb16b3 100644
 --- a/services/api-rs/Cargo.lock
 +++ b/services/api-rs/Cargo.lock
-@@ -1129,6 +1129,7 @@ name = "centaur-workflows"
+@@ -418,6 +418,7 @@ dependencies = [
+  "tower-http 0.7.1",
+  "tracing",
+  "urlencoding",
++ "uuid",
+ ]
+ 
+ [[package]]
+@@ -597,6 +598,7 @@ name = "centaur-workflows"
  version = "0.1.0"
  dependencies = [
   "absurd-sdk",
@@ -76,7 +84,7 @@ index ecd98c23..984425ae 100644
   "base64 0.23.1",
   "centaur-iron-control",
   "centaur-sandbox-core",
-@@ -1140,6 +1141,7 @@ dependencies = [
+@@ -608,6 +610,7 @@ dependencies = [
   "chrono-tz",
   "cron",
   "futures-util",
@@ -84,7 +92,7 @@ index ecd98c23..984425ae 100644
   "hmac 0.13.0",
   "reqwest",
   "serde",
-@@ -4841,6 +4843,7 @@ dependencies = [
+@@ -4047,6 +4050,7 @@ dependencies = [
   "tokio-stream",
   "tracing",
   "url",
@@ -92,7 +100,7 @@ index ecd98c23..984425ae 100644
   "webpki-roots 0.26.11",
  ]
  
-@@ -4923,6 +4926,7 @@ dependencies = [
+@@ -4129,6 +4133,7 @@ dependencies = [
   "thiserror 2.0.21",
   "time",
   "tracing",
@@ -100,7 +108,7 @@ index ecd98c23..984425ae 100644
   "whoami",
  ]
  
-@@ -4962,6 +4966,7 @@ dependencies = [
+@@ -4168,6 +4173,7 @@ dependencies = [
   "thiserror 2.0.21",
   "time",
   "tracing",
@@ -108,7 +116,7 @@ index ecd98c23..984425ae 100644
   "whoami",
  ]
  
-@@ -4989,6 +4994,7 @@ dependencies = [
+@@ -4195,6 +4201,7 @@ dependencies = [
   "time",
   "tracing",
   "url",
@@ -117,10 +125,10 @@ index ecd98c23..984425ae 100644
  
  [[package]]
 diff --git a/services/api-rs/crates/centaur-api-server/Cargo.toml b/services/api-rs/crates/centaur-api-server/Cargo.toml
-index 9a70c298..72e08168 100644
+index 6e907723..18854959 100644
 --- a/services/api-rs/crates/centaur-api-server/Cargo.toml
 +++ b/services/api-rs/crates/centaur-api-server/Cargo.toml
-@@ -37,7 +37,7 @@ serde_yaml.workspace = true
+@@ -33,7 +33,7 @@ serde_yaml.workspace = true
  sha2.workspace = true
  standardwebhooks.workspace = true
  subtle.workspace = true
@@ -129,11 +137,19 @@ index 9a70c298..72e08168 100644
  thiserror.workspace = true
  time.workspace = true
  tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+@@ -41,6 +41,7 @@ toml.workspace = true
+ tower-http.workspace = true
+ tracing.workspace = true
+ urlencoding.workspace = true
++uuid.workspace = true
+ 
+ [dev-dependencies]
+ async-trait.workspace = true
 diff --git a/services/api-rs/crates/centaur-api-server/src/auth.rs b/services/api-rs/crates/centaur-api-server/src/auth.rs
-index df8d2de1..c5de2a2a 100644
+index 0f320cb4..f1b4eebd 100644
 --- a/services/api-rs/crates/centaur-api-server/src/auth.rs
 +++ b/services/api-rs/crates/centaur-api-server/src/auth.rs
-@@ -191,8 +191,8 @@ impl ApiAuthConfig {
+@@ -189,8 +189,8 @@ impl ApiAuthConfig {
      pub(crate) fn verify_workflow_button(
          &self,
          request: centaur_workflows::slack_buttons::Invocation,
@@ -145,7 +161,7 @@ index df8d2de1..c5de2a2a 100644
      }
  
 diff --git a/services/api-rs/crates/centaur-api-server/src/lib.rs b/services/api-rs/crates/centaur-api-server/src/lib.rs
-index a1d62b82..a1ef20ce 100644
+index 2383f0aa..6875fc57 100644
 --- a/services/api-rs/crates/centaur-api-server/src/lib.rs
 +++ b/services/api-rs/crates/centaur-api-server/src/lib.rs
 @@ -5,6 +5,7 @@ mod error;
@@ -156,8 +172,8 @@ index a1d62b82..a1ef20ce 100644
  mod tool_discovery;
  pub mod types;
  
-@@ -168,6 +169,42 @@ mod tests {
-         );
+@@ -158,6 +159,42 @@ mod tests {
+         )
      }
  
 +    #[tokio::test]
@@ -199,7 +215,7 @@ index a1d62b82..a1ef20ce 100644
      #[tokio::test]
      async fn metrics_endpoint_renders_http_request_metrics() {
          let pool =
-@@ -492,6 +529,36 @@ mod tests {
+@@ -493,6 +530,36 @@ mod tests {
          }
      }
  
@@ -234,13 +250,13 @@ index a1d62b82..a1ef20ce 100644
 +    }
 +
      #[tokio::test]
-     async fn principal_jwt_is_capability_scoped_and_archive_exception_is_subject_scoped() {
+     async fn principal_jwt_is_capability_scoped() {
          let principal = principal_token("prn_sandbox");
 diff --git a/services/api-rs/crates/centaur-api-server/src/routes.rs b/services/api-rs/crates/centaur-api-server/src/routes.rs
-index 996bfda4..91ddb32f 100644
+index 7e2ca8a4..a65ff146 100644
 --- a/services/api-rs/crates/centaur-api-server/src/routes.rs
 +++ b/services/api-rs/crates/centaur-api-server/src/routes.rs
-@@ -179,7 +179,7 @@ impl AppState {
+@@ -144,7 +144,7 @@ impl AppState {
              .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
      }
  
@@ -249,7 +265,7 @@ index 996bfda4..91ddb32f 100644
          let initialized = self
              .initialized()
              .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
-@@ -188,7 +188,7 @@ impl AppState {
+@@ -153,7 +153,7 @@ impl AppState {
              .ok_or_else(|| ApiError::BadRequest("workflow runtime is not enabled".to_owned()))
      }
  
@@ -258,31 +274,31 @@ index 996bfda4..91ddb32f 100644
          let initialized = self
              .initialized()
              .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
-@@ -260,6 +260,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
-         .route("/api/session/{thread_key}/events", get(stream_events))
+@@ -229,6 +229,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
+         )
          .route("/api/sandboxes/drain", post(drain_sandboxes))
          .merge(slack_proxy_router())
 +        .merge(crate::tool_approvals::router())
          .route("/api/workflows/schedules", get(list_workflow_schedules))
          .route(
              "/api/workflows/runs",
-@@ -446,6 +447,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
+@@ -387,6 +388,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
  
  #[derive(Clone, Copy)]
  enum RouteAccess {
 +    ConsoleOnly,
      Capability(Capability),
      PrincipalOnly,
-     ArchiveDownload,
-@@ -483,6 +485,7 @@ async fn authorize_api_request(
+ }
+@@ -423,6 +425,7 @@ async fn authorize_api_request(
      };
  
      let allowed = match access {
 +        RouteAccess::ConsoleOnly => caller.class() == CallerClass::Console,
          RouteAccess::Capability(capability) => caller.has_capability(capability),
          RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
-         RouteAccess::ArchiveDownload => {
-@@ -537,6 +540,10 @@ async fn authorize_api_request(
+     };
+@@ -471,6 +474,10 @@ async fn authorize_api_request(
  fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
      let capability = |capability| Some(RouteAccess::Capability(capability));
      match (method, route) {
@@ -293,7 +309,7 @@ index 996bfda4..91ddb32f 100644
          (&Method::GET, "/api/session/{thread_key}")
          | (&Method::GET, "/api/session/{thread_key}/events") => {
              capability(Capability::SessionsRead)
-@@ -2858,14 +2865,24 @@ async fn ingest_google_docs_sync_batch(
+@@ -2368,14 +2375,24 @@ async fn ingest_google_docs_sync_batch(
  
  async fn invoke_workflow_button(
      State(state): State<AppState>,
@@ -374,10 +390,10 @@ index 00000000..78e2b9f0
 +    ))
 +}
 diff --git a/services/api-rs/crates/centaur-session-runtime/src/lib.rs b/services/api-rs/crates/centaur-session-runtime/src/lib.rs
-index 55f49344..52175a99 100644
+index 1c8c581d..74d7018d 100644
 --- a/services/api-rs/crates/centaur-session-runtime/src/lib.rs
 +++ b/services/api-rs/crates/centaur-session-runtime/src/lib.rs
-@@ -160,6 +160,7 @@ impl SessionPrincipalAdmission {
+@@ -161,6 +161,7 @@ impl SessionPrincipalAdmission {
  
  #[derive(Clone)]
  pub struct SessionRuntime {
@@ -385,15 +401,15 @@ index 55f49344..52175a99 100644
      store: PgSessionStore,
      sandbox_runtime: SandboxRuntime,
      sandbox_pipes: SessionPipeMap,
-@@ -748,6 +749,7 @@ impl SessionRuntime {
+@@ -746,6 +747,7 @@ impl SessionRuntime {
          Self {
              store,
              sandbox_runtime,
 +            workflow_only_principals: Arc::new(DashSet::new()),
              sandbox_pipes: Arc::new(DashMap::new()),
              sandbox_pipe_open_locks: Arc::new(DashMap::new()),
-             tool_host_call_locks: Arc::new(DashMap::new()),
-@@ -774,6 +776,41 @@ impl SessionRuntime {
+             dispatching_executions: Arc::new(DashSet::new()),
+@@ -773,6 +775,41 @@ impl SessionRuntime {
          self
      }
  
@@ -450,7 +466,7 @@ index 55f49344..52175a99 100644
          let tool_name = input.tool_name.trim().to_owned();
          let invocation = match input.invocation {
              ToolHostInvocation::V1 { method, arguments } => ToolHostInvocation::V1 {
-@@ -1578,6 +1623,7 @@ impl SessionRuntime {
+@@ -1584,6 +1629,7 @@ impl SessionRuntime {
                  }
              };
              let desired_capabilities = sandbox_capabilities_from_principal(&registered_principal);
@@ -458,7 +474,7 @@ index 55f49344..52175a99 100644
              // A session's persona is fixed by the first successful create.
              // Use the stored persona before the requested one so later persona
              // flags cannot change or invalidate an existing thread. Its
-@@ -2097,6 +2143,9 @@ impl SessionRuntime {
+@@ -2128,6 +2174,9 @@ impl SessionRuntime {
              );
              let session = self.store.get_session(thread_key).await?;
              correlation_sandbox_id = session.sandbox_id.clone();
@@ -468,7 +484,7 @@ index 55f49344..52175a99 100644
              let harness_label = session.harness_type.to_string();
              validate_input_lines(&input_lines)?;
              let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
-@@ -3234,6 +3283,7 @@ impl SessionRuntime {
+@@ -3270,6 +3319,7 @@ impl SessionRuntime {
              return Ok(SessionSandboxCapabilities::default_enabled());
          };
          let principal = self.iron_control.get_principal(principal_id).await?;
@@ -476,7 +492,7 @@ index 55f49344..52175a99 100644
          Ok(sandbox_capabilities_from_principal(&principal))
      }
  
-@@ -4128,7 +4178,19 @@ impl SandboxRuntime {
+@@ -4164,7 +4214,19 @@ impl SandboxRuntime {
          spec: SandboxSpec,
      ) -> Result<(SandboxId, centaur_sandbox_core::SandboxIoParts), SessionRuntimeError> {
          let handle = self.manager.create_running(spec).await?;
@@ -497,8 +513,8 @@ index 55f49344..52175a99 100644
          Ok((handle.id, io))
      }
  
-@@ -9622,6 +9684,66 @@ mod adoption_tests {
-         )
+@@ -9706,6 +9768,66 @@ mod adoption_tests {
+         reset_test_store(&store).await;
      }
  
 +    #[tokio::test]
@@ -2711,7 +2727,7 @@ index 00000000..ef71af0a
 +    admin.close().await;
 +}
 diff --git a/services/api-rs/crates/centaur-workflows/src/lib.rs b/services/api-rs/crates/centaur-workflows/src/lib.rs
-index 7d910109..cef02aac 100644
+index 63fc8857..90247f83 100644
 --- a/services/api-rs/crates/centaur-workflows/src/lib.rs
 +++ b/services/api-rs/crates/centaur-workflows/src/lib.rs
 @@ -37,6 +37,8 @@ use tokio::{
@@ -3212,7 +3228,7 @@ index 7d910109..cef02aac 100644
      WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
      let child_input = message.get("input").cloned().unwrap_or_else(|| json!({}));
      if !child_input.is_object() {
-@@ -5349,6 +5535,7 @@ mod tests {
+@@ -5305,6 +5491,7 @@ mod tests {
      #[test]
      fn required_workflow_principal_fails_closed_when_unregistered() {
          let assignments = WorkflowPrincipalAssignments {
@@ -3517,19 +3533,6 @@ index 00000000..e668305c
 +Console, real sandbox proxies, Slack, the isolated executor and a controlled
 +provider. Include unauthorized clicks, direct-call bypass, duplicates, expiry
 +and restart. No production enablement is implied by source or unit-test success.
-diff --git a/services/console/Gemfile.lock b/services/console/Gemfile.lock
-index e115f379..d18d7de2 100644
---- a/services/console/Gemfile.lock
-+++ b/services/console/Gemfile.lock
-@@ -84,7 +84,7 @@ GEM
-     bindex (0.8.1)
-     bootsnap (1.26.0)
-       msgpack (~> 1.5)
--    brakeman (8.0.6)
-+    brakeman (8.1.0)
-       racc
-     builder (3.3.0)
-     bundler-audit (0.9.3)
 diff --git a/services/console/app/controllers/api/v1/sandbox/tool_approvals_controller.rb b/services/console/app/controllers/api/v1/sandbox/tool_approvals_controller.rb
 new file mode 100644
 index 00000000..533caf9b
@@ -3601,10 +3604,10 @@ index 00000000..533caf9b
 +  end
 +end
 diff --git a/services/console/app/services/centaur_api_client.rb b/services/console/app/services/centaur_api_client.rb
-index 6169fb36..dcc72e38 100644
+index 0b3c213d..b5eadf9b 100644
 --- a/services/console/app/services/centaur_api_client.rb
 +++ b/services/console/app/services/centaur_api_client.rb
-@@ -128,6 +128,22 @@ class CentaurApiClient
+@@ -100,6 +100,22 @@ class CentaurApiClient
      post("/api/workflows/runs", payload)
    end
  
@@ -3628,10 +3631,10 @@ index 6169fb36..dcc72e38 100644
  
    def get(path, params = {})
 diff --git a/services/console/config/routes.rb b/services/console/config/routes.rb
-index 4a48a337..5ba167c1 100644
+index cb24b256..e331aa17 100644
 --- a/services/console/config/routes.rb
 +++ b/services/console/config/routes.rb
-@@ -262,6 +262,10 @@ Rails.application.routes.draw do
+@@ -248,6 +248,10 @@ Rails.application.routes.draw do
        # Called from inside sandboxes through their assigned iron-proxy. The
        # proxy injects a short-lived sandbox entitlement JWT scoped to these paths.
        namespace :sandbox do
@@ -3694,18 +3697,18 @@ index 00000000..f5c2a4ad
 +  end
 +end
 diff --git a/services/sandbox/SYSTEM_PROMPT.md b/services/sandbox/SYSTEM_PROMPT.md
-index 042e4f12..89957212 100644
+index 475c1b3e..36201db4 100644
 --- a/services/sandbox/SYSTEM_PROMPT.md
 +++ b/services/sandbox/SYSTEM_PROMPT.md
-@@ -153,6 +153,8 @@
- |vlogs query "level:error"       → recent service errors
- |centaur-tools call vmetrics query '{"expr":"centaur_deployment_info"}' → live Centaur deployment image/version/SHA metadata
- |Tool commands are normal CLIs backed by mounted repo packages. Use direct tool CLIs for tools.
+@@ -74,6 +74,8 @@
+ 
+ [Tools]
+ |Tools are shell CLIs. Run `centaur-tools list` to see what is available and `<tool> --help` before using an unfamiliar tool, unless a skill or this prompt gives the exact command. Never guess command names.
 +|When the deployment exposes `centaur-console approvals`, use `centaur-console approvals actions` to discover approval-gated actions. Submit their complete, non-secret JSON arguments with `centaur-console approvals call <action> --arguments '<json>'`; it posts Accept/Decline controls in this Slack thread and waits for the authorized decision and result.
 +|An approval request ID is a pending request, not evidence that the action succeeded. On timeout or an unknown outcome, inspect `centaur-console approvals status <id>` and the provider before requesting the action again. Do not route around a required approval.
- |For tool smoke tests, use `<tool> health` as the canonical check. Do not invent ad hoc "test this tool" probes or raw upstream calls unless `health` fails and you are triaging the failure.
- |For broad tool smoke tests, use the `tool-health-smoke` skill or run its health runner when it is available.
- |
+ |For tool smoke tests use `<tool> health` (or the `tool-health-smoke` skill), not ad hoc probes.
+ |Run independent lookups as parallel tool calls in one turn; serialize only when one result builds the next query.
+ |NEVER call external APIs directly via curl unless the prompt explicitly told you to fetch a file that way; use the tool CLI, which only exposes allowed tools.
 diff --git a/services/workflow-python/tests/test_workflow_host.py b/services/workflow-python/tests/test_workflow_host.py
 index 51ddeed2..a7888c2a 100644
 --- a/services/workflow-python/tests/test_workflow_host.py
@@ -3781,13 +3784,13 @@ index 9e270ae0..649997a4 100644
              for workflow in workflows.values()
          ],
 diff --git a/tools/README.md b/tools/README.md
-index 0f22a5df..a5df6880 100644
+index 035f2192..06fbeaaf 100644
 --- a/tools/README.md
 +++ b/tools/README.md
-@@ -63,8 +63,10 @@ The open-source tool inventory lives in this `tools/` tree and changes over time
+@@ -61,8 +61,10 @@ my-tool --help
  
- - `centaur_investigator`: parse Centaur Slack thread references and enrich them
-   with best-effort vlogs/vmetrics context without exposing message context.
+ The open-source tool inventory lives in this `tools/` tree and changes over time. To see what ships in a running sandbox, use `centaur-tools list`; private deployments may mount additional overlay tool directories.
+ 
 -- `centaur-console`: inspect sandbox permissions and configured OAuth apps, and
 -  manage the linked user's scheduled tasks.
 +- `centaur-console`: inspect sandbox permissions and configured OAuth apps,
