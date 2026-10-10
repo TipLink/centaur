@@ -195,6 +195,17 @@ jobs:
       - name: Check migration versions
         run: .github/scripts/check-migration-order.sh "origin/${{ github.base_ref || 'release/aws-core' }}"
 
+      # Production applied these two files from the reviewed patch series, and sqlx
+      # refuses to start when an applied migration's checksum (SHA-384) changes.
+      - name: Fork-owned migrations stay byte-identical
+        run: |
+          set -euo pipefail
+          dir=services/api-rs/crates/centaur-session-sqlx/migrations
+          printf '%s  %s\n' \
+            ae8dd0aede7c1d57bfaa7a22d9645a3cd0bd735cbf8f6540e9cd973c6ac874e76306bceac4a85cab34e00ce2f616718f "$dir/0056_tool_approvals.sql" \
+            bdce0242fa7bebd377fcb433354ca909b2bb52158c24093080ffce65dc81096ae94b2900dd746778069cc2d611bb3313 "$dir/0057_workflow_native_approvals.sql" \
+            | sha384sum --check --strict
+
   harness-server-checks:
     name: Harness server fmt, clippy, and tests
     runs-on: ubuntu-latest
