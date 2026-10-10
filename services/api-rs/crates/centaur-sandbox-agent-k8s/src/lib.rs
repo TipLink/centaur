@@ -1248,7 +1248,8 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    if repo_cache_tools.is_some() {
+    // fsGroup makes bootstrap emptyDirs and the state PVC writable by the agent UID.
+    if repo_cache_tools.is_some() || config.state_volume.is_some() {
         pod_spec["securityContext"] = tools::pod_security_context_json();
     }
     insert_optional(
@@ -1680,6 +1681,14 @@ mod tests {
         assert_eq!(container.image.as_deref(), Some("centaur-agent:latest"));
         assert_eq!(container.stdin, Some(true));
         assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 2);
+        let security_context = sandbox
+            .spec
+            .pod_template
+            .spec
+            .security_context
+            .as_ref()
+            .unwrap();
+        assert_eq!(security_context.fs_group, Some(1001));
         let resources = container.resources.as_ref().unwrap();
         let quantity = |value: &str| IntOrString::String(value.to_owned());
         assert_eq!(
@@ -1769,34 +1778,6 @@ mod tests {
                         && mount["readOnly"] == true
                 })
         );
-    }
-
-    #[test]
-    fn renders_partial_sandbox_resources() {
-        let spec = SandboxSpec::new("centaur-agent:latest").resources(
-            ResourceRequirements::new()
-                .request("memory", "4Gi")
-                .limit("memory", "4Gi"),
-        );
-        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
-
-        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
-
-        let resources = sandbox.spec.pod_template.spec.containers[0]
-            .resources
-            .as_ref()
-            .unwrap();
-        let memory = IntOrString::String("4Gi".to_owned());
-        assert_eq!(
-            resources.requests.as_ref().unwrap().get("memory"),
-            Some(&memory)
-        );
-        assert_eq!(
-            resources.limits.as_ref().unwrap().get("memory"),
-            Some(&memory)
-        );
-        assert!(!resources.requests.as_ref().unwrap().contains_key("cpu"));
-        assert!(!resources.limits.as_ref().unwrap().contains_key("cpu"));
     }
 
     #[test]

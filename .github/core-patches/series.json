@@ -1,24 +1,28 @@
 {
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
-  "upstream_revision": "380a26f0bd40e70d651c76cb6b8c2840a9e3dbef",
-  "result_tree": "0adbbba88bdbeae0030827b664b080301e3c2994",
+  "upstream_revision": "bf201201b2066911792ca03c789de7a515f41311",
+  "result_tree": "1f960834a84c9ef80c03f654f4df54152d120db6",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
-      "sha256": "2e26e37531419c98a208c29b8bfc88891540d50c49956d5549c44e530ca06d09"
+      "sha256": "ff2dbcc60646484bb107914090e3b0eab56427b39925acc007937d6792d9a051"
     },
     {
       "file": "0002-approval-slack-ux.patch",
-      "sha256": "03c3306c876ea3a9cab448afeb7cf9ec32383d488179abaf92e6461de5d2faee"
+      "sha256": "3855e75f904a7b07c857d2d6103a90056b954b59894374f3c4706e24ae71a6c2"
     },
     {
       "file": "0003-proxy-ack-diagnostics.patch",
-      "sha256": "d2bfd6cf8d76712fa02c66d07a23fac680d01635a9a8ee6ce4a9feb672baa8da"
+      "sha256": "5fe112fbc61e30c118fc292aa4e0f1ed4599d86abd9e8482247617991062d99a"
     },
     {
       "file": "0004-skills-requester-authoring.patch",
       "sha256": "eef8b19f011e6bea132e5670e6d699f9aebeac0add83c02468d7f2138d7a6e48"
+    },
+    {
+      "file": "0005-renumber-upstream-migrations.patch",
+      "sha256": "eaa43cc60df78e9f1721bfeddc123b4ab696e28cbe841f890d1003257e7983b6"
     }
   ]
 }

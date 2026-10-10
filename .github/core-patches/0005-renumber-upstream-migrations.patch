@@ -1,0 +1,20 @@
+diff --git a/services/api-rs/crates/centaur-session-sqlx/migrations/0057_drop_sessions_harness_type_supported.sql b/services/api-rs/crates/centaur-session-sqlx/migrations/0059_drop_sessions_harness_type_supported.sql
+similarity index 100%
+rename from services/api-rs/crates/centaur-session-sqlx/migrations/0057_drop_sessions_harness_type_supported.sql
+rename to services/api-rs/crates/centaur-session-sqlx/migrations/0059_drop_sessions_harness_type_supported.sql
+diff --git a/services/api-rs/crates/centaur-session-sqlx/migrations/0058_remove_centaur_user_email_override.sql b/services/api-rs/crates/centaur-session-sqlx/migrations/0060_remove_centaur_user_email_override.sql
+similarity index 100%
+rename from services/api-rs/crates/centaur-session-sqlx/migrations/0058_remove_centaur_user_email_override.sql
+rename to services/api-rs/crates/centaur-session-sqlx/migrations/0060_remove_centaur_user_email_override.sql
+diff --git a/services/api-rs/crates/centaur-session-sqlx/migrations/0059_drop_centaur_readonly_role.sql b/services/api-rs/crates/centaur-session-sqlx/migrations/0061_drop_centaur_readonly_role.sql
+similarity index 100%
+rename from services/api-rs/crates/centaur-session-sqlx/migrations/0059_drop_centaur_readonly_role.sql
+rename to services/api-rs/crates/centaur-session-sqlx/migrations/0061_drop_centaur_readonly_role.sql
+diff --git a/services/api-rs/crates/centaur-session-sqlx/search-migrations/paradedb/0056_company_context_text_search.sql b/services/api-rs/crates/centaur-session-sqlx/search-migrations/paradedb/0058_company_context_text_search.sql
+similarity index 100%
+rename from services/api-rs/crates/centaur-session-sqlx/search-migrations/paradedb/0056_company_context_text_search.sql
+rename to services/api-rs/crates/centaur-session-sqlx/search-migrations/paradedb/0058_company_context_text_search.sql
+diff --git a/services/api-rs/crates/centaur-session-sqlx/search-migrations/postgres/0056_company_context_text_search.sql b/services/api-rs/crates/centaur-session-sqlx/search-migrations/postgres/0058_company_context_text_search.sql
+similarity index 100%
+rename from services/api-rs/crates/centaur-session-sqlx/search-migrations/postgres/0056_company_context_text_search.sql
+rename to services/api-rs/crates/centaur-session-sqlx/search-migrations/postgres/0058_company_context_text_search.sql
