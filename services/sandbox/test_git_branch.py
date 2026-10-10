@@ -245,6 +245,69 @@ class GitBranchTest(unittest.TestCase):
             upstream_head,
         )
 
+    def test_clones_uncached_repo_from_github(self) -> None:
+        upstream = self.root / "uncached"
+        self.source.rename(upstream)
+        upstream_head = self._git("-C", str(upstream), "rev-parse", "HEAD").stdout.strip()
+        destination = self._run_git_branch(
+            {
+                "GITHUB_TOKEN": "",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": f"url.{upstream}.insteadOf",
+                "GIT_CONFIG_VALUE_0": "https://github.com/acme/centaur",
+            }
+        )
+
+        self.assertEqual(
+            self._git("-C", str(destination), "rev-parse", "HEAD").stdout.strip(),
+            upstream_head,
+        )
+        self.assertEqual(
+            self._git("-C", str(destination), "remote", "get-url", "origin").stdout.strip(),
+            "https://github.com/acme/centaur",
+        )
+        self.assertEqual(list(destination.parent.glob(".git-branch.*")), [])
+
+    def test_reuses_clone_when_cache_is_missing(self) -> None:
+        upstream_head = self._advance_upstream()
+        destination = self.home / "branches" / "acme" / "centaur"
+        destination.parent.mkdir(parents=True)
+        self._git("clone", str(self.root / "upstream"), str(destination))
+        self.source.rename(self.root / "removed-cache")
+        (destination / "README.md").write_text("unfinished work\n")
+
+        self.assertEqual(self._run_git_branch({"GITHUB_TOKEN": ""}), destination)
+        self.assertEqual((destination / "README.md").read_text(), "unfinished work\n")
+        self.assertEqual(
+            self._git("-C", str(destination), "rev-parse", "HEAD").stdout.strip(),
+            upstream_head,
+        )
+
+    def test_uncached_clone_failure_cleans_up_and_explains_access(self) -> None:
+        self.source.rename(self.root / "removed-cache")
+        result = subprocess.run(
+            [str(GIT_BRANCH), "acme/centaur", "fix-attribution"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "HOME": str(self.home),
+                "GITHUB_TOKEN": "",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": f"url.{self.root / 'missing'}.insteadOf",
+                "GIT_CONFIG_VALUE_0": "https://github.com/acme/centaur",
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("check the org/repo name", result.stderr)
+        self.assertIn("active GitHub credential can read it", result.stderr)
+        parent = self.home / "branches" / "acme"
+        self.assertFalse((parent / "centaur").exists())
+        self.assertEqual(list(parent.glob(".git-branch.*")), [])
+
 
 class CommitMessageHookTest(unittest.TestCase):
     def test_rejects_centaur_ai_coauthor(self) -> None:
