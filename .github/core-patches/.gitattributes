@@ -1,1 +1,2 @@
+# Reviewed patch bytes: whitespace and line endings are part of each pinned SHA-256, so they are never normalized.
 *.patch -whitespace
