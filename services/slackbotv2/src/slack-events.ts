@@ -2,6 +2,7 @@ import type { Logger, Message } from 'chat'
 import { withSlackApiTimeout } from './session-api'
 import type { JsonValue, SlackbotV2Options } from './types'
 import { isJsonObject, stringValue } from './utils'
+import { channelWebhookAllowed, channelUserAllowed } from './channel-user-policy'
 
 type RawSlackBotProfile = {
   app_id?: JsonValue
@@ -56,6 +57,10 @@ export function isAllowedSlackWebhookBody(
 ): boolean {
   const payload = parseSlackWebhookPayload(rawBody)
   if (!payload) return true
+  if (!channelWebhookAllowed(payload, options.channelUserPolicy)) {
+    logger.warn('slackbotv2_channel_user_denied', { type: payload.type })
+    return false
+  }
   if (isRawSlackInteraction(payload) && payload.type === 'block_actions') {
     return isAllowedSlackInteraction(payload, options, logger)
   }
@@ -81,7 +86,9 @@ export function parseSlackWebhookPayload(rawBody: string): Record<string, unknow
   const parsed = parseJsonObject(rawBody)
   if (parsed) return parsed
   const formPayload = new URLSearchParams(rawBody).get('payload')
-  return formPayload ? parseJsonObject(formPayload) : null
+  if (formPayload) return parseJsonObject(formPayload)
+  const form = new URLSearchParams(rawBody)
+  return form.has('command') ? Object.fromEntries(form) : null
 }
 
 function parseJsonObject(value: string): Record<string, unknown> | null {
@@ -123,6 +130,13 @@ export async function isAllowedSlackMessage(
   options: SlackbotV2Options,
   logger: Logger
 ): Promise<boolean> {
+  const channel = message.threadId.match(/(?:^|:)([CGD][A-Z0-9]+)(?::|$)/)?.[1]
+  const messageRaw = isJsonObject(message.raw) ? message.raw : {}
+  if (!channelUserAllowed(options.channelUserPolicy, channel,
+    messageRaw.team_id ?? messageRaw.team ?? options.slackHomeTeamId, message.author.userId)) {
+    logger.warn('slackbotv2_channel_user_denied', { channel_id: channel, user_id: message.author.userId })
+    return false
+  }
   const raw = isRawSlackEvent(message.raw) ? message.raw : undefined
   const allowedExternalTeamIds =
     options.allowedExternalTeamIds ?? splitEnvList(process.env.SLACKBOT_EXTERNAL_ORG_ALLOWLIST)

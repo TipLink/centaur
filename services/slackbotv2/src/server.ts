@@ -1,5 +1,6 @@
 import { createSlackbotV2, type SlackbotV2Options } from './index'
 import { parseChannelDefaults } from './channel-defaults'
+import { parseChannelUserPolicy } from './channel-user-policy'
 import { isHarnessEnabled, parseEnabledHarnesses } from './overrides'
 import { resolveSlackHomeTeamId } from './session-api'
 import { resolveSlackBotUserId } from './slack-user'
@@ -51,6 +52,7 @@ const consoleLogger = {
 }
 
 const options: SlackbotV2Options = {
+  channelUserPolicy: parseChannelUserPolicy(process.env.SLACKBOTV2_CHANNEL_USER_POLICY),
   apiUrl,
   agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),
   apiKey: optionalEnv('SLACKBOT_API_KEY'),

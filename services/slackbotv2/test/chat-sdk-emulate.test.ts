@@ -130,6 +130,24 @@ afterAll(async () => {
 })
 
 describe('slackbotv2', () => {
+  it('rejects unapproved channel starts and follow-ups before session mutation', async () => {
+    bot = createTestBot({ channelUserPolicy: { [CHANNEL_ID]: { team_id: TEAM_ID, allowed_user_ids: [USER_ID] } } })
+    const denied = await sendMessage(`<@${BOT_USER_ID}> start a background watcher`, { client: slackB })
+    await denied.finished()
+    expect(denied.response.status).toBe(200)
+    expect(codexApi.executes).toHaveLength(0)
+    expect(codexApi.creates).toHaveLength(0)
+    expect(codexApi.appends).toHaveLength(0)
+    const allowed = await sendMessage(`<@${BOT_USER_ID}> approved request`)
+    await allowed.finished()
+    expect(codexApi.executes).toHaveLength(1)
+    const mutationCounts = [codexApi.creates.length, codexApi.appends.length]
+    const followup = await sendMessage(`<@${BOT_USER_ID}> stop and run this instead`, { client: slackB, threadTs: allowed.ts })
+    await followup.finished()
+    expect(codexApi.executes).toHaveLength(1)
+    expect([codexApi.creates.length, codexApi.appends.length]).toEqual(mutationCounts)
+  })
+
   // Legacy (non-agent-view) DMs run end to end in e2e/tests/context.test.ts.
   it('routes agent-view DM roots and replies to their own sessions', async () => {
     bot = createTestBot({ agentViewEnabled: true })
