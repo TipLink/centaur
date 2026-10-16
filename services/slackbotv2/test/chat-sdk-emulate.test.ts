@@ -130,6 +130,35 @@ afterAll(async () => {
 })
 
 describe('slackbotv2', () => {
+  it('fixed ownership denies an approved user before append, stop and execution', async () => {
+    let allowed = true
+    let ownerChecks = 0
+    bot = createTestBot({
+      channelUserPolicy: { [CHANNEL_ID]: { team_id: TEAM_ID, allowed_user_ids: [USER_ID] } },
+      threadAdmissionUrl: 'http://ownership.test/slack/thread-admission',
+      fetch: async (input, init) => {
+        if (String(input) === 'http://ownership.test/slack/thread-admission') {
+          ownerChecks++
+          expect(new Headers(init?.headers).get('x-slack-signature')).toStartWith('v0=')
+          return Response.json({ allowed })
+        }
+        return fetch(input, init)
+      }
+    })
+    const initial = await sendMessage(`<@${BOT_USER_ID}> start`)
+    await initial.finished()
+    expect(codexApi.executes).toHaveLength(1)
+    const counts = [codexApi.creates.length, codexApi.appends.length, codexApi.executes.length]
+    allowed = false
+    for (const text of ['check again', 'stop', 'start a background script']) {
+      const denied = await sendMessage(`<@${BOT_USER_ID}> ${text}`, { threadTs: initial.ts })
+      await denied.finished()
+      expect(denied.response.status).toBe(200)
+      expect([codexApi.creates.length, codexApi.appends.length, codexApi.executes.length]).toEqual(counts)
+    }
+    expect(ownerChecks).toBeGreaterThanOrEqual(4)
+  })
+
   it('rejects unapproved channel starts and follow-ups before session mutation', async () => {
     bot = createTestBot({ channelUserPolicy: { [CHANNEL_ID]: { team_id: TEAM_ID, allowed_user_ids: [USER_ID] } } })
     const denied = await sendMessage(`<@${BOT_USER_ID}> start a background watcher`, { client: slackB })

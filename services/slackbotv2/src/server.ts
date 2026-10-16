@@ -52,6 +52,7 @@ const consoleLogger = {
 }
 
 const options: SlackbotV2Options = {
+  threadAdmissionUrl: optionalEnv('SLACKBOTV2_THREAD_ADMISSION_URL'),
   channelUserPolicy: parseChannelUserPolicy(process.env.SLACKBOTV2_CHANNEL_USER_POLICY),
   apiUrl,
   agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),

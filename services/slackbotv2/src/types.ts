@@ -131,6 +131,7 @@ export type SlackbotV2BlockActionPayload = {
 
 export type SlackbotV2Options = {
   /** Approved human callers per protected channel; omitted channels retain normal admission. */
+  threadAdmissionUrl?: string
   channelUserPolicy?: ChannelUserPolicy
   allowedExternalTeamIds?: readonly string[]
   apiKey?: string
