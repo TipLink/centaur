@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "bf201201b2066911792ca03c789de7a515f41311",
-  "result_tree": "1f960834a84c9ef80c03f654f4df54152d120db6",
+  "result_tree": "48b538928db4ce1f12feac73902f0c8b49e5b36f",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -23,6 +23,14 @@
     {
       "file": "0005-renumber-upstream-migrations.patch",
       "sha256": "eaa43cc60df78e9f1721bfeddc123b4ab696e28cbe841f890d1003257e7983b6"
+    },
+    {
+      "file": "0006-slack-channel-user-admission.patch",
+      "sha256": "ccb531bc5662c2dc01bcb5f7e64f55e6375859df6f13509240173b05f45789bf"
+    },
+    {
+      "file": "0007-fixed-thread-admission.patch",
+      "sha256": "30d4f847700310eeafa4fde8d605a0cbeace7e39287b04997f7ad1438664a8a7"
     }
   ]
 }

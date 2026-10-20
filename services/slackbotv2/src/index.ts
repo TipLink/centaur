@@ -1,3 +1,4 @@
+import { admitSlackThread } from './thread-admission'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
@@ -545,6 +546,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         ...webhookFields
       })
       if (!isAllowedSlackWebhookBody(rawBody, options, logger)) {
+        outcome = 'ignored'
+        return new globalThis.Response('ok', { status: 200 })
+      }
+      if (!(await admitSlackThread(c.req.raw, rawBody, options))) {
         outcome = 'ignored'
         return new globalThis.Response('ok', { status: 200 })
       }
