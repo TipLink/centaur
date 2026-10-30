@@ -1,10 +1,10 @@
 diff --git a/docs/pages/extend/skills.mdx b/docs/pages/extend/skills.mdx
-index bca7166a..1d70cfbe 100644
+index ccdbfc05..b7cd4fb1 100644
 --- a/docs/pages/extend/skills.mdx
 +++ b/docs/pages/extend/skills.mdx
-@@ -110,6 +110,13 @@ edits to public skills are visible to agents immediately. `delete` archives an
- owned skill by OID, removing it from the active catalog without deleting its
- stored record.
+@@ -118,6 +118,13 @@ changed the skill first. Edits to shared skills are visible to agents immediatel
+ `delete` archives an owned skill by OID, removing it from the active catalog
+ without deleting its stored record.
  
 +A turn started from a shared channel, such as a Slack thread, runs the write
 +commands as the person whose message started the turn, provided that person's
@@ -17,10 +17,10 @@ index bca7166a..1d70cfbe 100644
  
  Start an agent with the overlay loaded and ask it to inspect available skills.
 diff --git a/services/console/app/controllers/api/v1/sandbox/skills_controller.rb b/services/console/app/controllers/api/v1/sandbox/skills_controller.rb
-index b0fc5e64..62af58a8 100644
+index c3675a3a..a3c9047a 100644
 --- a/services/console/app/controllers/api/v1/sandbox/skills_controller.rb
 +++ b/services/console/app/controllers/api/v1/sandbox/skills_controller.rb
-@@ -89,7 +89,15 @@ module Api
+@@ -91,7 +91,15 @@ module Api
          def require_authoring_user!
            return if authoring_user
  
@@ -37,7 +37,7 @@ index b0fc5e64..62af58a8 100644
          end
  
          def visible_skills
-@@ -107,8 +115,17 @@ module Api
+@@ -109,8 +117,17 @@ module Api
            user if user&.active?
          end
  
@@ -57,10 +57,10 @@ index b0fc5e64..62af58a8 100644
  
          def owned_skill
 diff --git a/services/console/test/controllers/api/v1/sandbox_skills_controller_test.rb b/services/console/test/controllers/api/v1/sandbox_skills_controller_test.rb
-index 3a7ef23f..7f3ea4ce 100644
+index d94bfb21..bd85638f 100644
 --- a/services/console/test/controllers/api/v1/sandbox_skills_controller_test.rb
 +++ b/services/console/test/controllers/api/v1/sandbox_skills_controller_test.rb
-@@ -309,6 +309,7 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
+@@ -391,6 +391,7 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
        end
      end
      assert_response :forbidden
@@ -68,7 +68,7 @@ index 3a7ef23f..7f3ea4ce 100644
    end
  
    test "duplicate-name create races return a validation response" do
-@@ -345,8 +346,157 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
+@@ -427,8 +428,157 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
      assert_response :unauthorized
    end
  

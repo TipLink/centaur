@@ -16,6 +16,7 @@ import {
   type Thread
 } from 'chat'
 import { createSlackAdapter } from '@chat-adapter/slack'
+import { verifySlackSignature } from '@chat-adapter/slack/webhook'
 import {
   assertSlackOk,
   callSlackApi,
@@ -32,7 +33,6 @@ import {
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
 import { CitationTextFilter, stripUnresolvedCitations } from './citation-text'
-import { resolveHarnessRollout } from './harness-rollout'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import {
   renderSlackDisplayText,
@@ -53,6 +53,8 @@ import {
   serializeAttachment,
   serializeMessageLinks,
   serializeMessage,
+  SESSION_STEERING_DELIVERED_EVENT,
+  SESSION_STEERING_FAILED_EVENT,
   sessionStreamError,
   slackApiTimeoutMs,
   WORKFLOW_ACTION_PREFIX,
@@ -69,6 +71,8 @@ import {
   type SlackContextBlock
 } from './response-context'
 import { resolveChannelDefault } from './channel-defaults'
+import { proactiveThreadMessage } from './proactive-classifier'
+import { resolveProactivityRules, type ProactivityRule } from './proactivity-rules'
 import {
   extractMessageOverrides,
   extractPersonaOverride,
@@ -80,6 +84,7 @@ import { createFlagMessageOverridesStrategy } from './message-overrides-strategy
 import {
   isAllowedSlackMessage,
   isAllowedSlackWebhookBody,
+  SlackExternalTeamIdsUnavailableError,
   parseSlackWebhookPayload,
   slackStreamRecipientUserId
 } from './slack-events'
@@ -92,6 +97,7 @@ import {
 import type {
   ForwardSessionInput,
   JsonObject,
+  ProactiveDecision,
   SlackbotV2,
   SlackbotV2ApiAttachment,
   SlackbotV2BlockActionPayload,
@@ -99,6 +105,7 @@ import type {
   SlackbotV2ExecuteSessionResponse,
   SlackbotV2MessageMode,
   SlackbotV2Options,
+  SlackbotV2ProactivityOptions,
   SlackbotV2RenderObligation,
   SlackbotV2RendererSource,
   SlackbotV2ThreadState,
@@ -118,6 +125,10 @@ import {
 } from './utils'
 
 export type {
+  ProactiveClassifier,
+  ProactiveClassifierInput,
+  ProactiveDecision,
+  ProactiveThreadMessage,
   SlackbotV2,
   SlackbotV2ApiAttachment,
   SlackbotV2ApiAuthor,
@@ -129,6 +140,7 @@ export type {
   SlackbotV2ExecuteSessionResponse,
   SlackbotV2Fetch,
   SlackbotV2Options,
+  SlackbotV2ProactivityOptions,
   SlackbotV2SessionMessage,
   SlackbotV2SessionMessageRole
 } from './types'
@@ -138,6 +150,11 @@ type WaitUntilContext = {
 }
 
 type SlackAssistantAdapter = {
+  setSessionStatus?(
+    channelId: string,
+    threadTs: string,
+    status: 'processing' | 'active'
+  ): Promise<void>
   setAssistantStatus?(
     channelId: string,
     threadTs: string,
@@ -163,6 +180,8 @@ type StateConnectionStatus = {
 const requestContext = new AsyncLocalStorage<SlackbotV2RequestContext>()
 const RENDER_OBLIGATION_INDEX_KEY = 'slackbotv2:render:index'
 const RENDER_OBLIGATION_INDEX_MAX_LENGTH = 2000
+const RENDER_INDEX_APPEND_MAX_ATTEMPTS = 4
+const RENDER_INDEX_APPEND_BACKOFF_MS = 100
 const RENDER_INDEX_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000
 const RENDER_LEASE_REFRESH_INTERVAL_MS = 60 * 1000
@@ -187,6 +206,20 @@ const LATE_SLACK_FILE_IDLE_POLL_MS = 500
 const LATE_SLACK_FILE_MESSAGE_TEXT = 'Late Slack file attachment for the previous message.'
 const SLACK_BLOCK_ACTION_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000
 const SLACK_BLOCK_ACTION_LEASE_TTL_MS = 60 * 1000
+const PROACTIVE_CLASSIFIER_TIMEOUT_MS = 2_000
+const PROACTIVE_HISTORY_MESSAGES = 20
+// Bounds a crashed handoff's claim; a live one releases it once its execution starts.
+const PROACTIVE_CLAIM_TTL_MS = 60 * 1000
+// How long an accepted message waits for another handoff's turn to start.
+const PROACTIVE_CLAIM_WAIT_MS = 30 * 1000
+const PROACTIVE_CLAIM_POLL_MS = 250
+// Pending burst messages outlive the debounce by this much, covering handler
+// latency between recording a message and reading the burst.
+const PROACTIVE_PENDING_GRACE_MS = 60 * 1000
+const PROACTIVE_PENDING_MAX = 50
+// Mentions and proactive replies make a thread eligible; DMs already treat
+// every message as a mention.
+const PROACTIVE_ELIGIBILITY_TRIGGERS = new Set(['new_mention', 'proactive', 'subscribed_message'])
 
 type PendingLateSlackFileMention = {
   channel: string
@@ -333,6 +366,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     onLockConflict: 'force',
     logger
   })
+  const background = createBackgroundWork()
   const steeringReactions = createSteeringReactionController(options)
   const lateSlackFiles = createLateSlackFileRepair(options, state, steeringReactions)
   const stateConnectionStatus: StateConnectionStatus = { attempts: 0, connected: false }
@@ -480,11 +514,43 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     })
   })
 
+  // Classify after acknowledging Slack: a decision can take seconds and a
+  // declined or failed one leaves nothing to retry.
+  const scheduleProactiveMessage = (
+    thread: Thread<SlackbotV2ThreadState>,
+    message: ChatMessage,
+    proactivity: SlackbotV2ProactivityOptions
+  ) => {
+    backgroundWaitUntil(
+      handleProactiveMessage(thread, message, {
+        options,
+        proactivity,
+        state,
+        steeringReactions
+      }).catch(error => {
+        const trace = createHandoffTrace(thread, message, 'execute')
+        traceWarn(options, 'slackbotv2_proactive_failed', trace, { error: errorMessage(error) })
+      })
+    )
+  }
+
   // Slack does not classify mentions inside Block Kit or legacy attachments as
   // app_mention events. Alertmanager uses attachment.pretext, so inspect rich
   // payloads after Chat SDK has verified the webhook and before executing.
   chat.onNewMessage(/^.*$/s, async (thread, message) => {
-    if (!slackRichTextMentionsUser(message.raw, options.botUserId)) return
+    if (!slackRichTextMentionsUser(message.raw, options.botUserId)) {
+      // Outside subscribed threads only a rule match can reply. Check for
+      // rules first so other channels' traffic is neither gated nor counted.
+      const proactivity = options.proactivity
+      if (
+        proactivity
+        && resolveProactivityRules(proactivity.rules, thread.id) !== undefined
+        && (await isAllowedSlackMessage(message, options, logger))
+      ) {
+        scheduleProactiveMessage(thread, message, proactivity)
+      }
+      return
+    }
     if (!(await isAllowedSlackMessage(message, options, logger))) return
     message.isMention = true
     await handleSlackMessageHandoff(thread, message, {
@@ -502,6 +568,11 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     if (!(await isAllowedSlackMessage(message, options, logger))) return
     if (slackRichTextMentionsUser(message.raw, options.botUserId)) message.isMention = true
     if (message.isMention !== true) {
+      const proactivity = options.proactivity
+      if (proactivity) {
+        scheduleProactiveMessage(thread, message, proactivity)
+        return
+      }
       traceLog(
         options,
         'slackbotv2_subscribed_message_without_mention_ignored',
@@ -519,6 +590,36 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       steeringReactions,
       trigger: 'subscribed_message'
     })
+  })
+
+  // Slack's native Stop button. The adapter only aborts its local turn and
+  // resets the Slack session status; the execution itself runs in api-rs.
+  chat.onAgentSessionStopped(async event => {
+    const thread = chat.thread(event.threadId)
+    const trace: SlackbotV2Trace = {
+      includeContext: false,
+      messageId: event.threadTs,
+      mode: 'append',
+      openStream: false,
+      slackUserId: stringValue(event.userId),
+      startedAtMs: nowMs(),
+      threadId: thread.id
+    }
+    try {
+      await interruptThreadExecution(thread, options, trace, 'agent_session_stopped')
+    } catch {
+      // Slack already shows the session as stopped, so say the stop may
+      // not have taken effect.
+      await withSlackApiTimeout(options, 'post stop failure notice', () =>
+        thread.postEphemeral(
+          event.userId,
+          "Couldn't confirm the stop. The agent may still be working.",
+          { fallbackToDM: false }
+        )
+      ).catch(error => {
+        traceWarn(options, 'slackbotv2_stop_notice_failed', trace, { error: errorMessage(error) })
+      })
+    }
   })
 
   const app = new Hono()
@@ -545,7 +646,27 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         route,
         ...webhookFields
       })
-      if (!isAllowedSlackWebhookBody(rawBody, options, logger)) {
+      // Verify before the policy gate: it can call api-rs and answer 503, which
+      // an unsigned request must not be able to trigger. The adapter verifies
+      // again before dispatch.
+      try {
+        await verifySlackSignature(rawBody, c.req.raw.headers, {
+          signingSecret: options.signingSecret
+        })
+      } catch (error) {
+        outcome = 'error'
+        logger.warn('slackbotv2_webhook_signature_rejected', { error: errorMessage(error) })
+        return new globalThis.Response('Invalid signature', { status: 401 })
+      }
+      let allowed: boolean
+      try {
+        allowed = await isAllowedSlackWebhookBody(rawBody, options, logger)
+      } catch (error) {
+        if (!(error instanceof SlackExternalTeamIdsUnavailableError)) throw error
+        outcome = 'error'
+        return new globalThis.Response('Slack Connect allowlist is unavailable. Please retry.', { status: 503 })
+      }
+      if (!allowed) {
         outcome = 'ignored'
         return new globalThis.Response('ok', { status: 200 })
       }
@@ -561,16 +682,19 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
           && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
       const awaitHandoff = workflowAction || shouldAwaitSlackHandoff(rawBody)
       const handoffTasks: Promise<unknown>[] = []
-      const context: SlackbotV2RequestContext = {
-        waitUntil: promise => waitUntil(c, promise)
+      const keepAlive = (promise: Promise<unknown>) => {
+        background.track(promise)
+        waitUntil(c, promise)
       }
+      const context: SlackbotV2RequestContext = { waitUntil: keepAlive }
       const response = await requestContext.run(context, () => {
         return chat.webhooks.slack(c.req.raw, {
           waitUntil: promise => {
             if (awaitHandoff) {
+              background.track(promise)
               handoffTasks.push(promise)
             } else {
-              waitUntil(c, promise)
+              keepAlive(promise)
             }
           }
         })
@@ -578,7 +702,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       const channelCreatedJoinTask = response.ok && options.autoJoinCreatedChannels === true
         ? joinSlackChannelCreatedEvent(rawBody, options)
         : null
-      if (channelCreatedJoinTask) waitUntil(c, channelCreatedJoinTask)
+      if (channelCreatedJoinTask) keepAlive(channelCreatedJoinTask)
       if (awaitHandoff && response.ok) {
         const waitStartedAtMs = nowMs()
         const waitFields = {
@@ -613,7 +737,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         }
       }
       const lateFileTask = response.ok ? lateSlackFiles.repairFromWebhook(rawBody) : null
-      if (lateFileTask) waitUntil(c, lateFileTask)
+      if (lateFileTask) keepAlive(lateFileTask)
       outcome = response.ok ? 'success' : 'error'
       return new globalThis.Response(await response.text(), {
         headers: response.headers,
@@ -640,7 +764,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     scheduleRenderObligationRecovery(chat, state, options, stateConnected)
   }
 
-  return { app, chat }
+  return { app, chat, drain: background.drain }
 }
 
 async function handleSlackMessageHandoff(
@@ -653,6 +777,10 @@ async function handleSlackMessageHandoff(
     state: StateAdapter
     steeringReactions: SteeringReactionController
     subscribe?: boolean
+    /** An unmentioned message the proactive classifier accepted; it steers like a mention. */
+    proactive?: boolean
+    /** The operator rule this message matched, to tell the agent how to respond. */
+    proactiveRule?: ProactivityRule
     trigger: string
   }
 ): Promise<void> {
@@ -664,9 +792,15 @@ async function handleSlackMessageHandoff(
   })
   let initialAssistantStatusVisible = false
   let assistantStatus = Promise.resolve(false)
+  let syncInput: SyncThreadMessageInput | undefined
   try {
-    if (await handleStopCommand(thread, message, input.options, input.trigger)) {
+    // Only a mention can stop a run; an accepted unmentioned "stop that"
+    // steers it like any other message.
+    if (!input.proactive && await handleStopCommand(thread, message, input.options, input.trigger)) {
       return
+    }
+    if (input.options.proactivity && PROACTIVE_ELIGIBILITY_TRIGGERS.has(input.trigger)) {
+      await thread.setState({ proactiveEligible: true })
     }
     // Assistant status is thread-wide. A mentioned follow-up that steers an
     // active execution must not clear or replace the status owned by that run.
@@ -690,15 +824,18 @@ async function handleSlackMessageHandoff(
       initial_assistant_status_visible: initialAssistantStatusVisible,
       trigger: input.trigger
     })
-    await syncThreadMessageToSession(thread, message, {
+    syncInput = {
       initialAssistantStatus: assistantStatus,
       initialAssistantStatusRequested: assistantStatusRequested,
       initialAssistantStatusVisible,
       mode: input.mode,
       options: input.options,
+      proactive: input.proactive,
+      proactiveRule: input.proactiveRule,
       state: input.state,
       steeringReactions: input.steeringReactions
-    })
+    }
+    await syncThreadMessageToSession(thread, message, syncInput)
     traceLog(input.options, 'slackbotv2_handoff_complete', trace, {
       trigger: input.trigger
     })
@@ -707,6 +844,7 @@ async function handleSlackMessageHandoff(
       error: errorMessage(error),
       trigger: input.trigger
     })
+    if (syncInput) finishSteeringReaction(syncInput, trace)
     backgroundWaitUntil(
       assistantStatus
         .then(async visible => {
@@ -727,24 +865,40 @@ async function handleStopCommand(
   trigger: string
 ): Promise<boolean> {
   if (!isSlackStopCommand(message)) return false
-  const trace = createHandoffTrace(thread, message, 'append')
+  await interruptThreadExecution(thread, options, createHandoffTrace(thread, message, 'append'), trigger)
+  return true
+}
+
+async function interruptThreadExecution(
+  thread: Thread<SlackbotV2ThreadState>,
+  options: SlackbotV2Options,
+  trace: SlackbotV2Trace,
+  trigger: string
+): Promise<void> {
   traceLog(options, 'slackbotv2_stop_command_started', trace, { trigger })
   const latest = (await thread.state) ?? {}
-  const reason = `Interrupted from Slack by ${slackUserIdForMessage(message) ?? 'unknown user'}`
+  const reason = `Interrupted from Slack by ${trace.slackUserId ?? 'unknown user'}`
   try {
+    // Record the stop before interrupting: an execution api-rs has not
+    // started yet sees it in its handoff (see stopRequestedFor), and one it
+    // has started is visible to the interrupt below. A stop also ends
+    // proactive replies until the next mention.
+    await thread.setState({ proactiveEligible: false, stopRequestedAt: Date.now() })
     const response = await interruptSessionExecution(options, thread.id, reason)
-    await thread.setState({
-      activeExecution: false,
-      lastEventId: latest.lastEventId ?? latest.renderObligation?.afterEventId ?? 0,
-      renderObligation: null
-    })
+    // With nothing interrupted, a handoff may still own this state.
+    if (response.interrupted) {
+      await thread.setState({
+        activeExecution: false,
+        lastEventId: latest.lastEventId ?? latest.renderObligation?.afterEventId ?? 0,
+        renderObligation: null
+      })
+    }
     await setAssistantStatus(thread, '', options, trace)
     traceLog(options, 'slackbotv2_stop_command_complete', trace, {
       execution_id: response.execution_id,
       interrupted: response.interrupted,
       trigger
     })
-    return true
   } catch (error) {
     traceWarn(options, 'slackbotv2_stop_command_failed', trace, {
       error: errorMessage(error),
@@ -752,6 +906,262 @@ async function handleStopCommand(
     })
     throw error
   }
+}
+
+/** Whether a stop was requested after this message was sent. */
+function stopRequestedFor(state: SlackbotV2ThreadState, message: ChatMessage): boolean {
+  return (state.stopRequestedAt ?? 0) >= message.metadata.dateSent.getTime()
+}
+
+async function handleProactiveMessage(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  input: {
+    options: SlackbotV2Options
+    proactivity: SlackbotV2ProactivityOptions
+    state: StateAdapter
+    steeringReactions: SteeringReactionController
+  }
+): Promise<void> {
+  const { options, proactivity } = input
+  const trace = createHandoffTrace(thread, message, 'execute')
+  const startedAtMs = nowMs()
+  const record = (outcome: string, fields: JsonObject = {}) => {
+    slackbotMetrics.proactiveDecisions.inc({ outcome })
+    traceLog(options, 'slackbotv2_proactive_decision', trace, {
+      outcome,
+      phase_ms: elapsedMs(startedAtMs),
+      ...fields
+    })
+  }
+  const rules = resolveProactivityRules(proactivity.rules, thread.id)
+  let state = (await thread.state) ?? {}
+  let skipReason = proactiveSkipReason(rules, state, message)
+  if (skipReason) {
+    record(`skip_${skipReason}`)
+    return
+  }
+  // An idle thread waits for a pause so a message sent in parts is judged,
+  // and answered, once. An active turn takes messages as steers right away.
+  const debounceMs = state.activeExecution === true ? 0 : proactivity.debounceMs ?? 0
+  let burstIds = new Set<string>()
+  if (debounceMs > 0) {
+    const earlierBurstIds = await waitForBurstEnd(thread, message, input.state, debounceMs)
+    if (!earlierBurstIds) {
+      record('skip_superseded')
+      return
+    }
+    state = (await thread.state) ?? {}
+    // A turn that started during the wait, such as a mention's, may already
+    // carry the message; its burst must not count what that turn has.
+    const forwarded = new Set(state.forwardedMessageIds ?? [])
+    if (forwarded.has(message.id)) {
+      record('skip_forwarded')
+      return
+    }
+    skipReason = proactiveSkipReason(rules, state, message)
+    if (skipReason) {
+      record(`skip_${skipReason}`)
+      return
+    }
+    burstIds = new Set(earlierBurstIds.filter(id => !forwarded.has(id)))
+  }
+  // Each applicable layer asks its own question; any acceptance replies.
+  const layers = proactiveLayers(rules, state)
+  const decisionFields: JsonObject = {}
+  let decisions: Array<PromiseSettledResult<ProactiveDecision>>
+  try {
+    // A top-level message starts its thread, so it has no earlier messages.
+    const earlier = isSlackThreadReply(message)
+      ? await withSlackApiTimeout(options, 'collect proactive thread history', () =>
+          proactiveThreadHistory(thread, message)
+        )
+      : []
+    const history = earlier.filter(item => !burstIds.has(item.id)).map(proactiveThreadMessage)
+    const burst = earlier.filter(item => burstIds.has(item.id)).map(proactiveThreadMessage)
+    if (burst.length > 0) decisionFields.burst_messages = burst.length + 1
+    const signal = AbortSignal.timeout(proactivity.timeoutMs ?? PROACTIVE_CLASSIFIER_TIMEOUT_MS)
+    const aborted = new Promise<never>((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+    })
+    decisions = await Promise.allSettled(layers.map(layer => Promise.race([
+      proactivity.classifier(
+        {
+          botName: options.userName ?? 'centaur',
+          ...(burst.length > 0 ? { burst } : {}),
+          history,
+          message: proactiveThreadMessage(message),
+          ...(layer === 'rules' ? { rules } : {})
+        },
+        signal
+      ),
+      aborted
+    ])))
+  } catch (error) {
+    record('error', { ...decisionFields, error: errorMessage(error) })
+    return
+  }
+  layers.forEach((layer, index) => {
+    const result = decisions[index]!
+    if (result.status === 'fulfilled' && result.value.probability !== undefined) {
+      decisionFields[`${layer}_probability`] = result.value.probability
+    }
+  })
+  const respondingLayer = layers.find((_, index) => {
+    const result = decisions[index]!
+    return result.status === 'fulfilled' && result.value.respond
+  })
+  if (!respondingLayer) {
+    const failure = decisions.find(result => result.status === 'rejected')
+    if (failure) {
+      record('error', { ...decisionFields, error: errorMessage(failure.reason) })
+    } else {
+      record('decline', decisionFields)
+    }
+    return
+  }
+  decisionFields.layer = respondingLayer
+  // A matching rule shapes the reply even when the mentioned-thread layer
+  // also accepted the message.
+  const rulesDecision = decisions[layers.indexOf('rules')]
+  const matchedRule = rulesDecision?.status === 'fulfilled' && rulesDecision.value.respond
+    ? rules?.find(rule => rule.name === rulesDecision.value.rule)
+    : undefined
+  if (matchedRule) decisionFields.rule = matchedRule.name
+  const releaseClaim = await claimProactiveHandoff(thread, input.state)
+  if (!releaseClaim) {
+    record('skip_claimed', decisionFields)
+    return
+  }
+  try {
+    // A stop or another execution may have landed while the classifier ran.
+    const lateSkipReason = proactiveSkipReason(rules, (await thread.state) ?? {}, message)
+    if (lateSkipReason) {
+      record(`skip_${lateSkipReason}`, decisionFields)
+      return
+    }
+    record('respond', decisionFields)
+    await handleSlackMessageHandoff(thread, message, {
+      assistantStatusRequested: true,
+      mode: 'execute',
+      options,
+      proactive: true,
+      proactiveRule: matchedRule,
+      state: input.state,
+      steeringReactions: input.steeringReactions,
+      // A rule match may start a thread under a top-level message.
+      subscribe: true,
+      trigger: 'proactive'
+    })
+  } finally {
+    await releaseClaim()
+  }
+}
+
+/**
+ * Until a handoff records its execution as active, a second accepted message
+ * in the thread would queue a second turn. A claim in shared state lets one
+ * handoff start a turn at a time, across replicas; others wait until the turn
+ * is active and then steer it. Resolves to the release function, or undefined
+ * when the wait times out.
+ */
+async function claimProactiveHandoff(
+  thread: Thread<SlackbotV2ThreadState>,
+  state: StateAdapter
+): Promise<(() => Promise<void>) | undefined> {
+  const key = `slackbotv2:proactive:claim:${thread.id}`
+  const token = randomUUID()
+  const deadline = Date.now() + PROACTIVE_CLAIM_WAIT_MS
+  while (true) {
+    if (await state.setIfNotExists(key, token, PROACTIVE_CLAIM_TTL_MS)) {
+      return async () => {
+        if ((await state.get(key)) === token) await state.delete(key)
+      }
+    }
+    // Steering an active turn cannot start another one.
+    if ((await thread.state)?.activeExecution === true) return async () => {}
+    if (Date.now() >= deadline) return undefined
+    await sleep(PROACTIVE_CLAIM_POLL_MS)
+  }
+}
+
+type ProactiveLayer = 'mentioned' | 'rules'
+
+/** The kinds of proactivity that may answer an unmentioned message in this thread. */
+function proactiveLayers(
+  rules: ProactivityRule[] | undefined,
+  state: SlackbotV2ThreadState
+): ProactiveLayer[] {
+  const layers: ProactiveLayer[] = []
+  if (state.proactiveEligible === true) layers.push('mentioned')
+  // A stop silences rule matches in its thread until the next mention.
+  if (rules !== undefined && state.proactiveEligible !== false) layers.push('rules')
+  return layers
+}
+
+/** Tells the agent why it is replying unmentioned and how the operators want it to. */
+function proactiveRuleContext(rule: ProactivityRule): string {
+  const reason =
+    `You were not mentioned. This message matched the operators' proactive reply rule "${rule.name}".`
+  return rule.context ? `${reason} Their instructions for responding:\n${rule.context}` : reason
+}
+
+/** Why an unmentioned message gets no proactive reply, or undefined when it may. */
+function proactiveSkipReason(
+  rules: ProactivityRule[] | undefined,
+  state: SlackbotV2ThreadState,
+  message: ChatMessage
+): string | undefined {
+  if (proactiveLayers(rules, state).length === 0) return 'not_eligible'
+  if (!message.text.trim()) return 'empty'
+  return undefined
+}
+
+/**
+ * Records the message as pending in its thread, waits, and resolves to the
+ * earlier pending messages it ends the burst of, or undefined when a newer one
+ * is pending or a burst already ended at or after it. Pending messages are
+ * ordered by Slack timestamp, not by when their handlers ran, so a slow
+ * handler cannot hide a newer message. Both keys live outside thread state so
+ * that writing them never races its read-merge-write updates.
+ */
+async function waitForBurstEnd(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  state: StateAdapter,
+  debounceMs: number
+): Promise<string[] | undefined> {
+  const pendingKey = `slackbotv2:proactive:pending:${thread.id}`
+  const endKey = `slackbotv2:proactive:burst-end:${thread.id}`
+  const ttlMs = debounceMs + PROACTIVE_PENDING_GRACE_MS
+  await state.appendToList(pendingKey, message.id, { maxLength: PROACTIVE_PENDING_MAX, ttlMs })
+  await sleep(debounceMs)
+  const pending = await state.getList<string>(pendingKey)
+  if (pending.some(id => compareSlackTs(id, message.id) > 0)) return undefined
+  const lastEnd = await state.get<string>(endKey)
+  if (lastEnd && compareSlackTs(lastEnd, message.id) >= 0) return undefined
+  await state.set(endKey, message.id, ttlMs)
+  // Some adapters keep expired list entries, so older bursts are excluded by
+  // age as well as by the last burst end.
+  const oldestMs = slackTsToMs(message.id) - ttlMs
+  return pending.filter(id =>
+    compareSlackTs(id, message.id) < 0
+    && slackTsToMs(id) >= oldestMs
+    && (!lastEnd || compareSlackTs(id, lastEnd) > 0)
+  )
+}
+
+async function proactiveThreadHistory(
+  thread: Thread<SlackbotV2ThreadState>,
+  current: ChatMessage
+): Promise<ChatMessage[]> {
+  const history: ChatMessage[] = []
+  for await (const item of thread.messages) {
+    if (item.id === current.id || compareSlackTs(item.id, current.id) > 0) continue
+    history.push(item)
+    if (history.length >= PROACTIVE_HISTORY_MESSAGES) break
+  }
+  return history.reverse()
 }
 
 async function subscribeSlackThreadForHandoff(
@@ -1103,6 +1513,10 @@ type SyncThreadMessageInput = {
   initialAssistantStatusVisible?: boolean
   mode: SlackbotV2MessageMode
   options: SlackbotV2Options
+  /** An unmentioned message the proactive classifier accepted; it steers like a mention. */
+  proactive?: boolean
+  /** The operator rule this message matched, to tell the agent how to respond. */
+  proactiveRule?: ProactivityRule
   /** Number of in-process retries already spent on this message's handoff. */
   retryAttempt?: number
   /** Resolved once per local handoff chain so retryable failures stay idempotent. */
@@ -1221,6 +1635,11 @@ async function syncThreadMessageToSession(
     ? input.initialAssistantStatusVisible === true ||
       input.initialAssistantStatusRequested === true
     : false
+  // Acknowledge the turn before slower serialization, context, and sandbox
+  // startup; a handoff retry carries the same acknowledgement forward.
+  if (shouldStartExecution && !input.steeringReactionAck) {
+    input.steeringReactionAck = input.steeringReactions.begin(thread, message, 'ack', trace)
+  }
   if (shouldStartExecution && input.initialAssistantStatusVisible === undefined) {
     backgroundWaitUntil(
       setInitialAssistantStatus(thread, input.options, trace)
@@ -1338,25 +1757,14 @@ async function syncThreadMessageToSession(
   // Without an explicit override or channel default the harness runs its
   // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
   // config); show and record that instead of dropping the model entirely.
-  const harnessDefaultModel = defaultModelForHarness(
-    effectiveHarnessType,
-    input.options.harnessDefaultModels
-  )
-  const effectiveModel = resolvedModel ?? harnessDefaultModel
-  const modelOverride = resolvedModel !== harnessDefaultModel ? resolvedModel : undefined
-  const harnessRollout = resolveHarnessRollout({
-    modelOverride,
-    requestedHarness: effectiveHarnessType,
-    rolloutPercent: isHarnessEnabled('nanocodex', input.options.enabledHarnesses)
-      ? input.options.codexNanocodexRolloutPercent ?? 0
-      : 0,
-    threadId: thread.id
-  })
-  const rolloutSelected = harnessRollout.assignment !== undefined
+  const effectiveModel =
+    resolvedModel ??
+    defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
+  const requestedReasoning = overrides.reasoning ?? channelDefault?.reasoning
   const resolvedReasoning = reasoningForModel(
     effectiveHarnessType,
     effectiveModel,
-    overrides.reasoning ?? channelDefault?.reasoning
+    requestedReasoning
   )
   const effectiveReasoning = effectiveReasoningForHarness(
     effectiveHarnessType,
@@ -1440,13 +1848,21 @@ async function syncThreadMessageToSession(
 
   if (
     state.activeExecution === true
-    && message.isMention === true
+    && (message.isMention === true || input.proactive === true)
     && messagesToAppend.some(item => item.id === message.id)
     && !input.steeringReactionAck
   ) {
-    input.steeringReactionAck = input.steeringReactions.begin(thread, message, trace)
+    input.steeringReactionAck = input.steeringReactions.begin(thread, message, 'steering', trace)
   }
 
+  // A rule's context rides only on the first turn it starts in this thread;
+  // later turns have it in the session's context.
+  let proactiveRule =
+    shouldStartExecution
+    && input.proactiveRule
+    && !(state.proactiveRulesSent ?? []).includes(input.proactiveRule.name)
+      ? input.proactiveRule
+      : undefined
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
     executeContextMessages:
@@ -1454,21 +1870,15 @@ async function syncThreadMessageToSession(
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     // Sticky harness changes only apply when a message starts an execution;
     // restarting the thread out from under an active execution would kill it.
-    harnessType: shouldStartExecution
-      ? rolloutSelected
-        ? harnessRollout.harnessType
-        : resolvedHarnessType
-      : undefined,
-    harnessAssignment: shouldStartExecution ? harnessRollout.assignment : undefined,
+    harnessType: shouldStartExecution ? resolvedHarnessType : undefined,
     metadataHarnessType: shouldStartExecution ? effectiveHarnessType : undefined,
     messages: messagesToAppend,
     model: shouldStartExecution ? resolvedModel : undefined,
     metadataModel: shouldStartExecution ? effectiveModel : undefined,
     personaId: shouldStartExecution ? resolvedPersonaId : undefined,
+    proactiveContext: proactiveRule && proactiveRuleContext(proactiveRule),
     provider: shouldStartExecution ? resolvedProvider : undefined,
     reasoning: resolvedReasoning,
-    restartOnHarnessConflict:
-      shouldStartExecution && rolloutSelected ? Boolean(resolvedHarnessType) : undefined,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },
@@ -1500,6 +1910,13 @@ async function syncThreadMessageToSession(
       }
     }
     forwardInput.contextPreamble = harnessRestartPreamble(history, serializedMessage.id)
+    // The restart preamble replays Slack messages only, so rule contexts the
+    // old harness saw are gone: forget them and resend the current one.
+    await thread.setState({ proactiveRulesSent: [] })
+    if (shouldStartExecution && input.proactiveRule) {
+      proactiveRule = input.proactiveRule
+      forwardInput.proactiveContext = proactiveRuleContext(proactiveRule)
+    }
     traceLog(input.options, 'slackbotv2_forward_restart_context_built', trace, {
       degraded: restartContextDegraded,
       history_message_count: history.length,
@@ -1538,6 +1955,21 @@ async function syncThreadMessageToSession(
     latestExecutedMessageIds.add(serializedMessage.id)
     const steeringReactionAck = input.steeringReactionAck
     forwardInput.executionId = execution.execution_id
+    if (stopRequestedFor(latest, message)) {
+      // The stop landed while execute was in flight. Interrupt in the
+      // background; the live render shows the interrupted result.
+      traceLog(input.options, 'slackbotv2_forward_stop_requested_during_execute', trace, {
+        execution_id: execution.execution_id
+      })
+      backgroundWaitUntil(
+        interruptSessionExecution(input.options, thread.id, 'Interrupted from Slack').catch(error => {
+          traceWarn(input.options, 'slackbotv2_forward_stop_interrupt_failed', trace, {
+            error: errorMessage(error),
+            execution_id: execution.execution_id
+          })
+        })
+      )
+    }
     // Take the render lease before the obligation becomes visible so a
     // concurrent recovery sweep never claims it while this process is about
     // to render it live.
@@ -1553,6 +1985,13 @@ async function syncThreadMessageToSession(
       activeExecution: true,
       executedMessageIds: Array.from(latestExecutedMessageIds).slice(-1000),
       lastEventId,
+      ...(proactiveRule
+        ? {
+            proactiveRulesSent: Array.from(
+              new Set([...(latest.proactiveRulesSent ?? []), proactiveRule.name])
+            )
+          }
+        : {}),
       renderObligation: {
         afterEventId: lastEventId,
         executionId: execution.execution_id,
@@ -1610,10 +2049,15 @@ async function syncThreadMessageToSession(
   }
 
   let responseContextBlock: SlackContextBlock | undefined
+  let stoppedBeforeExecute = false
   try {
     await thread.setState({ activeExecution: true })
     traceLog(input.options, 'slackbotv2_forward_active_execution_marked', trace)
     await forwardToSessionApi(input.options, forwardInput, {
+      shouldExecute: async () => {
+        stoppedBeforeExecute = stopRequestedFor((await thread.state) ?? {}, message)
+        return !stoppedBeforeExecute
+      },
       onExecutionStarted: commitExecutionStarted,
       onMessagesAppended: commitMessagesAppended,
       onSessionCreated: async outcome => {
@@ -1638,26 +2082,34 @@ async function syncThreadMessageToSession(
           }
         }
         const harnessType = outcome.harnessType ?? effectiveHarnessType
-        const abTested = outcome.harnessAssignment?.experiment === 'codex_nanocodex_ab'
         forwardInput.metadataHarnessType = harnessType
-        forwardInput.harnessAssignment = outcome.harnessAssignment
+        // A persona-pinned model overrides any model or provider selection.
+        const personaModel = outcome.personaModel
         let model = effectiveModel
         let reasoning = effectiveReasoning
-        if (harnessType !== effectiveHarnessType || abTested) {
+        if (harnessType !== effectiveHarnessType || personaModel) {
           model =
-            resolvedModel ?? defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
-          const requestedReasoning = reasoningForModel(harnessType, model, resolvedReasoning)
+            personaModel ??
+            resolvedModel ??
+            defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
+          // Validate the raw request: resolvedReasoning was filtered against
+          // the model expected before the session resolved.
+          const modelReasoning = reasoningForModel(harnessType, model, requestedReasoning)
           reasoning = effectiveReasoningForHarness(
             harnessType,
-            requestedReasoning,
+            modelReasoning,
             input.options.harnessDefaultReasoning
           )
           forwardInput.metadataModel = model
-          forwardInput.reasoning = requestedReasoning
+          forwardInput.reasoning = modelReasoning
+          if (personaModel) {
+            // The API ignores model and provider selections on a pinned thread;
+            // don't send them, so a rejected pin isn't blamed on a sticky model.
+            forwardInput.model = undefined
+            forwardInput.provider = undefined
+          }
           traceLog(input.options, 'slackbotv2_session_harness_resolved', trace, {
-            ab_tested: abTested,
-            ab_test_experiment: outcome.harnessAssignment?.experiment,
-            ab_test_cohort: outcome.harnessAssignment?.cohort,
+            persona_model: personaModel,
             requested_harness_type: effectiveHarnessType,
             resolved_harness_type: harnessType
           })
@@ -1669,7 +2121,7 @@ async function syncThreadMessageToSession(
           notice: fallbackNotice,
           reasoning,
           serviceTier:
-            input.options.responseServiceTierEnabled === true && !resolvedProvider
+            input.options.responseServiceTierEnabled === true && (personaModel || !resolvedProvider)
               ? defaultServiceTierForHarness(harnessType)
               : undefined
         })
@@ -1677,6 +2129,19 @@ async function syncThreadMessageToSession(
       onSessionRestarted: handleSessionRestarted
     })
     finishSteeringReaction(input, trace)
+    if (stoppedBeforeExecute) {
+      const latest = (await thread.state) ?? {}
+      const latestExecutedMessageIds = new Set(latest.executedMessageIds ?? [])
+      latestExecutedMessageIds.add(serializedMessage.id)
+      await thread.setState({
+        activeExecution: false,
+        executedMessageIds: Array.from(latestExecutedMessageIds).slice(-1000)
+      })
+      if (assistantStatusVisible) await setAssistantStatus(thread, '', input.options, trace)
+      traceLog(input.options, 'slackbotv2_forward_stopped_before_execute', trace)
+      recordForward(input.mode, 'stopped', traceStartedAtMs)
+      return
+    }
     scheduleExecutionRender(
       thread,
       serializedMessage,
@@ -2313,26 +2778,26 @@ async function recoverRenderObligations(
         })
         continue
       }
-      const releaseLease = async (): Promise<void> => {
-        const activeLeaseToken = await state.get<string>(renderRecoveryLeaseKey(threadId))
-        if (activeLeaseToken === leaseToken) await state.delete(renderRecoveryLeaseKey(threadId))
-      }
+      const releaseLease = renewRenderLease(state, threadId, leaseToken)
 
       // A single hung recovery (for example an event stream that never
       // produces a chunk) must not block every obligation queued behind it.
       // Race a deadline; on timeout move on and leave the attempt running
       // detached - it may still finish and clear the obligation, which is why
-      // the lease is kept so a later pass does not start a duplicate render.
+      // the lease is renewed until the detached attempt actually settles.
       const recovery = recoverRenderObligation(chat, state, options, threadId, obligation)
+        .finally(releaseLease)
       let outcome: { timedOut: true } | { timedOut: false; deferred: boolean }
+      let timeout: ReturnType<typeof setTimeout> | undefined
       try {
         outcome = await Promise.race([
           recovery.then(deferred => ({ timedOut: false as const, deferred })),
-          sleep(timeoutMs).then(() => ({ timedOut: true as const }))
+          new Promise<{ timedOut: true }>(resolve => {
+            timeout = setTimeout(() => resolve({ timedOut: true }), timeoutMs)
+          })
         ])
-      } catch (error) {
-        await releaseLease()
-        throw error
+      } finally {
+        clearTimeout(timeout)
       }
       if (outcome.timedOut) {
         void recovery.catch(() => undefined)
@@ -2358,7 +2823,6 @@ async function recoverRenderObligations(
         )
         continue
       }
-      await releaseLease()
       if (outcome.deferred) {
         deferredCount += 1
         retryableDeferredCount += 1
@@ -2584,6 +3048,8 @@ async function recoverRenderObligation(
   return false
 }
 
+// The index only aids the recovery sweep; a failed append must not fail an execution that
+// api-rs already started.
 async function indexRenderObligation(
   state: StateAdapter,
   input: {
@@ -2592,12 +3058,33 @@ async function indexRenderObligation(
     trace?: SlackbotV2Trace
   }
 ): Promise<void> {
-  await state.appendToList(RENDER_OBLIGATION_INDEX_KEY, input.threadId, {
-    maxLength: RENDER_OBLIGATION_INDEX_MAX_LENGTH,
-    ttlMs: RENDER_INDEX_TTL_MS
-  })
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await state.appendToList(RENDER_OBLIGATION_INDEX_KEY, input.threadId, {
+        maxLength: RENDER_OBLIGATION_INDEX_MAX_LENGTH,
+        ttlMs: RENDER_INDEX_TTL_MS
+      })
+      break
+    } catch (error) {
+      if (isRetryablePostgresConflict(error) && attempt < RENDER_INDEX_APPEND_MAX_ATTEMPTS) {
+        await sleep(RENDER_INDEX_APPEND_BACKOFF_MS * attempt * (0.5 + Math.random()))
+        continue
+      }
+      traceWarn(input.options, 'slackbotv2_render_obligation_index_failed', input.trace, {
+        attempts: attempt,
+        error: errorMessage(error),
+        thread_id: input.threadId
+      })
+      return
+    }
+  }
   slackbotMetrics.renderObligationsIndexed.inc()
   traceLog(input.options, 'slackbotv2_render_obligation_indexed', input.trace)
+}
+
+function isRetryablePostgresConflict(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  return code === '40P01' || code === '40001'
 }
 
 async function* streamOpenedSession(
@@ -2688,6 +3175,16 @@ async function acquireRenderLease(
   const key = renderRecoveryLeaseKey(threadId)
   const token = randomUUID()
   await state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS)
+  return renewRenderLease(state, threadId, token)
+}
+
+/** Renew an owned lease until the render settles, including after a sweep timeout. */
+function renewRenderLease(
+  state: StateAdapter,
+  threadId: string,
+  token: string
+): () => Promise<void> {
+  const key = renderRecoveryLeaseKey(threadId)
   const refresh = setInterval(() => {
     void state
       .get<string>(key)
@@ -2730,23 +3227,25 @@ async function renderExecutionStream(
   }
   const titleStartedAtMs = nowMs()
   await setAssistantTitle(thread, titleFromMessage(promptText, options.userName), options, trace)
+  const statusTracker = newAssistantStatusTracker(thread, options)
   if (!assistantStatusVisible) {
-    await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...', options, trace)
+    await setTrackedAssistantStatus(thread, statusTracker, statusTracker.current, options, trace)
   }
   traceLog(options, 'slackbotv2_render_slack_metadata_set', trace, {
     assistant_status_already_visible: assistantStatusVisible,
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
+  let visibleStream: FirstChunkStream | null = null
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
-    const visibleStream = await streamAfterFirstChunk(
+    visibleStream = await streamAfterFirstChunk(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
             harnessToChatSdkStream(
-              stream,
-              rendererOptions(thread, options, capture, trace)
+              restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
+              rendererOptions(thread, options, capture, trace, statusTracker)
             ),
             taskDisplayMode
           )
@@ -2769,7 +3268,10 @@ async function renderExecutionStream(
     }) ?? await thread.post(visibleStream)
     return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
-    await setAssistantStatus(thread, '', options, trace)
+    // Stop the conflation pump and SSE even if the adapter abandoned the
+    // stream without draining it, then clear the status this render owns.
+    visibleStream?.close()
+    await closeAssistantStatus(thread, statusTracker, options, trace)
   }
 }
 
@@ -2787,20 +3289,22 @@ async function renderRecoveredExecutionStream(
   }
   const titleStartedAtMs = nowMs()
   await setAssistantTitle(thread, titleFromMessage(promptText, options.userName), options, trace)
-  await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...', options, trace)
+  const statusTracker = newAssistantStatusTracker(thread, options)
+  await setTrackedAssistantStatus(thread, statusTracker, statusTracker.current, options, trace)
   traceLog(options, 'slackbotv2_render_slack_metadata_set', trace, {
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
+  let visibleStream: FirstChunkStream | null = null
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
-    const visibleStream = await streamAfterFirstChunk(
+    visibleStream = await streamAfterFirstChunk(
       conflateChatSdkStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
             harnessToChatSdkStream(
-              stream,
-              rendererOptions(thread, options, capture, trace)
+              restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
+              rendererOptions(thread, options, capture, trace, statusTracker)
             ),
             taskDisplayMode
           )
@@ -2819,7 +3323,10 @@ async function renderRecoveredExecutionStream(
     ) ?? await thread.post(visibleStream)
     return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
-    await setAssistantStatus(thread, '', options, trace)
+    // Stop the conflation pump and SSE even if the adapter abandoned the
+    // stream without draining it, then clear the status this render owns.
+    visibleStream?.close()
+    await closeAssistantStatus(thread, statusTracker, options, trace)
   }
 }
 
@@ -2839,8 +3346,9 @@ async function renderPlainTextExecutionStream(
     options,
     trace
   )
+  const statusTracker = newAssistantStatusTracker(thread, options)
   if (!assistantStatusVisible) {
-    await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...', options, trace)
+    await setTrackedAssistantStatus(thread, statusTracker, statusTracker.current, options, trace)
   }
   traceLog(options, 'slackbotv2_render_plain_text_metadata_set', trace, {
     assistant_status_already_visible: assistantStatusVisible,
@@ -2850,8 +3358,10 @@ async function renderPlainTextExecutionStream(
     const chatStream = fallback.collectChatSdk(
       slackSafeChatSdkStream(
         harnessToChatSdkStream(
-          fallback.collectSource(stream),
-          rendererOptions(thread, options, undefined, trace)
+          fallback.collectSource(
+            restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace)
+          ),
+          rendererOptions(thread, options, undefined, trace, statusTracker)
         )
       )
     )
@@ -2868,7 +3378,7 @@ async function renderPlainTextExecutionStream(
     })
     await thread.post(text)
   } finally {
-    await setAssistantStatus(thread, '', options, trace)
+    await closeAssistantStatus(thread, statusTracker, options, trace)
   }
 }
 
@@ -2906,7 +3416,7 @@ class SlackRenderFallback {
     return (
       this.text() ||
       (this.interrupted
-        ? 'Execution interrupted'
+        ? 'Execution interrupted.'
         : EMPTY_FINAL_ANSWER_TEXT)
     )
   }
@@ -3008,20 +3518,40 @@ function truncateSlackText(value: string, maxChars: number, label: string): stri
   }
 }
 
+/** A render stream whose source can be released even if no consumer drains it. */
+type FirstChunkStream = AsyncIterable<ChatSDKStreamChunk> & { close(): void }
+
 async function streamAfterFirstChunk(
   stream: AsyncIterable<ChatSDKStreamChunk>
-): Promise<AsyncIterable<ChatSDKStreamChunk> | null> {
+): Promise<FirstChunkStream | null> {
   const iterator = stream[Symbol.asyncIterator]()
   const first = await iterator.next()
   if (first.done) return null
 
+  let finished = false
+  const close = (): void => {
+    if (finished) return
+    finished = true
+    // Do not await: a source blocked on a silent SSE can keep return() pending.
+    void Promise.resolve(iterator.return?.()).catch(() => undefined)
+  }
   return {
+    close,
     async *[Symbol.asyncIterator](): AsyncIterator<ChatSDKStreamChunk> {
-      yield first.value
-      for (;;) {
-        const next = await iterator.next()
-        if (next.done) return
-        yield next.value
+      try {
+        yield first.value
+        for (;;) {
+          const next = await iterator.next()
+          if (next.done) {
+            finished = true
+            return
+          }
+          yield next.value
+        }
+      } finally {
+        // A consumer that stops early (e.g. a Slack streaming error) must
+        // release the source so its pump stops consuming session events.
+        close()
       }
     }
   }
@@ -3065,6 +3595,40 @@ async function* streamSessionAfterHandoff(
 
 async function* streamError(error: unknown): AsyncIterable<SlackbotV2RendererSource> {
   yield sessionStreamError(error)
+}
+
+/**
+ * Work started by Slack webhooks: handoffs and the live renders and retries
+ * they schedule (via requestContext). Drained on shutdown.
+ */
+function createBackgroundWork() {
+  const pending = new Set<Promise<unknown>>()
+  return {
+    track(promise: Promise<unknown>): void {
+      if (pending.has(promise)) return
+      pending.add(promise)
+      const settle = () => pending.delete(promise)
+      promise.then(settle, settle)
+    },
+    /**
+     * Waits for tracked work, including work started while waiting, until the
+     * deadline. Returns how much is still running.
+     */
+    async drain(timeoutMs: number): Promise<number> {
+      const deadline = Date.now() + timeoutMs
+      while (pending.size > 0 && Date.now() < deadline) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        await Promise.race([
+          Promise.allSettled(pending),
+          new Promise(resolve => {
+            timer = setTimeout(resolve, deadline - Date.now())
+          })
+        ])
+        clearTimeout(timer)
+      }
+      return pending.size
+    }
+  }
 }
 
 function backgroundWaitUntil(promise: Promise<unknown>): void {
@@ -3686,9 +4250,10 @@ export function normalizeSlackText(input: string): string {
     .replace(/<@([A-Z0-9]+)>/g, '@$1')
     .replace(/<!subteam\^([A-Z0-9]+)\|([^>]+)>/g, '@$2')
     .replace(/<!(channel|here|everyone)>/g, '@$1')
-    .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
+    // Last, so an escaped entity such as &amp;lt; decodes to &lt;, not <.
+    .replace(/&amp;/g, '&')
     .trim()
 }
 
@@ -3710,11 +4275,123 @@ function rendererLogInfo(
   }
 }
 
+/** The status a live render currently owns, so it can be restored after Slack hides it. */
+type AssistantStatusTracker = { closed: boolean; current: string }
+
+/**
+ * Open render status trackers in this process, by thread id. A late status
+ * write from a finished render hands the thread back to the newer render
+ * that owns it instead of clearing that render's status.
+ */
+const openAssistantStatusTrackers = new Map<string, AssistantStatusTracker>()
+
+function newAssistantStatusTracker(
+  thread: Thread,
+  options: SlackbotV2Options
+): AssistantStatusTracker {
+  const tracker = { closed: false, current: options.assistantStatus ?? 'Thinking...' }
+  openAssistantStatusTrackers.set(thread.id, tracker)
+  return tracker
+}
+
+/**
+ * Sets a status owned by a live render. Once the render has cleared its
+ * status, late writers (an abandoned stream pump, or a Slack request that
+ * outlived its timeout and lands after the clear) must not leave a stale
+ * indicator behind. The timeout does not cancel the Slack request, so the
+ * compensating write is ordered after the request itself settles.
+ */
+async function setTrackedAssistantStatus(
+  thread: Thread,
+  tracker: AssistantStatusTracker,
+  status: string,
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): Promise<void> {
+  if (tracker.closed) return
+  let applied: Promise<boolean> | undefined
+  await setAssistantStatus(thread, status, options, trace, request => {
+    applied = request
+  })
+  if (!applied) return
+  backgroundWaitUntil(
+    applied
+      .then(async wasApplied => {
+        if (!wasApplied || !tracker.closed) return
+        const owner = openAssistantStatusTrackers.get(thread.id)
+        traceLog(options, 'slackbotv2_assistant_status_late_write_reverted', trace, {
+          restored_newer_render_status: Boolean(owner)
+        })
+        if (owner) {
+          await setTrackedAssistantStatus(thread, owner, owner.current, options, trace)
+        } else {
+          await setAssistantStatus(thread, '', options, trace)
+        }
+      })
+      .catch(() => undefined)
+  )
+}
+
+async function closeAssistantStatus(
+  thread: Thread,
+  tracker: AssistantStatusTracker,
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): Promise<void> {
+  tracker.closed = true
+  if (openAssistantStatusTrackers.get(thread.id) === tracker) {
+    openAssistantStatusTrackers.delete(thread.id)
+  }
+  await setAssistantStatus(thread, '', options, trace)
+}
+
+/**
+ * Slack hides the thread-wide assistant status when a new message is posted
+ * in the thread, and the steering handoff deliberately leaves the status to
+ * the active run. Once api-rs reports the follow-up delivered to (or failed
+ * for) that still-running execution, restore the run's latest status instead
+ * of leaving the thread without an indicator until the next activity summary
+ * (which may never arrive).
+ */
+async function* restoreAssistantStatusAfterSteering(
+  thread: Thread,
+  stream: AsyncIterable<SlackbotV2RendererSource>,
+  tracker: AssistantStatusTracker,
+  options: SlackbotV2Options,
+  trace?: SlackbotV2Trace
+): AsyncIterable<SlackbotV2RendererSource> {
+  for await (const event of stream) {
+    const steeringEvent = steeringEventKind(event)
+    if (steeringEvent) {
+      traceLog(
+        options,
+        tracker.closed
+          ? 'slackbotv2_assistant_status_restore_skipped_closed'
+          : 'slackbotv2_assistant_status_restored_after_steering',
+        trace,
+        { steering_event: steeringEvent }
+      )
+      await setTrackedAssistantStatus(thread, tracker, tracker.current, options, trace)
+      continue
+    }
+    yield event
+  }
+}
+
+function steeringEventKind(event: SlackbotV2RendererSource): string | null {
+  if (!event || typeof event !== 'object') return null
+  const eventKind = 'eventKind' in event ? event.eventKind : 'event' in event ? event.event : ''
+  return eventKind === SESSION_STEERING_DELIVERED_EVENT || eventKind === SESSION_STEERING_FAILED_EVENT
+    ? eventKind
+    : null
+}
+
 function rendererOptions(
   thread: Thread,
   options: SlackbotV2Options,
   capture?: { diverged: boolean },
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  statusTracker?: AssistantStatusTracker
 ): CodexAppServerToChatStreamOptions {
   const mapper = options.mapper
   return {
@@ -3726,7 +4403,12 @@ function rendererOptions(
         await setAssistantTitle(thread, event.title, options)
       }
       if (event.type === 'renderer.status' && options.activitySummaryStatusEnabled) {
-        await setAssistantStatus(thread, event.status, options, trace)
+        if (statusTracker) {
+          statusTracker.current = event.status
+          await setTrackedAssistantStatus(thread, statusTracker, event.status, options, trace)
+        } else {
+          await setAssistantStatus(thread, event.status, options, trace)
+        }
       }
     }
   }
@@ -3783,20 +4465,26 @@ async function setAssistantStatus(
   thread: Thread,
   status: string,
   options?: SlackbotV2Options,
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  /** Receives the Slack request itself, which may settle after the timeout. */
+  onRequest?: (applied: Promise<boolean>) => void
 ): Promise<boolean> {
   const startedAtMs = nowMs()
   const normalizedStatus = normalizeAssistantStatus(status)
   const target = slackAssistantTarget(thread)
   const adapter = thread.adapter as SlackAssistantAdapter
+  const nativeSessionStatus = options?.agentViewEnabled === true
+  const hasStatusAdapter = nativeSessionStatus
+    ? Boolean(adapter.setSessionStatus)
+    : Boolean(adapter.setAssistantStatus)
   const fields = {
-    has_adapter: Boolean(adapter.setAssistantStatus),
+    has_adapter: hasStatusAdapter,
     has_target: Boolean(target),
     operation: normalizedStatus ? 'set' : 'clear',
     status_empty: !normalizedStatus
   }
   if (options) traceLog(options, 'slackbotv2_assistant_status_started', trace, fields)
-  if (!target || !adapter.setAssistantStatus) {
+  if (!target || !hasStatusAdapter) {
     if (options) {
       traceLog(options, 'slackbotv2_assistant_status_complete', trace, {
         ...fields,
@@ -3816,16 +4504,24 @@ async function setAssistantStatus(
       )
     : () => undefined
   try {
-    const visible = await withSlackApiTimeout(options, 'set assistant status', () =>
-      ignoreAssistantError(() =>
-        adapter.setAssistantStatus!(
-          target.channel,
-          target.threadTs,
-          normalizedStatus,
-          normalizedStatus ? [normalizedStatus] : undefined
-        )
+    const visible = await withSlackApiTimeout(options, 'set assistant status', () => {
+      const request = ignoreAssistantError(() =>
+        nativeSessionStatus
+          ? adapter.setSessionStatus!(
+              target.channel,
+              target.threadTs,
+              normalizedStatus ? 'processing' : 'active'
+            )
+          : adapter.setAssistantStatus!(
+              target.channel,
+              target.threadTs,
+              normalizedStatus,
+              normalizedStatus ? [normalizedStatus] : undefined
+            )
       )
-    )
+      onRequest?.(request)
+      return request
+    })
     if (options) {
       traceLog(options, 'slackbotv2_assistant_status_complete', trace, {
         ...fields,

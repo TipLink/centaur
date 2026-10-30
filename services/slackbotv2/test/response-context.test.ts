@@ -19,6 +19,7 @@ describe('harnessDisplayName', () => {
     expect(harnessDisplayName('nanocodex')).toBe('Nanocodex')
     expect(harnessDisplayName('claudecode')).toBe('Claude Code')
     expect(harnessDisplayName('amp')).toBe('Amp')
+    expect(harnessDisplayName('omp')).toBe('OMP')
   })
 
   test('is case-insensitive and trims', () => {
@@ -59,6 +60,7 @@ describe('reasoningForModel', () => {
     'gpt-6-astra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
     'gpt-6-sol': [...standardEfforts, 'max'],
     'gpt-6.1-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+    'gpt-6.1-terra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
     'gpt-6-luna': [...standardEfforts, 'max']
   }
 
@@ -98,7 +100,9 @@ describe('reasoningForModel', () => {
 
   test('forwards Claude Code effort levels and rejects Codex-only efforts', () => {
     for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
-      expect(reasoningForModel('claudecode', 'claude-opus-5-5', effort)).toBe(effort)
+      for (const model of ['claude-opus-5-5', 'claude-fable-5-1', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+        expect(reasoningForModel('claudecode', model, effort)).toBe(effort)
+      }
     }
     expect(reasoningForModel('claudecode', undefined, 'HIGH')).toBe('high')
     for (const effort of ['none', 'minimal', 'ultra']) {
@@ -116,10 +120,12 @@ describe('reasoningForModel', () => {
   })
 
   test('forwards Pi thinking levels for any model and rejects Codex-only efforts', () => {
-    for (const effort of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
-      expect(reasoningForModel('pi', undefined, effort)).toBe(effort)
+    for (const harness of ['pi', 'omp']) {
+      for (const effort of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+        expect(reasoningForModel(harness, undefined, effort)).toBe(effort)
+      }
+      expect(reasoningForModel(harness, 'openai/gpt-5.5', 'ultra')).toBeUndefined()
     }
-    expect(reasoningForModel('pi', 'openai/gpt-5.5', 'ultra')).toBeUndefined()
   })
 
   test('rejects efforts for harnesses without an effort control', () => {
@@ -144,6 +150,12 @@ describe('defaultModelForHarness', () => {
     expect(defaultModelForHarness('claudecode', configured)).toBe('claude-fable-5')
     expect(defaultModelForHarness('codex', configured)).toBe(bakedCodexModel)
     expect(defaultModelForHarness('claudecode', { claudecode: '   ' })).toBe(bakedClaudeModel)
+    for (const harness of ['pi', 'omp']) {
+      expect(defaultModelForHarness(harness, { [harness]: 'anthropic/claude-opus-4-8' })).toBe(
+        'anthropic/claude-opus-4-8'
+      )
+      expect(defaultModelForHarness(harness)).toBeUndefined()
+    }
   })
 
   test('is case-insensitive and trims', () => {
@@ -181,6 +193,8 @@ describe('defaultReasoningForHarness', () => {
     expect(effectiveReasoningForHarness('nanocodex', 'minimal')).toBe('low')
     expect(effectiveReasoningForHarness('claudecode', 'high')).toBe('high')
     expect(effectiveReasoningForHarness('claudecode', undefined)).toBeUndefined()
+    expect(effectiveReasoningForHarness('omp', 'max')).toBe('max')
+    expect(effectiveReasoningForHarness('omp', undefined)).toBeUndefined()
     expect(effectiveReasoningForHarness('amp', 'high')).toBeUndefined()
   })
 })
@@ -200,6 +214,11 @@ describe('modelDisplayName', () => {
   test('formats Claude and GPT IDs as product names and uppercases other models', () => {
     expect(modelDisplayName('claude-opus-5-5')).toBe('Opus 5.5')
     expect(modelDisplayName('claude-fable-5')).toBe('Fable 5')
+    expect(modelDisplayName('claude-fable-5-1')).toBe('Fable 5.1')
+    expect(modelDisplayName('claude-sonnet-5-5')).toBe('Sonnet 5.5')
+    expect(modelDisplayName('claude-haiku-5-5')).toBe('Haiku 5.5')
+    expect(modelDisplayName('gpt-6.1-sol')).toBe('Sol 6.1')
+    expect(modelDisplayName('gpt-6.1-terra')).toBe('Terra 6.1')
     expect(modelDisplayName('claude-haiku-4-5-20251001')).toBe('Haiku 4.5')
     expect(modelDisplayName('claude-opus-5-fast')).toBe('Opus 5 Fast')
     expect(modelDisplayName('gpt-5.6-sol')).toBe('Sol 5.6')

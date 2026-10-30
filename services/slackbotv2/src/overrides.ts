@@ -2,14 +2,14 @@ import { escapeRegExp } from './utils'
 
 /**
  * Inline message directives, restored from the v1 slackbot:
- *   --claude | --claude-code | --amp | --codex | --nanocodex | --pi
+ *   --claude | --claude-code | --amp | --codex | --nanocodex | --pi | --omp
  *                                                  pick the harness for the thread
  *   --bedrock                                    codex via the AWS Bedrock provider
  *   --meta                                       codex via Meta AI direct
  *   --provider <name>                            codex via a configured provider
  *   --persona <id> (or --persona=<id>)           pick the persona independently
  *   --model <name> (or --model=<name>)           pick the model within that harness
- *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex/nanocodex/claude-code/pi)
+ *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex/nanocodex/claude-code/pi/omp)
  *   --fable | --opus | --sonnet | --haiku        model shortcuts (imply claude-code)
  *
  * Flags are stripped from the text before it reaches the agent. The harness
@@ -58,7 +58,8 @@ const HARNESS_FLAGS: Record<string, string> = {
   codex: 'codex',
   hermes: 'hermes',
   nanocodex: 'nanocodex',
-  pi: 'pi'
+  pi: 'pi',
+  omp: 'omp'
 }
 
 // Provider flags select a model provider within the codex harness (and imply
@@ -74,10 +75,10 @@ const PROVIDER_FLAGS: Record<string, ProviderMapping> = {
 // Claude model aliases, usable both as bare flags (--opus) and as --model
 // values (--model opus). Bare-flag form also implies the claude-code harness.
 const CLAUDE_MODEL_ALIASES: Record<string, string> = {
-  fable: 'claude-fable-5',
-  haiku: 'claude-haiku-4-5',
+  fable: 'claude-fable-5-1',
+  haiku: 'claude-haiku-5-5',
   opus: 'claude-opus-5-5',
-  sonnet: 'claude-sonnet-5'
+  sonnet: 'claude-sonnet-5-5'
 }
 
 const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
@@ -88,7 +89,7 @@ const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
     ])
   )
 
-const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex', 'pi'])
+const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex', 'pi', 'omp'])
 const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
 const STRATEGY_REASONING_EFFORTS = new Set([
   'none',
@@ -103,7 +104,9 @@ const STRATEGY_REASONING_EFFORTS = new Set([
 
 const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
   'claude-fable-5': 'claudecode',
+  'claude-fable-5-1': 'claudecode',
   'claude-haiku-4-5': 'claudecode',
+  'claude-haiku-5-5': 'claudecode',
   'claude-opus-4-7': 'claudecode',
   'claude-opus-4-8': 'claudecode',
   'claude-opus-5': 'claudecode',
@@ -111,6 +114,7 @@ const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
   'claude-opus-5-5': 'claudecode',
   'claude-sonnet-4-6': 'claudecode',
   'claude-sonnet-5': 'claudecode',
+  'claude-sonnet-5-5': 'claudecode',
   deep: 'amp',
   fast: 'amp',
   'gpt-5.4': 'codex',
@@ -125,6 +129,7 @@ const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
   'gpt-6-astra': 'codex',
   'gpt-6-sol': 'codex',
   'gpt-6.1-sol': 'codex',
+  'gpt-6.1-terra': 'codex',
   'gpt-6-luna': 'codex'
 }
 
@@ -284,7 +289,8 @@ export function validateStrategyOverrides(
       harnessType === undefined ||
       harnessType === 'codex' ||
       harnessType === 'nanocodex' ||
-      harnessType === 'pi'
+      harnessType === 'pi' ||
+      harnessType === 'omp'
         ? normalized
         : undefined
   }

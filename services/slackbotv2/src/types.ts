@@ -3,6 +3,7 @@ import type { CodexAppServerToChatStreamOptions } from '@centaur/rendering'
 import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
 import type { Hono } from 'hono'
 import type { ChannelDefaults } from './channel-defaults'
+import type { ProactivityRule, ProactivityRules } from './proactivity-rules'
 import type { ChannelUserPolicy } from './channel-user-policy'
 import type { HarnessOverrides } from './overrides'
 import type { SlackDisplayTextSource } from './slack-display-text'
@@ -81,13 +82,6 @@ export type SlackbotV2CreateSessionRequest = {
   persona_id?: string
 }
 
-export type SlackbotV2HarnessAssignment = {
-  experiment: string
-  requestedHarness: string
-  cohort: string
-  rolloutPercent: number
-}
-
 export type SlackbotV2ExecuteSessionRequest = {
   idempotency_key?: string
   idle_timeout_ms?: number
@@ -157,8 +151,6 @@ export type SlackbotV2Options = {
    * conversation id (SLACKBOTV2_CHANNEL_DEFAULTS). See channel-defaults.ts.
    */
   channelDefaults?: ChannelDefaults
-  /** Percentage of otherwise-default Codex threads assigned to Nanocodex. */
-  codexNanocodexRolloutPercent?: number
   /**
    * Harness for new threads when no --claude/--amp/--codex/--nanocodex/--hermes
    * flag is given (HarnessType wire value: codex | amp | claudecode |
@@ -169,8 +161,8 @@ export type SlackbotV2Options = {
   fetch?: SlackbotV2Fetch
   /**
    * Deployment-configured default model per harness wire value (claudecode |
-   * codex | nanocodex | pi), from the CLAUDE_MODEL / CODEX_MODEL /
-   * CENTAUR_PI_MODEL env vars the chart mirrors
+   * codex | nanocodex | pi | omp), from the CLAUDE_MODEL / CODEX_MODEL /
+   * CENTAUR_PI_MODEL / CENTAUR_OMP_MODEL env vars the chart mirrors
    * out of sandbox.extraEnv. Display/metadata only — never forwarded to the
    * harness. Unset harnesses fall back to the models pinned in this repo's
    * harness config files (see response-context.ts).
@@ -184,6 +176,12 @@ export type SlackbotV2Options = {
   harnessDefaultReasoning?: Record<string, string>
   /** Strategy for resolving message-level harness/model/provider/reasoning overrides. */
   messageOverridesStrategy?: MessageOverridesStrategy
+  /**
+   * Reply without a mention in threads where the bot was mentioned, and to
+   * messages that match a prompt, when the classifier decides a message calls
+   * for a response. Off when unset.
+   */
+  proactivity?: SlackbotV2ProactivityOptions
   /**
    * Backoff delays between in-process retries of a Slack handoff after a
    * retryable session API failure. Slack's own webhook redelivery cannot
@@ -213,6 +211,10 @@ export type SlackbotV2Options = {
   slackApiTimeoutMs?: number
   state?: StateAdapter
   stateKeyPrefix?: string
+  /** React to mentioned messages that start an execution until the response is posted. */
+  ackReactionEnabled?: boolean
+  /** Slack emoji name used for turn-start acknowledgements. */
+  ackReactionName?: string
   /** React to mentioned messages that are forwarded into an active execution. */
   steeringReactionEnabled?: boolean
   /** Slack emoji name used for active-execution acknowledgements. */
@@ -234,9 +236,74 @@ export type MessageOverridesStrategy = (
   input: MessageOverridesStrategyInput
 ) => Promise<MessageOverridesStrategyResult>
 
+export type SlackbotV2ProactivityOptions = {
+  classifier: ProactiveClassifier
+  /**
+   * Quiet period an idle thread waits for before classifying, so a message
+   * sent in parts gets one decision and one turn. 0 or unset classifies each
+   * message at once.
+   */
+  debounceMs?: number
+  /** Rules that remove the need for a mention. See proactivity-rules.ts. */
+  rules?: ProactivityRules
+  /** Deadline for one classifier decision; a late decision declines. Defaults to 2s. */
+  timeoutMs?: number
+}
+
+export type ProactiveThreadMessage = {
+  author: string
+  /** Whether this bot wrote the message. */
+  fromBot: boolean
+  text: string
+}
+
+export type ProactiveClassifierInput = {
+  botName: string
+  /**
+   * The channel's operator rules, in order. When set, decide which rule, if
+   * any, the message meets first; otherwise apply the built-in
+   * mentioned-thread rules.
+   */
+  rules?: ProactivityRule[]
+  /** Earlier thread messages, oldest first. */
+  history: ProactiveThreadMessage[]
+  /**
+   * Messages sent in quick succession just before `message`, oldest first,
+   * judged together with it as the newest message.
+   */
+  burst?: ProactiveThreadMessage[]
+  message: ProactiveThreadMessage
+}
+
+export type ProactiveDecision = {
+  respond: boolean
+  /**
+   * The backend's probability that the bot should reply, when it reports one.
+   * With rules, the matched rule's probability, else the highest.
+   */
+  probability?: number
+  /** With rules, the name of the first rule the message meets. */
+  rule?: string
+}
+
+/**
+ * Decides whether an unmentioned message in an eligible thread should get a
+ * reply. Implementations wrap one model backend; a thrown error or an aborted
+ * signal declines.
+ */
+export type ProactiveClassifier = (
+  input: ProactiveClassifierInput,
+  signal: AbortSignal
+) => Promise<ProactiveDecision>
+
 export type SlackbotV2 = {
   app: Hono
   chat: Chat
+  /**
+   * Waits up to `timeoutMs` for in-flight webhook handoffs and replies.
+   * Resolves to how many are still running.
+   */
+  drain(timeoutMs: number): Promise<number>
 }
 
 export type SlackbotV2ThreadState = {
@@ -251,9 +318,21 @@ export type SlackbotV2ThreadState = {
   model?: string | null
   /** Persona pinned by the session API. Null means the thread is pinned without a persona. */
   personaId?: string | null
+  /**
+   * Set when the bot joins the thread (a mention or a proactive reply) and
+   * false after a stop, which silences proactive replies until a mention.
+   */
+  proactiveEligible?: boolean
+  /** Proactivity rules whose context a turn in this thread already carried. */
+  proactiveRulesSent?: string[]
   /** Last thread-level model provider selected by Slack flags. Null clears persisted state. */
   provider?: string | null
   renderObligation?: SlackbotV2RenderObligation | null
+  /**
+   * When a user last stopped this thread (ms). An execution still being
+   * handed off for a message sent before then must not run.
+   */
+  stopRequestedAt?: number
 }
 
 export type SlackbotV2RenderObligation = {
@@ -285,14 +364,17 @@ export type ForwardSessionInput = {
    * new harness still sees the thread history.
    */
   contextPreamble?: string
+  /**
+   * Added before the execute message's text. Set when an operator proactivity
+   * rule's match starts the turn, to say why and how to respond.
+   */
+  proactiveContext?: string
   executionId?: string
   executeMessage?: SlackbotV2ApiMessage
-  /** Effective harness selected by Slack policy, including any rollout cohort. */
+  /** Effective harness selected by sticky thread flags or channel defaults. */
   harnessType?: string
   /** Harness persisted by api-rs. */
   metadataHarnessType?: string
-  /** Slack-owned experiment/cohort recorded on the session and execution. */
-  harnessAssignment?: SlackbotV2HarnessAssignment
   messages: SlackbotV2ApiMessage[]
   /** Effective model selected by sticky thread flags (--model/--opus/...). */
   model?: string
@@ -308,8 +390,6 @@ export type ForwardSessionInput = {
   provider?: string
   /** Per-turn reasoning effort parsed from the `-rsn` flag (Codex/Nanocodex/Claude Code). */
   reasoning?: string
-  /** Whether an explicit Slack override may restart a thread on harness conflict. */
-  restartOnHarnessConflict?: boolean
   onEventId(eventId: number): void
   openStream: boolean
   threadId: string
