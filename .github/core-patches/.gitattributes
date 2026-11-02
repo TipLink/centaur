@@ -1,2 +1,3 @@
 # Reviewed patch bytes: whitespace and line endings are part of each pinned SHA-256, so they are never normalized.
+# series.json pins every patch hash and the exact patched tree; prepare-centaur-core.py applies them without repair.
 *.patch -whitespace
