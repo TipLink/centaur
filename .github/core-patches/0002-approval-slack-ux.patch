@@ -1,20 +1,7 @@
-diff --git a/e2e/tests/workflows.test.ts b/e2e/tests/workflows.test.ts
-index 8e84bdc0..975c865f 100644
---- a/e2e/tests/workflows.test.ts
-+++ b/e2e/tests/workflows.test.ts
-@@ -282,7 +282,7 @@ test('a workflow button click starts its target once, for the person who clicked
-   // clicker is told so.
-   expect((await slack.click(CHANNEL, posted.ts, approve, { value: 'v1.forged.signature' })).status).toBe(200)
-   await eventually('the refusal to reach the clicker', 30_000, async () =>
--    (await slack.ephemeral(USER)).some(ephemeral => ephemeral.text === 'This request is no longer available.')
-+    (await slack.ephemeral(USER)).some(ephemeral => ephemeral.text.startsWith('This button could not be verified'))
-       ? true
-       : undefined
-   )
-diff --git a/services/api-rs/crates/centaur-api-server/src/error.rs b/services/api-rs/crates/centaur-api-server/src/error.rs
+diff --git a/crates/centaur-api-server/src/error.rs b/crates/centaur-api-server/src/error.rs
 index 7104b0f7..e6797fdc 100644
---- a/services/api-rs/crates/centaur-api-server/src/error.rs
-+++ b/services/api-rs/crates/centaur-api-server/src/error.rs
+--- a/crates/centaur-api-server/src/error.rs
++++ b/crates/centaur-api-server/src/error.rs
 @@ -75,6 +75,9 @@ impl IntoResponse for ApiError {
              )) => StatusCode::FORBIDDEN,
              Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
@@ -64,10 +51,10 @@ index 7104b0f7..e6797fdc 100644
      #[test]
      fn principal_derivation_errors_are_bad_requests() {
          let response = ApiError::Runtime(SessionRuntimeError::IronControl(
-diff --git a/services/api-rs/crates/centaur-workflows/src/approvals.rs b/services/api-rs/crates/centaur-workflows/src/approvals.rs
+diff --git a/crates/centaur-workflows/src/approvals.rs b/crates/centaur-workflows/src/approvals.rs
 index 5dd59a72..b110be1c 100644
---- a/services/api-rs/crates/centaur-workflows/src/approvals.rs
-+++ b/services/api-rs/crates/centaur-workflows/src/approvals.rs
+--- a/crates/centaur-workflows/src/approvals.rs
++++ b/crates/centaur-workflows/src/approvals.rs
 @@ -14,6 +14,23 @@ pub const DRIVER_WORKFLOW: &str = "centaur_approval_request";
  pub const DECISION_WORKFLOW: &str = "centaur_approval_decision";
  pub const EVENT_PREFIX: &str = "centaur.approval:";
@@ -103,10 +90,10 @@ index 5dd59a72..b110be1c 100644
  fn identifier(s: &str) -> bool {
      !s.is_empty()
          && s.len() <= 80
-diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs b/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs
+diff --git a/crates/centaur-workflows/src/approvals/repository.rs b/crates/centaur-workflows/src/approvals/repository.rs
 index c51c7efc..72376ef3 100644
---- a/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs
-+++ b/services/api-rs/crates/centaur-workflows/src/approvals/repository.rs
+--- a/crates/centaur-workflows/src/approvals/repository.rs
++++ b/crates/centaur-workflows/src/approvals/repository.rs
 @@ -191,10 +191,19 @@ impl Repository {
          validate_decision(p, &row, &input, button.message.as_ref())?;
          let user = input["click"]["user_id"].as_str().ok_or_else(unavailable)?;
@@ -160,10 +147,10 @@ index c51c7efc..72376ef3 100644
      Ok(())
  }
  
-diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs b/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
+diff --git a/crates/centaur-workflows/src/approvals/runner.rs b/crates/centaur-workflows/src/approvals/runner.rs
 index f1dc8caf..a92bbba8 100644
---- a/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
-+++ b/services/api-rs/crates/centaur-workflows/src/approvals/runner.rs
+--- a/crates/centaur-workflows/src/approvals/runner.rs
++++ b/crates/centaur-workflows/src/approvals/runner.rs
 @@ -40,16 +40,37 @@ pub(super) fn executor_outcome(
  
  pub(super) fn final_message(
@@ -308,10 +295,10 @@ index f1dc8caf..a92bbba8 100644
              &row.status,
              row.result.as_ref(),
              p.filter(|policy| hash(policy) == row.policy_hash),
-diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs b/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
+diff --git a/crates/centaur-workflows/src/approvals/tests.rs b/crates/centaur-workflows/src/approvals/tests.rs
 index a59b7ac1..2a8e7d0c 100644
---- a/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
-+++ b/services/api-rs/crates/centaur-workflows/src/approvals/tests.rs
+--- a/crates/centaur-workflows/src/approvals/tests.rs
++++ b/crates/centaur-workflows/src/approvals/tests.rs
 @@ -168,10 +168,23 @@ fn hello_world_public_result_reaches_slack_without_unselected_fields() {
          result,
          json!({"outcome":"succeeded","output":{"message":"Hello world!"}})
@@ -474,10 +461,10 @@ index a59b7ac1..2a8e7d0c 100644
 +    assert!(!invalid_requester.to_string().contains("<!channel"));
 +    assert_eq!(invalid_requester["mrkdwn"], false);
 +}
-diff --git a/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs b/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs
+diff --git a/crates/centaur-workflows/src/approvals/tests/postgres.rs b/crates/centaur-workflows/src/approvals/tests/postgres.rs
 index ef71af0a..6e931e21 100644
---- a/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs
-+++ b/services/api-rs/crates/centaur-workflows/src/approvals/tests/postgres.rs
+--- a/crates/centaur-workflows/src/approvals/tests/postgres.rs
++++ b/crates/centaur-workflows/src/approvals/tests/postgres.rs
 @@ -118,7 +118,7 @@ async fn native_admission_decision_claim_and_recovery() {
      sqlx::query("insert into session_executions(execution_id,thread_key,status,metadata) values('exe_test','slack:C1:1.000','running',$1)")
          .bind(json!({"source":"slackbotv2","platform":"slack","slack_team_id":"T1","slack_home_team_id":"T1","slack_channel_id":"C1","slack_user_id":"U2"})).execute(&pool).await.unwrap();
@@ -715,11 +702,11 @@ index ef71af0a..6e931e21 100644
      pool.close().await;
      sqlx::query(&format!("drop schema {schema} cascade"))
          .execute(&admin)
-diff --git a/services/api-rs/crates/centaur-workflows/src/lib.rs b/services/api-rs/crates/centaur-workflows/src/lib.rs
-index 90247f83..bb399c4d 100644
---- a/services/api-rs/crates/centaur-workflows/src/lib.rs
-+++ b/services/api-rs/crates/centaur-workflows/src/lib.rs
-@@ -4812,6 +4812,10 @@ pub enum WorkflowRuntimeError {
+diff --git a/crates/centaur-workflows/src/lib.rs b/crates/centaur-workflows/src/lib.rs
+index b5383a8a..7401af26 100644
+--- a/crates/centaur-workflows/src/lib.rs
++++ b/crates/centaur-workflows/src/lib.rs
+@@ -4853,6 +4853,10 @@ pub enum WorkflowRuntimeError {
      /// HTTP 403.
      #[error("{0}")]
      Disabled(String),
@@ -730,6 +717,19 @@ index 90247f83..bb399c4d 100644
      #[error("workflow run not found: {0}")]
      NotFound(String),
      /// Server-side failure (workflow host spawn/protocol, internal dispatch).
+diff --git a/e2e/tests/workflows.test.ts b/e2e/tests/workflows.test.ts
+index 8e84bdc0..975c865f 100644
+--- a/e2e/tests/workflows.test.ts
++++ b/e2e/tests/workflows.test.ts
+@@ -282,7 +282,7 @@ test('a workflow button click starts its target once, for the person who clicked
+   // clicker is told so.
+   expect((await slack.click(CHANNEL, posted.ts, approve, { value: 'v1.forged.signature' })).status).toBe(200)
+   await eventually('the refusal to reach the clicker', 30_000, async () =>
+-    (await slack.ephemeral(USER)).some(ephemeral => ephemeral.text === 'This request is no longer available.')
++    (await slack.ephemeral(USER)).some(ephemeral => ephemeral.text.startsWith('This button could not be verified'))
+       ? true
+       : undefined
+   )
 diff --git a/services/api-rs/rfcs/0006-tool-approvals.md b/services/api-rs/rfcs/0006-tool-approvals.md
 index e668305c..5f8d3c3e 100644
 --- a/services/api-rs/rfcs/0006-tool-approvals.md
@@ -786,10 +786,10 @@ index e668305c..5f8d3c3e 100644
  Never include secrets. Do not approve deferred mutable URLs/files/draft IDs;
  snapshot their contents first. The approval covers the reviewed executor's
 diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
-index ce2a79ae..42c4c4f8 100644
+index b852e1d8..b28dc4b8 100644
 --- a/services/slackbotv2/src/index.ts
 +++ b/services/slackbotv2/src/index.ts
-@@ -55,6 +55,7 @@ import {
+@@ -57,6 +57,7 @@ import {
    sessionStreamError,
    slackApiTimeoutMs,
    WORKFLOW_ACTION_PREFIX,
@@ -797,7 +797,7 @@ index ce2a79ae..42c4c4f8 100644
    withSlackApiTimeout
  } from './session-api'
  import {
-@@ -359,17 +360,17 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+@@ -393,17 +394,17 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
      }
      try {
        const result = await dispatchSlackBlockAction(options, payload)
@@ -821,12 +821,12 @@ index ce2a79ae..42c4c4f8 100644
                apiUrl: options.slackApiUrl,
                fetch: options.fetch as typeof globalThis.fetch | undefined,
 diff --git a/services/slackbotv2/src/session-api.ts b/services/slackbotv2/src/session-api.ts
-index 15945139..e2765022 100644
+index bc9f4cdb..2cbeec19 100644
 --- a/services/slackbotv2/src/session-api.ts
 +++ b/services/slackbotv2/src/session-api.ts
-@@ -569,6 +569,41 @@ export async function forwardToSessionApi(
- 
- export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
+@@ -571,6 +571,41 @@ export const SESSION_STEERING_DELIVERED_EVENT = 'session.steering_delivered'
+ /** Emitted by api-rs when a follow-up could not reach the still-running execution. */
+ export const SESSION_STEERING_FAILED_EVENT = 'session.steering_failed'
  
 +const approvalDecisionMessages: Record<string, string> = {
 +  not_approver: 'You are not an approver for this action. Ask a designated approver to review it.',
@@ -866,7 +866,7 @@ index 15945139..e2765022 100644
  export async function dispatchSlackBlockAction(
    options: SlackbotV2Options,
    payload: SlackbotV2BlockActionPayload
-@@ -619,8 +654,13 @@ export async function dispatchSlackBlockAction(
+@@ -621,8 +656,13 @@ export async function dispatchSlackBlockAction(
      action
    )
    if (workflowAction && response.status === 403) {
@@ -883,10 +883,10 @@ index 15945139..e2765022 100644
    await ensureApiOk(response, action)
    if (workflowAction) {
 diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
-index cd692641..956a571a 100644
+index d02e0641..db3335c9 100644
 --- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
 +++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
-@@ -325,6 +325,8 @@ describe('slackbotv2', () => {
+@@ -576,6 +576,8 @@ describe('slackbotv2', () => {
          ts: '1700000003.000200', text: 'Approve this release?',
          blocks: [
            { type: 'section', text: { type: 'mrkdwn', text: 'Approve this release?' } },
@@ -895,7 +895,7 @@ index cd692641..956a571a 100644
            { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Approve' },
              action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
              value: 'v1.opaque-signed-payload.signature' }] }
-@@ -370,6 +372,69 @@ describe('slackbotv2', () => {
+@@ -621,6 +623,69 @@ describe('slackbotv2', () => {
      expect(codexApi.workflowEvents).toHaveLength(0)
    })
  

@@ -2,6 +2,20 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "definitions": {
+    "slackbotv2ProactivityRules": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": ["name", "when"],
+        "properties": {
+          "name": { "type": "string", "pattern": "\\S" },
+          "when": { "type": "string", "pattern": "\\S" },
+          "context": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
     "podScheduling": {
       "type": "object",
       "properties": {
@@ -63,7 +77,8 @@
         "googleDocsSync": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" }
+            "enabled": { "type": "boolean" },
+            "oauthAppSlug": { "type": "string" }
           }
         },
         "service": {
@@ -231,6 +246,8 @@
       "type": "object",
       "properties": {
         "nodeSelector": { "type": "object" },
+        "hostUsers": { "type": ["boolean", "null"] },
+        "containerSecurityContext": { "type": "object" },
         "tolerations": { "type": "array" },
         "runtimeClassName": { "type": "string" },
         "serviceAccountName": { "type": "string" },
@@ -339,6 +356,38 @@
         "replicaCount": { "type": "integer", "minimum": 1 },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "databaseMaxConnections": { "type": "integer", "minimum": 1 },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "scrapeAnnotations": { "type": "boolean" },
+            "path": { "type": "string" },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        },
+        "resources": { "type": "object" },
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string" },
+            "tag": { "type": "string" },
+            "pullPolicy": { "type": "string" }
+          }
+        }
+      }
+    },
+    "tokenBroker": {
+      "allOf": [{ "$ref": "#/definitions/podScheduling" }],
+      "type": "object",
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "pollIntervalSeconds": { "type": "integer", "minimum": 1 },
+        "concurrency": { "type": "integer", "minimum": 1 },
+        "databaseMaxConnections": { "type": "integer", "minimum": 1 },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
         "metrics": {
           "type": "object",
           "properties": {
@@ -486,16 +535,29 @@
       "properties": {
         "agentViewEnabled": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
-        "codexNanocodexRolloutPercent": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 100
-        },
         "responseMetadataMode": {
           "type": "string",
           "enum": ["first", "always", "never"]
         },
         "responseServiceTierEnabled": { "type": "boolean" },
+        "proactivity": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "classifier": { "type": "string", "minLength": 1 },
+            "model": { "type": "string", "minLength": 1 },
+            "openaiBaseUrl": { "type": "string" },
+            "timeoutMs": { "type": "integer", "minimum": 1 },
+            "debounceMs": { "type": "integer", "minimum": 0 },
+            "defaultRules": { "$ref": "#/definitions/slackbotv2ProactivityRules" },
+            "channelRules": {
+              "type": "object",
+              "propertyNames": { "pattern": "^[A-Z0-9]+$" },
+              "additionalProperties": { "$ref": "#/definitions/slackbotv2ProactivityRules" }
+            }
+          },
+          "additionalProperties": false
+        },
         "metrics": {
           "type": "object",
           "properties": {

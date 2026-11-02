@@ -100,7 +100,7 @@ index 00000000..41e249d0
 +  return true
 +}
 diff --git a/services/slackbotv2/src/server.ts b/services/slackbotv2/src/server.ts
-index 95b56862..68fda95b 100644
+index 75eb0256..3cb5977d 100644
 --- a/services/slackbotv2/src/server.ts
 +++ b/services/slackbotv2/src/server.ts
 @@ -1,5 +1,6 @@
@@ -110,7 +110,7 @@ index 95b56862..68fda95b 100644
  import { isHarnessEnabled, parseEnabledHarnesses } from './overrides'
  import { resolveSlackHomeTeamId } from './session-api'
  import { resolveSlackBotUserId } from './slack-user'
-@@ -51,6 +52,7 @@ const consoleLogger = {
+@@ -53,6 +54,7 @@ const consoleLogger = {
  }
  
  const options: SlackbotV2Options = {
@@ -119,19 +119,19 @@ index 95b56862..68fda95b 100644
    agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),
    apiKey: optionalEnv('SLACKBOT_API_KEY'),
 diff --git a/services/slackbotv2/src/slack-events.ts b/services/slackbotv2/src/slack-events.ts
-index 6cd58f43..aba1e30c 100644
+index c824e695..629d891a 100644
 --- a/services/slackbotv2/src/slack-events.ts
 +++ b/services/slackbotv2/src/slack-events.ts
 @@ -2,6 +2,7 @@ import type { Logger, Message } from 'chat'
- import { withSlackApiTimeout } from './session-api'
+ import { fetchSlackExternalTeamIds, withSlackApiTimeout } from './session-api'
  import type { JsonValue, SlackbotV2Options } from './types'
- import { isJsonObject, stringValue } from './utils'
+ import { errorMessage, isJsonObject, nowMs, stringValue } from './utils'
 +import { channelWebhookAllowed, channelUserAllowed } from './channel-user-policy'
  
  type RawSlackBotProfile = {
    app_id?: JsonValue
-@@ -56,6 +57,10 @@ export function isAllowedSlackWebhookBody(
- ): boolean {
+@@ -80,6 +81,10 @@ export async function isAllowedSlackWebhookBody(
+ ): Promise<boolean> {
    const payload = parseSlackWebhookPayload(rawBody)
    if (!payload) return true
 +  if (!channelWebhookAllowed(payload, options.channelUserPolicy)) {
@@ -141,7 +141,7 @@ index 6cd58f43..aba1e30c 100644
    if (isRawSlackInteraction(payload) && payload.type === 'block_actions') {
      return isAllowedSlackInteraction(payload, options, logger)
    }
-@@ -81,7 +86,9 @@ export function parseSlackWebhookPayload(rawBody: string): Record<string, unknow
+@@ -103,7 +108,9 @@ export function parseSlackWebhookPayload(rawBody: string): Record<string, unknow
    const parsed = parseJsonObject(rawBody)
    if (parsed) return parsed
    const formPayload = new URLSearchParams(rawBody).get('payload')
@@ -152,7 +152,7 @@ index 6cd58f43..aba1e30c 100644
  }
  
  function parseJsonObject(value: string): Record<string, unknown> | null {
-@@ -123,6 +130,13 @@ export async function isAllowedSlackMessage(
+@@ -145,6 +152,13 @@ export async function isAllowedSlackMessage(
    options: SlackbotV2Options,
    logger: Logger
  ): Promise<boolean> {
@@ -164,21 +164,21 @@ index 6cd58f43..aba1e30c 100644
 +    return false
 +  }
    const raw = isRawSlackEvent(message.raw) ? message.raw : undefined
-   const allowedExternalTeamIds =
-     options.allowedExternalTeamIds ?? splitEnvList(process.env.SLACKBOT_EXTERNAL_ORG_ALLOWLIST)
+   const externalTeamId = raw ? externalSlackTeamId(raw) : undefined
+   if (externalTeamId && !(await isAllowedExternalTeamForMessage(externalTeamId, options, logger))) {
 diff --git a/services/slackbotv2/src/types.ts b/services/slackbotv2/src/types.ts
-index cae32128..0bcebe0e 100644
+index 6e590959..1a442ff5 100644
 --- a/services/slackbotv2/src/types.ts
 +++ b/services/slackbotv2/src/types.ts
-@@ -3,6 +3,7 @@ import type { CodexAppServerToChatStreamOptions } from '@centaur/rendering'
- import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
+@@ -4,6 +4,7 @@ import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
  import type { Hono } from 'hono'
  import type { ChannelDefaults } from './channel-defaults'
+ import type { ProactivityRule, ProactivityRules } from './proactivity-rules'
 +import type { ChannelUserPolicy } from './channel-user-policy'
  import type { HarnessOverrides } from './overrides'
  import type { SlackDisplayTextSource } from './slack-display-text'
  
-@@ -129,6 +130,8 @@ export type SlackbotV2BlockActionPayload = {
+@@ -123,6 +124,8 @@ export type SlackbotV2BlockActionPayload = {
  }
  
  export type SlackbotV2Options = {
@@ -189,7 +189,7 @@ index cae32128..0bcebe0e 100644
    apiUrl: string
 diff --git a/services/slackbotv2/test/channel-user-policy.test.ts b/services/slackbotv2/test/channel-user-policy.test.ts
 new file mode 100644
-index 00000000..af600433
+index 00000000..aabf60d0
 --- /dev/null
 +++ b/services/slackbotv2/test/channel-user-policy.test.ts
 @@ -0,0 +1,55 @@
@@ -221,9 +221,9 @@ index 00000000..af600433
 +    expect(channelWebhookAllowed(event('UOTHER', 'COTHER'), policy)).toBe(true)
 +    expect(channelWebhookAllowed({ ...event('UAPPROVED'), team_id: 'TOTHER' }, policy)).toBe(false)
 +  })
-+  it('blocks follow-ups, rich message mentions, file events and edits before SDK dispatch', () => {
++  it('blocks follow-ups, rich message mentions, file events and edits before SDK dispatch', async () => {
 +    for (const type of ['message', 'app_mention', 'file_shared']) {
-+      expect(isAllowedSlackWebhookBody(JSON.stringify(event('UOTHER', 'CPROTECTED', type)), options, logger)).toBe(false)
++      expect(await isAllowedSlackWebhookBody(JSON.stringify(event('UOTHER', 'CPROTECTED', type)), options, logger)).toBe(false)
 +    }
 +    const edited = event('UAPPROVED', 'CPROTECTED', 'message')
 +    expect(channelWebhookAllowed({ ...edited, event: { ...edited.event, subtype: 'message_changed', message: { user: 'UAPPROVED' } } }, policy)).toBe(false)
@@ -232,14 +232,14 @@ index 00000000..af600433
 +    const bot = event('UAPPROVED')
 +    expect(channelWebhookAllowed({ ...bot, event: { ...bot.event, bot_id: 'BBOT' } }, policy)).toBe(false)
 +  })
-+  it('checks workflow buttons, conflicting destinations and slash commands', () => {
++  it('checks workflow buttons, conflicting destinations and slash commands', async () => {
 +    const action = { type: 'block_actions', team: { id: 'THOME' }, user: { id: 'UOTHER' }, channel: { id: 'CPROTECTED' } }
 +    expect(channelWebhookAllowed(action, policy)).toBe(false)
 +    expect(channelWebhookAllowed({ ...action, user: { id: 'UAPPROVED' } }, policy)).toBe(true)
 +    expect(channelWebhookAllowed({ ...action, channel: { id: 'COTHER' }, container: { channel_id: 'CPROTECTED' } }, policy)).toBe(false)
 +    expect(channelWebhookAllowed({ ...action, channel: undefined }, policy)).toBe(false)
 +    const form = new URLSearchParams({ command: '/stop', team_id: 'THOME', channel_id: 'CPROTECTED', user_id: 'UOTHER' })
-+    expect(isAllowedSlackWebhookBody(form.toString(), options, logger)).toBe(false)
++    expect(await isAllowedSlackWebhookBody(form.toString(), options, logger)).toBe(false)
 +  })
 +  it('rechecks the normalized actor before message handoff', async () => {
 +    const message = { threadId: 'slack:CPROTECTED:1700000000.000001', author: { userId: 'UOTHER', isBot: false }, raw: { team: 'THOME' } } as Message
@@ -249,10 +249,10 @@ index 00000000..af600433
 +  })
 +})
 diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
-index 956a571a..6c3f407c 100644
+index db3335c9..e97b0222 100644
 --- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
 +++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
-@@ -130,6 +130,24 @@ afterAll(async () => {
+@@ -140,6 +140,24 @@ afterAll(async () => {
  })
  
  describe('slackbotv2', () => {

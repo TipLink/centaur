@@ -1,36 +1,36 @@
 {
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
-  "upstream_revision": "bf201201b2066911792ca03c789de7a515f41311",
-  "result_tree": "48b538928db4ce1f12feac73902f0c8b49e5b36f",
+  "upstream_revision": "466c93f3144ee681a259f4addc4373243bec458d",
+  "result_tree": "2ad88b5dd9b16570a9fd87abe78256ade1345167",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
-      "sha256": "ff2dbcc60646484bb107914090e3b0eab56427b39925acc007937d6792d9a051"
+      "sha256": "d033413764fea1beba6b43eca9922de7804e4e160a4ab73f6606f93680ac591a"
     },
     {
       "file": "0002-approval-slack-ux.patch",
-      "sha256": "3855e75f904a7b07c857d2d6103a90056b954b59894374f3c4706e24ae71a6c2"
+      "sha256": "47589ed327feb2424a8c301895db0908024db72e85a98376bd8928c60c92410b"
     },
     {
       "file": "0003-proxy-ack-diagnostics.patch",
-      "sha256": "5fe112fbc61e30c118fc292aa4e0f1ed4599d86abd9e8482247617991062d99a"
+      "sha256": "861df9ff0ceedecc889b0e2ac2ecbfc66c1ad3c016b4c94222642f3757b6a033"
     },
     {
       "file": "0004-skills-requester-authoring.patch",
-      "sha256": "eef8b19f011e6bea132e5670e6d699f9aebeac0add83c02468d7f2138d7a6e48"
+      "sha256": "b3478c4fdda3b2af7547c4c82d5d0a889a1afe4a18b2ca77b7966073abfdd3c4"
     },
     {
       "file": "0005-renumber-upstream-migrations.patch",
-      "sha256": "eaa43cc60df78e9f1721bfeddc123b4ab696e28cbe841f890d1003257e7983b6"
+      "sha256": "7429159354961263d101d63d19d20f8e344722889e5370d1cc9f6723ffb52434"
     },
     {
       "file": "0006-slack-channel-user-admission.patch",
-      "sha256": "ccb531bc5662c2dc01bcb5f7e64f55e6375859df6f13509240173b05f45789bf"
+      "sha256": "ec1e35cda135d39c857f14f98739482e72db3c83385364d3337ac32062fdda03"
     },
     {
       "file": "0007-fixed-thread-admission.patch",
-      "sha256": "30d4f847700310eeafa4fde8d605a0cbeace7e39287b04997f7ad1438664a8a7"
+      "sha256": "b6441f709ae18684fe42083623e1ab71b3d7a62127c2d4e3d1f50ef519514941"
     }
   ]
 }

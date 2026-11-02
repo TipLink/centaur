@@ -7,8 +7,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use codex_app_server_protocol::{JSONRPCMessage, ServerNotification};
-use harness_server::is_known_untyped_server_notification;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -1274,6 +1272,7 @@ fn turn_interrupt_rejects_wrong_thread_and_turn_without_killing_process() {
 
     let interrupted = bridge.run_turn_with_rejected_interrupts(
         &thread_id,
+        &start_log,
         3,
         4,
         5,
@@ -1884,9 +1883,12 @@ impl BridgeProcess {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Interrupts only after the harness has written `started_marker`, so a
+    /// slow spawn cannot be killed before it records its start.
     fn run_turn_with_rejected_interrupts(
         &mut self,
         thread_id: &str,
+        started_marker: &Path,
         request_id: i64,
         wrong_thread_interrupt_request_id: i64,
         wrong_turn_interrupt_request_id: i64,
@@ -1974,6 +1976,14 @@ impl BridgeProcess {
                     && !wrong_thread_interrupt_sent
                     && !capture.turn_id.is_empty()
                 {
+                    while !started_marker.exists() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "harness never wrote {}",
+                            started_marker.display()
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     self.send(json!({
                         "id": wrong_thread_interrupt_request_id,
                         "method": "turn/interrupt",
@@ -2507,27 +2517,24 @@ impl RawProcess {
     }
 }
 
+/// Checks the JSON-RPC envelope of a line of app-server stdout. Payload shapes
+/// are checked against the Codex types in `crates/harness-server-conformance`.
 fn validate_jsonrpc_value(value: &Value, allow_error: bool) {
-    let message: JSONRPCMessage =
-        serde_json::from_value(value.clone()).expect("valid JSON-RPC message");
-    match message {
-        JSONRPCMessage::Notification(notification) => {
-            let method = notification.method.clone();
-            if !is_known_untyped_server_notification(&method) {
-                ServerNotification::try_from(notification).unwrap_or_else(|error| {
-                    panic!(
-                        "notification is not a typed Codex App Server V2 notification: {error}; value={value}"
-                    )
-                });
-            }
-        }
-        JSONRPCMessage::Response(_) => {}
-        JSONRPCMessage::Error(error) => {
-            assert!(allow_error, "app-server returned JSON-RPC error: {error:?}");
-        }
-        JSONRPCMessage::Request(request) => {
-            panic!("app-server emitted unexpected request: {request:?}")
-        }
+    let has_id = value.get("id").is_some();
+    if value.get("method").is_some() {
+        assert!(!has_id, "app-server emitted unexpected request: {value}");
+        assert!(
+            value.get("params").is_some_and(Value::is_object),
+            "notification without params: {value}"
+        );
+    } else if let Some(error) = value.get("error") {
+        assert!(has_id, "JSON-RPC error without id: {value}");
+        assert!(allow_error, "app-server returned JSON-RPC error: {error}");
+    } else {
+        assert!(
+            has_id && value.get("result").is_some(),
+            "not a JSON-RPC message: {value}"
+        );
     }
 }
 
@@ -2751,6 +2758,135 @@ fn fake_codex_handles_resolved_and_unresolved_citations_in_both_modes() {
     }
 }
 
+/// The shared fake app-server, plus prompt-triggered exits for recovery tests.
+fn spawn_fake_codex_recovery(name: &str) -> (BridgeProcess, PathBuf, PathBuf) {
+    let fake_codex = temp_path(&format!("{name}.sh"));
+    let log = temp_path(&format!("{name}-requests.jsonl"));
+    let script = fake_codex_app_server_script(&log)
+        .replace("request_id() {", "echo $$ > \"$log.pid\"\n\nrequest_id() {")
+        .replace(
+            "    *'\"method\":\"turn/start\"'*)\n",
+            "    *'\"method\":\"turn/start\"'*)\n      case \"$line\" in *'die mid turn'*) exit 7;; esac\n",
+        )
+        .replace(
+            "      fi\n      ;;",
+            "      fi\n      case \"$line\" in *'exit after turn'*) exit 0;; esac\n      ;;",
+        );
+    std::fs::write(&fake_codex, script).unwrap();
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Codex,
+        None,
+        Some(("CODEX_BIN", fake_codex.to_str().unwrap())),
+    );
+    (bridge, fake_codex, log)
+}
+
+fn read_requests(log: &Path) -> Vec<Value> {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn count_method(requests: &[Value], method: &str) -> usize {
+    requests.iter().filter(|v| v["method"] == method).count()
+}
+
+/// Waits until the fake app-server has exited (a zombie counts: the harness reaps it).
+fn wait_for_fake_codex_exit(log: &Path) {
+    let pid_path = format!("{}.pid", log.display());
+    let pid = std::fs::read_to_string(pid_path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&output.stdout);
+        if stat.trim().is_empty() || stat.trim().starts_with('Z') {
+            return;
+        }
+        assert!(Instant::now() < deadline, "fake codex did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn fake_codex_blocks_mode_resumes_thread_after_app_server_exits_between_turns() {
+    let (mut bridge, fake_codex, log) = spawn_fake_codex_recovery("fake-idle-exit-codex");
+    for _ in 0..2 {
+        let turn = bridge.run_blocks_user_turn("exit after turn", Duration::from_secs(10));
+        assert_completed_turn(&turn);
+        wait_for_fake_codex_exit(&log);
+    }
+    let turn = bridge.run_blocks_user_turn("after restart", Duration::from_secs(10));
+    bridge.finish_successfully();
+    assert_completed_turn(&turn);
+
+    let requests = read_requests(&log);
+    assert_eq!(count_method(&requests, "thread/start"), 1);
+    assert_eq!(count_method(&requests, "turn/start"), 3);
+    let start = requests
+        .iter()
+        .find(|v| v["method"] == "thread/start")
+        .unwrap();
+    let resumes: Vec<_> = requests
+        .iter()
+        .filter(|v| v["method"] == "thread/resume")
+        .collect();
+    assert_eq!(resumes.len(), 2);
+    for resume in resumes {
+        assert_eq!(resume["params"]["threadId"], "thread-1");
+        assert_eq!(
+            resume["params"]["modelProvider"],
+            start["params"]["modelProvider"]
+        );
+    }
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_codex_blocks_mode_fails_disconnected_turn_without_replay_then_resumes() {
+    let (mut bridge, fake_codex, log) = spawn_fake_codex_recovery("fake-mid-turn-exit-codex");
+    assert_completed_turn(&bridge.run_blocks_user_turn("first", Duration::from_secs(10)));
+
+    bridge.send(json!({
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": "die mid turn"}]},
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = bridge.read_json(deadline);
+        assert_ne!(
+            value["method"], "turn/completed",
+            "disconnected turn must not succeed"
+        );
+        if value["method"] == "error" {
+            assert_eq!(value["params"]["willRetry"], false);
+            break;
+        }
+    }
+
+    let turn = bridge.run_blocks_user_turn("after restart", Duration::from_secs(10));
+    bridge.finish_successfully();
+    assert_completed_turn(&turn);
+
+    let requests = read_requests(&log);
+    assert_eq!(count_method(&requests, "thread/start"), 1);
+    assert_eq!(count_method(&requests, "thread/resume"), 1);
+    let prompts: Vec<_> = requests
+        .iter()
+        .filter(|v| v["method"] == "turn/start")
+        .map(|v| v["params"]["input"][0]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(prompts, ["first", "die mid turn", "after restart"]);
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(log);
+}
+
 fn fake_codex_app_server_script(log_path: &Path) -> String {
     let mut script = String::new();
     script.push_str("#!/bin/sh\n");
@@ -2886,4 +3022,99 @@ fn shell_quote(path: &Path) -> String {
 
 fn shell_quote_str(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+#[test]
+fn fake_codex_blocks_mode_filters_child_and_stale_notifications_across_queued_turns() {
+    // Codex 0.160.1 emits child-agent output on the parent's app-server pipe.
+    // Replay those shapes before the RPC response, during the turn, and after
+    // its completion so they cannot answer or complete a later execution.
+    let fake_codex = temp_path("fake-child-codex.sh");
+    let log = temp_path("fake-child-codex-requests.jsonl");
+    let replay = include_str!("fixtures/codex/child_notifications.jsonl")
+        .lines()
+        .map(|line| format!("printf '%s\\n' '{line}'"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parent_collab = json!({"method": "item/completed", "params": {
+        "threadId": "thread-1", "turnId": "turn-1", "completedAtMs": 2,
+        "item": {
+            "type": "collabAgentToolCall", "id": "spawn-child", "tool": "spawnAgent",
+            "status": "completed", "senderThreadId": "thread-1", "receiverThreadIds": ["child"],
+            "prompt": "review", "model": null, "reasoningEffort": null, "agentsStates": {},
+        },
+    }});
+    let script = fake_codex_app_server_script(&log)
+        .replace(
+            r#"      printf '{"id":%s,"result":{"turn":{"id":"turn-1"}}}\n' "$id""#,
+            &format!(
+                r#"{replay}
+      printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1"}}}}}}\n' "$id"
+{replay}"#,
+            ),
+        )
+        .replace(
+            "      if [ -n \"${FAKE_CODEX_TURN_DELAY:-}\" ]; then",
+            &format!("{replay}\nprintf '%s\\n' '{parent_collab}'\n      if [ -n \"${{FAKE_CODEX_TURN_DELAY:-}}\" ]; then"),
+        )
+        .replace(
+            "      fi\n      ;;",
+            &format!("      fi\n{replay}\n      ;;"),
+        );
+    std::fs::write(&fake_codex, script).expect("write fake codex script");
+    let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_codex, permissions).unwrap();
+    let mut bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Codex,
+        None,
+        Some(("CODEX_BIN", fake_codex.to_str().unwrap())),
+    );
+    for prompt in ["first queued turn", "second queued turn"] {
+        bridge.send(json!({
+            "type": "user", "thread_key": "slack:C123:123.456",
+            "trace_metadata": {"source": "slackbotv2", "action": "execute"},
+            "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for _ in 0..2 {
+        let turn = bridge.read_blocks_turn(deadline);
+        assert_completed_turn(&turn);
+        assert_codex_v2_turn(&turn);
+        assert_eq!(turn.text_from_deltas, "codex blocks");
+        assert_eq!(turn.completed_agent_items.len(), 1);
+    }
+    let lines = bridge.finish_successfully();
+    let events = lines
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["method"] == "turn/completed")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["params"]["item"]["id"] == "spawn-child")
+            .count(),
+        2
+    );
+    for event in events {
+        if let Some(thread) = event.pointer("/params/threadId") {
+            assert_eq!(thread, "thread-1");
+        }
+        if let Some(turn) = event
+            .pointer("/params/turnId")
+            .or_else(|| event.pointer("/params/turn/id"))
+        {
+            assert_eq!(turn, "turn-1");
+        }
+    }
+    std::fs::remove_file(fake_codex).unwrap();
+    std::fs::remove_file(log).unwrap();
 }

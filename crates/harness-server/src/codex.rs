@@ -10,11 +10,11 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use codex_app_server_protocol::UserInput;
 use serde_json::{Value, json};
 
 use self::citations::CodexCitationFilter;
 use crate::otel::{TurnStatus as TelemetryTurnStatus, TurnTelemetry};
+use crate::protocol::UserInput;
 use crate::server::{
     BlocksCommand, BlocksState, parse_blocks_line_with_state, usage_span_input_value,
     write_blocks_error,
@@ -241,6 +241,11 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 );
                 turn_active.store(true, Ordering::SeqCst);
                 let result = (|| -> Result<()> {
+                    if let Some(child) = codex.as_mut()
+                        && child.child.try_wait()?.is_some()
+                    {
+                        codex = None;
+                    }
                     if codex.is_none() {
                         let mut child = CodexJsonRpcChild::spawn()?;
                         initialize_codex(
@@ -249,6 +254,25 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                             &mut request_id,
                             traceparent.as_deref(),
                         )?;
+                        // A relay/app-server may exit between turns while the
+                        // surrounding sandbox remains healthy. Restore the
+                        // current conversation before sending any new input.
+                        if let Some(resume_id) = thread_id.as_deref() {
+                            let resumed = start_or_resume_thread(
+                                &mut child,
+                                &mut stdout,
+                                &mut request_id,
+                                model.as_deref().or(thread_model.as_deref()),
+                                thread_provider.as_deref().unwrap_or(&model_provider),
+                                Some(resume_id),
+                                traceparent.as_deref(),
+                            )?;
+                            if resumed.id != resume_id {
+                                return Err(HarnessServerError::Protocol(
+                                    "Codex app-server resumed a different thread".to_owned(),
+                                ));
+                            }
+                        }
                         codex = Some(child);
                     }
                     run_codex_user_turn(
@@ -276,6 +300,16 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 turn_active.store(false, Ordering::SeqCst);
                 drain_codex_active_turn_requests(&active_turn_rx);
                 if let Err(error) = result {
+                    if matches!(
+                        error,
+                        HarnessServerError::CodexTransport(_)
+                            | HarnessServerError::CodexExited { .. }
+                    ) {
+                        // Do not replay this turn: a disconnect can happen
+                        // after the server accepted it or ran tools. The next
+                        // explicit user turn will start a fresh child and resume.
+                        codex = None;
+                    }
                     let fallback_thread_id = thread_id.as_deref().unwrap_or("codex");
                     eprintln!("Codex blocks turn failed: {error:#}");
                     write_blocks_error(&mut stdout, fallback_thread_id, "turn", error.to_string())?;
@@ -339,7 +373,7 @@ fn initialize_codex<W: Write>(
         traceparent,
     )?;
     codex
-        .read_response_or_forward(initialize_id, stdout)
+        .read_response_or_forward(initialize_id, stdout, None)
         .map(|_| ())
 }
 
@@ -368,6 +402,7 @@ fn run_codex_user_turn<W: Write>(
             request_id,
             model.as_deref(),
             &model_provider,
+            None,
             traceparent,
         )?;
         *thread_id = Some(thread.id);
@@ -430,7 +465,8 @@ fn run_codex_user_turn<W: Write>(
     loop {
         let turn_request_id = next_request_id(request_id);
         codex.send_request(turn_request_id, "turn/start", params.clone(), traceparent)?;
-        let result = codex.read_response_or_forward(turn_request_id, stdout)?;
+        let result =
+            codex.read_response_or_forward(turn_request_id, stdout, Some(&current_thread_id))?;
         let turn_id = result
             .pointer("/turn/id")
             .and_then(Value::as_str)
@@ -481,12 +517,14 @@ fn start_or_resume_thread<W: Write>(
     request_id: &mut i64,
     model: Option<&str>,
     model_provider: &str,
+    resume_thread_id: Option<&str>,
     traceparent: Option<&str>,
 ) -> Result<StartedCodexThread> {
     let cwd = env::current_dir()?.display().to_string();
-    let resume = env::var("CODEX_CONTINUE_THREAD_ID")
+    let initial_resume = env::var("CODEX_CONTINUE_THREAD_ID")
         .or_else(|_| env::var("AMP_CONTINUE_THREAD_ID"))
         .unwrap_or_default();
+    let resume = resume_thread_id.unwrap_or(&initial_resume);
     let (method, mut params) = if resume.trim().is_empty() {
         (
             "thread/start",
@@ -522,7 +560,7 @@ fn start_or_resume_thread<W: Write>(
 
     let id = next_request_id(request_id);
     codex.send_request(id, method, params, traceparent)?;
-    let result = codex.read_response_or_forward(id, stdout)?;
+    let result = codex.read_response_or_forward(id, stdout, None)?;
     started_codex_thread_from_response(&result, method)
 }
 
@@ -634,9 +672,12 @@ impl CodexJsonRpcChild {
     }
 
     fn write_value(&mut self, value: &Value) -> Result<()> {
-        serde_json::to_writer(&mut self.stdin, value)?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        self.stdin
+            .write_all(&line)
+            .and_then(|()| self.stdin.flush())
+            .map_err(HarnessServerError::CodexTransport)?;
         Ok(())
     }
 
@@ -644,7 +685,11 @@ impl CodexJsonRpcChild {
         &mut self,
         expected_id: i64,
         stdout: &mut W,
+        thread_id: Option<&str>,
     ) -> Result<Value> {
+        // Notifications can precede the response that identifies the new thread
+        // or turn. Buffer them until ownership is known, including on resume.
+        let mut notifications = Vec::new();
         loop {
             let value = self.read_value()?;
             if is_server_request(&value) {
@@ -657,10 +702,21 @@ impl CodexJsonRpcChild {
                         "Codex app-server request {expected_id} failed: {error}"
                     )));
                 }
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                let result = value.get("result").cloned().unwrap_or(Value::Null);
+                let thread_id = result
+                    .pointer("/thread/id")
+                    .and_then(Value::as_str)
+                    .or(thread_id);
+                let turn_id = result.pointer("/turn/id").and_then(Value::as_str);
+                for notification in notifications {
+                    if notification_matches_scope(&notification, thread_id, turn_id) {
+                        self.citations.write_value(stdout, &notification)?;
+                    }
+                }
+                return Ok(result);
             }
             if notification_method(&value).is_some() && !is_dropped_notification(&value) {
-                self.citations.write_value(stdout, &value)?;
+                notifications.push(value);
             }
         }
     }
@@ -722,7 +778,9 @@ impl CodexJsonRpcChild {
                 }
                 continue;
             }
-            if notification_method(&value).is_none() {
+            if notification_method(&value).is_none()
+                || !notification_matches_scope(&value, Some(thread_id), Some(turn_id))
+            {
                 continue;
             }
             let terminal = is_terminal_notification(&value, thread_id, turn_id);
@@ -807,11 +865,8 @@ impl CodexJsonRpcChild {
     fn read_value(&mut self) -> Result<Value> {
         loop {
             let line = match self.stdout.recv() {
-                Ok(line) => line?,
-                Err(_) => {
-                    let status = self.child.wait()?;
-                    return Err(HarnessServerError::CodexExited { status });
-                }
+                Ok(line) => line.map_err(HarnessServerError::CodexTransport)?,
+                Err(_) => return Err(self.disconnected_stdout_error()),
             };
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -824,11 +879,10 @@ impl CodexJsonRpcChild {
     fn read_value_timeout(&mut self, timeout: Duration) -> Result<Option<Value>> {
         loop {
             let line = match self.stdout.recv_timeout(timeout) {
-                Ok(line) => line?,
+                Ok(line) => line.map_err(HarnessServerError::CodexTransport)?,
                 Err(RecvTimeoutError::Timeout) => return Ok(None),
                 Err(RecvTimeoutError::Disconnected) => {
-                    let status = self.child.wait()?;
-                    return Err(HarnessServerError::CodexExited { status });
+                    return Err(self.disconnected_stdout_error());
                 }
             };
             let trimmed = line.trim();
@@ -836,6 +890,19 @@ impl CodexJsonRpcChild {
                 continue;
             }
             return Ok(Some(serde_json::from_str(trimmed)?));
+        }
+    }
+
+    fn disconnected_stdout_error(&mut self) -> HarnessServerError {
+        // EOF does not guarantee process exit. A relay can close its transport
+        // while still running cleanup; waiting here would hang the user turn.
+        match self.child.try_wait() {
+            Ok(Some(status)) => HarnessServerError::CodexExited { status },
+            Ok(None) => HarnessServerError::CodexTransport(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "app-server stdout closed",
+            )),
+            Err(error) => HarnessServerError::CodexTransport(error),
         }
     }
 }
@@ -1058,6 +1125,26 @@ fn codex_supports_stdio_listen(bin: &str) -> bool {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     stdout.contains("--listen") || stderr.contains("--listen")
+}
+
+/// Only the requested thread and turn may reach the session stream. Codex
+/// 0.160.1 also emits child-agent notifications on the same app-server pipe;
+/// forwarding their answers or completion would close the parent execution.
+fn notification_matches_scope(
+    value: &Value,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> bool {
+    let notification_thread = value
+        .pointer("/params/threadId")
+        .or_else(|| value.pointer("/params/thread/id"))
+        .and_then(Value::as_str);
+    let notification_turn = value
+        .pointer("/params/turnId")
+        .or_else(|| value.pointer("/params/turn/id"))
+        .and_then(Value::as_str);
+    notification_thread.is_none_or(|id| Some(id) == thread_id)
+        && notification_turn.is_none_or(|id| Some(id) == turn_id)
 }
 
 #[cfg(test)]
@@ -1315,5 +1402,43 @@ mod tests {
         });
         assert!(!is_terminal_notification(&retryable, "thread-1", "turn-1"));
         assert!(is_terminal_notification(&exhausted, "thread-1", "turn-1"));
+    }
+
+    #[test]
+    fn notification_scope_preserves_parent_and_global_events() {
+        for params in [
+            json!({}),
+            json!({"threadId": "parent"}),
+            json!({"thread": {"id": "parent"}}),
+            json!({"threadId": "parent", "turnId": "active"}),
+            json!({"threadId": "parent", "turn": {"id": "active"}}),
+        ] {
+            assert!(notification_matches_scope(
+                &json!({"params": params}),
+                Some("parent"),
+                Some("active"),
+            ));
+        }
+    }
+
+    #[test]
+    fn notification_scope_rejects_children_and_stale_turns() {
+        for params in [
+            json!({"threadId": "child", "turnId": "active"}),
+            json!({"thread": {"id": "child"}}),
+            json!({"threadId": "parent", "turnId": "previous"}),
+            json!({"threadId": "parent", "turn": {"id": "previous"}}),
+        ] {
+            assert!(!notification_matches_scope(
+                &json!({"params": params}),
+                Some("parent"),
+                Some("active"),
+            ));
+        }
+        assert!(!notification_matches_scope(
+            &json!({"params": {"threadId": "child"}}),
+            None,
+            None,
+        ));
     }
 }

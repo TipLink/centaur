@@ -7,6 +7,30 @@ import {
 } from './codex-app-server'
 
 describe('CodexAppServerRendererEventMapper', () => {
+  it.each([
+    ['', ''],
+    ['\n', ''],
+    ['', '\n'],
+    ['\n', '\n'],
+    ['\n\n', ''],
+    ['', '\n\n']
+  ])('separates distinct answer items with a paragraph boundary (%j, %j)', (suffix, prefix) => {
+    const mapper = new CodexAppServerRendererEventMapper({ preStreamGraceMs: 0 })
+    const question = 'Does it stay chopped?\n- Stays chopped\n- Only during animation'
+    const answer = 'Opened draft PR to fix overlapping digits.'
+    const events = [
+      ...mapper.process({ type: 'item.agentMessage.delta', itemId: 'question', delta: question + suffix }),
+      // Token chunks within one item must still concatenate exactly.
+      ...mapper.process({ type: 'item.agentMessage.delta', itemId: 'answer', delta: prefix + 'Opened draft' }),
+      ...mapper.process({ type: 'item.agentMessage.delta', itemId: 'answer', delta: ' PR to fix overlapping digits.' }),
+      ...mapper.process({ type: 'item.completed', item: { id: 'answer', type: 'agentMessage', text: prefix + answer } }),
+      ...mapper.flush()
+    ]
+    const streamed = events.flatMap(event => event.type === 'renderer.message.delta' ? [event.delta] : []).join('')
+    expect(streamed).toBe(question + '\n\n' + answer)
+    expect(events.at(-1)).toMatchObject({ type: 'renderer.done', answerMarkdown: streamed })
+  })
+
   it('maps final answer deltas to generic renderer message deltas after activity exists', () => {
     const mapper = new CodexAppServerRendererEventMapper()
 
@@ -85,6 +109,135 @@ describe('CodexAppServerRendererEventMapper', () => {
     })
     expect(next.find(event => event.type === 'renderer.task.update')).toMatchObject({
       task: { id: 'cmd-1', title: '1. Command execution', status: 'in_progress' }
+    })
+  })
+
+  it('suppresses unphased progress messages and promotes only the terminal message', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const output: Array<ReturnType<typeof mapper.process>[number]> = []
+    const process = (event: unknown) => output.push(...mapper.process(event))
+
+    process({ type: 'item.started', item: { id: 'progress-1', type: 'agentMessage' } })
+    process({
+      type: 'item.agentMessage.delta',
+      itemId: 'progress-1',
+      delta: 'Let me inspect the linked thread.'
+    })
+    process({
+      type: 'item.completed',
+      item: { id: 'progress-1', type: 'agentMessage', text: 'Let me inspect the linked thread.' }
+    })
+    process({
+      type: 'item.started',
+      item: { id: 'cmd-1', type: 'commandExecution', command: 'slack thread C123:123.456' }
+    })
+    process({
+      type: 'item.completed',
+      item: {
+        id: 'cmd-1',
+        type: 'commandExecution',
+        command: 'slack thread C123:123.456',
+        status: 'completed'
+      }
+    })
+    process({ type: 'item.started', item: { id: 'final-1', type: 'agentMessage' } })
+    process({ type: 'item.agentMessage.delta', itemId: 'final-1', delta: 'Investigation complete.' })
+    process({
+      type: 'item.completed',
+      item: { id: 'final-1', type: 'agentMessage', text: 'Investigation complete.' }
+    })
+    process({ type: 'turn.completed', turn: { status: 'completed' } })
+
+    const messages = output.filter(event => event.type === 'renderer.message.delta')
+    expect(messages).toEqual([
+      {
+        type: 'renderer.message.delta',
+        delta: 'Investigation complete.',
+        force: false,
+        planPrefix: true
+      }
+    ])
+    expect(output.at(-1)).toMatchObject({
+      type: 'renderer.done',
+      answerMarkdown: 'Investigation complete.'
+    })
+  })
+
+  it('keeps every unphased message after the last tool call', () => {
+    const mapper = new CodexAppServerRendererEventMapper({ preStreamGraceMs: 0 })
+    const output: Array<ReturnType<typeof mapper.process>[number]> = []
+    const process = (event: unknown) => output.push(...mapper.process(event))
+    const message = (id: string, text: string) => {
+      process({ type: 'item.started', item: { id, type: 'agentMessage' } })
+      process({ type: 'item.agentMessage.delta', itemId: id, delta: text })
+      process({ type: 'item.completed', item: { id, type: 'agentMessage', text } })
+    }
+
+    message('progress-1', 'Let me run the tests.')
+    process({ type: 'item.started', item: { id: 'cmd-1', type: 'commandExecution', command: 'pnpm test' } })
+    process({
+      type: 'item.completed',
+      item: { id: 'cmd-1', type: 'commandExecution', command: 'pnpm test', status: 'completed' }
+    })
+    message('final-1', 'The tests pass.')
+    message('final-2', 'The fix is ready for review.')
+    process({ type: 'turn.completed', turn: { status: 'completed' } })
+
+    expect(output.at(-1)).toMatchObject({
+      type: 'renderer.done',
+      answerMarkdown: 'The tests pass.\n\nThe fix is ready for review.'
+    })
+  })
+
+  it('discards unphased messages before any non-message work item', () => {
+    for (const item of [
+      { type: 'webSearch', query: 'release notes' },
+      { type: 'mcpToolCall', server: 'docs', tool: 'search' },
+      { type: 'collabAgentToolCall', tool: 'spawn_agent' }
+    ]) {
+      const mapper = new CodexAppServerRendererEventMapper({ preStreamGraceMs: 0 })
+      const output: Array<ReturnType<typeof mapper.process>[number]> = []
+      const process = (event: unknown) => output.push(...mapper.process(event))
+      const message = (id: string, text: string) => {
+        process({ type: 'item.started', item: { id, type: 'agentMessage' } })
+        process({ type: 'item.completed', item: { id, type: 'agentMessage', text } })
+      }
+
+      message('progress-1', 'Let me look that up.')
+      process({ type: 'item.started', item: { id: 'work-1', ...item } })
+      process({ type: 'item.completed', item: { id: 'work-1', ...item } })
+      message('final-1', 'Here is the answer.')
+      process({ type: 'turn.completed', turn: { status: 'completed' } })
+
+      expect(output.at(-1)).toMatchObject({
+        type: 'renderer.done',
+        answerMarkdown: 'Here is the answer.'
+      })
+    }
+  })
+
+  it('uses the phased completed text when the phase arrives after deltas', () => {
+    const mapper = new CodexAppServerRendererEventMapper({ preStreamGraceMs: 0 })
+    const output: Array<ReturnType<typeof mapper.process>[number]> = []
+    const process = (event: unknown) => output.push(...mapper.process(event))
+
+    process({ type: 'item.started', item: { id: 'narration', type: 'agentMessage' } })
+    process({ type: 'item.agentMessage.delta', itemId: 'narration', delta: 'Narration draft.' })
+    process({
+      type: 'item.completed',
+      item: { id: 'narration', type: 'agentMessage', phase: 'commentary', text: 'Narration.' }
+    })
+    process({ type: 'item.started', item: { id: 'answer', type: 'agentMessage' } })
+    process({ type: 'item.agentMessage.delta', itemId: 'answer', delta: 'Draft answer.' })
+    process({
+      type: 'item.completed',
+      item: { id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'Canonical answer.' }
+    })
+    process({ type: 'turn.completed', turn: { status: 'completed' } })
+
+    expect(output.at(-1)).toMatchObject({
+      type: 'renderer.done',
+      answerMarkdown: 'Canonical answer.'
     })
   })
 
@@ -670,7 +823,7 @@ describe('CodexAppServerRendererEventMapper', () => {
   })
 
   it('suppresses the live delta instead of interleaving when the recomposed answer diverges from streamed text', () => {
-    // Two concurrent final-answer items compose as A + B. Growing A (a
+    // Two concurrent final-answer items compose as separate paragraphs. Growing A (a
     // non-trailing component) after B was already streamed shifts B's bytes, so
     // a byte-offset slice would re-read and re-emit B, duplicating it
     // ("Hello world." -> "Hello world.world."). The guard refuses the
@@ -699,7 +852,7 @@ describe('CodexAppServerRendererEventMapper', () => {
     run({ type: 'item.agentMessage.delta', itemId: 'A', delta: 'there ' })
 
     const streamed = deltas.join('')
-    expect(streamed).toBe('Hello world.')
+    expect(streamed).toBe('Hello \n\nworld.')
     expect(streamed).not.toContain('world.world.')
     expect(logs).toContain('codex_renderer_stream_divergence_suppressed')
     // The signal is recorded once per render, not on every subsequent event.
@@ -747,7 +900,7 @@ describe('CodexAppServerRendererEventMapper', () => {
           },
           {
             eventKind: 'session.execution_cancelled',
-            data: { error: 'Execution interrupted' }
+            data: { error: 'Execution interrupted.' }
           }
         ])
       )
@@ -756,7 +909,32 @@ describe('CodexAppServerRendererEventMapper', () => {
     expect(chunks.filter(chunk => chunk.type === 'markdown_text')).toEqual([
       {
         type: 'markdown_text',
-        text: 'Execution interrupted'
+        text: 'Execution interrupted.'
+      }
+    ])
+  })
+
+  it('emits interrupted final text when the interrupted turn precedes cancellation', async () => {
+    const chunks = await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          {
+            type: 'item.started',
+            item: { id: 'cmd-1', type: 'commandExecution', command: 'sleep 60' }
+          },
+          { type: 'turn.completed', turn: { id: 'turn-1', status: 'interrupted' } },
+          {
+            eventKind: 'session.execution_cancelled',
+            data: { error: 'Execution interrupted.' }
+          }
+        ])
+      )
+    )
+
+    expect(chunks.filter(chunk => chunk.type === 'markdown_text')).toEqual([
+      {
+        type: 'markdown_text',
+        text: 'Execution interrupted.'
       }
     ])
   })
