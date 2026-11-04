@@ -117,6 +117,8 @@ pub struct AnthropicSystemTask {
     #[serde(default, deserialize_with = "lenient")]
     pub task_id: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
+    pub tool_use_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
     pub task_type: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
     pub description: Option<String>,

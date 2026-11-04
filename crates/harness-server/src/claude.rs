@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -29,23 +29,26 @@ const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"]
 /// original delta chunks after an `AgentMessageStarted` carrying the stop reason,
 /// so the item starts with the right phase and native chunking is preserved.
 ///
-/// Background subagents (Agent tool with `run_in_background`) outlive the
+/// Background subagents and Monitor watches outlive the
 /// message that launched them: Claude Code emits that turn's `result`, then
-/// runs a follow-up turn on its own once a subagent's `task_notification`
-/// lands. While main-chain agents are running — or a notification has not
+/// runs a follow-up turn on its own once a task's `task_notification`
+/// lands. While main-chain tasks are running — or a notification has not
 /// yet been answered by a new main-chain message — the turn is held open:
 /// terminal text flushes as commentary and the interim `result` is swallowed,
 /// so the follow-up's answer is delivered by this turn instead of being
-/// drained as stale output before the next one. Each background agent is
+/// drained as stale output before the next one. Each background task is
 /// surfaced as a tool item that starts on `task_started` and completes with
-/// the agent's summary on `task_notification`; a resumed agent starts again
+/// the task's summary on `task_notification`; a resumed agent starts again
 /// and gets a new item.
 #[derive(Debug, Default)]
 pub struct ClaudeEventNormalizer {
     inner: AnthropicEventNormalizer,
     pending: Vec<PendingAgentMessage>,
-    /// Main-chain background agents still owed a `task_notification`, by task id.
-    background_agents: HashMap<String, BackgroundAgent>,
+    /// Main-chain tasks still owed a `task_notification`, by task id.
+    background_tasks: HashMap<String, BackgroundTask>,
+    /// Shell monitors have the same `local_bash` task type as detached servers.
+    /// Match their launch to the Monitor tool call instead of holding every shell.
+    monitor_calls: HashSet<String>,
     awaiting_follow_up: bool,
     /// Claude Code's own turn ended (its `result` was swallowed) and no
     /// follow-up message has started since.
@@ -53,15 +56,15 @@ pub struct ClaudeEventNormalizer {
 }
 
 #[derive(Debug)]
-struct BackgroundAgent {
+struct BackgroundTask {
     item_raw_id: String,
-    /// Listed by the latest `background_tasks_changed`. An agent can drop out
+    /// Listed by the latest `background_tasks_changed`. A task can drop out
     /// just before its notification lands, so it is still owed one.
     live: bool,
 }
 
 /// How long a held turn waits for Claude Code's follow-up once no background
-/// agent is live. Any output (including API retry notices) restarts it.
+/// task is live. Any output (including API retry notices) restarts it.
 const FOLLOW_UP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
@@ -84,7 +87,7 @@ impl ClaudeEventNormalizer {
         let token_usage = event.token_usage();
         let message_stop_reason = event.message_stop_reason().map(str::to_string);
         let mut out = Vec::new();
-        self.track_background_agents(&event, &mut out);
+        self.track_background_tasks(&event, &mut out);
         let normalized = self.inner.normalize(event);
         if let Some(usage) = token_usage {
             out.push(NormalizedEvent::TokenUsage { usage });
@@ -140,9 +143,20 @@ impl ClaudeEventNormalizer {
                     self.flush_other_messages(&item_id, out);
                     self.pending_for(item_id).canonical = Some(text);
                 }
-                part @ NormalizedContent::ToolUse { .. } => {
+                NormalizedContent::ToolUse {
+                    raw_id,
+                    tool,
+                    arguments,
+                } => {
+                    if tool == "Monitor" {
+                        self.monitor_calls.insert(raw_id.clone());
+                    }
                     has_tool_use = true;
-                    passthrough.push(part);
+                    passthrough.push(NormalizedContent::ToolUse {
+                        raw_id,
+                        tool,
+                        arguments,
+                    });
                 }
                 part @ NormalizedContent::ReasoningText { .. } => passthrough.push(part),
             }
@@ -196,7 +210,7 @@ impl ClaudeEventNormalizer {
     }
 
     fn flush_pending(&mut self, stop_reason: Option<String>, out: &mut Vec<NormalizedEvent>) {
-        // A message that ends the model's turn while background agents still
+        // A message that ends the model's turn while background tasks still
         // owe a follow-up is commentary, not the final answer; flushing it as
         // `end_turn` would also arm the terminal-stop fallback.
         let stop_reason = match stop_reason {
@@ -209,20 +223,20 @@ impl ClaudeEventNormalizer {
     }
 
     fn holding_turn(&self) -> bool {
-        self.awaiting_follow_up || !self.background_agents.is_empty()
+        self.awaiting_follow_up || !self.background_tasks.is_empty()
     }
 
     pub fn turn_hold(&self) -> TurnHold {
         if !self.holding_turn() {
             TurnHold::Released
-        } else if self.result_held && !self.background_agents.values().any(|agent| agent.live) {
+        } else if self.result_held && !self.background_tasks.values().any(|task| task.live) {
             TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
         } else {
             TurnHold::Waiting
         }
     }
 
-    fn track_background_agents(
+    fn track_background_tasks(
         &mut self,
         event: &AnthropicStreamEvent,
         out: &mut Vec<NormalizedEvent>,
@@ -242,13 +256,22 @@ impl ClaudeEventNormalizer {
             _ => return,
         };
         match subtype {
-            Some("task_started") if task.is_backgrounded && task.is_main_chain_agent() => {
+            Some("task_started") => {
                 let Some(task_id) = &task.task_id else { return };
+                let monitor = task
+                    .tool_use_id
+                    .as_ref()
+                    .is_some_and(|id| self.monitor_calls.remove(id));
+                if task.owned_by_subagent
+                    || !(monitor || task.is_backgrounded && task.is_main_chain_agent())
+                {
+                    return;
+                }
                 // Unique per run: a resumed agent reuses its task id.
-                let item_raw_id = format!("background-agent-{}", Uuid::new_v4().simple());
-                self.background_agents.insert(
+                let item_raw_id = format!("background-task-{}", Uuid::new_v4().simple());
+                self.background_tasks.insert(
                     task_id.clone(),
-                    BackgroundAgent {
+                    BackgroundTask {
                         item_raw_id: item_raw_id.clone(),
                         live: true,
                     },
@@ -258,7 +281,12 @@ impl ClaudeEventNormalizer {
                     stop_reason: None,
                     content: vec![NormalizedContent::ToolUse {
                         raw_id: item_raw_id,
-                        tool: BACKGROUND_AGENT_TOOL.to_string(),
+                        tool: if monitor {
+                            "BackgroundMonitor"
+                        } else {
+                            BACKGROUND_AGENT_TOOL
+                        }
+                        .to_string(),
                         arguments: json!({
                             "description": task.description,
                             "subagent_type": task.subagent_type,
@@ -269,12 +297,12 @@ impl ClaudeEventNormalizer {
             Some("task_notification") => {
                 // Notifications carry no task type; match the launch by id.
                 let Some(task_id) = &task.task_id else { return };
-                let Some(agent) = self.background_agents.remove(task_id) else {
+                let Some(task_run) = self.background_tasks.remove(task_id) else {
                     return;
                 };
                 self.awaiting_follow_up = true;
                 out.push(NormalizedEvent::ToolResults(vec![NormalizedToolResult {
-                    tool_use_id: agent.item_raw_id,
+                    tool_use_id: task_run.item_raw_id,
                     content: task.summary.clone().unwrap_or_default(),
                     is_error: task.status.as_deref() != Some("completed"),
                     exit_code: None,
@@ -282,8 +310,8 @@ impl ClaudeEventNormalizer {
             }
             Some("background_tasks_changed") => {
                 let Some(tasks) = &task.tasks else { return };
-                for (task_id, agent) in &mut self.background_agents {
-                    agent.live = tasks
+                for (task_id, task_run) in &mut self.background_tasks {
+                    task_run.live = tasks
                         .iter()
                         .any(|task| task.task_id.as_ref() == Some(task_id));
                 }
@@ -718,6 +746,19 @@ mod tests {
     /// follow-up turn once the agent's `task_notification` lands.
     #[test]
     fn background_agent_holds_turn_open_until_follow_up_result() {
+        background_task_follow_up("Agent", "local_agent");
+    }
+
+    #[test]
+    fn monitor_holds_turn_open_until_follow_up_result() {
+        // A real shell Monitor reports local_bash, just like a detached server.
+        // WebSocket and MCP monitors share the same tool-call correlation.
+        for task_type in ["local_bash", "monitor_ws", "monitor_mcp"] {
+            background_task_follow_up("Monitor", task_type);
+        }
+    }
+
+    fn background_task_follow_up(tool: &str, task_type: &str) {
         let harness = ClaudeCodeHarness;
         let mut normalizer = ClaudeEventNormalizer::default();
         let mut feed = |event: Value| {
@@ -734,15 +775,21 @@ mod tests {
         };
 
         feed(
-            json!({"type": "assistant", "message": {"id": "msg_1", "content": [{"type": "tool_use", "id": "toolu_agent", "name": "Agent", "input": {"run_in_background": true}}]}}),
+            json!({"type": "assistant", "message": {"id": "msg_1", "content": [{"type": "tool_use", "id": "toolu_agent", "name": tool, "input": {}}]}}),
         );
         feed(
-            json!({"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "a1", "task_type": "local_agent"}]}),
+            json!({"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "a1", "task_type": task_type}]}),
         );
         let started = feed(
-            json!({"type": "system", "subtype": "task_started", "task_id": "a1", "tool_use_id": "toolu_agent", "description": "Research prices", "subagent_type": "general-purpose", "is_backgrounded": true, "task_type": "local_agent"}),
+            json!({"type": "system", "subtype": "task_started", "task_id": "a1", "tool_use_id": "toolu_agent", "description": "Research prices", "subagent_type": "general-purpose", "is_backgrounded": true, "task_type": task_type}),
         );
-        let item_raw_id = background_agent_raw_id(&started);
+        let item_raw_id = background_task_raw_id(&started);
+        assert!(matches!(
+            &started[0],
+            NormalizedEvent::AssistantMessage { content, .. }
+                if matches!(&content[0], NormalizedContent::ToolUse { tool: name, .. }
+                    if name == &format!("Background{tool}"))
+        ));
         feed(
             json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_agent", "content": "Async agent launched successfully."}]}}),
         );
@@ -803,10 +850,12 @@ mod tests {
         assert!(done.iter().any(NormalizedEvent::is_terminal));
     }
 
-    fn background_agent_raw_id(events: &[NormalizedEvent]) -> String {
+    fn background_task_raw_id(events: &[NormalizedEvent]) -> String {
         match events {
             [NormalizedEvent::AssistantMessage { content, .. }] => match content.as_slice() {
-                [NormalizedContent::ToolUse { raw_id, tool, .. }] if tool == "BackgroundAgent" => {
+                [NormalizedContent::ToolUse { raw_id, tool, .. }]
+                    if matches!(tool.as_str(), "BackgroundAgent" | "BackgroundMonitor") =>
+                {
                     raw_id.clone()
                 }
                 other => panic!("expected a BackgroundAgent tool use, got {other:?}"),
@@ -856,13 +905,13 @@ mod tests {
         let notified = json!({"type": "system", "subtype": "task_notification", "task_id": "a1", "status": "completed"});
         let message_start = json!({"type": "stream_event", "event": {"type": "message_start", "message": {"id": "msg_2", "content": []}}});
 
-        let first = background_agent_raw_id(&normalize(&mut normalizer, started.clone()));
+        let first = background_task_raw_id(&normalize(&mut normalizer, started.clone()));
         normalize(&mut normalizer, notified.clone());
         normalize(&mut normalizer, message_start.clone());
         assert!(normalize(&mut normalizer, notified.clone()).is_empty());
         assert_eq!(normalizer.turn_hold(), TurnHold::Released);
 
-        let resumed = background_agent_raw_id(&normalize(&mut normalizer, started));
+        let resumed = background_task_raw_id(&normalize(&mut normalizer, started));
         assert_ne!(first, resumed);
         assert_eq!(normalizer.turn_hold(), TurnHold::Waiting);
         assert!(matches!(
@@ -932,6 +981,33 @@ mod tests {
             json!({"type": "result", "subtype": "success", "result": "done"}),
         );
         assert!(events.iter().any(NormalizedEvent::is_terminal));
+    }
+
+    #[test]
+    fn monitor_call_without_its_own_task_does_not_hold_the_turn() {
+        for task in [
+            json!({"tool_use_id": "unrelated", "task_type": "local_bash"}),
+            json!({"tool_use_id": "toolu_monitor", "task_type": "local_bash", "owned_by_subagent": true}),
+        ] {
+            let mut normalizer = ClaudeEventNormalizer::default();
+            normalize(
+                &mut normalizer,
+                json!({"type": "assistant", "message": {"id": "msg_1", "content": [{"type": "tool_use", "id": "toolu_monitor", "name": "Monitor", "input": {}}]}}),
+            );
+            // A rejected Monitor call alone cannot leave the turn waiting.
+            assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+            let mut started = json!({"type": "system", "subtype": "task_started", "task_id": "b1", "is_backgrounded": true});
+            started
+                .as_object_mut()
+                .unwrap()
+                .extend(task.as_object().unwrap().clone());
+            assert!(normalize(&mut normalizer, started).is_empty());
+            let done = normalize(
+                &mut normalizer,
+                json!({"type": "result", "subtype": "success", "result": "done"}),
+            );
+            assert!(done.iter().any(NormalizedEvent::is_terminal));
+        }
     }
 
     #[test]
