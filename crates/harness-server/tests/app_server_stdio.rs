@@ -246,6 +246,27 @@ fn codex_question_capability_change_resumes_the_same_thread() {
         .find(|request| request["method"] == "thread/resume")
         .expect("capability change must resume context");
     assert_eq!(resume["params"]["threadId"], "question-thread");
+    let turns: Vec<_> = requests
+        .iter()
+        .filter(|request| request["method"] == "turn/start")
+        .collect();
+    assert_eq!(turns.len(), 2);
+    assert!(
+        turns[0]["params"]["input"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("native question tool"))
+    );
+    assert_eq!(turns[0]["params"]["input"][1]["text"], "Interactive task");
+    assert_eq!(turns[1]["params"]["input"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        turns[1]["params"]["input"][0]["text"],
+        "Continue without UI"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["params"].get("developerInstructions").is_none())
+    );
     let launches = requests
         .iter()
         .filter_map(|request| request["argv"].as_array())
@@ -411,15 +432,24 @@ fn fake_claude_trailing_result_settles_the_turn_and_does_not_poison_the_next() {
 
 #[test]
 fn fake_claude_background_agent_follow_up_completes_the_turn() {
-    background_task_follow_up("Agent", "local_agent");
+    background_task_follow_up("Agent", "local_agent", json!({}));
 }
 
 #[test]
 fn fake_claude_monitor_follow_up_completes_the_turn() {
-    background_task_follow_up("Monitor", "local_bash");
+    background_task_follow_up("Monitor", "local_bash", json!({}));
 }
 
-fn background_task_follow_up(tool: &str, task_type: &str) {
+#[test]
+fn fake_claude_bounded_background_command_delivers_follow_up_in_the_original_turn() {
+    background_task_follow_up(
+        "Bash",
+        "local_bash",
+        json!({"command":"sleep 3", "run_in_background":true, "timeout":60000}),
+    );
+}
+
+fn background_task_follow_up(tool: &str, task_type: &str, input: Value) {
     // Claude Code ends the launching turn with its own `result`, then runs a
     // follow-up turn once the background agent notifies (here after 3s, longer
     // than the settle window). The follow-up's answer belongs to this turn.
@@ -427,8 +457,9 @@ fn background_task_follow_up(tool: &str, task_type: &str) {
         "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}'; ",
         "IFS= read -r _; ",
         "printf '%s\\n' ",
-        "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_launch\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_launch\",\"name\":\"__TOOL__\",\"input\":{}}]}}' ",
+        "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_launch\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_launch\",\"name\":\"__TOOL__\",\"input\":__INPUT__}]}}' ",
         "'{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"tool_use_id\":\"toolu_launch\",\"description\":\"Research\",\"is_backgrounded\":true,\"task_type\":\"__TASK_TYPE__\"}' ",
+        "'{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_launch\",\"content\":\"Background task started.\"}]}}' ",
         "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}}' ",
         "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"content\":[{\"type\":\"text\",\"text\":\"Started research.\"}]}}' ",
         "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}}' ",
@@ -442,7 +473,8 @@ fn background_task_follow_up(tool: &str, task_type: &str) {
         "sleep 60"
     )
     .replace("__TOOL__", tool)
-    .replace("__TASK_TYPE__", task_type);
+    .replace("__TASK_TYPE__", task_type)
+    .replace("__INPUT__", &input.to_string());
 
     let run = run_bridge_turn(BridgeTurnConfig {
         harness: Harness::ClaudeCode,
@@ -454,10 +486,90 @@ fn background_task_follow_up(tool: &str, task_type: &str) {
     assert_completed_turn(&run.turn);
     assert_eq!(run.turn.text_from_deltas, "Started research.The answer.");
     assert_codex_v2_turn(&run.turn);
+    if tool == "Bash" {
+        let notifications: Vec<Value> = run
+            .stdout_lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for method in ["item/started", "item/completed"] {
+            let command = notifications
+                .iter()
+                .find(|value| {
+                    value["method"] == method
+                        && value["params"]["item"]["tool"] == "BackgroundCommand"
+                })
+                .expect("bounded command lifecycle item");
+            assert_eq!(command["params"]["turnId"], run.turn.turn_id);
+        }
+        assert_eq!(
+            notifications
+                .iter()
+                .filter(|value| value["method"] == "turn/completed")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn fake_claude_unbounded_background_server_does_not_hold_the_turn() {
+    // The fake server remains alive and waits for another input. Holding the
+    // first turn would deadlock rather than yield a second user turn.
+    let fake_claude = concat!(
+        "IFS= read -r _; printf '%s\\n' ",
+        "'{\"type\":\"assistant\",\"message\":{\"id\":\"launch\",\"content\":[{\"type\":\"tool_use\",\"id\":\"server\",\"name\":\"Bash\",\"input\":{\"command\":\"serve\",\"run_in_background\":true}}]}}' ",
+        "'{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"server-task\",\"tool_use_id\":\"server\",\"is_backgrounded\":true,\"task_type\":\"local_bash\"}' ",
+        "'{\"type\":\"assistant\",\"message\":{\"id\":\"ready\",\"content\":[{\"type\":\"text\",\"text\":\"Server ready.\"}]}}' ",
+        "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Server ready.\"}'; ",
+        "IFS= read -r _; printf '%s\\n' ",
+        "'{\"type\":\"assistant\",\"message\":{\"id\":\"next\",\"content\":[{\"type\":\"text\",\"text\":\"Second answer.\"}]}}' ",
+        "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Second answer.\"}'; sleep 60"
+    );
+    let run = run_bridge_two_turns(BridgeTwoTurnConfig {
+        harness: Harness::ClaudeCode,
+        command_override: Some(fake_claude.to_string()),
+        first_prompt: "start server".to_string(),
+        second_prompt: "continue".to_string(),
+        timeout: Duration::from_secs(10),
+    });
+    assert_completed_turn(&run.turns[0]);
+    assert_eq!(run.turns[0].text_from_deltas, "Server ready.");
+    assert_completed_turn(&run.turns[1]);
+    assert_eq!(run.turns[1].text_from_deltas, "Second answer.");
 }
 
 #[test]
 fn fake_claude_turn_ending_with_live_background_agent_does_not_poison_the_next() {
+    background_task_ending_does_not_poison_the_next("Agent", "local_agent", json!({}), false);
+}
+
+#[test]
+fn fake_claude_bounded_background_command_error_does_not_poison_the_next_turn() {
+    background_task_ending_does_not_poison_the_next(
+        "Bash",
+        "local_bash",
+        json!({"command":"sleep 1", "run_in_background":true, "timeout":60000}),
+        false,
+    );
+}
+
+#[test]
+fn fake_claude_bounded_background_command_cancellation_does_not_poison_the_next_turn() {
+    background_task_ending_does_not_poison_the_next(
+        "Bash",
+        "local_bash",
+        json!({"command":"sleep 1", "run_in_background":true, "timeout":60000}),
+        true,
+    );
+}
+
+fn background_task_ending_does_not_poison_the_next(
+    tool: &str,
+    task_type: &str,
+    input: Value,
+    interrupt: bool,
+) {
     // An error result ends the turn while a background agent still runs. Its
     // later follow-up must not be read as the next turn's answer: the process
     // is stopped and the next turn resumes in a fresh one.
@@ -470,8 +582,9 @@ fn fake_claude_turn_ending_with_live_background_agent_does_not_poison_the_next()
             "'{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_3\",\"content\":[{{\"type\":\"text\",\"text\":\"second answer\"}}]}}}}' ",
             "'{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"second answer\"}}'; sleep 60; fi; ",
             "touch {marker}; printf '%s\\n' ",
-            "'{{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"is_backgrounded\":true,\"task_type\":\"local_agent\"}}' ",
-            "'{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}}'; ",
+            "'{{\"type\":\"assistant\",\"message\":{{\"id\":\"launch\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"launch-tool\",\"name\":\"{tool}\",\"input\":{input}}}]}}}}' ",
+            "'{{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"tool_use_id\":\"launch-tool\",\"is_backgrounded\":true,\"task_type\":\"{task_type}\"}}'; ",
+            "{ending}",
             "sleep 1; printf '%s\\n' ",
             "'{{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"a1\",\"status\":\"completed\"}}' ",
             "'{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"content\":[{{\"type\":\"text\",\"text\":\"stale follow-up\"}}]}}}}' ",
@@ -479,19 +592,53 @@ fn fake_claude_turn_ending_with_live_background_agent_does_not_poison_the_next()
             "sleep 60"
         ),
         marker = shell_quote(&marker),
+        tool = tool,
+        input = input,
+        task_type = task_type,
+        ending = if interrupt {
+            ""
+        } else {
+            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}'; "
+        },
     );
 
-    let run = run_bridge_two_turns(BridgeTwoTurnConfig {
-        harness: Harness::ClaudeCode,
-        command_override: Some(fake_claude),
-        first_prompt: "first".to_string(),
-        second_prompt: "second".to_string(),
-        timeout: Duration::from_secs(10),
-    });
+    let timeout = Duration::from_secs(10);
+    let mut bridge = BridgeProcess::spawn_harness(Harness::ClaudeCode, Some(fake_claude), None);
+    let thread_id = bridge.initialize_and_start_thread(Harness::ClaudeCode, timeout);
+    if interrupt {
+        bridge.send(json!({"id":3,"method":"turn/start","params":{
+            "threadId":thread_id,"input":[{"type":"text","text":"first","text_elements":[]}]
+        }}));
+        let deadline = Instant::now() + timeout;
+        loop {
+            let value = bridge.read_json(deadline);
+            if value["method"] == "item/started"
+                && value["params"]["item"]["tool"] == "BackgroundCommand"
+            {
+                bridge.send(json!({"id":4,"method":"turn/interrupt","params":{
+                    "threadId":thread_id,"turnId":value["params"]["turnId"]
+                }}));
+                break;
+            }
+            assert_ne!(value["method"], "turn/completed", "command was not held");
+        }
+        loop {
+            let value = bridge.read_json(deadline);
+            if value["method"] == "turn/completed" {
+                assert_eq!(value["params"]["turn"]["status"], "interrupted");
+                break;
+            }
+        }
+    } else {
+        let failed = bridge.run_turn(&thread_id, 3, "first", None, timeout);
+        assert_eq!(failed.terminal_status.as_deref(), Some("failed"));
+    }
+    let second = bridge.run_turn(&thread_id, 5, "second", None, timeout);
+    bridge.finish_successfully();
     let _ = std::fs::remove_file(&marker);
 
-    assert_completed_turn(&run.turns[1]);
-    assert_eq!(run.turns[1].text_from_deltas, "second answer");
+    assert_completed_turn(&second);
+    assert_eq!(second.text_from_deltas, "second answer");
 }
 
 #[test]

@@ -49,7 +49,7 @@ pub enum HarnessServerError {
     },
     #[error("Hermes exited with status {status}")]
     HermesExited { status: ExitStatus },
-    #[error("{kind:?} did not continue the turn after its background work finished")]
+    #[error("{kind:?} did not finish its background work or follow-up before the deadline")]
     BackgroundFollowUpStalled { kind: HarnessKind },
     #[error("{message}")]
     UnknownModel { message: String },
