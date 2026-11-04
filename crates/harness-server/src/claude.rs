@@ -4,10 +4,11 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::protocol::UserInput;
+use crate::user_input::{Answers, NativeUserInputRequest, Question, UserInputControl, json_line};
 use crate::{
     HarnessKind, HarnessServer, NormalizedContent, NormalizedEvent, NormalizedToolResult, Result,
     ThreadState, TurnHold,
@@ -376,6 +377,9 @@ impl HarnessServer for ClaudeCodeHarness {
             "--permission-mode",
             "bypassPermissions",
         ]);
+        if state.supports_user_input {
+            command.args(["--permission-prompt-tool", "stdio"]);
+        }
         if !state.model.is_empty() {
             command.args(["--model", &state.model]);
         }
@@ -433,6 +437,90 @@ impl HarnessServer for ClaudeCodeHarness {
         AnthropicStreamEvent::parse_json_line(line)
     }
 
+    fn user_input_control(&self, line: &str) -> Result<Option<UserInputControl>> {
+        let value: Value = serde_json::from_str(line)?;
+        if value["type"] == "control_cancel_request" {
+            return Ok(Some(UserInputControl::Cancel(value["request_id"].clone())));
+        }
+        if value["type"] != "control_request" {
+            return Ok(None);
+        }
+        let id = value["request_id"].clone();
+        let request = &value["request"];
+        if request["subtype"] == "can_use_tool" && request["tool_name"] == "AskUserQuestion" {
+            let input = request["input"].clone();
+            let Some(questions) = input["questions"].as_array() else {
+                return Ok(Some(rejected_question_control(id)?));
+            };
+            let mut normalized = Vec::with_capacity(questions.len());
+            let mut texts = std::collections::HashSet::new();
+            for (index, question) in questions.iter().enumerate() {
+                if !texts.insert(question["question"].as_str().unwrap_or_default()) {
+                    return Ok(Some(rejected_question_control(id)?));
+                }
+                let mut question = question.clone();
+                question["id"] = json!(format!("question_{}", index + 1));
+                question["allowOther"] = json!(true);
+                let Ok(question) = serde_json::from_value::<Question>(question) else {
+                    return Ok(Some(rejected_question_control(id)?));
+                };
+                normalized.push(question);
+            }
+            return Ok(Some(UserInputControl::Request(NativeUserInputRequest {
+                native_id: id,
+                item_id: request["tool_use_id"]
+                    .as_str()
+                    .unwrap_or("AskUserQuestion")
+                    .to_owned(),
+                questions: normalized,
+                input,
+                is_blocking: true,
+            })));
+        }
+        // Enabling the native question channel must not silently approve any
+        // other permission request. Ordinary bypassPermissions behavior stays
+        // in the CLI; requests it still escalates remain denied here.
+        let response = if request["subtype"] == "can_use_tool" {
+            json!({"subtype":"success","request_id":id,"response":{"behavior":"deny","message":"Centaur only handles AskUserQuestion on this input channel"}})
+        } else {
+            json!({"subtype":"error","request_id":id,"error":"Unsupported host control request"})
+        };
+        Ok(Some(UserInputControl::Reply(json_line(
+            &json!({"type":"control_response","response":response}),
+        )?)))
+    }
+
+    fn stdin_for_user_input_response(
+        &self,
+        request: &NativeUserInputRequest,
+        answers: &Answers,
+    ) -> Result<Vec<u8>> {
+        let mut input = request.input.clone();
+        let native_answers = request
+            .questions
+            .iter()
+            .map(|question| {
+                (
+                    question.question.clone(),
+                    json!(answers[&question.id].answers.join(", ")),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        input["answers"] = Value::Object(native_answers);
+        json_line(&json!({"type":"control_response","response":{
+            "subtype":"success","request_id":request.native_id,
+            "response":{"behavior":"allow","updatedInput":input}
+        }}))
+    }
+
+    fn stdin_for_user_input_rejection(&self, request: &NativeUserInputRequest) -> Result<Vec<u8>> {
+        let UserInputControl::Reply(bytes) = rejected_question_control(request.native_id.clone())?
+        else {
+            unreachable!()
+        };
+        Ok(bytes)
+    }
+
     fn normalize_events(
         &self,
         normalizer: &mut Self::EventNormalizer,
@@ -466,6 +554,15 @@ impl HarnessServer for ClaudeCodeHarness {
     }
 }
 
+fn rejected_question_control(native_id: Value) -> Result<UserInputControl> {
+    Ok(UserInputControl::Reply(json_line(
+        &json!({"type":"control_response","response":{
+            "subtype":"success","request_id":native_id,
+            "response":{"behavior":"deny","message":"This question request is unsupported or exceeds the chat input limits"}
+        }}),
+    )?))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -477,6 +574,69 @@ mod tests {
     };
 
     use super::{ClaudeCodeHarness, ClaudeEventNormalizer};
+    use crate::user_input::UserInputControl;
+
+    #[test]
+    fn native_questions_return_all_answers_in_claudes_original_shape() {
+        let original = json!({"type":"control_request","request_id":"native-1","request":{
+            "subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"tool-1",
+            "input":{"questions":[
+                {"header":"Project","question":"Which project?","options":[{"label":"Alpha","description":"Fits"},{"label":"Beta","description":"Fits too"}],"multiSelect":false},
+                {"header":"Scope","question":"Which features?","options":[{"label":"API","description":"Server"},{"label":"UI","description":"Client"}],"multiSelect":true}
+            ],"metadata":{"source":"native"}}
+        }});
+        let Some(UserInputControl::Request(request)) = ClaudeCodeHarness
+            .user_input_control(&original.to_string())
+            .unwrap()
+        else {
+            panic!("missing question");
+        };
+        assert!(request.questions[1].multi_select);
+        let answers = std::collections::BTreeMap::from([
+            (
+                "question_1".into(),
+                crate::user_input::UserInputAnswer {
+                    answers: vec!["Custom project".into()],
+                },
+            ),
+            (
+                "question_2".into(),
+                crate::user_input::UserInputAnswer {
+                    answers: vec!["API".into(), "UI".into()],
+                },
+            ),
+        ]);
+        let response: Value = serde_json::from_slice(
+            &ClaudeCodeHarness
+                .stdin_for_user_input_response(&request, &answers)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["response"]["request_id"], "native-1");
+        let input = &response["response"]["response"]["updatedInput"];
+        assert_eq!(
+            input["questions"],
+            original["request"]["input"]["questions"]
+        );
+        assert_eq!(input["metadata"]["source"], "native");
+        assert_eq!(
+            input["answers"],
+            json!({"Which project?":"Custom project","Which features?":"API, UI"})
+        );
+    }
+
+    #[test]
+    fn native_question_channel_does_not_approve_other_tools() {
+        let control = json!({"type":"control_request","request_id":"permission-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo should-not-run"}}});
+        let Some(UserInputControl::Reply(bytes)) = ClaudeCodeHarness
+            .user_input_control(&control.to_string())
+            .unwrap()
+        else {
+            panic!("missing denial");
+        };
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
+    }
 
     fn normalize(normalizer: &mut ClaudeEventNormalizer, event: Value) -> Vec<NormalizedEvent> {
         normalizer.normalize(serde_json::from_value(event).unwrap())

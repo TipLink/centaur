@@ -52,4 +52,12 @@ describe('channel user admission', () => {
     message.author.userId = 'UAPPROVED'
     expect(await isAllowedSlackMessage(message, options, logger)).toBe(true)
   })
+  it('checks the original channel on native question modal submissions', () => {
+    const modal = { type: 'view_submission', team: { id: 'THOME' }, user: { id: 'UOTHER' },
+      view: { callback_id: 'centaur.user_input:answer', private_metadata: JSON.stringify({ channel_id: 'CPROTECTED' }) } }
+    expect(channelWebhookAllowed(modal, policy)).toBe(false)
+    expect(channelWebhookAllowed({ ...modal, user: { id: 'UAPPROVED' } }, policy)).toBe(true)
+    expect(channelWebhookAllowed({ ...modal, channel: { id: 'COTHER' } }, policy)).toBe(false)
+    expect(channelWebhookAllowed({ ...modal, view: { ...modal.view, private_metadata: '{}' } }, policy)).toBe(false)
+  })
 })

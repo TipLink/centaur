@@ -121,6 +121,9 @@ pub fn run_hermes_blocks_server() -> Result<()> {
                 eprintln!("Hermes blocks interrupt ignored: no active turn runs");
             }
             Ok(BlocksCommand::AttachmentChunk) => {}
+            Ok(BlocksCommand::UserInputResponse(_)) => {
+                eprintln!("user input response ignored: harness does not support native questions");
+            }
             Err(error) => {
                 eprintln!("invalid Hermes blocks input: {error}");
                 write_blocks_error(&mut stdout, &thread_id, "input", error)?;

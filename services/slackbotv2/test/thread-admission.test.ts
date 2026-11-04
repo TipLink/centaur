@@ -29,3 +29,15 @@ test('errors and malformed responses fail closed; unrelated channels stay indepe
   expect(await admitSlackThread(request, body.replace('CPROTECTED', 'COTHER'), { ...options,
     fetch: (async () => { throw new Error('must not call') }) as unknown as NonNullable<SlackbotV2Options["fetch"]> })).toBe(true)
 })
+
+test('native controls retain the fixed-owner channel denial, including modal private metadata', async () => {
+  const noFetch = { ...options,
+    fetch: (async () => { throw new Error('controls must not establish ownership') }) as NonNullable<SlackbotV2Options['fetch']> }
+  const modal = { type: 'view_submission', team: { id: 'THOME' }, user: { id: 'UOWNER' },
+    view: { callback_id: 'centaur.user_input:answer', private_metadata: JSON.stringify({ channel_id: 'CPROTECTED' }) } }
+  expect(await admitSlackThread(request, JSON.stringify(modal), noFetch)).toBe(false)
+  expect(await admitSlackThread(request, JSON.stringify({ ...modal, channel: { id: 'COTHER' } }), noFetch)).toBe(false)
+  expect(await admitSlackThread(request, JSON.stringify({ type: 'block_actions', channel: { id: 'CPROTECTED' } }), noFetch)).toBe(false)
+  expect(await admitSlackThread(request, JSON.stringify({ ...modal,
+    view: { ...modal.view, private_metadata: JSON.stringify({ channel_id: 'COTHER' }) } }), noFetch)).toBe(true)
+})

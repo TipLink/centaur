@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
+import { supportsNativeUserInput } from './channel-user-policy'
 import { isRetryableCodexErrorNotification } from '@centaur/rendering'
 import type { Attachment, LinkPreview, Message } from 'chat'
 import { isHarnessEnabled } from './overrides'
@@ -570,6 +571,49 @@ export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
 export const SESSION_STEERING_DELIVERED_EVENT = 'session.steering_delivered'
 /** Emitted by api-rs when a follow-up could not reach the still-running execution. */
 export const SESSION_STEERING_FAILED_EVENT = 'session.steering_failed'
+/** Emitted by api-rs while a long execution is still running. */
+export const SESSION_PROGRESS_UPDATE_EVENT = 'session.progress_update'
+
+export const SESSION_USER_INPUT_REQUESTED_EVENT = 'session.user_input.requested'
+export const SESSION_USER_INPUT_RESOLVED_EVENT = 'session.user_input.resolved'
+
+export async function getSessionUserInput(
+  options: SlackbotV2Options,
+  threadId: string,
+  requestId: string
+): Promise<import('./types').SessionUserInputRequest> {
+  const response = await fetchWithTimeout(
+    options.fetch ?? globalThis.fetch,
+    new URL(`/api/session/${encodeURIComponent(threadId)}/user-input/${encodeURIComponent(requestId)}`, options.apiUrl),
+    { headers: apiHeaders(options, false) },
+    sessionApiTimeoutMs(options),
+    'get pending user input'
+  )
+  await ensureApiOk(response, 'get pending user input')
+  return response.json()
+}
+
+export async function submitSessionUserInput(
+  options: SlackbotV2Options,
+  threadId: string,
+  request: import('./types').SessionUserInputRequest,
+  answers: import('./types').SessionUserInputAnswers,
+  responderUserId: string
+): Promise<void> {
+  const response = await fetchWithTimeout(
+    options.fetch ?? globalThis.fetch,
+    new URL(`/api/session/${encodeURIComponent(threadId)}/user-input/${encodeURIComponent(request.request_id)}`, options.apiUrl),
+    {
+      method: 'POST',
+      headers: apiHeaders(options),
+      body: JSON.stringify({ execution_id: request.execution_id, answers, responder_user_id: responderUserId })
+    },
+    sessionApiTimeoutMs(options),
+    'answer pending user input'
+  )
+  await ensureApiOk(response, 'answer pending user input')
+  await response.body?.cancel()
+}
 
 const approvalDecisionMessages: Record<string, string> = {
   not_approver: 'You are not an approver for this action. Ask a designated approver to review it.',
@@ -1452,6 +1496,7 @@ async function executeSession(
       message,
       {
         action: 'execute',
+        supports_user_input: supportsNativeUserInput(threadId, options.channelUserPolicy, options.threadAdmissionUrl),
         ...(recordedModel ? { model: recordedModel } : {}),
         ...(metadataHarnessType ? { harness_type: metadataHarnessType } : {})
       },
@@ -1774,7 +1819,10 @@ function toCodexInputLineWithStaged(
   return JSON.stringify({
     type: 'user',
     thread_key: threadId,
-    trace_metadata: sessionMetadata(options, message, { action: 'execute' }, requesterIdentity),
+    trace_metadata: sessionMetadata(options, message, {
+      action: 'execute',
+      supports_user_input: supportsNativeUserInput(threadId, options.channelUserPolicy, options.threadAdmissionUrl)
+    }, requesterIdentity),
     ...(model ? { model } : {}),
     ...(provider ? { provider } : {}),
     ...(reasoning ? { reasoning } : {}),
@@ -2100,6 +2148,9 @@ async function* parseSessionEventStream(
     // Slack hides when a follow-up message lands in the thread.
     if (
       event.event === 'session.activity_summary' ||
+      event.event === SESSION_PROGRESS_UPDATE_EVENT ||
+      event.event === SESSION_USER_INPUT_REQUESTED_EVENT ||
+      event.event === SESSION_USER_INPUT_RESOLVED_EVENT ||
       event.event === SESSION_STEERING_DELIVERED_EVENT ||
       event.event === SESSION_STEERING_FAILED_EVENT
     ) {

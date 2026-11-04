@@ -1,14 +1,12 @@
 import type { SlackbotV2Options } from './types'
 import { parseSlackWebhookPayload } from './slack-events'
+import { slackWebhookChannels } from './channel-user-policy'
 
 /** Forward signed bytes to a trusted ownership service before any SDK effects. */
 export async function admitSlackThread(request: Request, body: string, options: SlackbotV2Options): Promise<boolean> {
   if (!options.threadAdmissionUrl) return true
   const payload = parseSlackWebhookPayload(body)
-  const event = payload?.event as Record<string, unknown> | undefined
-  const channel = payload?.channel as Record<string, unknown> | undefined
-  const container = payload?.container as Record<string, unknown> | undefined
-  const channels = [event?.channel, event?.channel_id, payload?.channel_id, channel?.id, container?.channel_id]
+  const channels = payload ? slackWebhookChannels(payload) : []
   if (!channels.some(id => typeof id === 'string' && Object.hasOwn(options.channelUserPolicy ?? {}, id))) return true
   // Channel-level controls/buttons cannot establish or switch a thread owner.
   if (payload?.type !== 'event_callback') return false
