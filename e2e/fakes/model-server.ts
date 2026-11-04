@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto'
 /** A provider error to answer with instead of text: an HTTP error from Anthropic, a failed response from OpenAI. */
 type ProviderError = { status: number; type: string; code?: string; message: string }
 type Question = { id: string; header: string; question: string; options: Array<{ label: string; description: string }> }
-type Reply = { match: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[] }
+type Reply = { match: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[]; suggestion?: string; suggestionDelayMs?: number }
 /** A request a tool command made to the echo path, and the test credential it carried. */
 type Echo = { at: string; match: string; credential?: string }
 type Recorded = {
@@ -212,9 +212,9 @@ function openaiEvents(
 
 async function anthropicMessage(path: string, caller: Caller, body: any): Promise<Response> {
   const reply = record('anthropic', path, caller, body, body.messages ?? [])
-  if (reply?.run) log('model_server_unmodeled_run', { provider: 'anthropic' })
-  const text = reply?.text ?? 'ok'
-  await Bun.sleep(reply?.delayMs ?? 0)
+  const predicting = isAnthropicPromptSuggestion(body.messages ?? [])
+  const text = predicting ? (reply?.suggestion ?? '') : (reply?.text ?? 'ok')
+  await Bun.sleep((predicting ? reply?.suggestionDelayMs : reply?.delayMs) ?? 0)
   if (reply?.error) {
     const { message: errorMessage, status, type } = reply.error
     return Response.json({ type: 'error', error: { type, message: errorMessage } }, { status })
@@ -222,19 +222,27 @@ async function anthropicMessage(path: string, caller: Caller, body: any): Promis
   const message = {
     id: `msg_${randomUUID()}`, type: 'message', role: 'assistant', model: body.model,
     content: [] as unknown[], stop_reason: null as string | null, stop_sequence: null,
-    usage: { input_tokens: 0, output_tokens: 0 }
+    // Native suggestions require a warm prefix. Only this opt-in fixture
+    // reports cached usage; ordinary scripts keep their existing behavior.
+    usage: reply?.suggestion !== undefined
+      ? { input_tokens: 1, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 }
+      : { input_tokens: 0, output_tokens: 0 }
   }
   const answered = hasAnthropicToolResult(body.messages ?? [])
-  if (reply?.questions && !answered) {
-    const input = { questions: reply.questions.map(({ id: _id, ...question }) => ({ ...question, multiSelect: false })) }
-    const content = { type: 'tool_use', id: `toolu_${randomUUID()}`, name: 'AskUserQuestion', input }
+  if (!predicting && !answered && (reply?.questions || reply?.run)) {
+    const input = reply.questions
+      ? { questions: reply.questions.map(({ id: _id, ...question }) => ({ ...question, multiSelect: false })) }
+      : { command: reply.run, description: 'Run the scripted command' }
+    const content = {
+      type: 'tool_use', id: `toolu_${randomUUID()}`, name: reply.questions ? 'AskUserQuestion' : 'Bash', input
+    }
     if (!body.stream) return Response.json({ ...message, content: [content], stop_reason: 'tool_use' })
     return sse([
       { type: 'message_start', message },
       { type: 'content_block_start', index: 0, content_block: { ...content, input: {} } },
       { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } },
       { type: 'content_block_stop', index: 0 },
-      { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 0 } },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: message.usage },
       { type: 'message_stop' }
     ])
   }
@@ -246,7 +254,7 @@ async function anthropicMessage(path: string, caller: Caller, body: any): Promis
     { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
     { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
     { type: 'content_block_stop', index: 0 },
-    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 } },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: message.usage },
     { type: 'message_stop' }
   ])
 }
@@ -259,9 +267,11 @@ function record(
   conversation: unknown[]
 ): Reply | undefined {
   // Claude returns tool results as a new user message without the script token.
-  // Only that continuation inherits the script from its preceding conversation.
-  const toolResult = hasAnthropicToolResult(conversation)
-  const reply = findReply(lastUserText(conversation)) ?? (toolResult ? findReply(JSON.stringify(conversation)) : undefined)
+  // Its native prediction also appends a user message without the script token.
+  // Only these continuations inherit the preceding conversation's script.
+  const continuation = provider === 'anthropic'
+    && (hasAnthropicToolResult(conversation) || isAnthropicPromptSuggestion(conversation))
+  const reply = findReply(lastUserText(conversation)) ?? (continuation ? findReply(JSON.stringify(conversation)) : undefined)
   requests.push({
     at: new Date().toISOString(),
     provider,
@@ -280,6 +290,11 @@ function record(
 function hasAnthropicToolResult(conversation: unknown[]): boolean {
   const lastUser = conversation.filter((item: any) => item?.role === 'user').at(-1) as any
   return Array.isArray(lastUser?.content) && lastUser.content.some((part: any) => part.type === 'tool_result')
+}
+
+/** The pinned CLI's native background prediction prompt, not a normal turn. */
+function isAnthropicPromptSuggestion(conversation: unknown[]): boolean {
+  return lastUserText(conversation).includes('[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]')
 }
 
 /** Whether this request returns the output of a tool call the model made. */

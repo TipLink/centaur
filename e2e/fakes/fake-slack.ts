@@ -44,6 +44,7 @@ const messages: Message[] = []
 const ephemerals: Ephemeral[] = []
 const triggers = new Map<string, string>()
 const views: Array<{ id: string; user: string; view: Record<string, unknown> }> = []
+const suggestedPrompts: Array<Record<string, unknown>> = []
 /** Assistant status by `channel:thread_ts`; Slack hides it once a message lands in the thread. */
 const statuses = new Map<string, string>()
 let lastTs = 0
@@ -82,6 +83,9 @@ Bun.serve({
     if (url.pathname === '/_e2e/status') {
       const key = `${url.searchParams.get('channel')}:${url.searchParams.get('thread_ts')}`
       return Response.json({ status: statuses.get(key) ?? '' })
+    }
+    if (url.pathname === '/_e2e/suggested-prompts') {
+      return Response.json(suggestedPrompts.filter(call => call.channel_id === url.searchParams.get('channel')))
     }
     const method = url.pathname.match(/^\/api\/([\w.]+)$/)?.[1]
     if (!method) return new Response('not found', { status: 404 })
@@ -218,6 +222,14 @@ function handle(method: string, actor: Actor, body: Record<string, unknown>) {
     case 'assistant.threads.setStatus':
       statuses.set(`${str(body.channel_id)}:${str(body.thread_ts)}`, str(body.status))
       return { ok: true }
+    case 'assistant.threads.setSuggestedPrompts': {
+      if (actor !== 'bot') return { ok: false, error: 'not_allowed_token_type' }
+      if (!conversation(str(body.channel_id))) return { ok: false, error: 'channel_not_found' }
+      const prompts = typeof body.prompts === 'string' ? JSON.parse(body.prompts) : body.prompts
+      if (!Array.isArray(prompts)) return { ok: false, error: 'invalid_arguments' }
+      suggestedPrompts.push({ ...body, prompts })
+      return { ok: true }
+    }
     default:
       // Title calls are cosmetic for this stand-in.
       log('fake_slack_unmodeled_method', { method })

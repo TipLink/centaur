@@ -31,7 +31,7 @@ export type ProviderError = { status: number; type: string; code?: string; messa
  * `run` first has the harness run a shell command through its shell tool.
  */
 export type Question = { id: string; header: string; question: string; options: Array<{ label: string; description: string }> }
-export type Script = { token: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[] }
+export type Script = { token: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[]; suggestion?: string; suggestionDelayMs?: number }
 
 export type Execution = { execution_id: string; status: string; error: string | null }
 
@@ -85,6 +85,12 @@ export type SlackMessage = {
   reactions?: Array<{ name: string; users: string[] }>
 }
 
+export type SuggestedPromptsCall = {
+  channel_id: string
+  thread_ts?: string
+  prompts: Array<{ title: string; message: string }>
+}
+
 const slackUrl = required('E2E_SLACK_URL')
 const modelUrl = required('E2E_MODEL_URL')
 const db = new SQL(required('E2E_DATABASE_URL'))
@@ -123,7 +129,7 @@ export const model = {
   },
   /**
    * Scripts the model to run a shell command through the harness's shell tool
-   * (OpenAI harnesses), then answer with `text` once the command finishes.
+   * then answer with `text` once the command finishes.
    */
   runs(command: string, text = 'Ran it.'): Script {
     return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: command }
@@ -131,6 +137,10 @@ export const model = {
   /** Ask through the harness's native question tool, then finish after its answer. */
   asks(questions: Question[], text = 'Thanks. The task continued.'): Script {
     return { token: `e2e-${randomUUID().slice(0, 8)}`, text, questions }
+  },
+  /** Warm Claude's cache with a tool turn, then answer its native prediction request. */
+  suggests(text: string, suggestion: string, options: { suggestionDelayMs?: number } = {}): Script {
+    return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: 'true', suggestion, ...options }
   },
   /**
    * The X-E2E-Credential header of each request a command made to
@@ -265,12 +275,16 @@ export const slack = {
     return posted.ts
   },
   /** Opens the user's DM with the bot and sends it a message; a DM needs no mention. */
-  async dm(text: string, script?: Script, options: { as?: SlackUser } = {}): Promise<Thread> {
+  async dm(text: string, script?: Script, options: { as?: SlackUser; agentView?: boolean } = {}): Promise<Thread> {
     const user = options.as ?? USER
     const { channel } = await slackApi<{ channel: { id: string } }>(user, 'conversations.open', { users: user.id })
     const dm = { id: channel.id, name: `dm-${user.name}` }
     const ts = await postMention(dm, user, text, script, undefined, { dm: true })
-    return new Thread(dm, ts, script, { dm: true })
+    return new Thread(dm, ts, script, { dm: true, agentView: options.agentView })
+  },
+  /** Native suggested-prompt API writes, oldest first, including clears. */
+  async suggestedPrompts(channel: Channel): Promise<SuggestedPromptsCall[]> {
+    return (await fetch(`${slackUrl}/_e2e/suggested-prompts?channel=${encodeURIComponent(channel.id)}`)).json()
   },
   /** A message as Slack holds it, with its reactions. */
   async message(channel: Channel, ts: string): Promise<SlackMessage> {
@@ -373,29 +387,31 @@ export const ironControl = {
 }
 
 /**
- * A conversation with the bot: a channel thread, or a DM, which slackbotv2
- * runs as one conversation-wide session.
+ * A conversation with the bot: a channel thread, an Agent-view DM thread,
+ * or a legacy DM with one conversation-wide session.
  */
 export class Thread {
   /** The user message that triggered each turn, and that turn's script token. */
   private readonly triggers: string[]
   private readonly scripts: Array<string | undefined>
   private readonly dm: boolean
+  private readonly agentView: boolean
   private turnsSeen = 0
 
   constructor(
     readonly channel: Channel,
     readonly ts: string,
     script?: Script,
-    options: { dm?: boolean; trigger?: string } = {}
+    options: { dm?: boolean; agentView?: boolean; trigger?: string } = {}
   ) {
     this.triggers = [options.trigger ?? ts]
     this.scripts = [script?.token]
     this.dm = options.dm ?? false
+    this.agentView = options.agentView ?? false
   }
 
   get key(): string {
-    return this.dm ? `slack:${this.channel.id}:` : `slack:${this.channel.id}:${this.ts}`
+    return this.dm && !this.agentView ? `slack:${this.channel.id}:` : `slack:${this.channel.id}:${this.ts}`
   }
 
   /** Follows up with a message that mentions the bot (in a DM, any message), by USER unless `as` says otherwise. */
@@ -414,7 +430,7 @@ export class Thread {
 
   /** Posts a reply that does not mention the bot. */
   async post(text: string, options: { as?: SlackUser } = {}): Promise<string> {
-    return slack.post(text, { channel: this.channel, as: options.as, threadTs: this.dm ? undefined : this.ts })
+    return slack.post(text, { channel: this.channel, as: options.as, threadTs: this.dm && !this.agentView ? undefined : this.ts })
   }
 
   /** Waits until the latest turn's model request is in flight, held by its script's delay. */
@@ -434,7 +450,7 @@ export class Thread {
   }
 
   private async send(text: string, script: Script | undefined, as: SlackUser = USER): Promise<string> {
-    return postMention(this.channel, as, text, script, this.dm ? undefined : this.ts, { dm: this.dm })
+    return postMention(this.channel, as, text, script, this.dm && !this.agentView ? undefined : this.ts, { dm: this.dm })
   }
 
   /**
@@ -507,9 +523,18 @@ export class Thread {
       where thread_key = ${this.key} order by created_at`
   }
 
+  /** Output persisted for one execution, in the same order the renderer consumes it. */
+  async outputLines(executionId: string): Promise<Array<{ eventId: number; line: string }>> {
+    return db`
+      select event_id as "eventId", payload as line from session_events
+      where thread_key = ${this.key} and execution_id = ${executionId}
+        and event_type = 'session.output.line'
+      order by event_id`
+  }
+
   /** Bot messages posted after a turn's trigger and before the next turn's trigger. */
   private async repliesTo(index: number): Promise<SlackMessage[]> {
-    const { messages } = this.dm
+    const { messages } = this.dm && !this.agentView
       ? await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.history', { channel: this.channel.id })
       : await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.replies', {
         channel: this.channel.id,
@@ -546,7 +571,7 @@ async function registerScript(script: Script): Promise<void> {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       match: script.token, text: script.text, delayMs: script.delayMs, error: script.error, run: script.run,
-      questions: script.questions
+      questions: script.questions, suggestion: script.suggestion, suggestionDelayMs: script.suggestionDelayMs
     })
   })
   if (!response.ok) throw new Error(`registering the model script failed: ${response.status}`)

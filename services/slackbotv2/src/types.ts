@@ -152,6 +152,8 @@ export type SlackbotV2Options = {
   apiUrl: string
   /** Enable Slack's Agent messaging experience. Must match the app manifest. */
   agentViewEnabled?: boolean
+  /** Opt in to Claude's native next-prompt suggestions in Agent-view DMs. */
+  promptSuggestionsEnabled?: boolean
   assistantStatus?: string
   /**
    * When enabled, session.activity_summary events update Slack's assistant
