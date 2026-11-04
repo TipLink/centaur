@@ -411,6 +411,15 @@ fn fake_claude_trailing_result_settles_the_turn_and_does_not_poison_the_next() {
 
 #[test]
 fn fake_claude_background_agent_follow_up_completes_the_turn() {
+    background_task_follow_up("Agent", "local_agent");
+}
+
+#[test]
+fn fake_claude_monitor_follow_up_completes_the_turn() {
+    background_task_follow_up("Monitor", "local_bash");
+}
+
+fn background_task_follow_up(tool: &str, task_type: &str) {
     // Claude Code ends the launching turn with its own `result`, then runs a
     // follow-up turn once the background agent notifies (here after 3s, longer
     // than the settle window). The follow-up's answer belongs to this turn.
@@ -418,7 +427,8 @@ fn fake_claude_background_agent_follow_up_completes_the_turn() {
         "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}'; ",
         "IFS= read -r _; ",
         "printf '%s\\n' ",
-        "'{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"description\":\"Research\",\"is_backgrounded\":true,\"task_type\":\"local_agent\"}' ",
+        "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_launch\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_launch\",\"name\":\"__TOOL__\",\"input\":{}}]}}' ",
+        "'{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"tool_use_id\":\"toolu_launch\",\"description\":\"Research\",\"is_backgrounded\":true,\"task_type\":\"__TASK_TYPE__\"}' ",
         "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}}' ",
         "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"content\":[{\"type\":\"text\",\"text\":\"Started research.\"}]}}' ",
         "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}}' ",
@@ -430,11 +440,13 @@ fn fake_claude_background_agent_follow_up_completes_the_turn() {
         "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}}' ",
         "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"The answer.\"}'; ",
         "sleep 60"
-    );
+    )
+    .replace("__TOOL__", tool)
+    .replace("__TASK_TYPE__", task_type);
 
     let run = run_bridge_turn(BridgeTurnConfig {
         harness: Harness::ClaudeCode,
-        command_override: Some(fake_claude.to_string()),
+        command_override: Some(fake_claude),
         prompt: "research".to_string(),
         timeout: Duration::from_secs(15),
     });
