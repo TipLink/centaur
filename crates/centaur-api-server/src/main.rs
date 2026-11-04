@@ -35,7 +35,8 @@ async fn main() -> Result<(), ServerError> {
         "starting centaur api-rs server"
     );
 
-    let app_state = AppState::unready(api_auth);
+    let app_state =
+        AppState::unready(api_auth).with_scheduled_task_controls(args.scheduled_task_controls());
     let app = build_router_with_app_state(app_state.clone());
     warm_slack_public_channel_cache();
     let shutdown_state = app_state.clone();

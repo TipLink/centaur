@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "fad924eb13035b977daa589c19fc815c5cbf91e3",
-  "result_tree": "82ee48a29a8666bc872fd65b324c6b70f67d7b4d",
+  "result_tree": "eb47d3bd221b83a8d493636de387d87d3f27635f",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -47,6 +47,10 @@
     {
       "file": "0011-native-interaction-followups.patch",
       "sha256": "c6d5998a04b1006d46a90655687f995a9fd778067d2da257e1e16d233309d052"
+    },
+    {
+      "file": "0012-cancel-scheduled-tasks-from-slack.patch",
+      "sha256": "2ffb11a6b95fd6f6e35f717d41e3b877463de9256aae3657c7779a8d65a127ca"
     }
   ]
 }

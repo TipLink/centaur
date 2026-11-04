@@ -661,6 +661,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_cancellation_requires_authenticated_slack_ingress() {
+        for (token, expected) in [
+            (console_token(), StatusCode::FORBIDDEN),
+            (principal_token("prn_owner"), StatusCode::FORBIDDEN),
+            ("unknown".into(), StatusCode::UNAUTHORIZED),
+            ("test-slackbot-key".into(), StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/slack/scheduled-tasks/tsk_example/cancel")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"team_id":"T12345678","user_id":"U12345678","channel_id":"C12345678"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_cancellation_uses_console_ownership_and_returns_only_confirmation() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::Mutex;
+
+        for (upstream_status, upstream_body, expected) in [
+            (
+                StatusCode::OK,
+                json!({"data":{"id":"tsk_example","enabled":false,"prompt":"private"}}),
+                StatusCode::OK,
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                json!({"error":"private upstream detail"}),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                json!({"error":"private upstream detail"}),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                StatusCode::OK,
+                json!({"data":{"id":"tsk_other","enabled":false}}),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                StatusCode::OK,
+                json!({"data":{"id":"tsk_example","enabled":true}}),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let backend = Router::new().route(
+                "/api/v1/scheduled_tasks/tsk_example/cancel",
+                post(
+                    move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                        let captured = captured.clone();
+                        let upstream_body = upstream_body.clone();
+                        async move {
+                            assert_eq!(headers[header::AUTHORIZATION], "Bearer test-console-key");
+                            captured.lock().unwrap().push(body);
+                            (upstream_status, Json(upstream_body))
+                        }
+                    },
+                ),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+            let app = build_router_with_app_state(
+                AppState::unready(test_auth_with_slack()).with_scheduled_task_controls(Some(
+                    centaur_iron_control::IronControlClient::new(
+                        format!("http://{address}"),
+                        "test-console-key",
+                    ),
+                )),
+            );
+            let context =
+                json!({"team_id":"T12345678","user_id":"U12345678","channel_id":"C12345678"});
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/slack/scheduled-tasks/tsk_example/cancel")
+                        .header(header::AUTHORIZATION, "Bearer test-slackbot-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(context.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("private"));
+            if expected == StatusCode::OK {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
+                    json!({"data":{"id":"tsk_example","enabled":false}})
+                );
+            }
+            assert_eq!(*requests.lock().unwrap(), vec![json!({"data":context})]);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn principal_jwt_is_capability_scoped() {
         let principal = principal_token("prn_sandbox");
         let write_response = build_router_with_app_state(AppState::unready(test_auth()))

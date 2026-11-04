@@ -61,6 +61,25 @@ impl IronControlClient {
         self
     }
 
+    /// Disable a scheduled task after Console checks its owner's verified Slack click.
+    pub async fn cancel_scheduled_task(
+        &self,
+        task_id: &str,
+        team_id: &str,
+        user_id: &str,
+        channel_id: &str,
+    ) -> Result<Value> {
+        self.write(
+            Method::POST,
+            &format!(
+                "{API_PREFIX}/scheduled_tasks/{}/cancel",
+                urlencoding::encode(task_id)
+            ),
+            &json!({ "team_id": team_id, "user_id": user_id, "channel_id": channel_id }),
+        )
+        .await
+    }
+
     // ----- principals & roles ---------------------------------------------
 
     /// Upsert a principal by ``foreign_id`` (create if absent, update if not).

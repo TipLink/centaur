@@ -66,6 +66,7 @@ pub struct AppState {
     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
     metrics: PrometheusHandle,
     auth: ApiAuthConfig,
+    scheduled_task_controls: Option<centaur_iron_control::IronControlClient>,
 }
 
 #[derive(Clone)]
@@ -81,7 +82,16 @@ impl AppState {
             initialized: Arc::new(RwLock::new(None)),
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             auth,
+            scheduled_task_controls: None,
         }
+    }
+
+    pub fn with_scheduled_task_controls(
+        mut self,
+        client: Option<centaur_iron_control::IronControlClient>,
+    ) -> Self {
+        self.scheduled_task_controls = client;
+        self
     }
 
     pub fn ready(
@@ -237,6 +247,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(pause_session_sandbox),
         )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
+        .route(
+            "/api/slack/scheduled-tasks/{task_id}/cancel",
+            post(cancel_scheduled_task),
+        )
         .route(
             "/api/slack/external-team-ids",
             get(get_slack_external_team_ids).put(replace_slack_external_team_ids),
@@ -402,6 +416,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
 #[derive(Clone, Copy)]
 enum RouteAccess {
     ConsoleOnly,
+    SlackIngressOnly,
     Capability(Capability),
     PrincipalOnly,
 }
@@ -439,6 +454,9 @@ async fn authorize_api_request(
 
     let allowed = match access {
         RouteAccess::ConsoleOnly => caller.class() == CallerClass::Console,
+        RouteAccess::SlackIngressOnly => {
+            caller.class() == CallerClass::Ingress && caller.identity() == "slackbot"
+        }
         RouteAccess::Capability(capability) => caller.has_capability(capability),
         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
     };
@@ -487,6 +505,10 @@ async fn authorize_api_request(
 fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
+        (&Method::POST, "/api/slack/scheduled-tasks/{task_id}/cancel") => {
+            Some(RouteAccess::SlackIngressOnly)
+        }
+        (_, "/api/slack/scheduled-tasks/{task_id}/cancel") => None,
         (&Method::POST, "/api/tool-approvals/context")
         | (&Method::POST, "/api/tool-approvals/request")
         | (&Method::POST, "/api/tool-approvals/{id}/read")
@@ -2512,6 +2534,73 @@ async fn invoke_workflow_button(
             .await?
     };
     Ok(Json(serde_json::to_value(run)?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelScheduledTaskRequest {
+    team_id: String,
+    user_id: String,
+    channel_id: String,
+}
+
+async fn cancel_scheduled_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(request): Json<CancelScheduledTaskRequest>,
+) -> Result<Json<Value>, ApiError> {
+    // Only the authenticated Slack ingress may assert these click identities.
+    // Console remains responsible for matching the task author and destination.
+    let slack_id = |id: &str, prefixes: &[char]| {
+        (2..=64).contains(&id.len())
+            && id.starts_with(prefixes)
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    };
+    if !task_id.strip_prefix("tsk_").is_some_and(|id| {
+        !id.is_empty() && id.len() <= 64 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    }) || !slack_id(&request.team_id, &['T'])
+        || !slack_id(&request.user_id, &['U', 'W'])
+        || !slack_id(&request.channel_id, &['C', 'G', 'D'])
+    {
+        return Err(ApiError::BadRequest("invalid schedule cancellation".into()));
+    }
+    let unavailable = || ApiError::ServiceUnavailable("schedule cancellation unavailable".into());
+    let client = state
+        .scheduled_task_controls
+        .as_ref()
+        .ok_or_else(unavailable)?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        client.cancel_scheduled_task(
+            &task_id,
+            &request.team_id,
+            &request.user_id,
+            &request.channel_id,
+        ),
+    )
+    .await
+    .map_err(|_| unavailable())?
+    .map_err(|error| match error {
+        centaur_iron_control::IronControlError::Status { status: 403, .. } => {
+            ApiError::Forbidden("only the schedule owner can cancel it here".into())
+        }
+        centaur_iron_control::IronControlError::Status { status: 404, .. } => {
+            ApiError::NotFound("schedule no longer available".into())
+        }
+        centaur_iron_control::IronControlError::Status {
+            status: 400 | 422, ..
+        } => ApiError::BadRequest("invalid schedule cancellation".into()),
+        _ => unavailable(),
+    })?;
+    if result.get("id").and_then(Value::as_str) != Some(task_id.as_str())
+        || result.get("enabled").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(unavailable());
+    }
+    // Do not forward task prompts or arbitrary upstream response fields.
+    Ok(Json(json!({"data": {"id": task_id, "enabled": false}})))
 }
 
 async fn create_workflow_run(

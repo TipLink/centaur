@@ -60,6 +60,7 @@ import {
   SESSION_USER_INPUT_RESOLVED_EVENT,
   sessionStreamError,
   slackApiTimeoutMs,
+  SCHEDULE_CANCEL_ACTION,
   WORKFLOW_ACTION_PREFIX,
   workflowActionFeedback,
   withSlackApiTimeout
@@ -397,9 +398,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   chat.onAction(async event => {
     const payload = slackBlockActionPayload(event)
     const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
-    // Workflow starts deduplicate durably using the Slack click identity.
+    const scheduleCancel = payload.action_id === SCHEDULE_CANCEL_ACTION
+    // Workflow starts and schedule cancellation are durably idempotent.
     // A temporary ingress lease must never acknowledge a lost click.
-    const dedupeKey = workflowAction ? undefined : slackBlockActionDedupeKey(payload)
+    const dedupeKey = workflowAction || scheduleCancel ? undefined : slackBlockActionDedupeKey(payload)
     const leaseToken = randomUUID()
     if (
       dedupeKey
@@ -416,9 +418,25 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     }
     try {
       const result = await dispatchSlackBlockAction(options, payload)
+      if (scheduleCancel && result?.outcome === 'cancelled') {
+        const message = cancelledScheduleMessage(payload)
+        if (message) await withSlackApiTimeout(options, 'mark schedule canceled', async () => {
+          assertSlackOk('chat.update', await callSlackApi('chat.update', message, {
+            apiUrl: options.slackApiUrl,
+            fetch: options.fetch as typeof globalThis.fetch | undefined,
+            token: options.botToken
+          }))
+        })
+      }
       // Decisions have committed before feedback. The workflow still owns the
       // shared card and execution result; feedback is private to the clicker.
-      const feedback = workflowActionFeedback(result)
+      const feedback = scheduleCancel
+        ? result?.outcome === 'cancelled'
+          ? 'Schedule canceled. No future scheduled runs.'
+          : result?.outcome === 'forbidden'
+            ? 'Only the schedule owner can cancel it from its original Slack workspace and conversation.'
+            : 'This schedule is no longer available.'
+        : workflowActionFeedback(result)
       if (feedback && payload.channel_id) {
         backgroundWaitUntil(
           withSlackApiTimeout(options, 'post workflow action feedback', () =>
@@ -441,7 +459,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       }
     } catch (error) {
       const context = requestContext.getStore()
-      if (workflowAction && context) context.actionError = error
+      if ((workflowAction || scheduleCancel) && context) context.actionError = error
       try {
         if (dedupeKey && (await state.get(dedupeKey)) === leaseToken) {
           await state.delete(dedupeKey)
@@ -480,7 +498,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       message_ts: payload.message_ts,
       team_id: payload.team_id,
       thread_ts: payload.thread_ts,
-      workflow_event_name: workflowAction ? undefined : `slack.block_action.${payload.action_id}`
+      workflow_event_name: workflowAction || scheduleCancel ? undefined : `slack.block_action.${payload.action_id}`
     })
   })
 
@@ -703,12 +721,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       }
       const userInputResponse = await handleSessionUserInputInteraction(interaction, options, stateConnected, keepAlive)
       if (userInputResponse) return userInputResponse
-      const workflowAction = interaction?.type === 'block_actions'
+      const awaitAction = interaction?.type === 'block_actions'
         && Array.isArray(interaction.actions)
         && interaction.actions.some(action => isJsonObject(action)
           && typeof action.action_id === 'string'
-          && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
-      const awaitHandoff = workflowAction || shouldAwaitSlackHandoff(rawBody)
+          && (action.action_id.startsWith(WORKFLOW_ACTION_PREFIX) || action.action_id === SCHEDULE_CANCEL_ACTION))
+      const awaitHandoff = awaitAction || shouldAwaitSlackHandoff(rawBody)
       const handoffTasks: Promise<unknown>[] = []
       const context: SlackbotV2RequestContext = { waitUntil: keepAlive }
       const response = await requestContext.run(context, () => {
@@ -755,9 +773,9 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
             phase_ms: elapsedMs(waitStartedAtMs)
           })
         }
-        if (workflowAction && (waitError || context.actionError)) {
+        if (awaitAction && (waitError || context.actionError)) {
           outcome = 'error'
-          return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
+          return new globalThis.Response('Action could not be recorded. Please retry.', { status: 503 })
         }
       }
       const lateFileTask = response.ok ? lateSlackFiles.repairFromWebhook(rawBody) : null
@@ -1347,7 +1365,7 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
   const messageTs = stringValue(message.ts) ?? stringValue(container.message_ts)
   const messageId = event.messageId.startsWith('ephemeral:') ? (messageTs ?? '') : event.messageId
   return removeUndefinedValues({
-    ...(event.actionId.startsWith(WORKFLOW_ACTION_PREFIX) && Array.isArray(message.blocks)
+    ...((event.actionId.startsWith(WORKFLOW_ACTION_PREFIX) || event.actionId === SCHEDULE_CANCEL_ACTION) && Array.isArray(message.blocks)
       ? { workflow_message: { text: stringValue(message.text) ?? '', blocks: message.blocks } }
       : {}),
     action_id: event.actionId,
@@ -1356,7 +1374,9 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
     channel_id: stringValue(channel.id) ?? stringValue(container.channel_id),
     message_id: messageId,
     message_ts: messageTs,
-    team_id: stringValue(team.id) ?? stringValue(user.team_id),
+    team_id: event.actionId === SCHEDULE_CANCEL_ACTION
+      ? stringValue(user.team_id) ?? stringValue(team.id)
+      : stringValue(team.id) ?? stringValue(user.team_id),
     thread_id: event.threadId,
     thread_ts: stringValue(message.thread_ts) ?? stringValue(container.thread_ts) ?? messageTs,
     type: 'block_actions',
@@ -1364,6 +1384,24 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
     user_name: event.user.userName,
     value: event.value
   }) as SlackbotV2BlockActionPayload
+}
+
+function cancelledScheduleMessage(payload: SlackbotV2BlockActionPayload): JsonObject | undefined {
+  const message = payload.workflow_message
+  if (!message || !Array.isArray(message.blocks) || !payload.channel_id || !payload.message_ts) return
+  let replaced = false
+  const blocks = message.blocks.map(block => {
+    if (!isJsonObject(block) || block.type !== 'actions' || !Array.isArray(block.elements)
+      || block.elements.length !== 1) return block
+    const button = block.elements[0]
+    if (!isJsonObject(button) || button.action_id !== SCHEDULE_CANCEL_ACTION || button.value !== payload.value) return block
+    replaced = true
+    return { type: 'context', elements: [{ type: 'mrkdwn', text: 'Schedule canceled. No future scheduled runs.' }] }
+  })
+  if (replaced) return {
+    channel: payload.channel_id, ts: payload.message_ts,
+    text: `${message.text ?? ''}\n\nSchedule canceled. No future scheduled runs.`, blocks
+  }
 }
 
 function slackBlockActionDedupeKey(payload: SlackbotV2BlockActionPayload): string | undefined {

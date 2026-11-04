@@ -1,0 +1,1156 @@
+diff --git a/crates/centaur-api-server/src/args.rs b/crates/centaur-api-server/src/args.rs
+index 8d013bc6..762359f3 100644
+--- a/crates/centaur-api-server/src/args.rs
++++ b/crates/centaur-api-server/src/args.rs
+@@ -89,6 +89,10 @@ pub(crate) struct Args {
+ }
+ 
+ impl Args {
++    pub(crate) fn scheduled_task_controls(&self) -> Option<IronControlClient> {
++        self.sandbox.iron_control.client()
++    }
++
+     pub(crate) async fn sandbox_runtime(&self) -> Result<SandboxRuntime, ServerError> {
+         self.sandbox.runtime().await
+     }
+diff --git a/crates/centaur-api-server/src/lib.rs b/crates/centaur-api-server/src/lib.rs
+index 8d8f86b3..d10585fe 100644
+--- a/crates/centaur-api-server/src/lib.rs
++++ b/crates/centaur-api-server/src/lib.rs
+@@ -660,6 +660,117 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn schedule_cancellation_requires_authenticated_slack_ingress() {
++        for (token, expected) in [
++            (console_token(), StatusCode::FORBIDDEN),
++            (principal_token("prn_owner"), StatusCode::FORBIDDEN),
++            ("unknown".into(), StatusCode::UNAUTHORIZED),
++            ("test-slackbot-key".into(), StatusCode::SERVICE_UNAVAILABLE),
++        ] {
++            let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
++                .oneshot(
++                    Request::builder()
++                        .method(Method::POST)
++                        .uri("/api/slack/scheduled-tasks/tsk_example/cancel")
++                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
++                        .header(header::CONTENT_TYPE, "application/json")
++                        .body(Body::from(r#"{"team_id":"T12345678","user_id":"U12345678","channel_id":"C12345678"}"#))
++                        .unwrap(),
++                )
++                .await
++                .unwrap();
++            assert_eq!(response.status(), expected);
++        }
++    }
++
++    #[tokio::test]
++    async fn schedule_cancellation_uses_console_ownership_and_returns_only_confirmation() {
++        use axum::{Json, Router, routing::post};
++        use std::sync::Mutex;
++
++        for (upstream_status, upstream_body, expected) in [
++            (
++                StatusCode::OK,
++                json!({"data":{"id":"tsk_example","enabled":false,"prompt":"private"}}),
++                StatusCode::OK,
++            ),
++            (
++                StatusCode::FORBIDDEN,
++                json!({"error":"private upstream detail"}),
++                StatusCode::FORBIDDEN,
++            ),
++            (
++                StatusCode::NOT_FOUND,
++                json!({"error":"private upstream detail"}),
++                StatusCode::NOT_FOUND,
++            ),
++            (
++                StatusCode::OK,
++                json!({"data":{"id":"tsk_other","enabled":false}}),
++                StatusCode::SERVICE_UNAVAILABLE,
++            ),
++            (
++                StatusCode::OK,
++                json!({"data":{"id":"tsk_example","enabled":true}}),
++                StatusCode::SERVICE_UNAVAILABLE,
++            ),
++        ] {
++            let requests = Arc::new(Mutex::new(Vec::new()));
++            let captured = requests.clone();
++            let backend = Router::new().route(
++                "/api/v1/scheduled_tasks/tsk_example/cancel",
++                post(
++                    move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
++                        let captured = captured.clone();
++                        let upstream_body = upstream_body.clone();
++                        async move {
++                            assert_eq!(headers[header::AUTHORIZATION], "Bearer test-console-key");
++                            captured.lock().unwrap().push(body);
++                            (upstream_status, Json(upstream_body))
++                        }
++                    },
++                ),
++            );
++            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++            let address = listener.local_addr().unwrap();
++            let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
++            let app = build_router_with_app_state(
++                AppState::unready(test_auth_with_slack()).with_scheduled_task_controls(Some(
++                    centaur_iron_control::IronControlClient::new(
++                        format!("http://{address}"),
++                        "test-console-key",
++                    ),
++                )),
++            );
++            let context =
++                json!({"team_id":"T12345678","user_id":"U12345678","channel_id":"C12345678"});
++            let response = app
++                .oneshot(
++                    Request::builder()
++                        .method(Method::POST)
++                        .uri("/api/slack/scheduled-tasks/tsk_example/cancel")
++                        .header(header::AUTHORIZATION, "Bearer test-slackbot-key")
++                        .header(header::CONTENT_TYPE, "application/json")
++                        .body(Body::from(context.to_string()))
++                        .unwrap(),
++                )
++                .await
++                .unwrap();
++            assert_eq!(response.status(), expected);
++            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
++            assert!(!String::from_utf8_lossy(&bytes).contains("private"));
++            if expected == StatusCode::OK {
++                assert_eq!(
++                    serde_json::from_slice::<Value>(&bytes).unwrap(),
++                    json!({"data":{"id":"tsk_example","enabled":false}})
++                );
++            }
++            assert_eq!(*requests.lock().unwrap(), vec![json!({"data":context})]);
++            server.abort();
++        }
++    }
++
+     #[tokio::test]
+     async fn principal_jwt_is_capability_scoped() {
+         let principal = principal_token("prn_sandbox");
+diff --git a/crates/centaur-api-server/src/main.rs b/crates/centaur-api-server/src/main.rs
+index 33ce239e..44f19f1b 100644
+--- a/crates/centaur-api-server/src/main.rs
++++ b/crates/centaur-api-server/src/main.rs
+@@ -35,7 +35,8 @@ async fn main() -> Result<(), ServerError> {
+         "starting centaur api-rs server"
+     );
+ 
+-    let app_state = AppState::unready(api_auth);
++    let app_state =
++        AppState::unready(api_auth).with_scheduled_task_controls(args.scheduled_task_controls());
+     let app = build_router_with_app_state(app_state.clone());
+     warm_slack_public_channel_cache();
+     let shutdown_state = app_state.clone();
+diff --git a/crates/centaur-api-server/src/routes.rs b/crates/centaur-api-server/src/routes.rs
+index 4b53b2b2..9b2bf985 100644
+--- a/crates/centaur-api-server/src/routes.rs
++++ b/crates/centaur-api-server/src/routes.rs
+@@ -66,6 +66,7 @@ pub struct AppState {
+     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
+     metrics: PrometheusHandle,
+     auth: ApiAuthConfig,
++    scheduled_task_controls: Option<centaur_iron_control::IronControlClient>,
+ }
+ 
+ #[derive(Clone)]
+@@ -81,9 +82,18 @@ impl AppState {
+             initialized: Arc::new(RwLock::new(None)),
+             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
+             auth,
++            scheduled_task_controls: None,
+         }
+     }
+ 
++    pub fn with_scheduled_task_controls(
++        mut self,
++        client: Option<centaur_iron_control::IronControlClient>,
++    ) -> Self {
++        self.scheduled_task_controls = client;
++        self
++    }
++
+     pub fn ready(
+         runtime: SessionRuntime,
+         workflows: Option<WorkflowRuntime>,
+@@ -237,6 +247,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
+             post(pause_session_sandbox),
+         )
+         .route("/api/sandboxes/drain", post(drain_sandboxes))
++        .route(
++            "/api/slack/scheduled-tasks/{task_id}/cancel",
++            post(cancel_scheduled_task),
++        )
+         .route(
+             "/api/slack/external-team-ids",
+             get(get_slack_external_team_ids).put(replace_slack_external_team_ids),
+@@ -402,6 +416,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
+ #[derive(Clone, Copy)]
+ enum RouteAccess {
+     ConsoleOnly,
++    SlackIngressOnly,
+     Capability(Capability),
+     PrincipalOnly,
+ }
+@@ -439,6 +454,9 @@ async fn authorize_api_request(
+ 
+     let allowed = match access {
+         RouteAccess::ConsoleOnly => caller.class() == CallerClass::Console,
++        RouteAccess::SlackIngressOnly => {
++            caller.class() == CallerClass::Ingress && caller.identity() == "slackbot"
++        }
+         RouteAccess::Capability(capability) => caller.has_capability(capability),
+         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
+     };
+@@ -487,6 +505,10 @@ async fn authorize_api_request(
+ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
+     let capability = |capability| Some(RouteAccess::Capability(capability));
+     match (method, route) {
++        (&Method::POST, "/api/slack/scheduled-tasks/{task_id}/cancel") => {
++            Some(RouteAccess::SlackIngressOnly)
++        }
++        (_, "/api/slack/scheduled-tasks/{task_id}/cancel") => None,
+         (&Method::POST, "/api/tool-approvals/context")
+         | (&Method::POST, "/api/tool-approvals/request")
+         | (&Method::POST, "/api/tool-approvals/{id}/read")
+@@ -2514,6 +2536,73 @@ async fn invoke_workflow_button(
+     Ok(Json(serde_json::to_value(run)?))
+ }
+ 
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct CancelScheduledTaskRequest {
++    team_id: String,
++    user_id: String,
++    channel_id: String,
++}
++
++async fn cancel_scheduled_task(
++    State(state): State<AppState>,
++    Path(task_id): Path<String>,
++    Json(request): Json<CancelScheduledTaskRequest>,
++) -> Result<Json<Value>, ApiError> {
++    // Only the authenticated Slack ingress may assert these click identities.
++    // Console remains responsible for matching the task author and destination.
++    let slack_id = |id: &str, prefixes: &[char]| {
++        (2..=64).contains(&id.len())
++            && id.starts_with(prefixes)
++            && id
++                .bytes()
++                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
++    };
++    if !task_id.strip_prefix("tsk_").is_some_and(|id| {
++        !id.is_empty() && id.len() <= 64 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
++    }) || !slack_id(&request.team_id, &['T'])
++        || !slack_id(&request.user_id, &['U', 'W'])
++        || !slack_id(&request.channel_id, &['C', 'G', 'D'])
++    {
++        return Err(ApiError::BadRequest("invalid schedule cancellation".into()));
++    }
++    let unavailable = || ApiError::ServiceUnavailable("schedule cancellation unavailable".into());
++    let client = state
++        .scheduled_task_controls
++        .as_ref()
++        .ok_or_else(unavailable)?;
++    let result = tokio::time::timeout(
++        Duration::from_secs(4),
++        client.cancel_scheduled_task(
++            &task_id,
++            &request.team_id,
++            &request.user_id,
++            &request.channel_id,
++        ),
++    )
++    .await
++    .map_err(|_| unavailable())?
++    .map_err(|error| match error {
++        centaur_iron_control::IronControlError::Status { status: 403, .. } => {
++            ApiError::Forbidden("only the schedule owner can cancel it here".into())
++        }
++        centaur_iron_control::IronControlError::Status { status: 404, .. } => {
++            ApiError::NotFound("schedule no longer available".into())
++        }
++        centaur_iron_control::IronControlError::Status {
++            status: 400 | 422, ..
++        } => ApiError::BadRequest("invalid schedule cancellation".into()),
++        _ => unavailable(),
++    })?;
++    if result.get("id").and_then(Value::as_str) != Some(task_id.as_str())
++        || result.get("enabled").and_then(Value::as_bool) != Some(false)
++    {
++        return Err(unavailable());
++    }
++    // Do not forward task prompts or arbitrary upstream response fields.
++    Ok(Json(json!({"data": {"id": task_id, "enabled": false}})))
++}
++
+ async fn create_workflow_run(
+     State(state): State<AppState>,
+     Extension(caller): Extension<AuthenticatedCaller>,
+diff --git a/crates/centaur-iron-control/src/client.rs b/crates/centaur-iron-control/src/client.rs
+index fc3f109c..526001bf 100644
+--- a/crates/centaur-iron-control/src/client.rs
++++ b/crates/centaur-iron-control/src/client.rs
+@@ -61,6 +61,25 @@ impl IronControlClient {
+         self
+     }
+ 
++    /// Disable a scheduled task after Console checks its owner's verified Slack click.
++    pub async fn cancel_scheduled_task(
++        &self,
++        task_id: &str,
++        team_id: &str,
++        user_id: &str,
++        channel_id: &str,
++    ) -> Result<Value> {
++        self.write(
++            Method::POST,
++            &format!(
++                "{API_PREFIX}/scheduled_tasks/{}/cancel",
++                urlencoding::encode(task_id)
++            ),
++            &json!({ "team_id": team_id, "user_id": user_id, "channel_id": channel_id }),
++        )
++        .await
++    }
++
+     // ----- principals & roles ---------------------------------------------
+ 
+     /// Upsert a principal by ``foreign_id`` (create if absent, update if not).
+diff --git a/crates/centaur-workflows/src/lib.rs b/crates/centaur-workflows/src/lib.rs
+index 7401af26..f501a236 100644
+--- a/crates/centaur-workflows/src/lib.rs
++++ b/crates/centaur-workflows/src/lib.rs
+@@ -3749,7 +3749,7 @@ async fn handle_python_context_request(
+             .await
+         }
+         Some("ctx.post_to_slack") => {
+-            match post_python_slack_message(message, ctx, &request_id).await {
++            match post_python_slack_message(message, ctx, input, &request_id).await {
+                 Ok(value) => Ok(value),
+                 Err(error) => Err(error.to_string()),
+             }
+@@ -4472,6 +4472,7 @@ async fn post_tool_result_to_slack(
+ async fn post_python_slack_message(
+     message: &Value,
+     ctx: &TaskContext,
++    input: &WorkflowTaskInput,
+     request_id: &str,
+ ) -> Result<Value, WorkflowRuntimeError> {
+     let channel = message
+@@ -4491,6 +4492,7 @@ async fn post_python_slack_message(
+         .unwrap_or_else(|| format!("{}:slack:{request_id}", ctx.task_id()));
+ 
+     let mut payload = python_slack_message_payload(channel, text, &client_msg_id, &args);
++    append_scheduled_task_cancel_button(&mut payload, input);
+     let secret = env::var("CENTAUR_JWT_SIGNING_SECRET").unwrap_or_default();
+     slack_buttons::sign_message(&mut payload, secret.trim().as_bytes())?;
+     let response = send_slack_request("chat.postMessage", payload).await?;
+@@ -4498,6 +4500,47 @@ async fn post_python_slack_message(
+         .map_err(WorkflowRuntimeError::from)
+ }
+ 
++fn append_scheduled_task_cancel_button(payload: &mut Value, input: &WorkflowTaskInput) {
++    if input.workflow_name != "console_workflow" {
++        return;
++    }
++    let Some(task_id) = input.input["scheduled_task_id"].as_str().filter(|value| {
++        value.strip_prefix("tsk_").is_some_and(|id| {
++            !id.is_empty() && id.len() <= 64 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
++        })
++    }) else {
++        return;
++    };
++    let Some(blocks) = payload["blocks"].as_array_mut() else {
++        return;
++    };
++    // Only the final Console report chunk contains the attribution context.
++    if blocks.last().is_none_or(|block| block["type"] != "context")
++        || blocks.iter().any(|block| {
++            block["elements"].as_array().is_some_and(|elements| {
++                elements
++                    .iter()
++                    .any(|element| element["action_id"] == "centaur.schedule.cancel")
++            })
++        })
++    {
++        return;
++    }
++    blocks.push(json!({
++        "type": "actions",
++        "elements": [{
++            "type": "button", "action_id": "centaur.schedule.cancel", "value": task_id,
++            "text": {"type": "plain_text", "text": "Cancel schedule"},
++            "confirm": {
++                "title": {"type": "plain_text", "text": "Cancel schedule?"},
++                "text": {"type": "plain_text", "text": "Stop future scheduled runs? A run already queued or running may still finish."},
++                "confirm": {"type": "plain_text", "text": "Cancel schedule"},
++                "deny": {"type": "plain_text", "text": "Keep schedule"}
++            }
++        }]
++    }));
++}
++
+ fn python_slack_message_payload(
+     channel: &str,
+     text: &str,
+@@ -5484,6 +5527,93 @@ mod tests {
+         assert!(payload.get("icon_emoji").is_none());
+     }
+ 
++    fn scheduled_task_report() -> (WorkflowTaskInput, Value) {
++        (
++            WorkflowTaskInput {
++                workflow_name: "console_workflow".into(),
++                input: json!({"scheduled_task_id": "tsk_A123"}),
++                harness_type: HarnessType::ClaudeCode,
++                slack_button_feedback: None,
++            },
++            python_slack_message_payload(
++                "C123",
++                "Daily report\n\nOwner attribution",
++                "stable-id",
++                &json!({
++                    "thread_ts": "123.1", "mrkdwn": true,
++                    "blocks": [
++                        {"type": "section", "text": {"type": "mrkdwn", "text": "Daily report"}},
++                        {"type": "context", "elements": [{"type": "mrkdwn", "text": "Owner attribution"}]}
++                    ]
++                }),
++            ),
++        )
++    }
++
++    #[test]
++    fn scheduled_task_cancel_button_preserves_report_and_targets_native_task() {
++        let (input, mut payload) = scheduled_task_report();
++        let original = payload.clone();
++        append_scheduled_task_cancel_button(&mut payload, &input);
++        let action = payload["blocks"].as_array_mut().unwrap().pop().unwrap();
++        assert_eq!(payload, original);
++        let button = &action["elements"][0];
++        assert_eq!(button["action_id"], "centaur.schedule.cancel");
++        assert_eq!(button["value"], input.input["scheduled_task_id"]);
++        assert!(
++            button["confirm"]["text"]["text"]
++                .as_str()
++                .unwrap()
++                .contains("already queued or running")
++        );
++    }
++
++    #[test]
++    fn scheduled_task_cancel_button_only_appears_on_final_report_chunk() {
++        for blocks in [Value::Null, json!([]), json!([{"type": "section"}])] {
++            let (input, mut payload) = scheduled_task_report();
++            payload["blocks"] = blocks;
++            let original = payload.clone();
++            append_scheduled_task_cancel_button(&mut payload, &input);
++            assert_eq!(payload, original);
++        }
++    }
++
++    #[test]
++    fn scheduled_task_cancel_button_requires_console_workflow_and_valid_native_id() {
++        let (mut input, mut payload) = scheduled_task_report();
++        let original = payload.clone();
++        input.workflow_name = "another_workflow".into();
++        append_scheduled_task_cancel_button(&mut payload, &input);
++        assert_eq!(payload, original);
++        input.workflow_name = "console_workflow".into();
++        for id in [
++            Value::Null,
++            json!("tsk_"),
++            json!("tsk_../another"),
++            json!("task_A123"),
++            json!(format!("tsk_{}", "a".repeat(65))),
++        ] {
++            input.input["scheduled_task_id"] = id;
++            append_scheduled_task_cancel_button(&mut payload, &input);
++            assert_eq!(payload, original);
++        }
++    }
++
++    #[test]
++    fn scheduled_task_cancel_button_does_not_duplicate_an_existing_action() {
++        let (input, mut payload) = scheduled_task_report();
++        append_scheduled_task_cancel_button(&mut payload, &input);
++        let original = payload.clone();
++        append_scheduled_task_cancel_button(&mut payload, &input);
++        assert_eq!(payload, original);
++        let blocks = payload["blocks"].as_array_mut().unwrap();
++        blocks.swap(1, 2);
++        let original = payload.clone();
++        append_scheduled_task_cancel_button(&mut payload, &input);
++        assert_eq!(payload, original);
++    }
++
+     #[test]
+     fn parses_python_workflow_metric_notification() {
+         let metric = parse_python_workflow_metric(&json!({
+diff --git a/services/console/app/controllers/api/v1/scheduled_tasks_controller.rb b/services/console/app/controllers/api/v1/scheduled_tasks_controller.rb
+index 29e683a0..08cc296a 100644
+--- a/services/console/app/controllers/api/v1/scheduled_tasks_controller.rb
++++ b/services/console/app/controllers/api/v1/scheduled_tasks_controller.rb
+@@ -1,6 +1,8 @@
+ module Api
+   module V1
+     class ScheduledTasksController < Api::BaseController
++      wrap_parameters false
++
+       def show
+         response.headers["Cache-Control"] = "no-store"
+         task = ScheduledTask.find_by_oid!(params[:id])
+@@ -12,6 +14,33 @@ module Api
+           }
+         }
+       end
++
++      def cancel
++        response.headers["Cache-Control"] = "no-store"
++        context = cancellation_context
++        task = ScheduledTask.find_by_oid!(params[:id])
++        task.cancel_from_slack!(**context.symbolize_keys)
++        render json: { data: { id: task.oid, enabled: false } }
++      rescue ScheduledTask::SlackCancellationNotAllowed
++        render_error(status: :forbidden, message: "scheduled task cancellation is not allowed")
++      end
++
++      private
++
++      def cancellation_context
++        body = request.request_parameters
++        context = body["data"]
++        formats = {
++          "team_id" => Principal::SLACK_TEAM_ID_FORMAT,
++          "user_id" => Principal::SLACK_USER_ID_FORMAT,
++          "channel_id" => Principal::SLACK_CHANNEL_ID_FORMAT
++        }
++        unless body.keys == [ "data" ] && context.is_a?(Hash) && context.keys.sort == formats.keys.sort &&
++            formats.all? { |key, format| context[key].is_a?(String) && format.match?(context[key]) }
++          raise ActionController::BadRequest, "invalid Slack cancellation context"
++        end
++        context
++      end
+     end
+   end
+ end
+diff --git a/services/console/app/models/scheduled_task.rb b/services/console/app/models/scheduled_task.rb
+index ec7786af..e250d7e8 100644
+--- a/services/console/app/models/scheduled_task.rb
++++ b/services/console/app/models/scheduled_task.rb
+@@ -2,6 +2,7 @@ require "fugit"
+ 
+ class ScheduledTask < ApplicationRecord
+   class DeliveryDestinationUnavailable < StandardError; end
++  class SlackCancellationNotAllowed < StandardError; end
+ 
+   oid_prefix "tsk"
+ 
+@@ -129,6 +130,25 @@ class ScheduledTask < ApplicationRecord
+     }
+   end
+ 
++  def cancel_from_slack!(team_id:, user_id:, channel_id:)
++    with_lock do
++      policy = SlackDeliveryPolicy.new(author)
++      destination_matches = delivery_channel == channel_id ||
++        (delivery_channel == user_id && channel_id.start_with?("D"))
++      unless author.active? && policy.slack_team_id == team_id &&
++          policy.slack_user_id == user_id && destination_matches
++        raise SlackCancellationNotAllowed
++      end
++
++      # Cancellation must still work after the delivery channel becomes unavailable.
++      # Only stop future runs; preserve the task and any execution already dispatched.
++      if enabled? || next_run_at.present?
++        update_columns(enabled: false, next_run_at: nil, updated_at: Time.current)
++      end
++    end
++    self
++  end
++
+   private
+ 
+   def simple_weekly_schedule
+diff --git a/services/console/config/routes.rb b/services/console/config/routes.rb
+index e632a8bd..092e6d22 100644
+--- a/services/console/config/routes.rb
++++ b/services/console/config/routes.rb
+@@ -228,7 +228,9 @@ Rails.application.routes.draw do
+       resources :grants, only: %i[show create destroy]
+       resources :api_keys, only: %i[index show create destroy]
+       resources :proxies, only: %i[index show create update destroy]
+-      resources :scheduled_tasks, only: %i[show]
++      resources :scheduled_tasks, only: %i[show] do
++        post :cancel, on: :member
++      end
+       # Operator-managed broker credentials (ApiKey auth). CRUD + lookup; the
+       # rotating token blob is never serialized back.
+       resources :broker_credentials, only: %i[index show create update destroy] do
+diff --git a/services/console/docs/API.md b/services/console/docs/API.md
+index 7fa8420d..c5392bf8 100644
+--- a/services/console/docs/API.md
++++ b/services/console/docs/API.md
+@@ -1485,6 +1485,14 @@ These endpoints use the sandbox entitlement JWT injected by `iron-proxy`. Every
+ 
+ The admin API also exposes `GET /api/v1/scheduled_tasks/:id` for scheduled workflows to read the task's current ID, enabled state, and delivery channel. It requires an active admin API key, returns `404` for deleted tasks, and sets `Cache-Control: no-store`.
+ 
++Trusted Slack ingress may call `POST /api/v1/scheduled_tasks/:id/cancel` with
++`data: { team_id, user_id, channel_id }` and the same admin API authentication.
++Only the active task author's resolved Slack identity can cancel, from the task's
++delivery channel or their DM for a user-addressed delivery. Success returns only
++`data: { id, enabled: false }`, including repeated cancellation. It stops future
++runs without deleting the task or interrupting an already dispatched execution.
++Wrong owner, workspace or destination returns `403`; missing tasks return `404`.
++
+ Responses include the task's optional cron expression, fixed timezone, human-readable schedule, enabled state, next run time, and latest run metadata. The `centaur-console` CLI exposes the same operations through `tasks`, `task`, `create-task`, `update-task`, `delete-task`, and `run-task`. Omit `--cron` when creating a manual-only task, or pass `update-task --cron ""` to remove an existing recurring schedule.
+ 
+ ## Skills
+diff --git a/services/console/test/controllers/api/v1/scheduled_tasks_controller_test.rb b/services/console/test/controllers/api/v1/scheduled_tasks_controller_test.rb
+index 5fcdbd30..c7b13501 100644
+--- a/services/console/test/controllers/api/v1/scheduled_tasks_controller_test.rb
++++ b/services/console/test/controllers/api/v1/scheduled_tasks_controller_test.rb
+@@ -64,8 +64,133 @@ module Api
+         assert_response :forbidden
+       end
+ 
++      test "the Slack owner cancels future runs without deleting the task or returning its content" do
++        original = @task.attributes
++        assert_no_difference [ "ScheduledTask.count", "Principal.count" ] do
++          cancel_task
++        end
++
++        assert_response :ok
++        assert_equal "no-store", response.headers["Cache-Control"]
++        assert_equal({ "data" => { "id" => @task.oid, "enabled" => false } }, response.parsed_body)
++        assert_not_includes response.body, @task.prompt
++        @task.reload
++        assert_not @task.enabled?
++        assert_nil @task.next_run_at
++        assert_equal original.except("enabled", "next_run_at", "updated_at"),
++          @task.attributes.except("enabled", "next_run_at", "updated_at")
++      end
++
++      test "repeated cancellation is idempotent" do
++        cancel_task
++        assert_response :ok
++
++        assert_no_changes -> { @task.reload.attributes } do
++          cancel_task
++        end
++        assert_response :ok
++        assert_equal({ "data" => { "id" => @task.oid, "enabled" => false } }, response.parsed_body)
++      end
++
++      test "other Slack users workspaces and delivery channels cannot cancel" do
++        [ { user_id: "U2222222222" }, { team_id: "T2222222222" },
++          { channel_id: "C2222222222" }, { channel_id: "D0123456789" } ].each do |context|
++          assert_no_changes -> { @task.reload.attributes } do
++            cancel_task(**context)
++          end
++          assert_response :forbidden
++          assert_not_includes response.body, @task.prompt
++        end
++      end
++
++      test "disabled and unlinked task authors cannot cancel" do
++        @author.update!(status: "disabled")
++        assert_no_changes -> { @task.reload.attributes } do
++          cancel_task(token: "iak_globex-ci-token")
++        end
++        assert_response :forbidden
++
++        @author.update!(status: "active")
++        @author.user_identities.destroy_all
++        assert_no_changes -> { @task.reload.attributes } do
++          cancel_task
++        end
++        assert_response :forbidden
++      end
++
++      test "ambiguous Slack ownership cannot cancel" do
++        @author.user_identities.create!(provider: "slack", subject: "U2222222222", team_id: "T0123456789")
++
++        assert_no_changes -> { @task.reload.attributes } do
++          cancel_task
++        end
++        assert_response :forbidden
++      end
++
++      test "user-addressed reports can be cancelled by that owner in a DM" do
++        @task.update!(delivery_channel: "U0123456789")
++
++        assert_no_changes -> { @task.reload.attributes } do
++          cancel_task
++        end
++        assert_response :forbidden
++
++        cancel_task(channel_id: "D0123456789")
++
++        assert_response :ok
++        assert_not @task.reload.enabled?
++        assert_nil @task.next_run_at
++      end
++
++      test "a former delivery destination does not prevent stopping the schedule" do
++        SlackBotChannel.find_by!(channel_id: @task.delivery_channel).update!(archived: true)
++
++        cancel_task
++
++        assert_response :ok
++        assert_not @task.reload.enabled?
++        assert_nil @task.next_run_at
++      end
++
++      test "missing tasks return not found without changing other tasks" do
++        @task.destroy!
++
++        assert_no_difference "ScheduledTask.count" do
++          cancel_task
++        end
++        assert_response :not_found
++      end
++
++      test "cancellation requires the existing active admin API key boundary" do
++        [ [ nil, :unauthorized ], [ "iak_member-token", :forbidden ],
++          [ "iak_disabled-token", :unauthorized ] ].each do |token, status|
++          assert_no_changes -> { @task.reload.attributes } do
++            cancel_task(token: token)
++          end
++          assert_response status
++        end
++      end
++
++      test "malformed or caller-selected ownership fields are rejected" do
++        context = { team_id: "T0123456789", user_id: "U0123456789", channel_id: "C0123456789" }
++        [ context, { data: context.except(:user_id) }, { data: context.merge(user_id: [ context[:user_id] ]) },
++          { data: context.merge(user_id: "U0123456789\n") },
++          { data: context.merge(author_id: @author.oid) }, { data: context, principal: "operator" } ].each do |body|
++          assert_no_changes -> { @task.reload.attributes } do
++            post "#{@path}/cancel", params: body, headers: auth_headers, as: :json
++          end
++          assert_response :bad_request
++        end
++      end
++
+       private
+ 
++      def cancel_task(team_id: "T0123456789", user_id: "U0123456789", channel_id: "C0123456789", token: "iak_acme-ci-token")
++        headers = token ? auth_headers(token: token) : {}
++        post "#{@path}/cancel", params: { data: { team_id: team_id, user_id: user_id, channel_id: channel_id } },
++          headers: headers, as: :json
++      end
++
+       def auth_headers(token: "iak_acme-ci-token")
+         { "Authorization" => "Bearer #{token}" }
+       end
+diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
+index 9a499872..b9d3d517 100644
+--- a/services/slackbotv2/src/index.ts
++++ b/services/slackbotv2/src/index.ts
+@@ -60,6 +60,7 @@ import {
+   SESSION_USER_INPUT_RESOLVED_EVENT,
+   sessionStreamError,
+   slackApiTimeoutMs,
++  SCHEDULE_CANCEL_ACTION,
+   WORKFLOW_ACTION_PREFIX,
+   workflowActionFeedback,
+   withSlackApiTimeout
+@@ -397,9 +398,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+   chat.onAction(async event => {
+     const payload = slackBlockActionPayload(event)
+     const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
+-    // Workflow starts deduplicate durably using the Slack click identity.
++    const scheduleCancel = payload.action_id === SCHEDULE_CANCEL_ACTION
++    // Workflow starts and schedule cancellation are durably idempotent.
+     // A temporary ingress lease must never acknowledge a lost click.
+-    const dedupeKey = workflowAction ? undefined : slackBlockActionDedupeKey(payload)
++    const dedupeKey = workflowAction || scheduleCancel ? undefined : slackBlockActionDedupeKey(payload)
+     const leaseToken = randomUUID()
+     if (
+       dedupeKey
+@@ -416,9 +418,25 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+     }
+     try {
+       const result = await dispatchSlackBlockAction(options, payload)
++      if (scheduleCancel && result?.outcome === 'cancelled') {
++        const message = cancelledScheduleMessage(payload)
++        if (message) await withSlackApiTimeout(options, 'mark schedule canceled', async () => {
++          assertSlackOk('chat.update', await callSlackApi('chat.update', message, {
++            apiUrl: options.slackApiUrl,
++            fetch: options.fetch as typeof globalThis.fetch | undefined,
++            token: options.botToken
++          }))
++        })
++      }
+       // Decisions have committed before feedback. The workflow still owns the
+       // shared card and execution result; feedback is private to the clicker.
+-      const feedback = workflowActionFeedback(result)
++      const feedback = scheduleCancel
++        ? result?.outcome === 'cancelled'
++          ? 'Schedule canceled. No future scheduled runs.'
++          : result?.outcome === 'forbidden'
++            ? 'Only the schedule owner can cancel it from its original Slack workspace and conversation.'
++            : 'This schedule is no longer available.'
++        : workflowActionFeedback(result)
+       if (feedback && payload.channel_id) {
+         backgroundWaitUntil(
+           withSlackApiTimeout(options, 'post workflow action feedback', () =>
+@@ -441,7 +459,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+       }
+     } catch (error) {
+       const context = requestContext.getStore()
+-      if (workflowAction && context) context.actionError = error
++      if ((workflowAction || scheduleCancel) && context) context.actionError = error
+       try {
+         if (dedupeKey && (await state.get(dedupeKey)) === leaseToken) {
+           await state.delete(dedupeKey)
+@@ -480,7 +498,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+       message_ts: payload.message_ts,
+       team_id: payload.team_id,
+       thread_ts: payload.thread_ts,
+-      workflow_event_name: workflowAction ? undefined : `slack.block_action.${payload.action_id}`
++      workflow_event_name: workflowAction || scheduleCancel ? undefined : `slack.block_action.${payload.action_id}`
+     })
+   })
+ 
+@@ -703,12 +721,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+       }
+       const userInputResponse = await handleSessionUserInputInteraction(interaction, options, stateConnected, keepAlive)
+       if (userInputResponse) return userInputResponse
+-      const workflowAction = interaction?.type === 'block_actions'
++      const awaitAction = interaction?.type === 'block_actions'
+         && Array.isArray(interaction.actions)
+         && interaction.actions.some(action => isJsonObject(action)
+           && typeof action.action_id === 'string'
+-          && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
+-      const awaitHandoff = workflowAction || shouldAwaitSlackHandoff(rawBody)
++          && (action.action_id.startsWith(WORKFLOW_ACTION_PREFIX) || action.action_id === SCHEDULE_CANCEL_ACTION))
++      const awaitHandoff = awaitAction || shouldAwaitSlackHandoff(rawBody)
+       const handoffTasks: Promise<unknown>[] = []
+       const context: SlackbotV2RequestContext = { waitUntil: keepAlive }
+       const response = await requestContext.run(context, () => {
+@@ -755,9 +773,9 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+             phase_ms: elapsedMs(waitStartedAtMs)
+           })
+         }
+-        if (workflowAction && (waitError || context.actionError)) {
++        if (awaitAction && (waitError || context.actionError)) {
+           outcome = 'error'
+-          return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
++          return new globalThis.Response('Action could not be recorded. Please retry.', { status: 503 })
+         }
+       }
+       const lateFileTask = response.ok ? lateSlackFiles.repairFromWebhook(rawBody) : null
+@@ -1347,7 +1365,7 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
+   const messageTs = stringValue(message.ts) ?? stringValue(container.message_ts)
+   const messageId = event.messageId.startsWith('ephemeral:') ? (messageTs ?? '') : event.messageId
+   return removeUndefinedValues({
+-    ...(event.actionId.startsWith(WORKFLOW_ACTION_PREFIX) && Array.isArray(message.blocks)
++    ...((event.actionId.startsWith(WORKFLOW_ACTION_PREFIX) || event.actionId === SCHEDULE_CANCEL_ACTION) && Array.isArray(message.blocks)
+       ? { workflow_message: { text: stringValue(message.text) ?? '', blocks: message.blocks } }
+       : {}),
+     action_id: event.actionId,
+@@ -1356,7 +1374,9 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
+     channel_id: stringValue(channel.id) ?? stringValue(container.channel_id),
+     message_id: messageId,
+     message_ts: messageTs,
+-    team_id: stringValue(team.id) ?? stringValue(user.team_id),
++    team_id: event.actionId === SCHEDULE_CANCEL_ACTION
++      ? stringValue(user.team_id) ?? stringValue(team.id)
++      : stringValue(team.id) ?? stringValue(user.team_id),
+     thread_id: event.threadId,
+     thread_ts: stringValue(message.thread_ts) ?? stringValue(container.thread_ts) ?? messageTs,
+     type: 'block_actions',
+@@ -1366,6 +1386,24 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
+   }) as SlackbotV2BlockActionPayload
+ }
+ 
++function cancelledScheduleMessage(payload: SlackbotV2BlockActionPayload): JsonObject | undefined {
++  const message = payload.workflow_message
++  if (!message || !Array.isArray(message.blocks) || !payload.channel_id || !payload.message_ts) return
++  let replaced = false
++  const blocks = message.blocks.map(block => {
++    if (!isJsonObject(block) || block.type !== 'actions' || !Array.isArray(block.elements)
++      || block.elements.length !== 1) return block
++    const button = block.elements[0]
++    if (!isJsonObject(button) || button.action_id !== SCHEDULE_CANCEL_ACTION || button.value !== payload.value) return block
++    replaced = true
++    return { type: 'context', elements: [{ type: 'mrkdwn', text: 'Schedule canceled. No future scheduled runs.' }] }
++  })
++  if (replaced) return {
++    channel: payload.channel_id, ts: payload.message_ts,
++    text: `${message.text ?? ''}\n\nSchedule canceled. No future scheduled runs.`, blocks
++  }
++}
++
+ function slackBlockActionDedupeKey(payload: SlackbotV2BlockActionPayload): string | undefined {
+   if (!payload.action_ts) return undefined
+   return [
+diff --git a/services/slackbotv2/src/session-api.ts b/services/slackbotv2/src/session-api.ts
+index 5fe141f0..5541f14f 100644
+--- a/services/slackbotv2/src/session-api.ts
++++ b/services/slackbotv2/src/session-api.ts
+@@ -567,6 +567,7 @@ export async function forwardToSessionApi(
+ }
+ 
+ export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
++export const SCHEDULE_CANCEL_ACTION = 'centaur.schedule.cancel'
+ /** Emitted by api-rs once a follow-up message reaches an active execution. */
+ export const SESSION_STEERING_DELIVERED_EVENT = 'session.steering_delivered'
+ /** Emitted by api-rs when a follow-up could not reach the still-running execution. */
+@@ -654,6 +655,7 @@ export async function dispatchSlackBlockAction(
+   options: SlackbotV2Options,
+   payload: SlackbotV2BlockActionPayload
+ ): Promise<JsonObject | undefined> {
++  if (payload.action_id === SCHEDULE_CANCEL_ACTION) return cancelScheduledTask(options, payload)
+   const action = `dispatch Slack block action ${payload.action_id}`
+   const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
+   let body: JsonObject = { event_name: `slack.block_action.${payload.action_id}`, payload }
+@@ -718,6 +720,39 @@ export async function dispatchSlackBlockAction(
+   }
+ }
+ 
++async function cancelScheduledTask(
++  options: SlackbotV2Options,
++  payload: SlackbotV2BlockActionPayload
++): Promise<JsonObject> {
++  if (!/^tsk_[A-Za-z0-9]{1,64}$/.test(payload.value ?? '')
++    || !payload.team_id || !payload.user_id || !payload.channel_id) {
++    return { outcome: 'unavailable' }
++  }
++  const action = 'cancel scheduled task'
++  return recordSessionApiOperation('cancel_scheduled_task', async () => {
++    const response = await fetchWithTimeout(
++      options.fetch ?? globalThis.fetch,
++      new URL(`/api/slack/scheduled-tasks/${encodeURIComponent(payload.value!)}/cancel`, options.apiUrl),
++      {
++        method: 'POST', headers: apiHeaders(options),
++        body: JSON.stringify({ team_id: payload.team_id, user_id: payload.user_id, channel_id: payload.channel_id })
++      },
++      sessionApiTimeoutMs(options), action
++    )
++    if (response.status === 403 || response.status === 404) {
++      await response.body?.cancel()
++      return { outcome: response.status === 403 ? 'forbidden' : 'unavailable' }
++    }
++    await ensureApiOk(response, action)
++    const result: unknown = await response.json()
++    if (!isJsonObject(result) || !isJsonObject(result.data)
++      || result.data.id !== payload.value || result.data.enabled !== false) {
++      throw new Error('Schedule cancellation API returned an invalid result')
++    }
++    return { outcome: 'cancelled' }
++  }, sessionApiTimeoutMs(options), action)
++}
++
+ export async function openSessionEventStream(
+   options: SlackbotV2Options,
+   input: Pick<ForwardSessionInput, 'afterEventId' | 'executionId' | 'onEventId' | 'threadId' | 'trace'>
+diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+index e1affcaa..2daf62c9 100644
+--- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
++++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+@@ -711,6 +711,131 @@ describe('slackbotv2', () => {
+     expect(codexApi.workflowEvents).toHaveLength(0)
+   })
+ 
++  function scheduleCancelPayload() {
++    const button = {
++      type: 'button', action_id: 'centaur.schedule.cancel', value: 'tsk_A123',
++      text: { type: 'plain_text', text: 'Cancel schedule' }
++    }
++    return {
++      type: 'block_actions', team: { id: TEAM_ID },
++      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
++      channel: { id: CHANNEL_ID },
++      message: {
++        ts: '1700000003.000200', thread_ts: '1700000003.000100',
++        text: 'Daily report\n\nScheduled task attribution',
++        blocks: [
++          { type: 'section', text: { type: 'mrkdwn', text: 'Daily report' } },
++          { type: 'context', elements: [{ type: 'mrkdwn', text: 'Scheduled task attribution' }] },
++          { type: 'actions', elements: [button] }
++        ]
++      },
++      actions: [{ ...button, action_ts: '1700000004.000200' }]
++    }
++  }
++
++  it('cancels a schedule before acknowledging, retries failures, and updates older report buttons without a model turn', async () => {
++    const requests: unknown[] = []
++    const updates: Record<string, string>[] = []
++    const feedback: Record<string, string>[] = []
++    let release: (() => void) | undefined
++    const held = new Promise<void>(resolve => { release = resolve })
++    let fail = true
++    bot = createTestBot({ fetch: async (input, init) => {
++      if (String(input).endsWith('/api/slack/scheduled-tasks/tsk_A123/cancel')) {
++        requests.push(JSON.parse(String(init?.body)))
++        await held
++        return fail
++          ? Response.json({ error: 'unavailable' }, { status: 503 })
++          : Response.json({ data: { id: 'tsk_A123', enabled: false } })
++      }
++      if (String(input).endsWith('/chat.update') || String(input).endsWith('/chat.postEphemeral')) {
++        const body = Object.fromEntries(new URLSearchParams(String(init?.body)))
++        if (String(input).endsWith('/chat.update')) updates.push(body)
++        else feedback.push(body)
++        return Response.json({ ok: true })
++      }
++      return globalThis.fetch(input, init)
++    } })
++    const payload = scheduleCancelPayload()
++    const waits: Promise<unknown>[] = []
++    let acknowledged = false
++    const first = Promise.resolve(bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits)))
++      .then(response => { acknowledged = true; return response })
++    await waitFor(() => requests.length === 1)
++    expect(acknowledged).toBe(false)
++    release?.()
++    expect((await first).status).toBe(503)
++    expect(updates).toHaveLength(0)
++    fail = false
++    for (let attempt = 0; attempt < 2; attempt++) {
++      const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
++      expect(response.status).toBe(200)
++    }
++    await Promise.all(waits)
++    expect(requests).toEqual(Array(3).fill({ team_id: TEAM_ID, user_id: USER_ID, channel_id: CHANNEL_ID }))
++    expect(updates).toHaveLength(2)
++    expect(updates[0]).toEqual(updates[1])
++    expect(updates[0]?.channel).toBe(CHANNEL_ID)
++    expect(updates[0]?.ts).toBe(payload.message.ts)
++    expect(updates[0]?.text).toBe(`${payload.message.text}\n\nSchedule canceled. No future scheduled runs.`)
++    expect(JSON.parse(updates[0]!.blocks!)).toEqual([
++      ...payload.message.blocks.slice(0, 2),
++      { type: 'context', elements: [{ type: 'mrkdwn', text: 'Schedule canceled. No future scheduled runs.' }] }
++    ])
++    expect(feedback).toHaveLength(2)
++    expect(feedback[0]?.user).toBe(USER_ID)
++    expect(feedback[0]?.text).toContain('No future scheduled runs')
++    expect(codexApi.creates).toHaveLength(0)
++    expect(codexApi.executes).toHaveLength(0)
++    expect(codexApi.workflowEvents).toHaveLength(0)
++  })
++
++  for (const status of [403, 404]) it(`keeps a scheduled report unchanged on ${status} and replies privately`, async () => {
++    const feedback: Record<string, string>[] = []
++    bot = createTestBot({ fetch: async (input, init) => {
++      if (String(input).endsWith('/api/slack/scheduled-tasks/tsk_A123/cancel')) {
++        return Response.json({ error: 'private backend details' }, { status })
++      }
++      if (String(input).endsWith('/chat.update')) throw new Error('must not change report')
++      if (String(input).endsWith('/chat.postEphemeral')) {
++        feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
++        return Response.json({ ok: true })
++      }
++      return globalThis.fetch(input, init)
++    } })
++    const waits: Promise<unknown>[] = []
++    const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(scheduleCancelPayload()), {}, waitUntilContext(waits))
++    expect(response.status).toBe(200)
++    await Promise.all(waits)
++    expect(feedback).toHaveLength(1)
++    expect(feedback[0]?.user).toBe(USER_ID)
++    expect(feedback[0]?.text).toContain(status === 403 ? 'Only the schedule owner' : 'no longer available')
++    expect(JSON.stringify(feedback)).not.toContain('private backend details')
++    expect(codexApi.executes).toHaveLength(0)
++  })
++
++  it('attests the cancel clicker workspace and rejects unsigned cancel requests', async () => {
++    const requests: unknown[] = []
++    bot = createTestBot({ allowedExternalTeamIds: ['TEXTERNAL'], fetch: async (input, init) => {
++      if (String(input).endsWith('/api/slack/scheduled-tasks/tsk_A123/cancel')) {
++        requests.push(JSON.parse(String(init?.body)))
++        return Response.json({ error: 'wrong workspace' }, { status: 403 })
++      }
++      if (String(input).endsWith('/chat.postEphemeral')) return Response.json({ ok: true })
++      if (String(input).endsWith('/chat.update')) throw new Error('must not change report')
++      return globalThis.fetch(input, init)
++    } })
++    const payload = scheduleCancelPayload()
++    payload.user.team_id = 'TEXTERNAL'
++    const signed = signedSlackInteraction(payload)
++    const waits: Promise<unknown>[] = []
++    expect((await bot.app.request('/api/slack/actions', { ...signed, headers: {} }, {}, waitUntilContext(waits))).status).toBe(401)
++    expect(requests).toHaveLength(0)
++    expect((await bot.app.request('/api/slack/actions', signed, {}, waitUntilContext(waits))).status).toBe(200)
++    await Promise.all(waits)
++    expect(requests).toEqual([{ team_id: 'TEXTERNAL', user_id: USER_ID, channel_id: CHANNEL_ID }])
++  })
++
+   const approvalFeedbackCases = [
+     { name: 'untrusted button', status: 403, body: { error: 'invalid or untrusted workflow button' }, expected: 'could not be verified' },
+     ...[
+diff --git a/services/slackbotv2/test/session-api.test.ts b/services/slackbotv2/test/session-api.test.ts
+index aedd276c..d9a4f1e2 100644
+--- a/services/slackbotv2/test/session-api.test.ts
++++ b/services/slackbotv2/test/session-api.test.ts
+@@ -3,6 +3,7 @@ import {
+   clearConversationNameCacheForTests,
+   clearRequesterIdentityCacheForTests,
+   DEFAULT_SESSION_IDLE_TIMEOUT_MS,
++  dispatchSlackBlockAction,
+   forwardToSessionApi,
+   harnessRestartPreamble,
+   interruptSessionExecution,
+@@ -19,6 +20,7 @@ import type {
+   JsonObject,
+   JsonValue,
+   SlackbotV2ApiMessage,
++  SlackbotV2BlockActionPayload,
+   SlackbotV2Options
+ } from '../src/types'
+ 
+@@ -128,6 +130,42 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
+   }
+ }
+ 
++describe('scheduled task cancellation', () => {
++  const payload: SlackbotV2BlockActionPayload = {
++    type: 'block_actions', action_id: 'centaur.schedule.cancel', value: 'tsk_A123',
++    team_id: 'T1', user_id: 'U1', channel_id: 'C1', message_id: '123.1',
++    thread_id: 'slack:C1:123.1', user_name: 'tester'
++  }
++
++  test('accepts only a disabled response for the exact clicked task', async () => {
++    for (const data of [{ id: 'tsk_other', enabled: false }, { id: 'tsk_A123', enabled: true }, {}]) {
++      await expect(dispatchSlackBlockAction(options(async () => Response.json({ data })), payload))
++        .rejects.toThrow('invalid result')
++    }
++    expect(await dispatchSlackBlockAction(options(async (url, init) => {
++      expect(String(url)).toBe('http://api.test/api/slack/scheduled-tasks/tsk_A123/cancel')
++      expect(init?.method).toBe('POST')
++      expect(JSON.parse(String(init?.body))).toEqual({ team_id: 'T1', user_id: 'U1', channel_id: 'C1' })
++      return Response.json({ data: { id: 'tsk_A123', enabled: false } })
++    }), payload)).toEqual({ outcome: 'cancelled' })
++  })
++
++  test('rejects malformed task IDs before making a request', async () => {
++    const config = options(async () => { throw new Error('must not request') })
++    for (const value of ['', 'tsk_x/other', '../tasks', 'task_A123']) {
++      expect(await dispatchSlackBlockAction(config, { ...payload, value })).toEqual({ outcome: 'unavailable' })
++    }
++  })
++
++  test('bounds a stalled cancellation response body', async () => {
++    const config = {
++      ...options(async () => new Response(new ReadableStream())),
++      sessionApiTimeoutMs: 20
++    }
++    await expect(dispatchSlackBlockAction(config, payload)).rejects.toThrow('timed out')
++  })
++})
++
+ describe('native question deployment admission', () => {
+   test('does not advertise buttons where fixed-owner admission rejects controls', async () => {
+     for (const [threadId, admission, enabled] of [

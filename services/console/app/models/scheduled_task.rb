@@ -2,6 +2,7 @@ require "fugit"
 
 class ScheduledTask < ApplicationRecord
   class DeliveryDestinationUnavailable < StandardError; end
+  class SlackCancellationNotAllowed < StandardError; end
 
   oid_prefix "tsk"
 
@@ -127,6 +128,25 @@ class ScheduledTask < ApplicationRecord
       scheduled_task_id: oid,
       scheduled_task_name: name
     }
+  end
+
+  def cancel_from_slack!(team_id:, user_id:, channel_id:)
+    with_lock do
+      policy = SlackDeliveryPolicy.new(author)
+      destination_matches = delivery_channel == channel_id ||
+        (delivery_channel == user_id && channel_id.start_with?("D"))
+      unless author.active? && policy.slack_team_id == team_id &&
+          policy.slack_user_id == user_id && destination_matches
+        raise SlackCancellationNotAllowed
+      end
+
+      # Cancellation must still work after the delivery channel becomes unavailable.
+      # Only stop future runs; preserve the task and any execution already dispatched.
+      if enabled? || next_run_at.present?
+        update_columns(enabled: false, next_run_at: nil, updated_at: Time.current)
+      end
+    end
+    self
   end
 
   private

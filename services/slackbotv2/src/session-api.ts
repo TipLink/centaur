@@ -567,6 +567,7 @@ export async function forwardToSessionApi(
 }
 
 export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
+export const SCHEDULE_CANCEL_ACTION = 'centaur.schedule.cancel'
 /** Emitted by api-rs once a follow-up message reaches an active execution. */
 export const SESSION_STEERING_DELIVERED_EVENT = 'session.steering_delivered'
 /** Emitted by api-rs when a follow-up could not reach the still-running execution. */
@@ -654,6 +655,7 @@ export async function dispatchSlackBlockAction(
   options: SlackbotV2Options,
   payload: SlackbotV2BlockActionPayload
 ): Promise<JsonObject | undefined> {
+  if (payload.action_id === SCHEDULE_CANCEL_ACTION) return cancelScheduledTask(options, payload)
   const action = `dispatch Slack block action ${payload.action_id}`
   const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
   let body: JsonObject = { event_name: `slack.block_action.${payload.action_id}`, payload }
@@ -716,6 +718,39 @@ export async function dispatchSlackBlockAction(
     }
     return { ...result, outcome: result.created ? 'accepted' : 'duplicate' }
   }
+}
+
+async function cancelScheduledTask(
+  options: SlackbotV2Options,
+  payload: SlackbotV2BlockActionPayload
+): Promise<JsonObject> {
+  if (!/^tsk_[A-Za-z0-9]{1,64}$/.test(payload.value ?? '')
+    || !payload.team_id || !payload.user_id || !payload.channel_id) {
+    return { outcome: 'unavailable' }
+  }
+  const action = 'cancel scheduled task'
+  return recordSessionApiOperation('cancel_scheduled_task', async () => {
+    const response = await fetchWithTimeout(
+      options.fetch ?? globalThis.fetch,
+      new URL(`/api/slack/scheduled-tasks/${encodeURIComponent(payload.value!)}/cancel`, options.apiUrl),
+      {
+        method: 'POST', headers: apiHeaders(options),
+        body: JSON.stringify({ team_id: payload.team_id, user_id: payload.user_id, channel_id: payload.channel_id })
+      },
+      sessionApiTimeoutMs(options), action
+    )
+    if (response.status === 403 || response.status === 404) {
+      await response.body?.cancel()
+      return { outcome: response.status === 403 ? 'forbidden' : 'unavailable' }
+    }
+    await ensureApiOk(response, action)
+    const result: unknown = await response.json()
+    if (!isJsonObject(result) || !isJsonObject(result.data)
+      || result.data.id !== payload.value || result.data.enabled !== false) {
+      throw new Error('Schedule cancellation API returned an invalid result')
+    }
+    return { outcome: 'cancelled' }
+  }, sessionApiTimeoutMs(options), action)
 }
 
 export async function openSessionEventStream(
