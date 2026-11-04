@@ -146,6 +146,27 @@ describe('native question deployment admission', () => {
   })
 })
 
+describe('Claude prompt suggestion capability', () => {
+  test('opts in only effective Claude executions in Agent-view DMs', async () => {
+    for (const [enabled, agentView, harnessType, channel, expected] of [
+      [true, true, 'claudecode', 'D1', true],
+      [false, true, 'claudecode', 'D1', undefined],
+      [true, false, 'claudecode', 'D1', undefined],
+      [true, true, 'codex', 'D1', undefined],
+      [true, true, 'claudecode', 'C1', undefined]
+    ] as const) {
+      const { fetchFn, requests } = fakeApi()
+      const threadId = `slack:${channel}:1700000000.000100`
+      await forwardToSessionApi({
+        ...options(fetchFn), promptSuggestionsEnabled: enabled,
+        agentViewEnabled: agentView, defaultHarnessType: harnessType
+      }, forwardInput(apiMessage('Check the change', { threadId }), { metadataHarnessType: harnessType }))
+      const execute = executeBody(requests)
+      expect((execute.metadata as JsonObject).supports_prompt_suggestions).toBe(expected)
+    }
+  })
+})
+
 function executeBody(requests: RecordedRequest[]): Record<string, unknown> {
   const execute = requests.find(request => request.url.endsWith('/execute'))
   return (execute?.body ?? {}) as Record<string, unknown>

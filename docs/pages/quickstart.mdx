@@ -231,9 +231,13 @@ Streaming progress and titles continue through the existing renderer. With
 the running execution, like the mentioned `stop` command. Without that
 subscription, Slack shows a loading indicator without a Stop button.
 
-Suggested prompts can be configured statically in the manifest. Context-aware
-prompts and synchronization of user-edited Slack session titles are separate
-integrations.
+Suggested prompts can be configured statically in the manifest. To use Claude's
+native next-prompt suggestions instead, remove `suggested_prompts` from the app
+configuration and set `SLACKBOTV2_PROMPT_SUGGESTIONS_ENABLED=true` in the
+Slackbot service environment. This opt-in feature uses Claude's background model
+request and displays suggestions in the Agent view's Messages tab for DMs.
+See `services/slackbotv2/README.md` for behavior and configuration requirements.
+Synchronization of user-edited Slack session titles is a separate integration.
 
 See Slack's [migration guide](https://docs.slack.dev/ai/migrating-to-agent-messaging/)
 for the app-side rollout requirements.

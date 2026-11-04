@@ -94,6 +94,12 @@ import {
 import { isSlackStopCommand } from './stop-command'
 import { handleSessionUserInputInteraction, renderSessionUserInput, UserInputRenderError } from './user-input'
 import {
+  beginPromptSuggestionMessage,
+  bindPromptSuggestionExecution,
+  stopPromptSuggestions,
+  withPromptSuggestions
+} from './prompt-suggestions'
+import {
   createSteeringReactionController,
   type SteeringReactionAck,
   type SteeringReactionController
@@ -621,6 +627,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       threadId: thread.id
     }
     try {
+      await stopPromptSuggestions(thread.id, options, backgroundWaitUntil)
       await interruptThreadExecution(thread, options, trace, 'agent_session_stopped')
     } catch {
       // Slack already shows the session as stopped, so say the stop may
@@ -811,6 +818,7 @@ async function handleSlackMessageHandoff(
   let assistantStatus = Promise.resolve(false)
   let syncInput: SyncThreadMessageInput | undefined
   try {
+    await beginPromptSuggestionMessage(thread.id, message.id, input.options, backgroundWaitUntil)
     // Only a mention can stop a run; an accepted unmentioned "stop that"
     // steers it like any other message.
     if (!input.proactive && await handleStopCommand(thread, message, input.options, input.trigger)) {
@@ -1972,6 +1980,10 @@ async function syncThreadMessageToSession(
     latestExecutedMessageIds.add(serializedMessage.id)
     const steeringReactionAck = input.steeringReactionAck
     forwardInput.executionId = execution.execution_id
+    await bindPromptSuggestionExecution(
+      thread.id, serializedMessage.id, execution.execution_id,
+      forwardInput.metadataHarnessType, input.options
+    )
     if (stopRequestedFor(latest, message)) {
       // The stop landed while execute was in flight. Interrupt in the
       // background; the live render shows the interrupted result.
@@ -2332,7 +2344,8 @@ async function renderExecutionAttempt(
       options,
       trace,
       assistantStatusVisible,
-      responseContextBlock
+      responseContextBlock,
+      input.executionId
     )
     rendered = true
     outcome = 'complete'
@@ -2963,7 +2976,8 @@ async function recoverRenderObligation(
       streamOpenedSession(input, openedStream),
       obligation.message,
       options,
-      trace
+      trace,
+      obligation.executionId
     )
     rendered = true
     renderOutcome = 'complete'
@@ -3234,8 +3248,10 @@ async function renderExecutionStream(
   options: SlackbotV2Options,
   trace?: SlackbotV2Trace,
   assistantStatusVisible = false,
-  responseContextBlock?: SlackContextBlock
+  responseContextBlock?: SlackContextBlock,
+  executionId?: string
 ): Promise<{ diverged: boolean; messageId?: string }> {
+  stream = withPromptSuggestions(stream, thread.id, message.id, executionId, options, backgroundWaitUntil)
   const promptText = slackMessagePromptText(message)
   if (isPlainTextOnlyRequest(promptText)) {
     await renderPlainTextExecutionStream(
@@ -3312,8 +3328,10 @@ async function renderRecoveredExecutionStream(
   stream: AsyncIterable<SlackbotV2RendererSource>,
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  executionId?: string
 ): Promise<{ diverged: boolean; messageId?: string }> {
+  stream = withPromptSuggestions(stream, thread.id, message.id, executionId, options, backgroundWaitUntil)
   const promptText = slackMessagePromptText(message)
   if (isPlainTextOnlyRequest(promptText)) {
     await renderPlainTextExecutionStream(thread, stream, message, options, trace)

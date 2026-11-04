@@ -36,6 +36,8 @@ pub struct ThreadState {
     pub thread_started_sent: bool,
     /// Whether the calling ingress can collect and return native questions.
     pub supports_user_input: bool,
+    /// Whether the calling ingress can render Claude's optional next prompt.
+    pub supports_prompt_suggestions: bool,
 }
 
 pub struct HarnessChild {
@@ -154,6 +156,18 @@ pub trait HarnessServer {
         TurnHold::Released
     }
 
+    /// Best-effort window for a native suggestion after a successful result.
+    /// Harnesses without native suggestions never hold their terminal event.
+    fn prompt_suggestion_window(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Optional output is deliberately lenient: malformed, empty or foreign
+    /// suggestions must not fail an otherwise completed answer.
+    fn prompt_suggestion(&self, _line: &str, _session_id: Option<&str>) -> Option<String> {
+        None
+    }
+
     fn thread_state(&self, params: &ThreadStartParams, cwd: PathBuf) -> ThreadState {
         let model = params.model.clone().unwrap_or_else(|| self.default_model());
         let model_provider = params
@@ -173,6 +187,7 @@ pub trait HarnessServer {
             process: None,
             thread_started_sent: false,
             supports_user_input: false,
+            supports_prompt_suggestions: false,
         }
     }
 }
