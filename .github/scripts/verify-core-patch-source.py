@@ -15,6 +15,9 @@ prepared = args.prepared.resolve()
 def git(root, *argv):
     return subprocess.check_output(['git', '-C', str(root), *argv])
 
+# The publication branch need not contain the official base in its history.
+git(source, 'fetch', '--depth=1', '--no-tags', str(prepared), manifest['upstream_revision'])
+
 # Publication workflows and their image probe are build orchestration, not core
 # runtime patches. Everything else in the reviewed source must match exactly.
 diff = git(source, 'diff', '--binary', manifest['upstream_revision'], 'HEAD', '--',
