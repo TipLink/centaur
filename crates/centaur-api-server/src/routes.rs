@@ -52,12 +52,12 @@ use crate::{
     slack_external_teams::{get_slack_external_team_ids, replace_slack_external_team_ids},
     slack_proxy::slack_proxy_router,
     types::{
-        AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
-        DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
-        ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
-        InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
-        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        stream_error_sse,
+        AnswerUserInputRequest, AppendMessagesRequest, AppendMessagesResponse,
+        CreateSessionRequest, CreateSessionResponse, DiscordThreadContext,
+        EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
+        GithubThreadContext, InterruptSessionExecutionRequest, InterruptSessionExecutionResponse,
+        LinearThreadContext, ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse,
+        SessionSseEvent, SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -224,6 +224,14 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(interrupt_session_execution),
         )
         .route("/api/session/{thread_key}/events", get(stream_events))
+        .route(
+            "/api/session/{thread_key}/user-input",
+            get(list_user_input_requests),
+        )
+        .route(
+            "/api/session/{thread_key}/user-input/{request_id}",
+            get(get_user_input_request).post(answer_user_input),
+        )
         .route(
             "/api/session/{thread_key}/pause",
             post(pause_session_sandbox),
@@ -484,13 +492,16 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         | (&Method::POST, "/api/tool-approvals/{id}/read")
         | (&Method::POST, "/api/tool-approvals/{id}/cancel") => Some(RouteAccess::ConsoleOnly),
         (&Method::GET, "/api/session/{thread_key}")
-        | (&Method::GET, "/api/session/{thread_key}/events") => {
+        | (&Method::GET, "/api/session/{thread_key}/events")
+        | (&Method::GET, "/api/session/{thread_key}/user-input")
+        | (&Method::GET, "/api/session/{thread_key}/user-input/{request_id}") => {
             capability(Capability::SessionsRead)
         }
         (&Method::POST, "/api/session/{thread_key}")
         | (&Method::POST, "/api/session/{thread_key}/messages")
         | (&Method::POST, "/api/session/{thread_key}/execute")
-        | (&Method::POST, "/api/session/{thread_key}/interrupt") => {
+        | (&Method::POST, "/api/session/{thread_key}/interrupt")
+        | (&Method::POST, "/api/session/{thread_key}/user-input/{request_id}") => {
             capability(Capability::SessionsWrite)
         }
         (&Method::POST, "/api/sandboxes/drain")
@@ -787,6 +798,62 @@ async fn interrupt_session_execution(
         execution_id: outcome.execution_id,
         thread_key,
     }))
+}
+
+async fn list_user_input_requests(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path(raw_thread_key): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
+    Ok(Json(
+        json!({"requests": runtime.list_user_input_requests(&thread_key).await?}),
+    ))
+}
+
+async fn get_user_input_request(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path((raw_thread_key, request_id)): Path<(String, String)>,
+) -> Result<Json<centaur_session_core::user_input::SessionUserInputRequest>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
+    Ok(Json(
+        runtime
+            .get_user_input_request(&thread_key, &request_id)
+            .await?,
+    ))
+}
+
+async fn answer_user_input(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path((raw_thread_key, request_id)): Path<(String, String)>,
+    Json(request): Json<AnswerUserInputRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    // Ingress credentials are platform scoped by middleware. Only trusted
+    // ingress/console/admin services can assert a responder identity; ordinary
+    // principal JWTs must never manufacture another user's answer.
+    if caller.class() == CallerClass::Principal {
+        return Err(ApiError::Forbidden(
+            "a trusted ingress must submit user answers".to_owned(),
+        ));
+    }
+    let response = state
+        .runtime()?
+        .answer_user_input(
+            &thread_key,
+            &request.execution_id,
+            &request_id,
+            &request.responder_user_id,
+            &request.answers,
+        )
+        .await?;
+    Ok(Json(json!({"ok":true,"status":response.status})))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

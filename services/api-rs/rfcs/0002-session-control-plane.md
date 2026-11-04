@@ -284,6 +284,57 @@ Execution rules:
 - If a producer or consumer discovers a harness-native thread id, it can report
   that separately; the session API should not infer it by parsing output lines.
 
+### Native questions
+
+The harness adapter can suspend a native tool request while its caller collects
+answers. This keeps the original execution active; submitting answers does not
+append a chat message or start another execution.
+Questions remain bound to their original active execution. Secret-input requests
+are rejected by the adapter; answering a question after its execution ends does
+not start another execution. A native UI's `isBlocking` hint does not change
+this lifetime.
+
+- `GET /api/session/{thread_key}/user-input` returns
+  `{"requests":[...]}` for the active execution's pending/submitted requests.
+- `GET /api/session/{thread_key}/user-input/{request_id}` reads one request,
+  including its terminal status.
+- `POST /api/session/{thread_key}/user-input/{request_id}` accepts
+  `{"execution_id":"exe_123","responder_user_id":"user_123","answers":{"project":{"answers":["Project A"]}}}`.
+  The response is `{"ok":true,"status":"submitted"}` until the adapter acknowledges
+  the response, or `"resolved"` after acknowledgment.
+
+Only trusted ingress, Console, or admin callers may submit a responder identity.
+Ingress credentials retain their platform scope. The responder must match the
+original execution's persisted `metadata.user_id`; model output cannot choose
+the requester. Requests without that identity cannot be answered.
+
+An ingress advertises its UI with `metadata.supports_user_input: true` on the
+execution request. The runtime forwards this capability in the original turn's
+`trace_metadata` only when a requester `user_id` is also present. Adapters keep
+native question support disabled for callers without that capability, including
+unattended workflows and ingress implementations without a question UI.
+
+The normalized adapter emits `item/tool/requestUserInput` with an opaque UUID
+in both `id` and `params.requestId`, plus `params.questions`. Questions have
+`id`, `header`, `question`, `options` (label/description), `multiSelect`, and
+`allowOther`. The runtime commits the request and
+`session.user_input.requested` event together before exposing it to an ingress.
+The event includes `request_id`, `execution_id`, `requester_user_id`,
+`questions`, and `status`.
+
+Answers are committed before delivery as a `user_input_response` input line
+with the request id and original execution id. A repeated submission must carry
+identical answers; conflicting answers return 409. Adapters deduplicate accepted
+responses and emit `serverRequest/resolved`, which commits a
+`session.user_input.resolved` event with `request_id`, `execution_id`,
+`status`, and `reason`. Native process replacement cannot accept an old opaque
+request id. This protocol does not restart a lost native tool request.
+
+Execution completion, failure, or cancellation atomically cancels outstanding
+questions and emits their resolved events. Existing execution duration limits
+continue to apply while waiting. An ingress restart recovers pending requests
+from Postgres; it does not rely on its previous event stream remaining connected.
+
 ### Stream Session Events
 
 ```text

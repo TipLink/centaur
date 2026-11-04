@@ -33,18 +33,44 @@ function object(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
+function isNativeQuestionModal(payload: Record<string, unknown>): boolean {
+  return payload.type === 'view_submission'
+    && object(payload.view).callback_id === 'centaur.user_input:answer'
+}
+
+/** Modal submissions carry the original channel in signed private metadata. */
+export function slackWebhookChannels(payload: Record<string, unknown>): unknown[] {
+  const event = object(payload.event)
+  const channel = object(payload.channel)
+  const container = object(payload.container)
+  const channels = [event.channel, event.channel_id, payload.channel_id, channel.id, container.channel_id]
+  if (isNativeQuestionModal(payload)) {
+    const metadata = object(payload.view).private_metadata
+    try { channels.push(object(JSON.parse(String(metadata))).channel_id) } catch { /* fail closed below */ }
+  }
+  return channels
+}
+
+/** Fixed-owner channels deliberately do not accept interactive controls. */
+export function supportsNativeUserInput(
+  threadId: string,
+  policy: ChannelUserPolicy | undefined,
+  threadAdmissionUrl: string | undefined
+): boolean {
+  const channel = /^slack:([^:]+):/.exec(threadId)?.[1]
+  return !!channel && !(threadAdmissionUrl && policy && Object.hasOwn(policy, channel))
+}
+
 /** Filter only; Slack's SDK must still verify the original request before accepting it. */
 export function channelWebhookAllowed(payload: Record<string, unknown>, policy: ChannelUserPolicy | undefined): boolean {
   if (!policy || !Object.keys(policy).length) return true
   const event = object(payload.event)
-  const channel = object(payload.channel)
-  const container = object(payload.container)
   const team = object(payload.team)
   const user = object(payload.user)
   const message = object(event.message)
   // Check every advertised destination, so conflicting channel fields cannot
   // make the filter inspect one channel while the SDK acts on another.
-  const channels = [event.channel, event.channel_id, payload.channel_id, channel.id, container.channel_id]
+  const channels = slackWebhookChannels(payload)
   const actor = payload.type === 'event_callback' ? event.user : (user.id ?? payload.user_id)
   const teamId = payload.team_id ?? team.id
   for (const id of channels) {
@@ -57,6 +83,7 @@ export function channelWebhookAllowed(payload: Record<string, unknown>, policy: 
   }
   // Native workflow buttons always have a channel. A missing destination must
   // not bypass the channel gate and then resolve to a protected workflow.
-  if (payload.type === 'block_actions' && !channels.some(id => typeof id === 'string' && /^[CGD]/.test(id))) return false
+  if ((payload.type === 'block_actions' || isNativeQuestionModal(payload))
+    && !channels.some(id => typeof id === 'string' && /^[CGD]/.test(id))) return false
   return true
 }

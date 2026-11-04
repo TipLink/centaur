@@ -13,6 +13,7 @@ pub mod protocol;
 mod server;
 mod traits;
 mod turn;
+pub mod user_input;
 mod util;
 pub mod wire;
 

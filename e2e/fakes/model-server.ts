@@ -16,7 +16,8 @@ import { randomUUID } from 'node:crypto'
 
 /** A provider error to answer with instead of text: an HTTP error from Anthropic, a failed response from OpenAI. */
 type ProviderError = { status: number; type: string; code?: string; message: string }
-type Reply = { match: string; text: string; delayMs?: number; error?: ProviderError; run?: string }
+type Question = { id: string; header: string; question: string; options: Array<{ label: string; description: string }> }
+type Reply = { match: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[] }
 /** A request a tool command made to the echo path, and the test credential it carried. */
 type Echo = { at: string; match: string; credential?: string }
 type Recorded = {
@@ -148,7 +149,10 @@ function openaiEvents(
   const text = reply?.text ?? 'ok'
   const responseId = `resp_${randomUUID()}`
   const itemId = `msg_${randomUUID()}`
-  const toolCall = reply?.run && !hasToolOutput(body.input) ? shellCall([...(body.tools ?? []), ...declaredTools(conversation)], reply.run) : undefined
+  const tools = [...(body.tools ?? []), ...declaredTools(conversation)]
+  const toolCall = hasToolOutput(body.input) ? undefined
+    : reply?.questions ? questionCall(reply.questions)
+    : reply?.run ? shellCall(tools, reply.run) : undefined
   if (toolCall) {
     const output = (status: string) => ({
       id: responseId, object: 'response', model: body.model, status, output: [toolCall],
@@ -220,6 +224,20 @@ async function anthropicMessage(path: string, caller: Caller, body: any): Promis
     content: [] as unknown[], stop_reason: null as string | null, stop_sequence: null,
     usage: { input_tokens: 0, output_tokens: 0 }
   }
+  const answered = hasAnthropicToolResult(body.messages ?? [])
+  if (reply?.questions && !answered) {
+    const input = { questions: reply.questions.map(({ id: _id, ...question }) => ({ ...question, multiSelect: false })) }
+    const content = { type: 'tool_use', id: `toolu_${randomUUID()}`, name: 'AskUserQuestion', input }
+    if (!body.stream) return Response.json({ ...message, content: [content], stop_reason: 'tool_use' })
+    return sse([
+      { type: 'message_start', message },
+      { type: 'content_block_start', index: 0, content_block: { ...content, input: {} } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 0 } },
+      { type: 'message_stop' }
+    ])
+  }
   if (!body.stream) {
     return Response.json({ ...message, content: [{ type: 'text', text }], stop_reason: 'end_turn' })
   }
@@ -240,7 +258,10 @@ function record(
   body: any,
   conversation: unknown[]
 ): Reply | undefined {
-  const reply = findReply(lastUserText(conversation))
+  // Claude returns tool results as a new user message without the script token.
+  // Only that continuation inherits the script from its preceding conversation.
+  const toolResult = hasAnthropicToolResult(conversation)
+  const reply = findReply(lastUserText(conversation)) ?? (toolResult ? findReply(JSON.stringify(conversation)) : undefined)
   requests.push({
     at: new Date().toISOString(),
     provider,
@@ -253,6 +274,12 @@ function record(
     body
   })
   return reply
+}
+
+/** Claude may append a system reminder after its newest user/tool message. */
+function hasAnthropicToolResult(conversation: unknown[]): boolean {
+  const lastUser = conversation.filter((item: any) => item?.role === 'user').at(-1) as any
+  return Array.isArray(lastUser?.content) && lastUser.content.some((part: any) => part.type === 'tool_result')
 }
 
 /** Whether this request returns the output of a tool call the model made. */
@@ -268,6 +295,15 @@ function declaredTools(conversation: unknown[]): any[] {
   const flatten = (tools: any[]): any[] =>
     tools.flatMap(tool => (tool?.type === 'namespace' ? flatten(tool.tools ?? []) : [tool]))
   return flatten(conversation.flatMap((item: any) => (item?.type === 'additional_tools' ? item.tools ?? [] : [])))
+}
+
+/** Native control tools stay direct even when Codex offers code-mode exec. */
+function questionCall(questions: Question[]): Record<string, unknown> {
+  const args = { questions }
+  return {
+    type: 'function_call', id: `fc_${randomUUID()}`, call_id: `call_${randomUUID()}`,
+    status: 'completed', name: 'request_user_input', arguments: JSON.stringify(args)
+  }
 }
 
 /** A call to whichever shell tool the harness offered, running `command`. */

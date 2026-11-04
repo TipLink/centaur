@@ -30,7 +30,8 @@ export type ProviderError = { status: number; type: string; code?: string; messa
  * A scripted model answer, matched by a token placed in the user's message.
  * `run` first has the harness run a shell command through its shell tool.
  */
-export type Script = { token: string; text: string; delayMs?: number; error?: ProviderError; run?: string }
+export type Question = { id: string; header: string; question: string; options: Array<{ label: string; description: string }> }
+export type Script = { token: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[] }
 
 export type Execution = { execution_id: string; status: string; error: string | null }
 
@@ -80,7 +81,7 @@ export type SlackMessage = {
   bot_id?: string
   thread_ts?: string
   streaming?: boolean
-  blocks?: Array<{ type?: string; elements?: Array<{ text?: string; action_id?: string; value?: string }> }>
+  blocks?: Array<{ type?: string; block_id?: string; elements?: Array<{ text?: string; action_id?: string; value?: string }> }>
   reactions?: Array<{ name: string; users: string[] }>
 }
 
@@ -126,6 +127,10 @@ export const model = {
    */
   runs(command: string, text = 'Ran it.'): Script {
     return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: command }
+  },
+  /** Ask through the harness's native question tool, then finish after its answer. */
+  asks(questions: Question[], text = 'Thanks. The task continued.'): Script {
+    return { token: `e2e-${randomUUID().slice(0, 8)}`, text, questions }
   },
   /**
    * The X-E2E-Credential header of each request a command made to
@@ -276,6 +281,15 @@ export const slack = {
   async ephemeral(user: SlackUser): Promise<Array<{ channel: string; text: string }>> {
     const response = await fetch(`${slackUrl}/_e2e/ephemeral?user=${encodeURIComponent(user.id)}`)
     return response.json()
+  },
+  async views(user: SlackUser = USER): Promise<Array<{ id: string; view: Record<string, unknown> }>> {
+    return (await fetch(`${slackUrl}/_e2e/views?user=${encodeURIComponent(user.id)}`)).json()
+  },
+  async submitView(viewId: string, values: unknown, user: SlackUser = USER): Promise<{ status: number; body: string }> {
+    return (await fetch(`${slackUrl}/_e2e/view-submit`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ view_id: viewId, values, user: user.id })
+    })).json()
   },
   /**
    * Clicks a block element on a message, as `as` (USER by default). `value`
@@ -441,7 +455,7 @@ export class Thread {
     const seen = `execution ${JSON.stringify(execution)}`
     let lastReplies: SlackMessage[] = []
     const replies = await eventually(`reply to turn ${index + 1} of ${this.key}`, renderTimeoutMs, async () => {
-      lastReplies = await this.repliesTo(index)
+      lastReplies = (await this.repliesTo(index)).filter(message => !isQuestionCard(message))
       return lastReplies.length > 0 && lastReplies.every(reply => !reply.streaming) ? lastReplies : undefined
     }).catch(error => {
       throw new Error(`${error.message}; ${seen}; replies ${JSON.stringify(lastReplies.map(({ ts, text, streaming }) => ({ ts, text, streaming })))}`)
@@ -482,7 +496,12 @@ export class Thread {
       ) ready order by event_id`
   }
 
-  private async executions(): Promise<Execution[]> {
+  /** Native question cards are separate from the task's final streamed reply. */
+  async questionCards(): Promise<SlackMessage[]> {
+    return (await this.repliesTo(0)).filter(isQuestionCard)
+  }
+
+  async executions(): Promise<Execution[]> {
     return db`
       select execution_id, status, error from session_executions
       where thread_key = ${this.key} order by created_at`
@@ -526,10 +545,15 @@ async function registerScript(script: Script): Promise<void> {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      match: script.token, text: script.text, delayMs: script.delayMs, error: script.error, run: script.run
+      match: script.token, text: script.text, delayMs: script.delayMs, error: script.error, run: script.run,
+      questions: script.questions
     })
   })
   if (!response.ok) throw new Error(`registering the model script failed: ${response.status}`)
+}
+
+function isQuestionCard(message: SlackMessage): boolean {
+  return (message.blocks ?? []).some(block => block.block_id?.startsWith('centaur.user_input:'))
 }
 
 async function modelRequests(token: string): Promise<ModelRequest[]> {

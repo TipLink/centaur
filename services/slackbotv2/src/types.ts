@@ -106,6 +106,26 @@ export type SlackbotV2InterruptSessionResponse = {
 
 export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
+export type SessionUserInputQuestion = {
+  id: string
+  header: string
+  question: string
+  options: Array<{ label: string; description: string }>
+  multiSelect?: boolean
+  allowOther?: boolean
+}
+
+export type SessionUserInputAnswers = Record<string, { answers: string[] }>
+
+export type SessionUserInputRequest = {
+  request_id: string
+  execution_id: string
+  requester_user_id: string | null
+  questions: SessionUserInputQuestion[]
+  status: 'pending' | 'submitted' | 'resolved' | 'cancelled'
+  answers?: SessionUserInputAnswers
+}
+
 export type SlackbotV2BlockActionPayload = {
   workflow_message?: JsonObject
   action_id: string

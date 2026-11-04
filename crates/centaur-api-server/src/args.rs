@@ -44,7 +44,10 @@ use sqlx::{
 };
 use tracing::{info, warn};
 
-use crate::{ServerError, activity_summary::ActivitySummaryConfig};
+use crate::{
+    ServerError,
+    activity_summary::{ActivitySummaryConfig, ProgressUpdateConfig},
+};
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
@@ -227,6 +230,31 @@ struct ActivitySummaryArgs {
         default_value = "low"
     )]
     reasoning_effort: String,
+    /// Post model-written progress updates to the chat thread while a
+    /// long-running execution is still working.
+    #[arg(
+        long = "session-progress-update-enabled",
+        env = "SESSION_PROGRESS_UPDATE_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    progress_update_enabled: bool,
+    /// Execution age before the first progress update.
+    #[arg(
+        long = "session-progress-update-after-secs",
+        env = "SESSION_PROGRESS_UPDATE_AFTER_SECS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    progress_update_after_secs: u64,
+    /// Minimum time between progress updates for one execution.
+    #[arg(
+        long = "session-progress-update-interval-secs",
+        env = "SESSION_PROGRESS_UPDATE_INTERVAL_SECS",
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    progress_update_interval_secs: u64,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -285,6 +313,10 @@ impl ActivitySummaryArgs {
             model: self.model.clone(),
             reasoning_effort: clean_optional_value(Some(self.reasoning_effort.as_str())),
             timeout: Duration::from_secs(self.timeout_secs),
+            progress: self.progress_update_enabled.then(|| ProgressUpdateConfig {
+                after: Duration::from_secs(self.progress_update_after_secs),
+                interval: Duration::from_secs(self.progress_update_interval_secs),
+            }),
         })
     }
 }
@@ -796,9 +828,10 @@ struct SandboxArgs {
         default_value_t = 0
     )]
     sandbox_running_limit: usize,
-    /// Stop any sandbox older than this regardless of status; sessions replace
-    /// reaped sandboxes on their next message. 0 disables the max-lifetime
-    /// sweep.
+    /// Stop any sandbox older than this; sessions replace reaped sandboxes on
+    /// their next message. Warm-pool sandboxes age from their claim, and
+    /// sandboxes with an active execution are skipped unless that execution
+    /// outlived this too. 0 disables the max-lifetime sweep.
     #[arg(
         long = "session-sandbox-max-lifetime-secs",
         env = "SESSION_SANDBOX_MAX_LIFETIME_SECS",
@@ -1976,6 +2009,21 @@ struct IronProxyArgs {
         value_delimiter = ','
     )]
     database_cidrs: Vec<String>,
+    /// Pod labels of an in-cluster core database. Per-sandbox iron-proxy
+    /// NetworkPolicies allow egress to these pods on the database port.
+    #[arg(
+        long = "kubernetes-iron-proxy-database-pod-label-selector",
+        env = "KUBERNETES_IRON_PROXY_DATABASE_POD_LABEL_SELECTOR",
+        value_parser = parse_label_selector_arg
+    )]
+    database_pod_label_selector: Option<BTreeMap<String, String>>,
+    /// Namespace of the in-cluster core database's pods. Defaults to the
+    /// sandbox namespace.
+    #[arg(
+        long = "kubernetes-iron-proxy-database-namespace",
+        env = "KUBERNETES_IRON_PROXY_DATABASE_NAMESPACE"
+    )]
+    database_namespace: Option<String>,
     #[arg(
         long = "kubernetes-iron-proxy-database-port",
         env = "KUBERNETES_IRON_PROXY_DATABASE_PORT",
@@ -2058,6 +2106,9 @@ impl IronProxyArgs {
                 Ok(cidr.to_owned())
             })
             .collect::<Result<_, ServerError>>()?;
+        config.database_pod_labels = self.database_pod_label_selector.clone().unwrap_or_default();
+        config.database_namespace =
+            non_empty(self.database_namespace.as_deref()).map(ToOwned::to_owned);
         config.database_port = self.database_port;
         self.source.apply_to_config(&mut config);
         config.fragments = harness_fragments;
@@ -2685,6 +2736,32 @@ mod tests {
 
         let config = args.activity_summary_config().unwrap();
         assert_eq!(config.api_key, "sk-test");
+    }
+
+    #[test]
+    fn progress_updates_require_their_feature_flag() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("OPENAI_API_KEY", "sk-test")]);
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--session-activity-summary-enabled",
+                "true",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv)
+                .unwrap()
+                .activity_summary_config()
+                .unwrap()
+                .progress
+        };
+
+        assert!(parse(&[]).is_none());
+        let progress = parse(&["--session-progress-update-enabled", "true"]).unwrap();
+        assert_eq!(progress.after, Duration::from_secs(60));
+        assert_eq!(progress.interval, Duration::from_secs(120));
     }
 
     #[test]
@@ -3690,6 +3767,37 @@ mod tests {
         for invalid in ["db.example.com", "10.0.32.0", "10.0.32.0/33"] {
             assert!(parse(invalid).is_err(), "{invalid} must be rejected");
         }
+    }
+
+    #[test]
+    fn iron_proxy_database_pod_selector_is_parsed() {
+        let config = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-iron-proxy-database-pod-label-selector",
+            "cnpg.io/cluster=core-db,cnpg.io/instanceRole=primary",
+            "--kubernetes-iron-proxy-database-namespace",
+            "databases",
+        ])
+        .unwrap()
+        .sandbox
+        .iron_proxy
+        .to_config()
+        .unwrap();
+
+        assert_eq!(
+            config.database_pod_labels,
+            BTreeMap::from([
+                ("cnpg.io/cluster".to_owned(), "core-db".to_owned()),
+                ("cnpg.io/instanceRole".to_owned(), "primary".to_owned()),
+            ])
+        );
+        assert_eq!(config.database_namespace.as_deref(), Some("databases"));
     }
 
     #[test]

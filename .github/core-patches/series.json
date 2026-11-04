@@ -1,16 +1,16 @@
 {
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
-  "upstream_revision": "466c93f3144ee681a259f4addc4373243bec458d",
-  "result_tree": "2ad88b5dd9b16570a9fd87abe78256ade1345167",
+  "upstream_revision": "889d62664770c8ae19e5052a4c2dce156915fe64",
+  "result_tree": "e781c19196d14490da8c9155be5fd84ba14c9437",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
-      "sha256": "d033413764fea1beba6b43eca9922de7804e4e160a4ab73f6606f93680ac591a"
+      "sha256": "545f286f544e5f2499f4c8251809f435684567ccb8e92d5ba61d3e080e7e2c9e"
     },
     {
       "file": "0002-approval-slack-ux.patch",
-      "sha256": "47589ed327feb2424a8c301895db0908024db72e85a98376bd8928c60c92410b"
+      "sha256": "c59522071429c0476964f695cefe5d411d4967a8d1c3f16e370e75466b4e92be"
     },
     {
       "file": "0003-proxy-ack-diagnostics.patch",
@@ -31,6 +31,10 @@
     {
       "file": "0007-fixed-thread-admission.patch",
       "sha256": "b6441f709ae18684fe42083623e1ab71b3d7a62127c2d4e3d1f50ef519514941"
+    },
+    {
+      "file": "0008-native-user-questions.patch",
+      "sha256": "77da88f0b8b36077fd0c9f87b39471c7cc8e823085430a6df102bee5e9d90ff1"
     }
   ]
 }

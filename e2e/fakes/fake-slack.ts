@@ -42,6 +42,8 @@ const eventsUrl = requiredEnv('SLACK_EVENTS_URL')
 
 const messages: Message[] = []
 const ephemerals: Ephemeral[] = []
+const triggers = new Map<string, string>()
+const views: Array<{ id: string; user: string; view: Record<string, unknown> }> = []
 /** Assistant status by `channel:thread_ts`; Slack hides it once a message lands in the thread. */
 const statuses = new Map<string, string>()
 let lastTs = 0
@@ -56,6 +58,22 @@ Bun.serve({
     if (url.pathname === '/healthz') return new Response('ok')
     if (url.pathname === '/_e2e/actions' && request.method === 'POST') {
       return Response.json(await clickAction((await request.json()) as ClickRequest))
+    }
+    if (url.pathname === '/_e2e/views') {
+      return Response.json(views.filter(view => view.user === url.searchParams.get('user')))
+    }
+    if (url.pathname === '/_e2e/view-submit' && request.method === 'POST') {
+      const body = await request.json() as { user: string; view_id: string; values: unknown }
+      const view = views.find(view => view.id === body.view_id)
+      const user = USERS.find(user => user.id === body.user)
+      if (!view || !user) return Response.json({ ok: false, error: 'not_found' })
+      const payload = {
+        type: 'view_submission', team: { id: TEAM.id }, api_app_id: BOT.appId,
+        user: { id: user.id, team_id: user.teamId },
+        view: { ...view.view, id: view.id, state: { values: body.values } }
+      }
+      const response = await sendSigned(`payload=${encodeURIComponent(JSON.stringify(payload))}`, 'application/x-www-form-urlencoded')
+      return Response.json({ ok: true, status: response.status, body: await response.text() })
     }
     if (url.pathname === '/_e2e/ephemeral') {
       const user = url.searchParams.get('user')
@@ -78,6 +96,14 @@ log('fake_slack_started', { port, events_url: eventsUrl })
 function handle(method: string, actor: Actor, body: Record<string, unknown>) {
   const channel = str(body.channel)
   switch (method) {
+    case 'views.open': {
+      const user = triggers.get(str(body.trigger_id))
+      if (actor !== 'bot' || !user) return { ok: false, error: 'invalid_trigger_id' }
+      const view = typeof body.view === 'string' ? JSON.parse(body.view) : body.view
+      const entry = { id: `VE2E${views.length + 1}`, user, view }
+      views.push(entry)
+      return { ok: true, view: { ...view, id: entry.id } }
+    }
     case 'auth.test':
       return actor === 'bot'
         ? { ok: true, url: 'https://centaur-e2e.slack.com/', team: TEAM.name, team_id: TEAM.id, user: BOT.name, user_id: BOT.userId, bot_id: BOT.id }
@@ -332,6 +358,7 @@ async function clickAction(click: ClickRequest) {
     .find(candidate => candidate.action_id === click.action_id)
   if (!element) return { ok: false, error: 'action_not_found' }
   const actionTs = click.action_ts ?? nextTs()
+  triggers.set(`trigger-${actionTs}`, user.id)
   const payload = {
     type: 'block_actions',
     team: { id: TEAM.id, domain: TEAM.domain },

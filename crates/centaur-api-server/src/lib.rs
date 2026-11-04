@@ -299,6 +299,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_input_routes_require_auth_and_preserve_ingress_platform_scope() {
+        let body = json!({"execution_id":"exe-test","responder_user_id":"U1",
+            "answers":{"project":{"answers":["A"]}}})
+        .to_string();
+        for (method, path) in [
+            (
+                Method::GET,
+                "/api/session/slack%3AC123%3A123.456/user-input",
+            ),
+            (
+                Method::GET,
+                "/api/session/slack%3AC123%3A123.456/user-input/request-1",
+            ),
+            (
+                Method::POST,
+                "/api/session/slack%3AC123%3A123.456/user-input/request-1",
+            ),
+        ] {
+            let anonymous = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+            let allowed = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header(header::AUTHORIZATION, "Bearer test-slackbot-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(allowed.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let denied = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path.replace("slack%3A", "discord%3A"))
+                        .header(header::AUTHORIZATION, "Bearer test-slackbot-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
     async fn console_service_jwt_passes_every_capability_route_family() {
         for request in [
             Request::builder()

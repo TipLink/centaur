@@ -104,6 +104,219 @@ fn fake_claude_app_server_streams_codex_v2_notifications() {
     assert_codex_v2_turn(&run.turn);
 }
 
+const QUESTION_CLI: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+claude = os.environ['FAKE_QUESTION_HARNESS'] == 'claude-code'
+turn = 0
+with open(os.environ['FAKE_QUESTION_LOG']+'.requests','a') as log: log.write(json.dumps({'argv':sys.argv[1:]})+'\n')
+def emit(value):
+    print(json.dumps(value), flush=True)
+def finished():
+    if claude:
+        emit({'type':'assistant','message':{'id':'answer-'+str(turn),'role':'assistant','content':[{'type':'text','text':'Continued original task'}],'stop_reason':'end_turn'}})
+        emit({'type':'result','subtype':'success','result':'Continued original task'})
+    else:
+        emit({'method':'turn/completed','params':{'threadId':'question-thread','turn':{'id':'turn-'+str(turn),'items':[],'status':'completed','error':None}}})
+for line in sys.stdin:
+    value = json.loads(line)
+    with open(os.environ['FAKE_QUESTION_LOG']+'.requests','a') as log: log.write(json.dumps(value)+'\n')
+    method = value.get('method')
+    if method == 'initialize': emit({'id':value['id'],'result':{}})
+    elif method in ('thread/start','thread/resume'):
+        emit({'id':value['id'],'result':{'thread':{'id':'question-thread'},'model':'fake'}})
+    elif (claude and value.get('type') == 'user') or method == 'turn/start':
+        turn += 1
+        question = {'header':'Project','question':'Which project?','options':[{'label':'Alpha','description':'First fit'},{'label':'Beta','description':'Second fit'}],'multiSelect':False}
+        if claude:
+            emit({'type':'control_request','request_id':'native-reused-id','request':{'subtype':'can_use_tool','tool_name':'AskUserQuestion','tool_use_id':'tool-'+str(turn),'input':{'questions':[question]}}})
+        else:
+            question['id'] = 'project'
+            # Exercise requests that arrive before the turn/start response.
+            emit({'id':7,'method':'item/tool/requestUserInput','params':{'threadId':'question-thread','turnId':'turn-'+str(turn),'itemId':'tool-'+str(turn),'isBlocking':False,'questions':[question]}})
+            emit({'id':value['id'],'result':{'turn':{'id':'turn-'+str(turn)}}})
+    elif (claude and value.get('type') == 'control_response') or (('result' in value or 'error' in value) and value.get('id') == 7):
+        with open(os.environ['FAKE_QUESTION_LOG'],'a') as log: log.write(json.dumps(value)+'\n')
+        finished()
+    elif method == 'turn/interrupt':
+        emit({'id':value['id'],'result':{}})
+        emit({'method':'turn/completed','params':{'threadId':'question-thread','turn':{'id':'turn-'+str(turn),'items':[],'status':'interrupted','error':None}}})
+"#;
+
+fn question_bridge(harness: Harness) -> (BridgeProcess, PathBuf, PathBuf) {
+    let script = temp_path("native-question-cli.py");
+    let log = temp_path("native-question-responses.jsonl");
+    std::fs::write(&script, QUESTION_CLI).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let process = BridgeProcess::spawn_harness_blocks_envs(
+        harness,
+        Some(format!("python3 {}", script.display())),
+        Some(("CODEX_BIN", script.to_str().unwrap())),
+        &[
+            ("FAKE_QUESTION_HARNESS", harness.name()),
+            ("FAKE_QUESTION_LOG", log.to_str().unwrap()),
+        ],
+    );
+    (process, script, log)
+}
+
+fn read_question_method(process: &mut BridgeProcess, method: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = process.read_json(deadline);
+        if value["method"] == method {
+            return value;
+        }
+    }
+}
+
+fn assert_native_questions_resume_once(harness: Harness) {
+    let (mut process, script, log) = question_bridge(harness);
+    let mut previous = Value::Null;
+    for execution in ["execution-1", "execution-2"] {
+        process.send(json!({"type":"user","text":"Create the ticket and PR", "trace_metadata":{"execution_id":execution,"supports_user_input":true}}));
+        let request = read_question_method(&mut process, "item/tool/requestUserInput");
+        assert_eq!(
+            request["params"]["isBlocking"],
+            matches!(harness, Harness::ClaudeCode)
+        );
+        assert_eq!(request["id"], request["params"]["requestId"]);
+        assert_ne!(request["id"], previous["request_id"]);
+        let question_id = request["params"]["questions"][0]["id"].as_str().unwrap();
+        let answer = json!({"type":"user_input_response","request_id":request["id"],"execution_id":execution,"answers":{question_id:{"answers":["Custom project"]}}});
+        let mut wrong_execution = answer.clone();
+        wrong_execution["execution_id"] = json!("other-execution");
+        process.send(wrong_execution);
+        if !previous.is_null() {
+            previous["execution_id"] = json!(execution);
+            process.send(previous.clone());
+            let stale = read_question_method(&mut process, "serverRequest/resolved");
+            assert_eq!(stale["params"]["requestId"], previous["request_id"]);
+            assert_eq!(stale["params"]["reason"], "cancelled");
+        }
+        process.send(answer.clone());
+        process.send(answer.clone());
+        let resolved = read_question_method(&mut process, "serverRequest/resolved");
+        assert_eq!(resolved["params"]["requestId"], request["id"]);
+        let terminal = read_question_method(&mut process, "turn/completed");
+        assert_eq!(terminal["params"]["turn"]["status"], "completed");
+        previous = answer;
+    }
+    process.finish_successfully();
+    let responses = read_requests(&log);
+    assert_eq!(
+        responses.len(),
+        2,
+        "duplicate/stale answer reached native CLI"
+    );
+    for response in responses {
+        let native_answers = if matches!(harness, Harness::ClaudeCode) {
+            assert_eq!(response["response"]["response"]["behavior"], "allow");
+            response["response"]["response"]["updatedInput"]["answers"]["Which project?"].clone()
+        } else {
+            response["result"]["answers"]["project"]["answers"][0].clone()
+        };
+        assert_eq!(native_answers, "Custom project");
+    }
+    let _ = std::fs::remove_file(format!("{}.requests", log.display()));
+    let _ = std::fs::remove_file(script);
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn codex_question_capability_change_resumes_the_same_thread() {
+    let (mut process, script, log) = question_bridge(Harness::Codex);
+    process.send(json!({"type":"user","text":"Interactive task","trace_metadata":{"execution_id":"first","supports_user_input":true}}));
+    let question = read_question_method(&mut process, "item/tool/requestUserInput");
+    process.send(json!({"type":"user_input_response","request_id":question["id"],"execution_id":"first","answers":{"project":{"answers":["Alpha"]}}}));
+    read_question_method(&mut process, "turn/completed");
+    process.send(json!({"type":"user","text":"Continue without UI","trace_metadata":{"execution_id":"second","supports_user_input":false}}));
+    read_question_method(&mut process, "turn/completed");
+    process.finish_successfully();
+    let requests_path = PathBuf::from(format!("{}.requests", log.display()));
+    let requests = read_requests(&requests_path);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["method"] == "thread/start")
+            .count(),
+        1
+    );
+    let resume = requests
+        .iter()
+        .find(|request| request["method"] == "thread/resume")
+        .expect("capability change must resume context");
+    assert_eq!(resume["params"]["threadId"], "question-thread");
+    let launches = requests
+        .iter()
+        .filter_map(|request| request["argv"].as_array())
+        .collect::<Vec<_>>();
+    assert_eq!(launches.len(), 2);
+    assert!(launches[0].contains(&json!("features.default_mode_request_user_input=true")));
+    assert!(launches[1].contains(&json!("features.default_mode_request_user_input=false")));
+    let _ = std::fs::remove_file(script);
+    let _ = std::fs::remove_file(log);
+    let _ = std::fs::remove_file(requests_path);
+}
+
+#[test]
+fn fake_claude_native_questions_resume_once_and_reject_stale_answers() {
+    assert_native_questions_resume_once(Harness::ClaudeCode);
+}
+
+#[test]
+fn fake_codex_native_questions_resume_once_and_reject_stale_answers() {
+    assert_native_questions_resume_once(Harness::Codex);
+}
+
+#[test]
+fn native_questions_are_cancelled_when_the_turn_is_interrupted() {
+    for harness in [Harness::ClaudeCode, Harness::Codex] {
+        let (mut process, script, log) = question_bridge(harness);
+        process.send(json!({"type":"user","text":"Ask a question", "trace_metadata":{"execution_id":"execution","supports_user_input":true}}));
+        let question = read_question_method(&mut process, "item/tool/requestUserInput");
+        process.send(json!({"type":"interrupt"}));
+        let resolved = read_question_method(&mut process, "serverRequest/resolved");
+        assert_eq!(resolved["params"]["requestId"], question["id"]);
+        assert_eq!(resolved["params"]["reason"], "cancelled");
+        assert_eq!(
+            read_question_method(&mut process, "turn/completed")["params"]["turn"]["status"],
+            "interrupted"
+        );
+        process.finish_successfully();
+        assert!(!log.exists(), "interruption answered the native tool");
+        let _ = std::fs::remove_file(format!("{}.requests", log.display()));
+        let _ = std::fs::remove_file(script);
+    }
+}
+
+#[test]
+fn native_questions_are_denied_when_the_ingress_has_not_opted_in() {
+    for harness in [Harness::ClaudeCode, Harness::Codex] {
+        let (mut process, script, log) = question_bridge(harness);
+        process.send(json!({"type":"user","text":"Unattended task","trace_metadata":{"execution_id":"execution"}}));
+        assert_eq!(
+            read_question_method(&mut process, "turn/completed")["params"]["turn"]["status"],
+            "completed"
+        );
+        let output = process.finish_successfully();
+        assert!(
+            !output
+                .iter()
+                .any(|line| line.contains("item/tool/requestUserInput"))
+        );
+        let responses = read_requests(&log);
+        assert_eq!(responses.len(), 1);
+        if matches!(harness, Harness::ClaudeCode) {
+            assert_eq!(responses[0]["response"]["response"]["behavior"], "deny");
+        } else {
+            assert_eq!(responses[0]["error"]["code"], -32000);
+        }
+        let _ = std::fs::remove_file(format!("{}.requests", log.display()));
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(log);
+    }
+}
+
 #[test]
 fn fake_claude_app_server_completes_on_stop_sequence_without_result() {
     let fake_claude = concat!(
@@ -2522,7 +2735,10 @@ impl RawProcess {
 fn validate_jsonrpc_value(value: &Value, allow_error: bool) {
     let has_id = value.get("id").is_some();
     if value.get("method").is_some() {
-        assert!(!has_id, "app-server emitted unexpected request: {value}");
+        assert!(
+            !has_id || value["method"] == "item/tool/requestUserInput",
+            "app-server emitted unexpected request: {value}"
+        );
         assert!(
             value.get("params").is_some_and(Value::is_object),
             "notification without params: {value}"

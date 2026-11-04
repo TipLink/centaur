@@ -824,9 +824,11 @@ diff --git a/services/slackbotv2/src/session-api.ts b/services/slackbotv2/src/se
 index bc9f4cdb..2cbeec19 100644
 --- a/services/slackbotv2/src/session-api.ts
 +++ b/services/slackbotv2/src/session-api.ts
-@@ -571,6 +571,41 @@ export const SESSION_STEERING_DELIVERED_EVENT = 'session.steering_delivered'
+@@ -571,8 +571,43 @@ export const SESSION_STEERING_DELIVERED_EVENT = 'session.steering_delivered'
  /** Emitted by api-rs when a follow-up could not reach the still-running execution. */
  export const SESSION_STEERING_FAILED_EVENT = 'session.steering_failed'
+ /** Emitted by api-rs while a long execution is still running. */
+ export const SESSION_PROGRESS_UPDATE_EVENT = 'session.progress_update'
  
 +const approvalDecisionMessages: Record<string, string> = {
 +  not_approver: 'You are not an approver for this action. Ask a designated approver to review it.',

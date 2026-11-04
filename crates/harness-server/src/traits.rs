@@ -34,6 +34,8 @@ pub struct ThreadState {
     pub completed_turns: Vec<Turn>,
     pub process: Option<HarnessChild>,
     pub thread_started_sent: bool,
+    /// Whether the calling ingress can collect and return native questions.
+    pub supports_user_input: bool,
 }
 
 pub struct HarnessChild {
@@ -104,6 +106,31 @@ pub trait HarnessServer {
         Ok(Vec::new())
     }
     fn parse_stdout_line(&self, line: &str) -> Result<Self::Event>;
+    /// Native requests that need a host answer are handled outside the text
+    /// stream, while their tool call remains pending in the CLI.
+    fn user_input_control(
+        &self,
+        _line: &str,
+    ) -> Result<Option<crate::user_input::UserInputControl>> {
+        Ok(None)
+    }
+    fn stdin_for_user_input_response(
+        &self,
+        _request: &crate::user_input::NativeUserInputRequest,
+        _answers: &crate::user_input::Answers,
+    ) -> Result<Vec<u8>> {
+        Err(crate::HarnessServerError::Protocol(
+            "harness does not support user input responses".into(),
+        ))
+    }
+    fn stdin_for_user_input_rejection(
+        &self,
+        _request: &crate::user_input::NativeUserInputRequest,
+    ) -> Result<Vec<u8>> {
+        Err(crate::HarnessServerError::Protocol(
+            "harness does not support user input responses".into(),
+        ))
+    }
     fn normalize_events(
         &self,
         normalizer: &mut Self::EventNormalizer,
@@ -145,6 +172,7 @@ pub trait HarnessServer {
             completed_turns: Vec::new(),
             process: None,
             thread_started_sent: false,
+            supports_user_input: false,
         }
     }
 }

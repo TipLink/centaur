@@ -136,7 +136,7 @@ index c446f655..872ed69b 100644
 +sqlx = { workspace = true, features = ["uuid"] }
  thiserror.workspace = true
  time.workspace = true
- tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 @@ -42,6 +42,7 @@ toml.workspace = true
  tower-http.workspace = true
  tracing.workspace = true

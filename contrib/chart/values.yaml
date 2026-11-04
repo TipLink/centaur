@@ -467,6 +467,9 @@ proxySync:
 # HTTPS to token endpoints. Replicas coordinate through row locks, so a rolling
 # update never refreshes a credential twice.
 tokenBroker:
+  # Set false to run no broker, for example while another deployment refreshes
+  # the same credentials. The console's own refresh jobs are unaffected.
+  enabled: true
   replicaCount: 1
   nodeSelector: {}
   affinity: {}
@@ -697,8 +700,11 @@ apiRs:
       # migration, index rebuild, and re-embedding existing rows. pgvector will
       # not build an HNSW or IVFFlat index above 2000.
       dimensions: 1536
-  # Reaper: stop sandboxes older than the max lifetime, regardless of whether
-  # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
+  # Reaper: stop sandboxes older than the max lifetime, whether running or
+  # suspended. Warm-pool sandboxes age from when a session claims them, and a
+  # sandbox with a queued or running turn waits for a later sweep unless that
+  # turn has itself run longer than the max lifetime. 0 disables the sweep.
+  # Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
   sandboxReapIntervalSecs: 300
   # Delete session.output.line events older than this many days, once their
@@ -733,6 +739,13 @@ apiRs:
     # the whole budget reasoning and returns no message. Empty omits the
     # parameter, for a server that rejects it outright.
     reasoningEffort: low
+    # Post a model-written progress message to the chat thread once an
+    # execution has run afterSecs, then at most every intervalSecs while new
+    # activity arrives. Requires activitySummary.enabled.
+    progressUpdates:
+      enabled: false
+      afterSecs: 60
+      intervalSecs: 120
   metrics:
     # The Rust API always serves Prometheus text metrics at /metrics. This flag
     # only controls scrape annotations for Prometheus/VictoriaMetrics-style
@@ -1044,6 +1057,17 @@ externalDatabase:
   # networkPolicy.enabled=true; must be empty while postgres.enabled=true.
   cidrs: []
   #   - 10.0.32.0/20
+  # Labels of the database's pods, for a database running in the cluster such
+  # as a CloudNativePG cluster. Control-plane pods and per-sandbox iron-proxies
+  # may reach these pods on port. Use this instead of cidrs for an in-cluster
+  # database: NetworkPolicy ipBlock rules may not match pod traffic. One of
+  # cidrs or podSelector is required when networkPolicy.enabled=true; both
+  # must be empty while postgres.enabled=true.
+  podSelector: {}
+  #   cnpg.io/cluster: core-db
+  # Namespace of those pods; requires podSelector. Empty means the release
+  # namespace.
+  namespace: ""
   port: 5432
   # Keyword search backend for company context. "postgres" (used when empty)
   # uses built-in full-text search and works on RDS and Cloud SQL; "paradedb"

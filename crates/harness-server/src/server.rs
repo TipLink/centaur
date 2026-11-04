@@ -38,6 +38,7 @@ use crate::traits::{
     NormalizedEvent, ThreadState, TurnHold,
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
+use crate::user_input::{PendingQuestions, UserInputControl, UserInputResponse};
 use crate::util::{absolute_path, default_codex_home, write_value};
 use crate::wire::notification_to_wire_value;
 use crate::{HarnessServerError, Result};
@@ -88,6 +89,14 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 }
 
                 match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
+                    Ok(BlocksCommand::UserInputResponse(response)) => {
+                        if request_tx
+                            .send(ActiveTurnRequest::UserInput(response))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
                         if request_tx.send(ActiveTurnRequest::BlocksInterrupt).is_err() {
                             break;
@@ -137,6 +146,15 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 reasoning,
                 trace_context,
             }) => {
+                let supports_user_input = trace_context
+                    .metadata
+                    .get("supports_user_input")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if state.supports_user_input != supports_user_input {
+                    state.process = None;
+                    state.supports_user_input = supports_user_input;
+                }
                 if let Some(model) = model {
                     state.model = model;
                 }
@@ -166,6 +184,7 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 eprintln!("blocks interrupt ignored: no active turn runs");
             }
             BlocksReaderInput::Command(BlocksCommand::AttachmentChunk) => {}
+            BlocksReaderInput::Command(BlocksCommand::UserInputResponse(_)) => {}
             BlocksReaderInput::Error(error) => {
                 eprintln!("invalid blocks input: {error}");
                 write_blocks_error(&mut stdout, &state.id, "input", error)?;
@@ -222,6 +241,9 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
             ActiveTurnRequest::BlocksInterrupt => {
                 eprintln!("blocks interrupt ignored: no active turn runs");
             }
+            ActiveTurnRequest::UserInput(_) => {
+                eprintln!("user input response ignored: no active turn runs")
+            }
         }
     }
 
@@ -270,6 +292,7 @@ enum BlocksReaderInput {
 enum ActiveTurnRequest {
     JsonRpc(JSONRPCRequest),
     BlocksInterrupt,
+    UserInput(UserInputResponse),
 }
 
 fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
@@ -279,6 +302,7 @@ fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum BlocksCommand {
+    UserInputResponse(UserInputResponse),
     User {
         input: Vec<UserInput>,
         client_user_message_id: Option<String>,
@@ -431,6 +455,9 @@ pub(crate) fn parse_blocks_line_with_state(
         })?;
 
     match parsed.kind.as_str() {
+        "user_input_response" => Ok(BlocksCommand::UserInputResponse(serde_json::from_str(
+            line,
+        )?)),
         "user" => {
             let trace_context = parsed.trace_context();
             let content = parsed
@@ -1026,6 +1053,7 @@ fn resumed_thread_state<H: HarnessServer>(
         completed_turns: Vec::new(),
         process: None,
         thread_started_sent: false,
+        supports_user_input: false,
     })
 }
 
@@ -1182,6 +1210,9 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
         stdout,
         request_rx,
         &mut telemetry,
+        trace_context
+            .and_then(|context| context.metadata.get("execution_id"))
+            .and_then(Value::as_str),
     ) {
         Ok(Some(turn)) => {
             telemetry.finish(TelemetryTurnStatus::Completed);
@@ -1241,6 +1272,7 @@ fn finish_turn_with_error<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_harness_turn<H: HarnessServer, W: Write>(
     harness: &H,
     state: &mut ThreadState,
@@ -1249,6 +1281,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     stdout: &mut W,
     request_rx: &Receiver<ActiveTurnRequest>,
     telemetry: &mut TurnTelemetry,
+    execution_id: Option<&str>,
 ) -> Result<Option<Turn>> {
     ensure_harness_process(harness, state)?;
     {
@@ -1284,13 +1317,38 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     let mut last_session_id = state.harness_session_id.clone();
     let mut event_normalizer = H::EventNormalizer::default();
     let mut completed_turn = None;
+    let mut questions = PendingQuestions::new(execution_id, state.supports_user_input);
     loop {
         while let Ok(request) = request_rx.try_recv() {
             let process = state
                 .process
                 .as_mut()
                 .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
+            if let ActiveTurnRequest::UserInput(response) = request {
+                match questions.validate_response(&response) {
+                    Ok(pending) => {
+                        if let Some(pending) = pending {
+                            process.stdin.write_all(
+                                &harness
+                                    .stdin_for_user_input_response(pending, &response.answers)?,
+                            )?;
+                            process.stdin.flush()?;
+                        }
+                        write_value(stdout, &questions.answered(response))?;
+                    }
+                    Err(error) => {
+                        eprintln!("user input response rejected: {error}");
+                        if let Some(notification) = questions.stale_response(&response) {
+                            write_value(stdout, &notification)?;
+                        }
+                    }
+                }
+                continue;
+            }
             if handle_active_turn_request(harness, process, normalizer, request, stdout)? {
+                for notification in questions.cancel_all() {
+                    write_value(stdout, &notification)?;
+                }
                 state.process = None;
                 return Err(HarnessServerError::TurnInterrupted {
                     kind: harness.kind(),
@@ -1317,6 +1375,48 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 if trimmed.is_empty() {
                     continue;
                 }
+                if let Some(control) = harness.user_input_control(trimmed)? {
+                    match control {
+                        UserInputControl::Request(request) => {
+                            match questions.register(
+                                request.clone(),
+                                normalizer.thread_id(),
+                                normalizer.turn_id(),
+                            ) {
+                                Ok(wire) => {
+                                    write_value(stdout, &wire)?;
+                                    settle_deadline = None;
+                                    hold_deadline = None;
+                                }
+                                Err(error) => {
+                                    eprintln!("native user input request rejected: {error}");
+                                    let process = state
+                                        .process
+                                        .as_mut()
+                                        .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
+                                    process.stdin.write_all(
+                                        &harness.stdin_for_user_input_rejection(&request)?,
+                                    )?;
+                                    process.stdin.flush()?;
+                                }
+                            }
+                        }
+                        UserInputControl::Cancel(native_id) => {
+                            if let Some(notification) = questions.cancel_native(&native_id) {
+                                write_value(stdout, &notification)?;
+                            }
+                        }
+                        UserInputControl::Reply(bytes) => {
+                            let process = state
+                                .process
+                                .as_mut()
+                                .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
+                            process.stdin.write_all(&bytes)?;
+                            process.stdin.flush()?;
+                        }
+                    }
+                    continue;
+                }
                 let event = harness.parse_stdout_line(trimmed)?;
                 let normalized_events = harness.normalize_events(&mut event_normalizer, event)?;
                 let mut terminal_stop = false;
@@ -1335,7 +1435,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     terminal_stop |=
                         settle_window.is_some() && normalized.is_terminal_assistant_stop();
                 }
-                if !terminal {
+                if !terminal && !questions.is_pending() {
                     match settle_window {
                         Some(window) if terminal_stop && window.is_zero() => terminal = true,
                         Some(window) if terminal_stop || settle_deadline.is_some() => {
@@ -1344,9 +1444,11 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                         _ => {}
                     }
                 }
-                hold_deadline = match harness.turn_hold(&event_normalizer) {
-                    TurnHold::Idle(window) => Some(Instant::now() + window),
-                    TurnHold::Released | TurnHold::Waiting => None,
+                hold_deadline = match (questions.is_pending(), harness.turn_hold(&event_normalizer))
+                {
+                    (true, _) => None,
+                    (false, TurnHold::Idle(window)) => Some(Instant::now() + window),
+                    (false, TurnHold::Released | TurnHold::Waiting) => None,
                 };
             }
             Err(RecvTimeoutError::Timeout)
@@ -1383,6 +1485,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
             }
         }
         if terminal {
+            for notification in questions.cancel_all() {
+                write_value(stdout, &notification)?;
+            }
             // Background work outliving the turn (e.g. an error result while
             // agents run) would deliver its output into the next turn; stop
             // it with the process, which the next turn resumes.

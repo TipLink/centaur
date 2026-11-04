@@ -128,6 +128,24 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
   }
 }
 
+describe('native question deployment admission', () => {
+  test('does not advertise buttons where fixed-owner admission rejects controls', async () => {
+    for (const [threadId, admission, enabled] of [
+      ['slack:C1:1700000000.000100', 'http://owner-gate', false],
+      ['slack:C2:1700000000.000100', 'http://owner-gate', true],
+      ['slack:C1:1700000000.000100', undefined, true]
+    ] as const) {
+      const { fetchFn, requests } = fakeApi()
+      await forwardToSessionApi({ ...options(fetchFn), threadAdmissionUrl: admission,
+        channelUserPolicy: { C1: { team_id: 'T1', allowed_user_ids: ['U1'] } }
+      }, forwardInput(apiMessage('Choose a project', { threadId })))
+      const execute = requests.find(request => request.url.endsWith('/execute'))!.body as JsonObject
+      expect((execute.metadata as JsonObject).supports_user_input).toBe(enabled)
+      expect((executeLine(requests).trace_metadata as JsonObject).supports_user_input).toBe(enabled)
+    }
+  })
+})
+
 function executeBody(requests: RecordedRequest[]): Record<string, unknown> {
   const execute = requests.find(request => request.url.endsWith('/execute'))
   return (execute?.body ?? {}) as Record<string, unknown>
@@ -228,8 +246,9 @@ describe('Slack home team API metadata', () => {
     expect(create.metadata?.slack_home_team_id).toBe('T_HOME')
     expect(append.messages?.[0]?.metadata?.slack_home_team_id).toBe('T_HOME')
     expect(execute.metadata?.slack_home_team_id).toBe('T_HOME')
+    expect(execute.metadata?.supports_user_input).toBe(true)
     expect(executeLine(requests).trace_metadata).toEqual(
-      expect.objectContaining({ slack_home_team_id: 'T_HOME' })
+      expect.objectContaining({ slack_home_team_id: 'T_HOME', supports_user_input: true })
     )
   })
 

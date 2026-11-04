@@ -19,6 +19,7 @@ use crate::server::{
     BlocksCommand, BlocksState, parse_blocks_line_with_state, usage_span_input_value,
     write_blocks_error,
 };
+use crate::user_input::{NativeUserInputRequest, PendingQuestions, Question, UserInputResponse};
 use crate::{AppServerRuntime, HarnessServerError, Result};
 
 mod citations;
@@ -159,6 +160,14 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 }
 
                 match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
+                    Ok(BlocksCommand::UserInputResponse(response)) => {
+                        if active_turn_tx
+                            .send(CodexActiveTurnRequest::UserInput(response))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
                         if active_turn_tx
                             .send(CodexActiveTurnRequest::Interrupt)
@@ -228,6 +237,11 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 trace_context,
             }) => {
                 let traceparent = trace_context.effective_traceparent();
+                let supports_user_input = trace_context
+                    .metadata
+                    .get("supports_user_input")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let model = model.or_else(|| config.default_model());
                 let model_provider =
                     config.model_provider_for(provider.as_deref(), model.as_deref());
@@ -242,12 +256,13 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 turn_active.store(true, Ordering::SeqCst);
                 let result = (|| -> Result<()> {
                     if let Some(child) = codex.as_mut()
-                        && child.child.try_wait()?.is_some()
+                        && (child.child.try_wait()?.is_some()
+                            || child.supports_user_input != supports_user_input)
                     {
                         codex = None;
                     }
                     if codex.is_none() {
-                        let mut child = CodexJsonRpcChild::spawn()?;
+                        let mut child = CodexJsonRpcChild::spawn(supports_user_input)?;
                         initialize_codex(
                             &mut child,
                             &mut stdout,
@@ -290,6 +305,10 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                         &active_turn_rx,
                         traceparent.as_deref(),
                         &mut telemetry,
+                        trace_context
+                            .metadata
+                            .get("execution_id")
+                            .and_then(Value::as_str),
                     )
                 })();
                 telemetry.finish(if result.is_ok() {
@@ -319,6 +338,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 eprintln!("Codex blocks interrupt ignored: no active turn runs");
             }
             CodexBlocksReaderInput::Command(BlocksCommand::AttachmentChunk) => {}
+            CodexBlocksReaderInput::Command(BlocksCommand::UserInputResponse(_)) => {}
             CodexBlocksReaderInput::Error(error) => {
                 eprintln!("invalid Codex blocks input: {error}");
                 write_blocks_error(
@@ -340,6 +360,7 @@ enum CodexBlocksReaderInput {
 }
 
 enum CodexActiveTurnRequest {
+    UserInput(UserInputResponse),
     Interrupt,
     Steer {
         input: Vec<UserInput>,
@@ -393,7 +414,9 @@ fn run_codex_user_turn<W: Write>(
     active_turn_rx: &Receiver<CodexActiveTurnRequest>,
     traceparent: Option<&str>,
     telemetry: &mut TurnTelemetry,
+    execution_id: Option<&str>,
 ) -> Result<()> {
+    codex.questions = PendingQuestions::new(execution_id, codex.supports_user_input);
     let (model, model_provider) = model_and_provider;
     if thread_id.is_none() {
         let thread = start_or_resume_thread(
@@ -586,13 +609,19 @@ struct CodexJsonRpcChild {
     stdin: ChildStdin,
     stdout: Receiver<io::Result<String>>,
     citations: CodexCitationFilter,
+    questions: PendingQuestions,
+    supports_user_input: bool,
 }
 
 impl CodexJsonRpcChild {
-    fn spawn() -> Result<Self> {
+    fn spawn(supports_user_input: bool) -> Result<Self> {
         let bin = codex_bin();
         let mut child = ProcessCommand::new(&bin)
             .args(["app-server", "--listen", "stdio://"])
+            .args([
+                "-c",
+                &format!("features.default_mode_request_user_input={supports_user_input}"),
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -638,6 +667,8 @@ impl CodexJsonRpcChild {
             stdin,
             stdout: stdout_rx,
             citations: CodexCitationFilter::default(),
+            questions: PendingQuestions::new(None, supports_user_input),
+            supports_user_input,
         })
     }
 
@@ -671,6 +702,64 @@ impl CodexJsonRpcChild {
         }))
     }
 
+    fn forward_user_input_request<W: Write>(
+        &mut self,
+        value: &Value,
+        stdout: &mut W,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Result<bool> {
+        if value["method"] != "item/tool/requestUserInput"
+            || thread_id.is_none()
+            || value.pointer("/params/threadId").and_then(Value::as_str) != thread_id
+            || value
+                .pointer("/params/turnId")
+                .and_then(Value::as_str)
+                .is_none()
+            || turn_id.is_some_and(|id| value["params"]["turnId"] != id)
+        {
+            return Ok(false);
+        }
+        let params = &value["params"];
+        // Codex sets isBlocking only in Plan mode. Its ordinary request tool
+        // awaits an answer in Default mode too; preserve the native UI hint.
+        let Some(questions) = params["questions"].as_array() else {
+            return Ok(false);
+        };
+        let mut normalized = Vec::with_capacity(questions.len());
+        for question in questions {
+            // Slack's normal question surface is not a secret input channel.
+            if question["isSecret"] == true {
+                return Ok(false);
+            }
+            let mut question = question.clone();
+            if question["options"].is_null() {
+                question["options"] = json!([]);
+            }
+            question["allowOther"] = json!(true);
+            let Ok(question) = serde_json::from_value::<Question>(question) else {
+                return Ok(false);
+            };
+            normalized.push(question);
+        }
+        let request = NativeUserInputRequest {
+            native_id: value["id"].clone(),
+            item_id: params["itemId"].as_str().unwrap_or_default().to_owned(),
+            questions: normalized,
+            input: Value::Null,
+            is_blocking: params["isBlocking"].as_bool().unwrap_or(true),
+        };
+        let Ok(wire) = self.questions.register(
+            request,
+            thread_id.unwrap_or_default(),
+            params["turnId"].as_str().unwrap_or_default(),
+        ) else {
+            return Ok(false);
+        };
+        crate::util::write_value(stdout, &wire)?;
+        Ok(true)
+    }
+
     fn write_value(&mut self, value: &Value) -> Result<()> {
         let mut line = serde_json::to_vec(value)?;
         line.push(b'\n');
@@ -693,7 +782,11 @@ impl CodexJsonRpcChild {
         loop {
             let value = self.read_value()?;
             if is_server_request(&value) {
-                self.send_error_response(&value)?;
+                if value["method"] == "item/tool/requestUserInput" && thread_id.is_some() {
+                    notifications.push(value);
+                } else {
+                    self.send_error_response(&value)?;
+                }
                 continue;
             }
             if response_id(&value) == Some(expected_id) {
@@ -709,7 +802,23 @@ impl CodexJsonRpcChild {
                     .or(thread_id);
                 let turn_id = result.pointer("/turn/id").and_then(Value::as_str);
                 for notification in notifications {
-                    if notification_matches_scope(&notification, thread_id, turn_id) {
+                    if is_server_request(&notification) {
+                        if !self.forward_user_input_request(
+                            &notification,
+                            stdout,
+                            thread_id,
+                            turn_id,
+                        )? {
+                            self.send_error_response(&notification)?;
+                        }
+                    } else if notification["method"] == "serverRequest/resolved" {
+                        if let Some(resolved) = self
+                            .questions
+                            .cancel_native(&notification["params"]["requestId"])
+                        {
+                            crate::util::write_value(stdout, &resolved)?;
+                        }
+                    } else if notification_matches_scope(&notification, thread_id, turn_id) {
                         self.citations.write_value(stdout, &notification)?;
                     }
                 }
@@ -738,7 +847,10 @@ impl CodexJsonRpcChild {
         traceparent: Option<&str>,
         telemetry: &mut TurnTelemetry,
     ) -> Result<TurnTermination> {
-        let mut guard = TurnGuard::default();
+        let mut guard = TurnGuard {
+            streamed: self.questions.is_pending(),
+            ..TurnGuard::default()
+        };
         let mut interrupt_request_id = None;
         let mut steer_request_ids = HashSet::new();
         loop {
@@ -750,13 +862,31 @@ impl CodexJsonRpcChild {
                 thread_id,
                 turn_id,
                 traceparent,
+                stdout,
             )?;
             let value = match self.read_value_timeout(Duration::from_millis(50))? {
                 Some(value) => value,
                 None => continue,
             };
             if is_server_request(&value) {
-                self.send_error_response(&value)?;
+                if self.forward_user_input_request(
+                    &value,
+                    stdout,
+                    Some(thread_id),
+                    Some(turn_id),
+                )? {
+                    guard.streamed = true;
+                } else {
+                    self.send_error_response(&value)?;
+                }
+                continue;
+            }
+            if value["method"] == "serverRequest/resolved" {
+                if let Some(notification) =
+                    self.questions.cancel_native(&value["params"]["requestId"])
+                {
+                    crate::util::write_value(stdout, &notification)?;
+                }
                 continue;
             }
             if let Some(id) = response_id(&value) {
@@ -795,6 +925,9 @@ impl CodexJsonRpcChild {
                     }
                 }
                 GuardStep::ForwardThenDone(values) => {
+                    for notification in self.questions.cancel_all() {
+                        crate::util::write_value(stdout, &notification)?;
+                    }
                     for value in &values {
                         telemetry.observe_wire_value(value);
                         self.citations.write_value(stdout, value)?;
@@ -806,7 +939,7 @@ impl CodexJsonRpcChild {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_pending_active_turn_requests(
+    fn forward_pending_active_turn_requests<W: Write>(
         &mut self,
         active_turn_rx: &Receiver<CodexActiveTurnRequest>,
         interrupt_request_id: &mut Option<i64>,
@@ -815,9 +948,29 @@ impl CodexJsonRpcChild {
         thread_id: &str,
         turn_id: &str,
         traceparent: Option<&str>,
+        stdout: &mut W,
     ) -> Result<()> {
         while let Ok(request) = active_turn_rx.try_recv() {
             match request {
+                CodexActiveTurnRequest::UserInput(response) => {
+                    match self.questions.validate_response(&response) {
+                        Ok(pending) => {
+                            if let Some(pending) = pending {
+                                let native_id = pending.native_id.clone();
+                                self.write_value(
+                                    &json!({"id":native_id,"result":{"answers":response.answers}}),
+                                )?;
+                            }
+                            crate::util::write_value(stdout, &self.questions.answered(response))?;
+                        }
+                        Err(error) => {
+                            eprintln!("user input response rejected: {error}");
+                            if let Some(notification) = self.questions.stale_response(&response) {
+                                crate::util::write_value(stdout, &notification)?;
+                            }
+                        }
+                    }
+                }
                 CodexActiveTurnRequest::Interrupt => {
                     if interrupt_request_id.is_some() {
                         eprintln!("Codex blocks interrupt ignored: interrupt already requested");
