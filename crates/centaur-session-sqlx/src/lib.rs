@@ -23,6 +23,9 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
 mod migrations;
+mod user_input;
+
+pub use user_input::UserInputClaim;
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
 

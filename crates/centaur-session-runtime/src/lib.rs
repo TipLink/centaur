@@ -1,6 +1,7 @@
 mod cleanup;
 mod retention;
 mod title_generator;
+mod user_input;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -58,6 +59,7 @@ pub use title_generator::SessionTitleGenerationError;
 use title_generator::{
     OpenAiSessionTitleGenerator, sanitize_session_title, session_title_source_from_parts,
 };
+pub use user_input::UserInputError;
 
 pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
@@ -2206,6 +2208,7 @@ impl SessionRuntime {
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
             let requester_metadata = metadata.clone();
+            let input_lines = user_input::input_lines_with_user_input_support(input_lines, metadata.as_ref());
             let persona_model = self.persona_model(&session);
             let input_lines = match persona_model {
                 Some(model) => input_lines_with_persona_model(input_lines, model),
@@ -5079,6 +5082,12 @@ async fn run_stdout_pump(
             else {
                 continue;
             };
+            if let Some(execution) = active_execution.as_ref()
+                && execution.execution_id == output_execution_id
+                && let Some(value) = output_value.as_ref()
+            {
+                user_input::persist_user_input_output(&ctx, &thread_key, execution, value).await?;
+            }
             let first_token_execution = active_execution
                 .as_ref()
                 .filter(|execution| {
@@ -6223,6 +6232,7 @@ fn execution_duration(execution: &SessionExecution) -> Option<Duration> {
 fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
     match error {
         SessionRuntimeError::BadRequest(_) => "bad_request",
+        SessionRuntimeError::UserInput(_) => "user_input",
         SessionRuntimeError::ShuttingDown => "shutting_down",
         SessionRuntimeError::Store(_) => "store",
         SessionRuntimeError::Sandbox(SandboxError::NotFound(_)) => "sandbox_not_found",
@@ -6852,9 +6862,12 @@ fn input_line_with_session_context(
             .entry("trace_metadata")
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         if let Value::Object(metadata) = trace_metadata {
-            metadata
-                .entry("execution_id")
-                .or_insert_with(|| Value::String(execution_id.to_owned()));
+            // The adapter uses this identity to fence native question replies.
+            // A caller-supplied or replayed id must not override the durable execution.
+            metadata.insert(
+                "execution_id".to_owned(),
+                Value::String(execution_id.to_owned()),
+            );
         }
     }
     prepend_chat_surface_note(map, thread_key);
@@ -7545,6 +7558,8 @@ fn terminal_output_from_lines(lines: &[String]) -> Option<TerminalOutput> {
 pub enum SessionRuntimeError {
     #[error("{0}")]
     BadRequest(String),
+    #[error(transparent)]
+    UserInput(#[from] UserInputError),
     #[error("control plane is shutting down")]
     ShuttingDown,
     #[error(transparent)]
@@ -9034,7 +9049,7 @@ mod tests {
         let line = input_line_with_session_context(
             &thread_key,
             &trace,
-            r#"{"type":"user","trace_metadata":{"action":"execute"}}"#,
+            r#"{"type":"user","trace_metadata":{"action":"execute","execution_id":"caller-supplied"}}"#,
         );
         let value: Value = serde_json::from_str(&line).unwrap();
 
@@ -9983,6 +9998,139 @@ mod adoption_tests {
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
             TestSessionPrincipalRegistrar,
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_user_input_round_trip_preserves_execution_and_replays_request() {
+        use centaur_session_core::user_input::UserInputAnswers;
+        use tokio::io::AsyncBufReadExt;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!("test:user-input-{}", Uuid::new_v4())).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap();
+        let execution = runtime.enqueue_session_execution(&thread_key, ExecuteSessionInput {
+            idempotency_key: Some("original-task".to_owned()),
+            metadata: Some(json!({"user_id":"U-requester","supports_user_input":true})),
+            input_lines: vec![json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"Make a PR and ticket"}]}}).to_string()],
+            idle_timeout_ms: None,
+            max_duration_ms: None,
+        }).await.unwrap();
+        let mut stdin = tokio::io::BufReader::new(stdin).lines();
+        let kickoff = timeout(Duration::from_secs(10), stdin.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let kickoff: Value = serde_json::from_str(&kickoff).unwrap();
+        assert_eq!(kickoff["trace_metadata"]["supports_user_input"], true);
+        let request_id = Uuid::new_v4().to_string();
+        let question = json!({
+            "id":request_id,"method":"item/tool/requestUserInput",
+            "params":{"requestId":request_id,"threadId":"native-thread","turnId":"native-turn",
+                "requester_user_id":"model-must-not-set-owner",
+                "questions":[{"id":"project","header":"Project","question":"Which project?",
+                    "options":[{"label":"Project A","description":"Matches the work"}]}]}
+        });
+        stdout
+            .write_all(format!("{question}\n").as_bytes())
+            .await
+            .unwrap();
+        wait_for_event(&store, &thread_key, "session.user_input.requested").await;
+        let reopened = runtime_with(&store, backend);
+        let pending = reopened
+            .list_user_input_requests(&thread_key)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].execution_id, execution.execution_id);
+        assert_eq!(pending[0].requester_user_id.as_deref(), Some("U-requester"));
+        let answers: UserInputAnswers =
+            serde_json::from_value(json!({"project":{"answers":["Project A"]}})).unwrap();
+        assert!(matches!(
+            runtime
+                .answer_user_input(
+                    &thread_key,
+                    &execution.execution_id,
+                    &request_id,
+                    "U-other",
+                    &answers
+                )
+                .await,
+            Err(SessionRuntimeError::UserInput(UserInputError::Forbidden))
+        ));
+        let result = runtime
+            .answer_user_input(
+                &thread_key,
+                &execution.execution_id,
+                &request_id,
+                "U-requester",
+                &answers,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, "submitted");
+        let line = timeout(Duration::from_secs(5), stdin.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let line: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(line["type"], "user_input_response");
+        assert_eq!(line["request_id"], request_id);
+        assert_eq!(line["execution_id"], execution.execution_id);
+        assert_eq!(
+            line["trace_metadata"]["execution_id"],
+            execution.execution_id
+        );
+        assert_eq!(line["answers"]["project"]["answers"][0], "Project A");
+        stdout.write_all(format!("{}\n", json!({"method":"serverRequest/resolved","params":{"requestId":request_id,"reason":"answered"}})).as_bytes()).await.unwrap();
+        wait_for_event(&store, &thread_key, "session.user_input.resolved").await;
+        stdout
+            .write_all(&completed_output_bytes("PR and ticket finished"))
+            .await
+            .unwrap();
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let replay = runtime
+            .answer_user_input(
+                &thread_key,
+                &execution.execution_id,
+                &request_id,
+                "U-requester",
+                &answers,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status, "resolved");
+        let count: i64 =
+            sqlx::query_scalar("select count(*) from session_executions where thread_key = $1")
+                .bind(thread_key.as_str())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            runtime
+                .list_user_input_requests(&thread_key)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        reset_test_store(&store).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

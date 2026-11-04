@@ -4,7 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use centaur_session_core::ThreadKeyError;
-use centaur_session_runtime::SessionRuntimeError;
+use centaur_session_runtime::{SessionRuntimeError, UserInputError};
 use centaur_session_sqlx::SessionStoreError;
 use centaur_workflows::WorkflowRuntimeError;
 use serde_json::json;
@@ -57,6 +57,15 @@ impl IntoResponse for ApiError {
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Runtime(SessionRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
+            Self::Runtime(SessionRuntimeError::UserInput(UserInputError::NotFound)) => {
+                StatusCode::NOT_FOUND
+            }
+            Self::Runtime(SessionRuntimeError::UserInput(UserInputError::Forbidden)) => {
+                StatusCode::FORBIDDEN
+            }
+            Self::Runtime(SessionRuntimeError::UserInput(UserInputError::Conflict(_))) => {
+                StatusCode::CONFLICT
+            }
             Self::Runtime(SessionRuntimeError::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {
                 StatusCode::NOT_FOUND

@@ -228,8 +228,9 @@ describe('Slack home team API metadata', () => {
     expect(create.metadata?.slack_home_team_id).toBe('T_HOME')
     expect(append.messages?.[0]?.metadata?.slack_home_team_id).toBe('T_HOME')
     expect(execute.metadata?.slack_home_team_id).toBe('T_HOME')
+    expect(execute.metadata?.supports_user_input).toBe(true)
     expect(executeLine(requests).trace_metadata).toEqual(
-      expect.objectContaining({ slack_home_team_id: 'T_HOME' })
+      expect.objectContaining({ slack_home_team_id: 'T_HOME', supports_user_input: true })
     )
   })
 

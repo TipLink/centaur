@@ -55,6 +55,8 @@ import {
   SESSION_PROGRESS_UPDATE_EVENT,
   SESSION_STEERING_DELIVERED_EVENT,
   SESSION_STEERING_FAILED_EVENT,
+  SESSION_USER_INPUT_REQUESTED_EVENT,
+  SESSION_USER_INPUT_RESOLVED_EVENT,
   sessionStreamError,
   slackApiTimeoutMs,
   WORKFLOW_ACTION_PREFIX,
@@ -88,6 +90,7 @@ import {
   slackStreamRecipientUserId
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
+import { handleSessionUserInputInteraction, renderSessionUserInput, UserInputRenderError } from './user-input'
 import {
   createSteeringReactionController,
   type SteeringReactionAck,
@@ -681,6 +684,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         return new globalThis.Response('ok', { status: 200 })
       }
       const interaction = parseSlackWebhookPayload(rawBody)
+      const keepAlive = (promise: Promise<unknown>) => {
+        background.track(promise)
+        waitUntil(c, promise)
+      }
+      const userInputResponse = await handleSessionUserInputInteraction(interaction, options, stateConnected, keepAlive)
+      if (userInputResponse) return userInputResponse
       const workflowAction = interaction?.type === 'block_actions'
         && Array.isArray(interaction.actions)
         && interaction.actions.some(action => isJsonObject(action)
@@ -688,10 +697,6 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
           && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
       const awaitHandoff = workflowAction || shouldAwaitSlackHandoff(rawBody)
       const handoffTasks: Promise<unknown>[] = []
-      const keepAlive = (promise: Promise<unknown>) => {
-        background.track(promise)
-        waitUntil(c, promise)
-      }
       const context: SlackbotV2RequestContext = { waitUntil: keepAlive }
       const response = await requestContext.run(context, () => {
         return chat.webhooks.slack(c.req.raw, {
@@ -2360,7 +2365,7 @@ async function renderExecutionAttempt(
     // otherwise be misclassified as retryable session API errors and re-render
     // the whole stream instead of posting the durable final answer.
     const answerLost = slackAnswerLost(error)
-    if (answerLost === undefined && isRetryableSessionApiError(error)) {
+    if (error instanceof UserInputRenderError || (answerLost === undefined && isRetryableSessionApiError(error))) {
       retry = true
       outcome = 'retry'
       traceLog(
@@ -2941,6 +2946,7 @@ async function recoverRenderObligation(
   }
 
   let rendered = false
+  let questionsDeferred = false
   try {
     await thread.setState({
       activeExecution: true,
@@ -2981,6 +2987,11 @@ async function recoverRenderObligation(
       divergence_reconciled: divergenceReconciled
     })
   } catch (error) {
+    if (error instanceof UserInputRenderError) {
+      questionsDeferred = true
+      renderOutcome = 'deferred'
+      return true
+    }
     const answerLost = slackAnswerLost(error)
     if (answerLost === false) {
       // The recovered stream broke only after the final answer became
@@ -3041,7 +3052,7 @@ async function recoverRenderObligation(
   } finally {
     const latest = (await thread.state) ?? {}
     await thread.setState({
-      activeExecution: false,
+      activeExecution: questionsDeferred,
       lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
       ...(rendered ? { renderObligation: null } : {})
     })
@@ -4392,6 +4403,16 @@ async function* restoreAssistantStatusAfterSteering(
   answerStream?: AnswerStreamProgress
 ): AsyncIterable<SlackbotV2RendererSource> {
   for await (const event of stream) {
+    try {
+      if (await renderSessionUserInput(thread, event, options, backgroundWaitUntil)) continue
+    } catch (error) {
+      const kind = sessionEventKind(event)
+      if (kind === SESSION_USER_INPUT_REQUESTED_EVENT) throw new UserInputRenderError(error)
+      // Closing stale buttons must not hide the task's final answer. The API
+      // already rejects answers to a resolved or cancelled request.
+      traceWarn(options, 'slackbotv2_user_input_close_failed', trace, { error: errorMessage(error) })
+      if (kind === SESSION_USER_INPUT_RESOLVED_EVENT) continue
+    }
     if (sessionEventKind(event) === SESSION_PROGRESS_UPDATE_EVENT) {
       await postProgressUpdate(thread, event, tracker, options, trace, answerStream)
       continue

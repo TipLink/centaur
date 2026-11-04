@@ -80,7 +80,7 @@ export async function isAllowedSlackWebhookBody(
 ): Promise<boolean> {
   const payload = parseSlackWebhookPayload(rawBody)
   if (!payload) return true
-  if (isRawSlackInteraction(payload) && payload.type === 'block_actions') {
+  if (isRawSlackInteraction(payload) && (payload.type === 'block_actions' || payload.type === 'view_submission')) {
     return isAllowedSlackInteraction(payload, options, logger)
   }
   if (!isRawSlackEnvelope(payload) || payload.type !== 'event_callback') return true

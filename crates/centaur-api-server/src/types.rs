@@ -130,6 +130,13 @@ pub struct InterruptSessionExecutionRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct AnswerUserInputRequest {
+    pub execution_id: String,
+    pub responder_user_id: String,
+    pub answers: centaur_session_core::user_input::UserInputAnswers,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct InterruptSessionExecutionResponse {
     pub ok: bool,
