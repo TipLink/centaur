@@ -711,6 +711,131 @@ describe('slackbotv2', () => {
     expect(codexApi.workflowEvents).toHaveLength(0)
   })
 
+  function scheduleCancelPayload() {
+    const button = {
+      type: 'button', action_id: 'centaur.schedule.cancel', value: 'tsk_A123',
+      text: { type: 'plain_text', text: 'Cancel schedule' }
+    }
+    return {
+      type: 'block_actions', team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+      channel: { id: CHANNEL_ID },
+      message: {
+        ts: '1700000003.000200', thread_ts: '1700000003.000100',
+        text: 'Daily report\n\nScheduled task attribution',
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: 'Daily report' } },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: 'Scheduled task attribution' }] },
+          { type: 'actions', elements: [button] }
+        ]
+      },
+      actions: [{ ...button, action_ts: '1700000004.000200' }]
+    }
+  }
+
+  it('cancels a schedule before acknowledging, retries failures, and updates older report buttons without a model turn', async () => {
+    const requests: unknown[] = []
+    const updates: Record<string, string>[] = []
+    const feedback: Record<string, string>[] = []
+    let release: (() => void) | undefined
+    const held = new Promise<void>(resolve => { release = resolve })
+    let fail = true
+    bot = createTestBot({ fetch: async (input, init) => {
+      if (String(input).endsWith('/api/slack/scheduled-tasks/tsk_A123/cancel')) {
+        requests.push(JSON.parse(String(init?.body)))
+        await held
+        return fail
+          ? Response.json({ error: 'unavailable' }, { status: 503 })
+          : Response.json({ data: { id: 'tsk_A123', enabled: false } })
+      }
+      if (String(input).endsWith('/chat.update') || String(input).endsWith('/chat.postEphemeral')) {
+        const body = Object.fromEntries(new URLSearchParams(String(init?.body)))
+        if (String(input).endsWith('/chat.update')) updates.push(body)
+        else feedback.push(body)
+        return Response.json({ ok: true })
+      }
+      return globalThis.fetch(input, init)
+    } })
+    const payload = scheduleCancelPayload()
+    const waits: Promise<unknown>[] = []
+    let acknowledged = false
+    const first = Promise.resolve(bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits)))
+      .then(response => { acknowledged = true; return response })
+    await waitFor(() => requests.length === 1)
+    expect(acknowledged).toBe(false)
+    release?.()
+    expect((await first).status).toBe(503)
+    expect(updates).toHaveLength(0)
+    fail = false
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
+      expect(response.status).toBe(200)
+    }
+    await Promise.all(waits)
+    expect(requests).toEqual(Array(3).fill({ team_id: TEAM_ID, user_id: USER_ID, channel_id: CHANNEL_ID }))
+    expect(updates).toHaveLength(2)
+    expect(updates[0]).toEqual(updates[1])
+    expect(updates[0]?.channel).toBe(CHANNEL_ID)
+    expect(updates[0]?.ts).toBe(payload.message.ts)
+    expect(updates[0]?.text).toBe(`${payload.message.text}\n\nSchedule canceled. No future scheduled runs.`)
+    expect(JSON.parse(updates[0]!.blocks!)).toEqual([
+      ...payload.message.blocks.slice(0, 2),
+      { type: 'context', elements: [{ type: 'mrkdwn', text: 'Schedule canceled. No future scheduled runs.' }] }
+    ])
+    expect(feedback).toHaveLength(2)
+    expect(feedback[0]?.user).toBe(USER_ID)
+    expect(feedback[0]?.text).toContain('No future scheduled runs')
+    expect(codexApi.creates).toHaveLength(0)
+    expect(codexApi.executes).toHaveLength(0)
+    expect(codexApi.workflowEvents).toHaveLength(0)
+  })
+
+  for (const status of [403, 404]) it(`keeps a scheduled report unchanged on ${status} and replies privately`, async () => {
+    const feedback: Record<string, string>[] = []
+    bot = createTestBot({ fetch: async (input, init) => {
+      if (String(input).endsWith('/api/slack/scheduled-tasks/tsk_A123/cancel')) {
+        return Response.json({ error: 'private backend details' }, { status })
+      }
+      if (String(input).endsWith('/chat.update')) throw new Error('must not change report')
+      if (String(input).endsWith('/chat.postEphemeral')) {
+        feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
+        return Response.json({ ok: true })
+      }
+      return globalThis.fetch(input, init)
+    } })
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(scheduleCancelPayload()), {}, waitUntilContext(waits))
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(feedback).toHaveLength(1)
+    expect(feedback[0]?.user).toBe(USER_ID)
+    expect(feedback[0]?.text).toContain(status === 403 ? 'Only the schedule owner' : 'no longer available')
+    expect(JSON.stringify(feedback)).not.toContain('private backend details')
+    expect(codexApi.executes).toHaveLength(0)
+  })
+
+  it('attests the cancel clicker workspace and rejects unsigned cancel requests', async () => {
+    const requests: unknown[] = []
+    bot = createTestBot({ allowedExternalTeamIds: ['TEXTERNAL'], fetch: async (input, init) => {
+      if (String(input).endsWith('/api/slack/scheduled-tasks/tsk_A123/cancel')) {
+        requests.push(JSON.parse(String(init?.body)))
+        return Response.json({ error: 'wrong workspace' }, { status: 403 })
+      }
+      if (String(input).endsWith('/chat.postEphemeral')) return Response.json({ ok: true })
+      if (String(input).endsWith('/chat.update')) throw new Error('must not change report')
+      return globalThis.fetch(input, init)
+    } })
+    const payload = scheduleCancelPayload()
+    payload.user.team_id = 'TEXTERNAL'
+    const signed = signedSlackInteraction(payload)
+    const waits: Promise<unknown>[] = []
+    expect((await bot.app.request('/api/slack/actions', { ...signed, headers: {} }, {}, waitUntilContext(waits))).status).toBe(401)
+    expect(requests).toHaveLength(0)
+    expect((await bot.app.request('/api/slack/actions', signed, {}, waitUntilContext(waits))).status).toBe(200)
+    await Promise.all(waits)
+    expect(requests).toEqual([{ team_id: 'TEXTERNAL', user_id: USER_ID, channel_id: CHANNEL_ID }])
+  })
+
   const approvalFeedbackCases = [
     { name: 'untrusted button', status: 403, body: { error: 'invalid or untrusted workflow button' }, expected: 'could not be verified' },
     ...[

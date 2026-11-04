@@ -3,6 +3,7 @@ import {
   clearConversationNameCacheForTests,
   clearRequesterIdentityCacheForTests,
   DEFAULT_SESSION_IDLE_TIMEOUT_MS,
+  dispatchSlackBlockAction,
   forwardToSessionApi,
   harnessRestartPreamble,
   interruptSessionExecution,
@@ -19,6 +20,7 @@ import type {
   JsonObject,
   JsonValue,
   SlackbotV2ApiMessage,
+  SlackbotV2BlockActionPayload,
   SlackbotV2Options
 } from '../src/types'
 
@@ -127,6 +129,42 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
     signingSecret: 'secret'
   }
 }
+
+describe('scheduled task cancellation', () => {
+  const payload: SlackbotV2BlockActionPayload = {
+    type: 'block_actions', action_id: 'centaur.schedule.cancel', value: 'tsk_A123',
+    team_id: 'T1', user_id: 'U1', channel_id: 'C1', message_id: '123.1',
+    thread_id: 'slack:C1:123.1', user_name: 'tester'
+  }
+
+  test('accepts only a disabled response for the exact clicked task', async () => {
+    for (const data of [{ id: 'tsk_other', enabled: false }, { id: 'tsk_A123', enabled: true }, {}]) {
+      await expect(dispatchSlackBlockAction(options(async () => Response.json({ data })), payload))
+        .rejects.toThrow('invalid result')
+    }
+    expect(await dispatchSlackBlockAction(options(async (url, init) => {
+      expect(String(url)).toBe('http://api.test/api/slack/scheduled-tasks/tsk_A123/cancel')
+      expect(init?.method).toBe('POST')
+      expect(JSON.parse(String(init?.body))).toEqual({ team_id: 'T1', user_id: 'U1', channel_id: 'C1' })
+      return Response.json({ data: { id: 'tsk_A123', enabled: false } })
+    }), payload)).toEqual({ outcome: 'cancelled' })
+  })
+
+  test('rejects malformed task IDs before making a request', async () => {
+    const config = options(async () => { throw new Error('must not request') })
+    for (const value of ['', 'tsk_x/other', '../tasks', 'task_A123']) {
+      expect(await dispatchSlackBlockAction(config, { ...payload, value })).toEqual({ outcome: 'unavailable' })
+    }
+  })
+
+  test('bounds a stalled cancellation response body', async () => {
+    const config = {
+      ...options(async () => new Response(new ReadableStream())),
+      sessionApiTimeoutMs: 20
+    }
+    await expect(dispatchSlackBlockAction(config, payload)).rejects.toThrow('timed out')
+  })
+})
 
 describe('native question deployment admission', () => {
   test('does not advertise buttons where fixed-owner admission rejects controls', async () => {

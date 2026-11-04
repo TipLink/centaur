@@ -89,6 +89,10 @@ pub(crate) struct Args {
 }
 
 impl Args {
+    pub(crate) fn scheduled_task_controls(&self) -> Option<IronControlClient> {
+        self.sandbox.iron_control.client()
+    }
+
     pub(crate) async fn sandbox_runtime(&self) -> Result<SandboxRuntime, ServerError> {
         self.sandbox.runtime().await
     }

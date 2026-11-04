@@ -3749,7 +3749,7 @@ async fn handle_python_context_request(
             .await
         }
         Some("ctx.post_to_slack") => {
-            match post_python_slack_message(message, ctx, &request_id).await {
+            match post_python_slack_message(message, ctx, input, &request_id).await {
                 Ok(value) => Ok(value),
                 Err(error) => Err(error.to_string()),
             }
@@ -4472,6 +4472,7 @@ async fn post_tool_result_to_slack(
 async fn post_python_slack_message(
     message: &Value,
     ctx: &TaskContext,
+    input: &WorkflowTaskInput,
     request_id: &str,
 ) -> Result<Value, WorkflowRuntimeError> {
     let channel = message
@@ -4491,11 +4492,53 @@ async fn post_python_slack_message(
         .unwrap_or_else(|| format!("{}:slack:{request_id}", ctx.task_id()));
 
     let mut payload = python_slack_message_payload(channel, text, &client_msg_id, &args);
+    append_scheduled_task_cancel_button(&mut payload, input);
     let secret = env::var("CENTAUR_JWT_SIGNING_SECRET").unwrap_or_default();
     slack_buttons::sign_message(&mut payload, secret.trim().as_bytes())?;
     let response = send_slack_request("chat.postMessage", payload).await?;
     serde_json::to_value(slack_post_result_from_response(channel, response))
         .map_err(WorkflowRuntimeError::from)
+}
+
+fn append_scheduled_task_cancel_button(payload: &mut Value, input: &WorkflowTaskInput) {
+    if input.workflow_name != "console_workflow" {
+        return;
+    }
+    let Some(task_id) = input.input["scheduled_task_id"].as_str().filter(|value| {
+        value.strip_prefix("tsk_").is_some_and(|id| {
+            !id.is_empty() && id.len() <= 64 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+    }) else {
+        return;
+    };
+    let Some(blocks) = payload["blocks"].as_array_mut() else {
+        return;
+    };
+    // Only the final Console report chunk contains the attribution context.
+    if blocks.last().is_none_or(|block| block["type"] != "context")
+        || blocks.iter().any(|block| {
+            block["elements"].as_array().is_some_and(|elements| {
+                elements
+                    .iter()
+                    .any(|element| element["action_id"] == "centaur.schedule.cancel")
+            })
+        })
+    {
+        return;
+    }
+    blocks.push(json!({
+        "type": "actions",
+        "elements": [{
+            "type": "button", "action_id": "centaur.schedule.cancel", "value": task_id,
+            "text": {"type": "plain_text", "text": "Cancel schedule"},
+            "confirm": {
+                "title": {"type": "plain_text", "text": "Cancel schedule?"},
+                "text": {"type": "plain_text", "text": "Stop future scheduled runs? A run already queued or running may still finish."},
+                "confirm": {"type": "plain_text", "text": "Cancel schedule"},
+                "deny": {"type": "plain_text", "text": "Keep schedule"}
+            }
+        }]
+    }));
 }
 
 fn python_slack_message_payload(
@@ -5482,6 +5525,93 @@ mod tests {
 
         assert!(payload.get("username").is_none());
         assert!(payload.get("icon_emoji").is_none());
+    }
+
+    fn scheduled_task_report() -> (WorkflowTaskInput, Value) {
+        (
+            WorkflowTaskInput {
+                workflow_name: "console_workflow".into(),
+                input: json!({"scheduled_task_id": "tsk_A123"}),
+                harness_type: HarnessType::ClaudeCode,
+                slack_button_feedback: None,
+            },
+            python_slack_message_payload(
+                "C123",
+                "Daily report\n\nOwner attribution",
+                "stable-id",
+                &json!({
+                    "thread_ts": "123.1", "mrkdwn": true,
+                    "blocks": [
+                        {"type": "section", "text": {"type": "mrkdwn", "text": "Daily report"}},
+                        {"type": "context", "elements": [{"type": "mrkdwn", "text": "Owner attribution"}]}
+                    ]
+                }),
+            ),
+        )
+    }
+
+    #[test]
+    fn scheduled_task_cancel_button_preserves_report_and_targets_native_task() {
+        let (input, mut payload) = scheduled_task_report();
+        let original = payload.clone();
+        append_scheduled_task_cancel_button(&mut payload, &input);
+        let action = payload["blocks"].as_array_mut().unwrap().pop().unwrap();
+        assert_eq!(payload, original);
+        let button = &action["elements"][0];
+        assert_eq!(button["action_id"], "centaur.schedule.cancel");
+        assert_eq!(button["value"], input.input["scheduled_task_id"]);
+        assert!(
+            button["confirm"]["text"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("already queued or running")
+        );
+    }
+
+    #[test]
+    fn scheduled_task_cancel_button_only_appears_on_final_report_chunk() {
+        for blocks in [Value::Null, json!([]), json!([{"type": "section"}])] {
+            let (input, mut payload) = scheduled_task_report();
+            payload["blocks"] = blocks;
+            let original = payload.clone();
+            append_scheduled_task_cancel_button(&mut payload, &input);
+            assert_eq!(payload, original);
+        }
+    }
+
+    #[test]
+    fn scheduled_task_cancel_button_requires_console_workflow_and_valid_native_id() {
+        let (mut input, mut payload) = scheduled_task_report();
+        let original = payload.clone();
+        input.workflow_name = "another_workflow".into();
+        append_scheduled_task_cancel_button(&mut payload, &input);
+        assert_eq!(payload, original);
+        input.workflow_name = "console_workflow".into();
+        for id in [
+            Value::Null,
+            json!("tsk_"),
+            json!("tsk_../another"),
+            json!("task_A123"),
+            json!(format!("tsk_{}", "a".repeat(65))),
+        ] {
+            input.input["scheduled_task_id"] = id;
+            append_scheduled_task_cancel_button(&mut payload, &input);
+            assert_eq!(payload, original);
+        }
+    }
+
+    #[test]
+    fn scheduled_task_cancel_button_does_not_duplicate_an_existing_action() {
+        let (input, mut payload) = scheduled_task_report();
+        append_scheduled_task_cancel_button(&mut payload, &input);
+        let original = payload.clone();
+        append_scheduled_task_cancel_button(&mut payload, &input);
+        assert_eq!(payload, original);
+        let blocks = payload["blocks"].as_array_mut().unwrap();
+        blocks.swap(1, 2);
+        let original = payload.clone();
+        append_scheduled_task_cancel_button(&mut payload, &input);
+        assert_eq!(payload, original);
     }
 
     #[test]
