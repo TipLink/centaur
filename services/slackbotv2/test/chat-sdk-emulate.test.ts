@@ -237,6 +237,47 @@ describe('slackbotv2', () => {
     expect(slackApi.calls.some(call => call.method === 'assistant.threads.setStatus')).toBe(false)
   })
 
+  it('delivers a Claude DM answer and its native suggested prompt through the signed webhook', async () => {
+    const prompts: Array<Record<string, unknown>> = []
+    codexApi.autoRespond = false
+    bot = createTestBot({
+      agentViewEnabled: true,
+      promptSuggestionsEnabled: true,
+      defaultHarnessType: 'claudecode',
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/assistant.threads.setSuggestedPrompts')) {
+          const form = new URLSearchParams(String(init?.body))
+          expect(form.has('thread_ts')).toBe(false)
+          prompts.push({
+            channel_id: form.get('channel_id'), prompts: JSON.parse(form.get('prompts')!)
+          })
+          return Response.json({ ok: true })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const delivery = await sendDirectMessage('Review this change.')
+    expect(delivery.response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    expect(codexApi.executes[0]!.body.metadata).toMatchObject({ supports_prompt_suggestions: true })
+    const key = `slack:${delivery.channel}:${delivery.ts}`
+    const lines = sampleCodexOutputLines('The change looks good.')
+    lines.splice(lines.length - 1, 0, JSON.stringify({
+      method: 'turn/promptSuggestion',
+      params: { threadId: 'thread-1', turnId: 'turn-1', suggestion: 'Run the focused tests' }
+    }))
+    codexApi.emitOutputLines(key, lines)
+    await delivery.finished()
+    await waitFor(() => prompts.some(call => Array.isArray(call.prompts) && call.prompts.length === 1))
+    const replies = await slackBot.conversations.replies({ channel: delivery.channel, ts: delivery.ts })
+    expect((replies.messages ?? []).map(message => message.text ?? '').join('\n'))
+      .toContain('The change looks good.')
+    expect(prompts.at(-1)).toEqual({ channel_id: delivery.channel, prompts: [
+      { title: 'Run the focused tests', message: 'Run the focused tests' }
+    ] })
+    expect(codexApi.executes).toHaveLength(1)
+  })
+
   it('uses native session lifecycle for agent-view channel mentions', async () => {
     bot = createTestBot({ agentViewEnabled: true })
     const parent = await postUserMessage('Channel context.')

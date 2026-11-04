@@ -1497,6 +1497,11 @@ async function executeSession(
       {
         action: 'execute',
         supports_user_input: supportsNativeUserInput(threadId, options.channelUserPolicy, options.threadAdmissionUrl),
+        ...(options.promptSuggestionsEnabled === true
+          && options.agentViewEnabled === true
+          && metadataHarnessType === 'claudecode'
+          && /^slack:D[^:]+:[^:]+$/.test(threadId)
+          ? { supports_prompt_suggestions: true } : {}),
         ...(recordedModel ? { model: recordedModel } : {}),
         ...(metadataHarnessType ? { harness_type: metadataHarnessType } : {})
       },

@@ -1,0 +1,2147 @@
+diff --git a/crates/centaur-session-runtime/src/lib.rs b/crates/centaur-session-runtime/src/lib.rs
+index ae9b9190..fd4bb5be 100644
+--- a/crates/centaur-session-runtime/src/lib.rs
++++ b/crates/centaur-session-runtime/src/lib.rs
+@@ -1,4 +1,5 @@
+ mod cleanup;
++mod prompt_suggestions;
+ mod retention;
+ mod title_generator;
+ mod user_input;
+@@ -2258,6 +2259,11 @@ impl SessionRuntime {
+             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
+             let requester_metadata = metadata.clone();
+             let input_lines = user_input::input_lines_with_user_input_support(input_lines, metadata.as_ref());
++            let input_lines = prompt_suggestions::input_lines_with_prompt_suggestions_support(
++                input_lines,
++                &session.harness_type,
++                metadata.as_ref(),
++            );
+             let persona_model = self.persona_model(&session);
+             let input_lines = match persona_model {
+                 Some(model) => input_lines_with_persona_model(input_lines, model),
+@@ -8767,6 +8773,31 @@ mod tests {
+         assert_eq!(state.execution_for_line(Some("exe-new"), delta), None);
+     }
+ 
++    #[test]
++    fn prompt_suggestions_keep_turn_attribution_without_becoming_answer_text() {
++        let mut state = StdoutPumpState::default();
++        let started = r#"{"method":"turn/started","params":{"turn":{"id":"turn-1"}}}"#;
++        let answer = r#"{"method":"item/completed","params":{"turnId":"turn-1","item":{"id":"answer-1","type":"agentMessage","phase":"final_answer","text":"The requested task is complete."}}}"#;
++        let suggestion = r#"{"method":"turn/promptSuggestion","params":{"threadId":"thread-1","turnId":"turn-1","suggestion":"Show the test results"}}"#;
++        let terminal =
++            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#;
++
++        for line in [started, answer, suggestion] {
++            assert_eq!(
++                state.execution_for_line(Some("exe-1"), line),
++                Some("exe-1".to_owned())
++            );
++            assert_eq!(state.observe("exe-1", line), None);
++        }
++        assert_eq!(
++            state.observe("exe-1", terminal),
++            Some(TerminalOutput::Completed {
++                reason: "turn_completed",
++                result_text: Some("The requested task is complete.".to_owned()),
++            })
++        );
++    }
++
+     #[test]
+     fn stdout_state_uses_final_agent_message_when_turn_completed_is_textless() {
+         let mut state = StdoutPumpState::default();
+diff --git a/crates/centaur-session-runtime/src/prompt_suggestions.rs b/crates/centaur-session-runtime/src/prompt_suggestions.rs
+new file mode 100644
+index 00000000..e397749c
+--- /dev/null
++++ b/crates/centaur-session-runtime/src/prompt_suggestions.rs
+@@ -0,0 +1,97 @@
++use centaur_session_core::HarnessType;
++use serde_json::{Value, json};
++
++/// Prompt generation is an opt-in capability of the current caller, not a
++/// property of replayed user content. Only Claude implements native suggestions.
++pub(super) fn input_lines_with_prompt_suggestions_support(
++    input_lines: Vec<String>,
++    harness_type: &HarnessType,
++    metadata: Option<&Value>,
++) -> Vec<String> {
++    let enabled = *harness_type == HarnessType::ClaudeCode
++        && metadata.is_some_and(|metadata| {
++            metadata
++                .get("supports_prompt_suggestions")
++                .and_then(Value::as_bool)
++                == Some(true)
++                && metadata
++                    .get("user_id")
++                    .and_then(Value::as_str)
++                    .is_some_and(|id| !id.trim().is_empty())
++        });
++    input_lines
++        .into_iter()
++        .map(|line| {
++            let Ok(Value::Object(mut value)) = serde_json::from_str::<Value>(&line) else {
++                return line;
++            };
++            if value.get("type").and_then(Value::as_str) != Some("user") {
++                return line;
++            }
++            let trace = value.entry("trace_metadata").or_insert_with(|| json!({}));
++            if !trace.is_object() {
++                *trace = json!({});
++            }
++            trace["supports_prompt_suggestions"] = json!(enabled);
++            Value::Object(value).to_string()
++        })
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn with_capability(harness_type: &HarnessType, metadata: Option<&Value>) -> Value {
++        let lines = input_lines_with_prompt_suggestions_support(
++            vec![
++                json!({
++                    "type": "user",
++                    "trace_metadata": {
++                        "supports_prompt_suggestions": true,
++                        "request_id": "preserved-request",
++                    },
++                    "message": {"role": "user", "content": []},
++                })
++                .to_string(),
++            ],
++            harness_type,
++            metadata,
++        );
++        serde_json::from_str(&lines[0]).unwrap()
++    }
++
++    #[test]
++    fn embedded_opt_in_cannot_enable_suggestions_without_the_current_requester() {
++        for metadata in [
++            None,
++            Some(json!({"user_id": "U-requester"})),
++            Some(json!({"supports_prompt_suggestions": true})),
++            Some(json!({"supports_prompt_suggestions": true, "user_id": " "})),
++            Some(json!({"supports_prompt_suggestions": false, "user_id": "U-requester"})),
++            Some(json!({"supports_prompt_suggestions": "true", "user_id": "U-requester"})),
++        ] {
++            let line = with_capability(&HarnessType::ClaudeCode, metadata.as_ref());
++            assert_eq!(line["trace_metadata"]["supports_prompt_suggestions"], false);
++            assert_eq!(line["trace_metadata"]["request_id"], "preserved-request");
++        }
++    }
++
++    #[test]
++    fn caller_opt_in_applies_only_to_the_authoritative_claude_session() {
++        let metadata = json!({"supports_prompt_suggestions": true, "user_id": "U-requester"});
++        for harness_type in [
++            HarnessType::Codex,
++            HarnessType::Amp,
++            HarnessType::Nanocodex,
++            HarnessType::Hermes,
++            HarnessType::Pi,
++            HarnessType::Omp,
++        ] {
++            let line = with_capability(&harness_type, Some(&metadata));
++            assert_eq!(line["trace_metadata"]["supports_prompt_suggestions"], false);
++        }
++        let line = with_capability(&HarnessType::ClaudeCode, Some(&metadata));
++        assert_eq!(line["trace_metadata"]["supports_prompt_suggestions"], true);
++    }
++}
+diff --git a/crates/harness-server/src/claude.rs b/crates/harness-server/src/claude.rs
+index f12f9939..ca2e1f7e 100644
+--- a/crates/harness-server/src/claude.rs
++++ b/crates/harness-server/src/claude.rs
+@@ -380,6 +380,9 @@ impl HarnessServer for ClaudeCodeHarness {
+         if state.supports_user_input {
+             command.args(["--permission-prompt-tool", "stdio"]);
+         }
++        if state.supports_prompt_suggestions {
++            command.arg("--prompt-suggestions");
++        }
+         if !state.model.is_empty() {
+             command.args(["--model", &state.model]);
+         }
+@@ -552,6 +555,26 @@ impl HarnessServer for ClaudeCodeHarness {
+     fn turn_hold(&self, normalizer: &Self::EventNormalizer) -> TurnHold {
+         normalizer.turn_hold()
+     }
++
++    fn prompt_suggestion_window(&self) -> Option<Duration> {
++        Some(Duration::from_secs(2))
++    }
++
++    fn prompt_suggestion(&self, line: &str, session_id: Option<&str>) -> Option<String> {
++        let value: Value = serde_json::from_str(line).ok()?;
++        if value["type"] != "prompt_suggestion" || value["session_id"].as_str() != Some(session_id?)
++        {
++            return None;
++        }
++        let suggestion = value["suggestion"].as_str()?.trim();
++        if suggestion.is_empty()
++            || suggestion.chars().count() > 500
++            || suggestion.chars().any(char::is_control)
++        {
++            return None;
++        }
++        Some(suggestion.to_owned())
++    }
+ }
+ 
+ fn rejected_question_control(native_id: Value) -> Result<UserInputControl> {
+@@ -576,6 +599,67 @@ mod tests {
+     use super::{ClaudeCodeHarness, ClaudeEventNormalizer};
+     use crate::user_input::UserInputControl;
+ 
++    #[test]
++    fn native_prompt_suggestions_are_opt_in() {
++        let mut state = ClaudeCodeHarness.thread_state(
++            &crate::protocol::ThreadStartParams::default(),
++            std::env::temp_dir(),
++        );
++        for enabled in [false, true] {
++            state.supports_prompt_suggestions = enabled;
++            let command = ClaudeCodeHarness.command_for_turn(&state);
++            assert_eq!(
++                command.get_args().any(|arg| arg == "--prompt-suggestions"),
++                enabled,
++            );
++        }
++    }
++
++    #[test]
++    fn native_prompt_suggestions_reject_malformed_or_foreign_output() {
++        let harness = ClaudeCodeHarness;
++        let valid = json!({
++            "type": "prompt_suggestion",
++            "session_id": "native-session",
++            "suggestion": "  Run the tests  ",
++        });
++        assert_eq!(
++            harness.prompt_suggestion(&valid.to_string(), Some("native-session")),
++            Some("Run the tests".to_string()),
++        );
++        assert_eq!(harness.prompt_suggestion(&valid.to_string(), None), None);
++        assert_eq!(
++            harness.prompt_suggestion(&valid.to_string(), Some("different-session")),
++            None,
++        );
++        for suggestion in [
++            json!(""),
++            json!(" \n "),
++            json!("x".repeat(501)),
++            json!("a\nb"),
++            json!(7),
++        ] {
++            let mut invalid = valid.clone();
++            invalid["suggestion"] = suggestion;
++            assert_eq!(
++                harness.prompt_suggestion(&invalid.to_string(), Some("native-session")),
++                None,
++            );
++        }
++        assert_eq!(
++            harness.prompt_suggestion("not JSON", Some("native-session")),
++            None
++        );
++        assert_eq!(
++            harness.prompt_suggestion(
++                &json!({"type":"result","session_id":"native-session","suggestion":"ignored"})
++                    .to_string(),
++                Some("native-session"),
++            ),
++            None,
++        );
++    }
++
+     #[test]
+     fn native_questions_return_all_answers_in_claudes_original_shape() {
+         let original = json!({"type":"control_request","request_id":"native-1","request":{
+diff --git a/crates/harness-server/src/server.rs b/crates/harness-server/src/server.rs
+index 20e7abdc..c733f1f6 100644
+--- a/crates/harness-server/src/server.rs
++++ b/crates/harness-server/src/server.rs
+@@ -5,8 +5,8 @@ use std::io::{self, BufRead, Write};
+ use std::path::{Path, PathBuf};
+ use std::process::Stdio;
+ use std::sync::{
+-    Arc,
+-    atomic::{AtomicBool, Ordering},
++    Arc, Mutex,
++    atomic::{AtomicBool, AtomicUsize, Ordering},
+     mpsc::{self, Receiver, RecvTimeoutError},
+ };
+ use std::time::{Duration, Instant};
+@@ -73,9 +73,12 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
+     let (command_tx, command_rx) = mpsc::channel();
+     let (request_tx, request_rx) = mpsc::channel();
+     let turn_active = Arc::new(AtomicBool::new(false));
++    let queued_user_inputs = Arc::new(AtomicUsize::new(0));
++    let queued_turn_tx = request_tx.clone();
+ 
+     {
+         let turn_active = Arc::clone(&turn_active);
++        let queued_user_inputs = Arc::clone(&queued_user_inputs);
+         std::thread::spawn(move || {
+             let stdin = io::stdin();
+             let mut blocks_state = BlocksState::default();
+@@ -103,6 +106,32 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
+                         }
+                     }
+                     Ok(command @ BlocksCommand::User { .. }) => {
++                        queued_user_inputs.fetch_add(1, Ordering::SeqCst);
++                        if matches!(&command, BlocksCommand::User { trace_context, .. }
++                            if trace_context.metadata.get("action").and_then(Value::as_str)
++                                == Some("steer_active_execution"))
++                        {
++                            // Keep a queued fallback if the active turn ends
++                            // before it can consume this steering frame.
++                            let command = Arc::new(Mutex::new(Some(command)));
++                            turn_active.store(true, Ordering::SeqCst);
++                            if request_tx
++                                .send(ActiveTurnRequest::BlocksSteer {
++                                    command: Arc::clone(&command),
++                                    queued_user_inputs: Arc::clone(&queued_user_inputs),
++                                })
++                                .is_err()
++                                || command_tx.send(BlocksReaderInput::Steer(command)).is_err()
++                            {
++                                break;
++                            }
++                            continue;
++                        }
++                        if turn_active.load(Ordering::SeqCst)
++                            && request_tx.send(ActiveTurnRequest::NextTurnQueued).is_err()
++                        {
++                            break;
++                        }
+                         turn_active.store(true, Ordering::SeqCst);
+                         if command_tx
+                             .send(BlocksReaderInput::Command(command))
+@@ -133,6 +162,15 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
+     }
+ 
+     while let Ok(input) = command_rx.recv() {
++        let input = match input {
++            BlocksReaderInput::Steer(command) => {
++                let Some(command) = command.lock().expect("blocks steering lock").take() else {
++                    continue;
++                };
++                BlocksReaderInput::Command(command)
++            }
++            input => input,
++        };
+         match input {
+             BlocksReaderInput::Command(BlocksCommand::User {
+                 input,
+@@ -146,6 +184,13 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
+                 reasoning,
+                 trace_context,
+             }) => {
++                turn_active.store(true, Ordering::SeqCst);
++                if queued_user_inputs.fetch_sub(1, Ordering::SeqCst) > 1 {
++                    // Earlier turns may have consumed the reader's markers
++                    // for a burst of queued inputs. Every superseded turn
++                    // must still omit its optional suggestion.
++                    let _ = queued_turn_tx.send(ActiveTurnRequest::NextTurnQueued);
++                }
+                 let supports_user_input = trace_context
+                     .metadata
+                     .get("supports_user_input")
+@@ -155,6 +200,16 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
+                     state.process = None;
+                     state.supports_user_input = supports_user_input;
+                 }
++                let supports_prompt_suggestions = harness.kind() == HarnessKind::ClaudeCode
++                    && trace_context
++                        .metadata
++                        .get("supports_prompt_suggestions")
++                        .and_then(Value::as_bool)
++                        .unwrap_or(false);
++                if state.supports_prompt_suggestions != supports_prompt_suggestions {
++                    state.process = None;
++                    state.supports_prompt_suggestions = supports_prompt_suggestions;
++                }
+                 if let Some(model) = model {
+                     state.model = model;
+                 }
+@@ -189,6 +244,7 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
+                 eprintln!("invalid blocks input: {error}");
+                 write_blocks_error(&mut stdout, &state.id, "input", error)?;
+             }
++            BlocksReaderInput::Steer(_) => unreachable!("steering fallback resolved above"),
+         }
+     }
+ 
+@@ -244,6 +300,7 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
+             ActiveTurnRequest::UserInput(_) => {
+                 eprintln!("user input response ignored: no active turn runs")
+             }
++            ActiveTurnRequest::NextTurnQueued | ActiveTurnRequest::BlocksSteer { .. } => {}
+         }
+     }
+ 
+@@ -286,6 +343,7 @@ fn run_blocks_turn<H: HarnessServer, W: Write>(
+ 
+ enum BlocksReaderInput {
+     Command(BlocksCommand),
++    Steer(Arc<Mutex<Option<BlocksCommand>>>),
+     Error(String),
+ }
+ 
+@@ -293,6 +351,13 @@ enum ActiveTurnRequest {
+     JsonRpc(JSONRPCRequest),
+     BlocksInterrupt,
+     UserInput(UserInputResponse),
++    /// A blocks user frame has queued the next turn. Optional output from the
++    /// current answer is now stale, even while the native result is pending.
++    NextTurnQueued,
++    BlocksSteer {
++        command: Arc<Mutex<Option<BlocksCommand>>>,
++        queued_user_inputs: Arc<AtomicUsize>,
++    },
+ }
+ 
+ fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
+@@ -1054,6 +1119,7 @@ fn resumed_thread_state<H: HarnessServer>(
+         process: None,
+         thread_started_sent: false,
+         supports_user_input: false,
++        supports_prompt_suggestions: false,
+     })
+ }
+ 
+@@ -1078,16 +1144,23 @@ fn apply_resume_overrides(state: &mut ThreadState, params: &ThreadResumeParams)
+     Ok(())
+ }
+ 
++#[derive(Debug, PartialEq, Eq)]
++enum ActiveTurnOutcome {
++    Ignored,
++    Steered,
++    Interrupted,
++}
++
+ fn handle_active_turn_request<H: HarnessServer, W: Write>(
+     harness: &H,
+     process: &mut HarnessChild,
+     normalizer: &mut CodexTurnNormalizer,
+     request: ActiveTurnRequest,
+     stdout: &mut W,
+-) -> Result<bool> {
++) -> Result<ActiveTurnOutcome> {
+     let ActiveTurnRequest::JsonRpc(request) = request else {
+         process.kill_and_wait()?;
+-        return Ok(true);
++        return Ok(ActiveTurnOutcome::Interrupted);
+     };
+ 
+     match request.method.as_str() {
+@@ -1100,7 +1173,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
+                     -32600,
+                     format!("unknown threadId {}", params.thread_id),
+                 )?;
+-                return Ok(false);
++                return Ok(ActiveTurnOutcome::Ignored);
+             }
+             if params.expected_turn_id != normalizer.turn_id() {
+                 write_error(
+@@ -1113,7 +1186,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
+                         normalizer.turn_id()
+                     ),
+                 )?;
+-                return Ok(false);
++                return Ok(ActiveTurnOutcome::Ignored);
+             }
+             process
+                 .stdin
+@@ -1131,7 +1204,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
+             {
+                 write_value(stdout, &notification_to_wire_value(&notification)?)?;
+             }
+-            Ok(false)
++            Ok(ActiveTurnOutcome::Steered)
+         }
+         "turn/interrupt" => {
+             let params: TurnInterruptParams = request_params(request.params)?;
+@@ -1142,7 +1215,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
+                     -32600,
+                     format!("unknown threadId {}", params.thread_id),
+                 )?;
+-                return Ok(false);
++                return Ok(ActiveTurnOutcome::Ignored);
+             }
+             if params.turn_id != normalizer.turn_id() {
+                 write_error(
+@@ -1155,11 +1228,11 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
+                         normalizer.turn_id()
+                     ),
+                 )?;
+-                return Ok(false);
++                return Ok(ActiveTurnOutcome::Ignored);
+             }
+             process.kill_and_wait()?;
+             write_response(stdout, request.id, &TurnInterruptResponse {})?;
+-            Ok(true)
++            Ok(ActiveTurnOutcome::Interrupted)
+         }
+         _ => {
+             write_error(
+@@ -1168,7 +1241,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
+                 -32600,
+                 format!("cannot handle {} while a turn is active", request.method),
+             )?;
+-            Ok(false)
++            Ok(ActiveTurnOutcome::Ignored)
+         }
+     }
+ }
+@@ -1318,8 +1391,64 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+     let mut event_normalizer = H::EventNormalizer::default();
+     let mut completed_turn = None;
+     let mut questions = PendingQuestions::new(execution_id, state.supports_user_input);
++    let suggestion_window = state
++        .supports_prompt_suggestions
++        .then(|| harness.prompt_suggestion_window())
++        .flatten();
++    // The final answer items are already flushed at the native result. Keep
++    // only the terminal event open briefly for the optional native suggestion.
++    // This absolute deadline never extends for noise or invalid suggestions.
++    let mut suggestion_deadline: Option<Instant> = None;
++    let mut next_turn_queued = false;
+     loop {
+         while let Ok(request) = request_rx.try_recv() {
++            if let ActiveTurnRequest::BlocksSteer {
++                command,
++                queued_user_inputs,
++            } = request
++            {
++                let mut command = command.lock().expect("blocks steering lock");
++                if command.is_none() {
++                    continue;
++                }
++                if suggestion_deadline.is_some() && !next_turn_queued {
++                    let Some(BlocksCommand::User {
++                        input,
++                        client_user_message_id,
++                        ..
++                    }) = command.take()
++                    else {
++                        unreachable!("only user frames can steer");
++                    };
++                    queued_user_inputs.fetch_sub(1, Ordering::SeqCst);
++                    let process = state
++                        .process
++                        .as_mut()
++                        .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
++                    process.stdin.write_all(&harness.stdin_for_steer(&input)?)?;
++                    process.stdin.flush()?;
++                    for notification in
++                        normalizer.emit_user_message(client_user_message_id, input)?
++                    {
++                        write_value(stdout, &notification_to_wire_value(&notification)?)?;
++                    }
++                    // The runtime still owns this execution during the tail.
++                    // Its reply must finish in the same canonical turn.
++                    suggestion_deadline = None;
++                    settle_deadline = None;
++                    hold_deadline = None;
++                } else {
++                    next_turn_queued = true;
++                }
++                continue;
++            }
++            if matches!(request, ActiveTurnRequest::NextTurnQueued) {
++                next_turn_queued = true;
++                if suggestion_deadline.is_some() {
++                    suggestion_deadline = Some(Instant::now());
++                }
++                continue;
++            }
+             let process = state
+                 .process
+                 .as_mut()
+@@ -1345,37 +1474,54 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                 }
+                 continue;
+             }
+-            if handle_active_turn_request(harness, process, normalizer, request, stdout)? {
+-                for notification in questions.cancel_all() {
+-                    write_value(stdout, &notification)?;
++            match handle_active_turn_request(harness, process, normalizer, request, stdout)? {
++                ActiveTurnOutcome::Interrupted => {
++                    for notification in questions.cancel_all() {
++                        write_value(stdout, &notification)?;
++                    }
++                    state.process = None;
++                    return Err(HarnessServerError::TurnInterrupted {
++                        kind: harness.kind(),
++                    });
+                 }
+-                state.process = None;
+-                return Err(HarnessServerError::TurnInterrupted {
+-                    kind: harness.kind(),
+-                });
++                // A successful steer re-opens the turn. Its own result may
++                // produce a new suggestion; buffered old suggestions are
++                // ignored while the new answer is active.
++                ActiveTurnOutcome::Steered => {
++                    settle_deadline = None;
++                    suggestion_deadline = None;
++                }
++                ActiveTurnOutcome::Ignored => {}
+             }
+-            // A steer re-opens the turn: the harness now owes a response whose
+-            // first token can take longer than the settle window, so the
+-            // pending fallback completion no longer applies. The response's
+-            // own terminal stop re-arms it.
+-            settle_deadline = None;
+         }
+ 
+         let mut terminal = false;
+-        match state
+-            .process
+-            .as_mut()
+-            .ok_or(HarnessServerError::HarnessStdoutUnavailable)?
+-            .stdout
+-            .recv_timeout(Duration::from_millis(50))
+-        {
++        let received = if suggestion_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
++            Err(RecvTimeoutError::Timeout)
++        } else {
++            state
++                .process
++                .as_mut()
++                .ok_or(HarnessServerError::HarnessStdoutUnavailable)?
++                .stdout
++                .recv_timeout(Duration::from_millis(50))
++        };
++        match received {
++            Ok(Err(_)) if suggestion_deadline.is_some() => {
++                // Optional trailing output cannot turn a successful answer
++                // into a failure. Resume a fresh native process next turn.
++                state.process = None;
++                terminal = true;
++            }
+             Ok(line) => {
+                 let line = line?;
+                 let trimmed = line.trim();
+                 if trimmed.is_empty() {
+                     continue;
+                 }
+-                if let Some(control) = harness.user_input_control(trimmed)? {
++                if suggestion_deadline.is_none()
++                    && let Some(control) = harness.user_input_control(trimmed)?
++                {
+                     match control {
+                         UserInputControl::Request(request) => {
+                             match questions.register(
+@@ -1417,9 +1563,33 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                     }
+                     continue;
+                 }
+-                let event = harness.parse_stdout_line(trimmed)?;
+-                let normalized_events = harness.normalize_events(&mut event_normalizer, event)?;
++                let normalized_events = if let Some(deadline) = suggestion_deadline {
++                    if Instant::now() >= deadline {
++                        terminal = true;
++                    } else if let Some(suggestion) = harness.prompt_suggestion(
++                        trimmed,
++                        Some(state.harness_session_id.as_deref().unwrap_or(&state.id)),
++                    ) {
++                        write_value(
++                            stdout,
++                            &json!({
++                                "method": "turn/promptSuggestion",
++                                "params": {
++                                    "threadId": normalizer.thread_id(),
++                                    "turnId": normalizer.turn_id(),
++                                    "suggestion": suggestion,
++                                },
++                            }),
++                        )?;
++                        terminal = true;
++                    }
++                    Vec::new()
++                } else {
++                    let event = harness.parse_stdout_line(trimmed)?;
++                    harness.normalize_events(&mut event_normalizer, event)?
++                };
+                 let mut terminal_stop = false;
++                let mut successful_result = false;
+                 for normalized in normalized_events {
+                     telemetry.observe_normalized(&normalized);
+                     if let Some(session_id) = normalized.session_id() {
+@@ -1432,9 +1602,19 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                         write_value(stdout, &value)?;
+                     }
+                     terminal |= normalized.is_terminal();
++                    successful_result |=
++                        matches!(&normalized, NormalizedEvent::Result { error: None });
+                     terminal_stop |=
+                         settle_window.is_some() && normalized.is_terminal_assistant_stop();
+                 }
++                if successful_result
++                    && !next_turn_queued
++                    && let Some(window) = suggestion_window
++                {
++                    suggestion_deadline = Some(Instant::now() + window);
++                    settle_deadline = None;
++                    terminal = false;
++                }
+                 if !terminal && !questions.is_pending() {
+                     match settle_window {
+                         Some(window) if terminal_stop && window.is_zero() => terminal = true,
+@@ -1451,6 +1631,11 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                     (false, TurnHold::Released | TurnHold::Waiting) => None,
+                 };
+             }
++            Err(RecvTimeoutError::Timeout)
++                if suggestion_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
++            {
++                terminal = true;
++            }
+             Err(RecvTimeoutError::Timeout)
+                 if hold_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+             {
+@@ -1462,6 +1647,12 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                 Some(deadline) if Instant::now() >= deadline => terminal = true,
+                 _ => continue,
+             },
++            Err(RecvTimeoutError::Disconnected) if suggestion_deadline.is_some() => {
++                // EOF need not mean the process exited. Drop kills it before
++                // waiting, so optional output cannot hold a finished answer.
++                state.process = None;
++                terminal = true;
++            }
+             Err(RecvTimeoutError::Disconnected) => {
+                 let status = state
+                     .process
+diff --git a/crates/harness-server/src/traits.rs b/crates/harness-server/src/traits.rs
+index 0726a0ca..fe4fe026 100644
+--- a/crates/harness-server/src/traits.rs
++++ b/crates/harness-server/src/traits.rs
+@@ -36,6 +36,8 @@ pub struct ThreadState {
+     pub thread_started_sent: bool,
+     /// Whether the calling ingress can collect and return native questions.
+     pub supports_user_input: bool,
++    /// Whether the calling ingress can render Claude's optional next prompt.
++    pub supports_prompt_suggestions: bool,
+ }
+ 
+ pub struct HarnessChild {
+@@ -154,6 +156,18 @@ pub trait HarnessServer {
+         TurnHold::Released
+     }
+ 
++    /// Best-effort window for a native suggestion after a successful result.
++    /// Harnesses without native suggestions never hold their terminal event.
++    fn prompt_suggestion_window(&self) -> Option<Duration> {
++        None
++    }
++
++    /// Optional output is deliberately lenient: malformed, empty or foreign
++    /// suggestions must not fail an otherwise completed answer.
++    fn prompt_suggestion(&self, _line: &str, _session_id: Option<&str>) -> Option<String> {
++        None
++    }
++
+     fn thread_state(&self, params: &ThreadStartParams, cwd: PathBuf) -> ThreadState {
+         let model = params.model.clone().unwrap_or_else(|| self.default_model());
+         let model_provider = params
+@@ -173,6 +187,7 @@ pub trait HarnessServer {
+             process: None,
+             thread_started_sent: false,
+             supports_user_input: false,
++            supports_prompt_suggestions: false,
+         }
+     }
+ }
+diff --git a/crates/harness-server/tests/app_server_stdio.rs b/crates/harness-server/tests/app_server_stdio.rs
+index 14dc8b1a..65b46aab 100644
+--- a/crates/harness-server/tests/app_server_stdio.rs
++++ b/crates/harness-server/tests/app_server_stdio.rs
+@@ -808,6 +808,261 @@ fn fake_amp_app_server_streams_codex_v2_notifications() {
+     assert_codex_v2_turn(&run.turn);
+ }
+ 
++const SUGGESTION_CLI: &str = r#"#!/usr/bin/env python3
++import json, os, pathlib, sys, threading, time
++generation = 0
++def emit(value):
++    print(json.dumps(value), flush=True)
++def suggest(text, session='suggestion-session'):
++    emit({'type':'prompt_suggestion', 'session_id':session, 'suggestion':text, 'uuid':'native-id'})
++def later(text, delay, owner, cancel):
++    time.sleep(delay)
++    if not cancel or owner == generation:
++        suggest(text)
++for raw in sys.stdin:
++    value = json.loads(raw)
++    if value.get('type') != 'user':
++        continue
++    generation += 1
++    if generation == 1:
++        emit({'type':'system','subtype':'init','session_id':'suggestion-session'})
++    mode = value['message']['content'][0]['text']
++    if mode == 'early':
++        suggest('Old prediction before the result')
++    emit({'type':'assistant','message':{'id':'answer-'+str(generation),'role':'assistant','content':[{'type':'text','text':'Answer '+mode}],'stop_reason':'end_turn'}})
++    if mode == 'next':
++        time.sleep(0.4)
++    emit({'type':'result','subtype':'success','result':'Answer '+mode})
++    if mode == 'delayed':
++        deadline = time.monotonic() + 8
++        while not pathlib.Path(os.environ['FAKE_SUGGESTION_RELEASE']).exists() and time.monotonic() < deadline:
++            time.sleep(0.01)
++        suggest('Foreign prediction', 'another-session')
++        suggest('')
++        suggest('x'*501)
++        suggest('Run the tests')
++        suggest('Duplicate prediction')
++    elif mode == 'queued':
++        threading.Thread(target=later, args=('Superseded prediction', 0.2, generation, True), daemon=True).start()
++    elif mode == 'late':
++        threading.Thread(target=later, args=('Prediction after deadline', 2.2, generation, False), daemon=True).start()
++    elif mode == 'next':
++        suggest('Next answer prediction')
++    elif mode == 'closed':
++        os.close(1)
++        time.sleep(60)
++"#;
++
++fn suggestion_bridge() -> (BridgeProcess, PathBuf, PathBuf) {
++    let script = temp_path("native-suggestion-cli.py");
++    let release = temp_path("native-suggestion-release");
++    std::fs::write(&script, SUGGESTION_CLI).unwrap();
++    let bridge = BridgeProcess::spawn_harness_blocks(
++        Harness::ClaudeCode,
++        Some(format!("exec python3 {}", script.display())),
++        Some(("FAKE_SUGGESTION_RELEASE", release.to_str().unwrap())),
++    );
++    (bridge, script, release)
++}
++
++fn suggestion_user(mode: &str, enabled: bool) -> Value {
++    json!({
++        "type":"user",
++        "thread_key":"slack:T123:D123:123.456",
++        "trace_metadata":{"supports_prompt_suggestions":enabled},
++        "text":mode,
++    })
++}
++
++fn suggestion_notifications(lines: &[String]) -> Vec<Value> {
++    lines
++        .iter()
++        .filter_map(|line| {
++            let value: Value = serde_json::from_str(line).unwrap();
++            (value["method"] == "turn/promptSuggestion").then_some(value)
++        })
++        .collect()
++}
++
++fn read_final_suggestion_answer(bridge: &mut BridgeProcess) -> Value {
++    let deadline = Instant::now() + Duration::from_secs(10);
++    loop {
++        let value = bridge.read_json(deadline);
++        assert_ne!(
++            value["method"], "turn/completed",
++            "answer must flush before completion"
++        );
++        if value["method"] == "item/completed" && value["params"]["item"]["type"] == "agentMessage"
++        {
++            return value;
++        }
++    }
++}
++
++#[test]
++fn fake_claude_prompt_suggestion_follows_the_visible_answer_before_completion() {
++    let (mut bridge, script, release) = suggestion_bridge();
++    bridge.send(suggestion_user("delayed", true));
++    let answer = read_final_suggestion_answer(&mut bridge);
++    // The native fixture cannot emit its suggestion until the final answer
++    // has reached this client: no buffering the answer behind prediction.
++    std::fs::write(&release, "continue").unwrap();
++    let suggestion = read_question_method(&mut bridge, "turn/promptSuggestion");
++    assert_eq!(suggestion["params"]["suggestion"], "Run the tests");
++    assert_eq!(
++        suggestion["params"]["threadId"],
++        answer["params"]["threadId"]
++    );
++    assert_eq!(suggestion["params"]["turnId"], answer["params"]["turnId"]);
++    let done = read_question_method(&mut bridge, "turn/completed");
++    assert_eq!(done["params"]["turn"]["status"], "completed");
++    let lines = bridge.finish_successfully();
++    assert_eq!(suggestion_notifications(&lines).len(), 1);
++    let _ = std::fs::remove_file(script);
++    let _ = std::fs::remove_file(release);
++}
++
++#[test]
++fn fake_claude_prompt_suggestion_is_optional_and_requires_a_native_result() {
++    for mode in ["none", "early"] {
++        let (mut bridge, script, _) = suggestion_bridge();
++        let turn = bridge.run_blocks_user_line(suggestion_user(mode, true), Duration::from_secs(5));
++        assert_completed_turn(&turn);
++        assert_eq!(turn.text_from_deltas, format!("Answer {mode}"));
++        assert!(suggestion_notifications(&bridge.finish_successfully()).is_empty());
++        let _ = std::fs::remove_file(script);
++    }
++}
++
++#[test]
++fn fake_claude_prompt_suggestion_disabled_completes_without_waiting() {
++    let (mut bridge, script, _) = suggestion_bridge();
++    bridge.send(suggestion_user("delayed", false));
++    read_final_suggestion_answer(&mut bridge);
++    // The fixture is still waiting for a release marker that is never sent.
++    let done = bridge.read_blocks_turn(Instant::now() + Duration::from_secs(1));
++    assert_completed_turn(&done);
++    assert!(suggestion_notifications(&bridge.finish_successfully()).is_empty());
++    let _ = std::fs::remove_file(script);
++}
++
++#[test]
++fn fake_claude_prompt_suggestion_tail_is_interruptible() {
++    let (mut bridge, script, _) = suggestion_bridge();
++    bridge.send(suggestion_user("none", true));
++    read_final_suggestion_answer(&mut bridge);
++    thread::sleep(Duration::from_millis(100));
++    bridge.send(json!({"type":"interrupt"}));
++    let done = read_question_method(&mut bridge, "turn/completed");
++    assert_eq!(done["params"]["turn"]["status"], "interrupted");
++    assert!(suggestion_notifications(&bridge.finish_successfully()).is_empty());
++    let _ = std::fs::remove_file(script);
++}
++
++#[test]
++fn fake_claude_prompt_suggestion_eof_does_not_wait_for_a_live_child() {
++    let (mut bridge, script, _) = suggestion_bridge();
++    bridge.send(suggestion_user("closed", true));
++    read_final_suggestion_answer(&mut bridge);
++    let done = bridge.read_blocks_turn(Instant::now() + Duration::from_secs(1));
++    assert_completed_turn(&done);
++    assert!(suggestion_notifications(&bridge.finish_successfully()).is_empty());
++    let _ = std::fs::remove_file(script);
++}
++
++#[test]
++fn fake_claude_queued_input_supersedes_the_old_prompt_suggestion() {
++    let (mut bridge, script, _) = suggestion_bridge();
++    bridge.send(suggestion_user("queued", true));
++    read_final_suggestion_answer(&mut bridge);
++    bridge.send(suggestion_user("queued", true));
++    bridge.send(suggestion_user("next", true));
++    let first = read_question_method(&mut bridge, "turn/completed");
++    assert_eq!(first["params"]["turn"]["status"], "completed");
++    assert!(suggestion_notifications(&bridge.stdout_lines).is_empty());
++    let second = read_question_method(&mut bridge, "turn/completed");
++    assert_eq!(second["params"]["turn"]["status"], "completed");
++    assert!(suggestion_notifications(&bridge.stdout_lines).is_empty());
++    let suggestion = read_question_method(&mut bridge, "turn/promptSuggestion");
++    let third = read_question_method(&mut bridge, "turn/completed");
++    assert_ne!(
++        first["params"]["turn"]["id"],
++        second["params"]["turn"]["id"]
++    );
++    assert_eq!(
++        suggestion["params"]["turnId"],
++        third["params"]["turn"]["id"]
++    );
++    assert_eq!(suggestion["params"]["suggestion"], "Next answer prediction");
++    assert_eq!(
++        suggestion_notifications(&bridge.finish_successfully()).len(),
++        1
++    );
++    let _ = std::fs::remove_file(script);
++}
++
++#[test]
++fn fake_claude_runtime_steer_during_suggestion_tail_finishes_in_the_same_turn() {
++    let (mut bridge, script, _) = suggestion_bridge();
++    bridge.send(suggestion_user("queued", true));
++    let first = read_final_suggestion_answer(&mut bridge);
++    let mut steer = suggestion_user("next", true);
++    steer["trace_metadata"]["action"] = json!("steer_active_execution");
++    bridge.send(steer);
++    let second = read_final_suggestion_answer(&mut bridge);
++    assert_eq!(first["params"]["turnId"], second["params"]["turnId"]);
++    let suggestion = read_question_method(&mut bridge, "turn/promptSuggestion");
++    assert_eq!(suggestion["params"]["suggestion"], "Next answer prediction");
++    let done = read_question_method(&mut bridge, "turn/completed");
++    assert_eq!(done["params"]["turn"]["id"], first["params"]["turnId"]);
++    assert_eq!(done["params"]["turn"]["status"], "completed");
++    let lines = bridge.finish_successfully();
++    assert_eq!(suggestion_notifications(&lines).len(), 1);
++    let turns_started = lines
++        .iter()
++        .filter(|line| serde_json::from_str::<Value>(line).unwrap()["method"] == "turn/started")
++        .count();
++    assert_eq!(
++        turns_started, 1,
++        "consumed steer must not run again from queue"
++    );
++    let _ = std::fs::remove_file(script);
++}
++
++#[test]
++fn fake_claude_runtime_steer_after_suggestion_tail_keeps_its_queued_fallback() {
++    let (mut bridge, script, _) = suggestion_bridge();
++    let first = bridge.run_blocks_user_line(suggestion_user("none", true), Duration::from_secs(5));
++    assert_completed_turn(&first);
++    let mut steer = suggestion_user("next", true);
++    steer["trace_metadata"]["action"] = json!("steer_active_execution");
++    let second = bridge.run_blocks_user_line(steer, Duration::from_secs(5));
++    assert_completed_turn(&second);
++    assert_eq!(second.text_from_deltas, "Answer next");
++    assert_ne!(first.turn_id, second.turn_id);
++    let suggestions = suggestion_notifications(&bridge.finish_successfully());
++    assert_eq!(suggestions.len(), 1);
++    assert_eq!(suggestions[0]["params"]["turnId"], second.turn_id);
++    let _ = std::fs::remove_file(script);
++}
++
++#[test]
++fn fake_claude_prompt_suggestion_after_deadline_cannot_poison_the_next_answer() {
++    let (mut bridge, script, _) = suggestion_bridge();
++    let first = bridge.run_blocks_user_line(suggestion_user("late", true), Duration::from_secs(5));
++    assert_completed_turn(&first);
++    let second = bridge.run_blocks_user_line(suggestion_user("next", true), Duration::from_secs(5));
++    assert_completed_turn(&second);
++    let suggestions = suggestion_notifications(&bridge.finish_successfully());
++    assert_eq!(suggestions.len(), 1);
++    assert_eq!(suggestions[0]["params"]["turnId"], second.turn_id);
++    assert_eq!(
++        suggestions[0]["params"]["suggestion"],
++        "Next answer prediction"
++    );
++    let _ = std::fs::remove_file(script);
++}
++
+ #[test]
+ fn fake_claude_blocks_mode_accepts_user_blocks_by_default() {
+     let fake_claude = concat!(
+diff --git a/docs/pages/quickstart.mdx b/docs/pages/quickstart.mdx
+index b5359059..3e0f5d06 100644
+--- a/docs/pages/quickstart.mdx
++++ b/docs/pages/quickstart.mdx
+@@ -231,9 +231,13 @@ Streaming progress and titles continue through the existing renderer. With
+ the running execution, like the mentioned `stop` command. Without that
+ subscription, Slack shows a loading indicator without a Stop button.
+ 
+-Suggested prompts can be configured statically in the manifest. Context-aware
+-prompts and synchronization of user-edited Slack session titles are separate
+-integrations.
++Suggested prompts can be configured statically in the manifest. To use Claude's
++native next-prompt suggestions instead, remove `suggested_prompts` from the app
++configuration and set `SLACKBOTV2_PROMPT_SUGGESTIONS_ENABLED=true` in the
++Slackbot service environment. This opt-in feature uses Claude's background model
++request and displays suggestions in the Agent view's Messages tab for DMs.
++See `services/slackbotv2/README.md` for behavior and configuration requirements.
++Synchronization of user-edited Slack session titles is a separate integration.
+ 
+ See Slack's [migration guide](https://docs.slack.dev/ai/migrating-to-agent-messaging/)
+ for the app-side rollout requirements.
+diff --git a/e2e/fakes/fake-slack.ts b/e2e/fakes/fake-slack.ts
+index e81f0a08..f55776d2 100644
+--- a/e2e/fakes/fake-slack.ts
++++ b/e2e/fakes/fake-slack.ts
+@@ -44,6 +44,7 @@ const messages: Message[] = []
+ const ephemerals: Ephemeral[] = []
+ const triggers = new Map<string, string>()
+ const views: Array<{ id: string; user: string; view: Record<string, unknown> }> = []
++const suggestedPrompts: Array<Record<string, unknown>> = []
+ /** Assistant status by `channel:thread_ts`; Slack hides it once a message lands in the thread. */
+ const statuses = new Map<string, string>()
+ let lastTs = 0
+@@ -83,6 +84,9 @@ Bun.serve({
+       const key = `${url.searchParams.get('channel')}:${url.searchParams.get('thread_ts')}`
+       return Response.json({ status: statuses.get(key) ?? '' })
+     }
++    if (url.pathname === '/_e2e/suggested-prompts') {
++      return Response.json(suggestedPrompts.filter(call => call.channel_id === url.searchParams.get('channel')))
++    }
+     const method = url.pathname.match(/^\/api\/([\w.]+)$/)?.[1]
+     if (!method) return new Response('not found', { status: 404 })
+     const actor = authenticate(request, url)
+@@ -218,6 +222,14 @@ function handle(method: string, actor: Actor, body: Record<string, unknown>) {
+     case 'assistant.threads.setStatus':
+       statuses.set(`${str(body.channel_id)}:${str(body.thread_ts)}`, str(body.status))
+       return { ok: true }
++    case 'assistant.threads.setSuggestedPrompts': {
++      if (actor !== 'bot') return { ok: false, error: 'not_allowed_token_type' }
++      if (!conversation(str(body.channel_id))) return { ok: false, error: 'channel_not_found' }
++      const prompts = typeof body.prompts === 'string' ? JSON.parse(body.prompts) : body.prompts
++      if (!Array.isArray(prompts)) return { ok: false, error: 'invalid_arguments' }
++      suggestedPrompts.push({ ...body, prompts })
++      return { ok: true }
++    }
+     default:
+       // Title calls are cosmetic for this stand-in.
+       log('fake_slack_unmodeled_method', { method })
+diff --git a/e2e/fakes/model-server.ts b/e2e/fakes/model-server.ts
+index c764d810..cee13427 100644
+--- a/e2e/fakes/model-server.ts
++++ b/e2e/fakes/model-server.ts
+@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto'
+ /** A provider error to answer with instead of text: an HTTP error from Anthropic, a failed response from OpenAI. */
+ type ProviderError = { status: number; type: string; code?: string; message: string }
+ type Question = { id: string; header: string; question: string; options: Array<{ label: string; description: string }> }
+-type Reply = { match: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[] }
++type Reply = { match: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[]; suggestion?: string; suggestionDelayMs?: number }
+ /** A request a tool command made to the echo path, and the test credential it carried. */
+ type Echo = { at: string; match: string; credential?: string }
+ type Recorded = {
+@@ -212,9 +212,9 @@ function openaiEvents(
+ 
+ async function anthropicMessage(path: string, caller: Caller, body: any): Promise<Response> {
+   const reply = record('anthropic', path, caller, body, body.messages ?? [])
+-  if (reply?.run) log('model_server_unmodeled_run', { provider: 'anthropic' })
+-  const text = reply?.text ?? 'ok'
+-  await Bun.sleep(reply?.delayMs ?? 0)
++  const predicting = isAnthropicPromptSuggestion(body.messages ?? [])
++  const text = predicting ? (reply?.suggestion ?? '') : (reply?.text ?? 'ok')
++  await Bun.sleep((predicting ? reply?.suggestionDelayMs : reply?.delayMs) ?? 0)
+   if (reply?.error) {
+     const { message: errorMessage, status, type } = reply.error
+     return Response.json({ type: 'error', error: { type, message: errorMessage } }, { status })
+@@ -222,19 +222,27 @@ async function anthropicMessage(path: string, caller: Caller, body: any): Promis
+   const message = {
+     id: `msg_${randomUUID()}`, type: 'message', role: 'assistant', model: body.model,
+     content: [] as unknown[], stop_reason: null as string | null, stop_sequence: null,
+-    usage: { input_tokens: 0, output_tokens: 0 }
++    // Native suggestions require a warm prefix. Only this opt-in fixture
++    // reports cached usage; ordinary scripts keep their existing behavior.
++    usage: reply?.suggestion !== undefined
++      ? { input_tokens: 1, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 }
++      : { input_tokens: 0, output_tokens: 0 }
+   }
+   const answered = hasAnthropicToolResult(body.messages ?? [])
+-  if (reply?.questions && !answered) {
+-    const input = { questions: reply.questions.map(({ id: _id, ...question }) => ({ ...question, multiSelect: false })) }
+-    const content = { type: 'tool_use', id: `toolu_${randomUUID()}`, name: 'AskUserQuestion', input }
++  if (!predicting && !answered && (reply?.questions || reply?.run)) {
++    const input = reply.questions
++      ? { questions: reply.questions.map(({ id: _id, ...question }) => ({ ...question, multiSelect: false })) }
++      : { command: reply.run, description: 'Run the scripted command' }
++    const content = {
++      type: 'tool_use', id: `toolu_${randomUUID()}`, name: reply.questions ? 'AskUserQuestion' : 'Bash', input
++    }
+     if (!body.stream) return Response.json({ ...message, content: [content], stop_reason: 'tool_use' })
+     return sse([
+       { type: 'message_start', message },
+       { type: 'content_block_start', index: 0, content_block: { ...content, input: {} } },
+       { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } },
+       { type: 'content_block_stop', index: 0 },
+-      { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 0 } },
++      { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: message.usage },
+       { type: 'message_stop' }
+     ])
+   }
+@@ -246,7 +254,7 @@ async function anthropicMessage(path: string, caller: Caller, body: any): Promis
+     { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+     { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
+     { type: 'content_block_stop', index: 0 },
+-    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 } },
++    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: message.usage },
+     { type: 'message_stop' }
+   ])
+ }
+@@ -259,9 +267,11 @@ function record(
+   conversation: unknown[]
+ ): Reply | undefined {
+   // Claude returns tool results as a new user message without the script token.
+-  // Only that continuation inherits the script from its preceding conversation.
+-  const toolResult = hasAnthropicToolResult(conversation)
+-  const reply = findReply(lastUserText(conversation)) ?? (toolResult ? findReply(JSON.stringify(conversation)) : undefined)
++  // Its native prediction also appends a user message without the script token.
++  // Only these continuations inherit the preceding conversation's script.
++  const continuation = provider === 'anthropic'
++    && (hasAnthropicToolResult(conversation) || isAnthropicPromptSuggestion(conversation))
++  const reply = findReply(lastUserText(conversation)) ?? (continuation ? findReply(JSON.stringify(conversation)) : undefined)
+   requests.push({
+     at: new Date().toISOString(),
+     provider,
+@@ -282,6 +292,11 @@ function hasAnthropicToolResult(conversation: unknown[]): boolean {
+   return Array.isArray(lastUser?.content) && lastUser.content.some((part: any) => part.type === 'tool_result')
+ }
+ 
++/** The pinned CLI's native background prediction prompt, not a normal turn. */
++function isAnthropicPromptSuggestion(conversation: unknown[]): boolean {
++  return lastUserText(conversation).includes('[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]')
++}
++
+ /** Whether this request returns the output of a tool call the model made. */
+ function hasToolOutput(input: unknown): boolean {
+   return Array.isArray(input) && input.some((item: any) => String(item?.type ?? '').endsWith('_call_output'))
+diff --git a/e2e/lib/index.ts b/e2e/lib/index.ts
+index c0cf9c6f..7207cca1 100644
+--- a/e2e/lib/index.ts
++++ b/e2e/lib/index.ts
+@@ -31,7 +31,7 @@ export type ProviderError = { status: number; type: string; code?: string; messa
+  * `run` first has the harness run a shell command through its shell tool.
+  */
+ export type Question = { id: string; header: string; question: string; options: Array<{ label: string; description: string }> }
+-export type Script = { token: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[] }
++export type Script = { token: string; text: string; delayMs?: number; error?: ProviderError; run?: string; questions?: Question[]; suggestion?: string; suggestionDelayMs?: number }
+ 
+ export type Execution = { execution_id: string; status: string; error: string | null }
+ 
+@@ -85,6 +85,12 @@ export type SlackMessage = {
+   reactions?: Array<{ name: string; users: string[] }>
+ }
+ 
++export type SuggestedPromptsCall = {
++  channel_id: string
++  thread_ts?: string
++  prompts: Array<{ title: string; message: string }>
++}
++
+ const slackUrl = required('E2E_SLACK_URL')
+ const modelUrl = required('E2E_MODEL_URL')
+ const db = new SQL(required('E2E_DATABASE_URL'))
+@@ -123,7 +129,7 @@ export const model = {
+   },
+   /**
+    * Scripts the model to run a shell command through the harness's shell tool
+-   * (OpenAI harnesses), then answer with `text` once the command finishes.
++   * then answer with `text` once the command finishes.
+    */
+   runs(command: string, text = 'Ran it.'): Script {
+     return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: command }
+@@ -132,6 +138,10 @@ export const model = {
+   asks(questions: Question[], text = 'Thanks. The task continued.'): Script {
+     return { token: `e2e-${randomUUID().slice(0, 8)}`, text, questions }
+   },
++  /** Warm Claude's cache with a tool turn, then answer its native prediction request. */
++  suggests(text: string, suggestion: string, options: { suggestionDelayMs?: number } = {}): Script {
++    return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: 'true', suggestion, ...options }
++  },
+   /**
+    * The X-E2E-Credential header of each request a command made to
+    * https://<provider host>/_e2e/echo/<match>, oldest first.
+@@ -265,12 +275,16 @@ export const slack = {
+     return posted.ts
+   },
+   /** Opens the user's DM with the bot and sends it a message; a DM needs no mention. */
+-  async dm(text: string, script?: Script, options: { as?: SlackUser } = {}): Promise<Thread> {
++  async dm(text: string, script?: Script, options: { as?: SlackUser; agentView?: boolean } = {}): Promise<Thread> {
+     const user = options.as ?? USER
+     const { channel } = await slackApi<{ channel: { id: string } }>(user, 'conversations.open', { users: user.id })
+     const dm = { id: channel.id, name: `dm-${user.name}` }
+     const ts = await postMention(dm, user, text, script, undefined, { dm: true })
+-    return new Thread(dm, ts, script, { dm: true })
++    return new Thread(dm, ts, script, { dm: true, agentView: options.agentView })
++  },
++  /** Native suggested-prompt API writes, oldest first, including clears. */
++  async suggestedPrompts(channel: Channel): Promise<SuggestedPromptsCall[]> {
++    return (await fetch(`${slackUrl}/_e2e/suggested-prompts?channel=${encodeURIComponent(channel.id)}`)).json()
+   },
+   /** A message as Slack holds it, with its reactions. */
+   async message(channel: Channel, ts: string): Promise<SlackMessage> {
+@@ -373,29 +387,31 @@ export const ironControl = {
+ }
+ 
+ /**
+- * A conversation with the bot: a channel thread, or a DM, which slackbotv2
+- * runs as one conversation-wide session.
++ * A conversation with the bot: a channel thread, an Agent-view DM thread,
++ * or a legacy DM with one conversation-wide session.
+  */
+ export class Thread {
+   /** The user message that triggered each turn, and that turn's script token. */
+   private readonly triggers: string[]
+   private readonly scripts: Array<string | undefined>
+   private readonly dm: boolean
++  private readonly agentView: boolean
+   private turnsSeen = 0
+ 
+   constructor(
+     readonly channel: Channel,
+     readonly ts: string,
+     script?: Script,
+-    options: { dm?: boolean; trigger?: string } = {}
++    options: { dm?: boolean; agentView?: boolean; trigger?: string } = {}
+   ) {
+     this.triggers = [options.trigger ?? ts]
+     this.scripts = [script?.token]
+     this.dm = options.dm ?? false
++    this.agentView = options.agentView ?? false
+   }
+ 
+   get key(): string {
+-    return this.dm ? `slack:${this.channel.id}:` : `slack:${this.channel.id}:${this.ts}`
++    return this.dm && !this.agentView ? `slack:${this.channel.id}:` : `slack:${this.channel.id}:${this.ts}`
+   }
+ 
+   /** Follows up with a message that mentions the bot (in a DM, any message), by USER unless `as` says otherwise. */
+@@ -414,7 +430,7 @@ export class Thread {
+ 
+   /** Posts a reply that does not mention the bot. */
+   async post(text: string, options: { as?: SlackUser } = {}): Promise<string> {
+-    return slack.post(text, { channel: this.channel, as: options.as, threadTs: this.dm ? undefined : this.ts })
++    return slack.post(text, { channel: this.channel, as: options.as, threadTs: this.dm && !this.agentView ? undefined : this.ts })
+   }
+ 
+   /** Waits until the latest turn's model request is in flight, held by its script's delay. */
+@@ -434,7 +450,7 @@ export class Thread {
+   }
+ 
+   private async send(text: string, script: Script | undefined, as: SlackUser = USER): Promise<string> {
+-    return postMention(this.channel, as, text, script, this.dm ? undefined : this.ts, { dm: this.dm })
++    return postMention(this.channel, as, text, script, this.dm && !this.agentView ? undefined : this.ts, { dm: this.dm })
+   }
+ 
+   /**
+@@ -507,9 +523,18 @@ export class Thread {
+       where thread_key = ${this.key} order by created_at`
+   }
+ 
++  /** Output persisted for one execution, in the same order the renderer consumes it. */
++  async outputLines(executionId: string): Promise<Array<{ eventId: number; line: string }>> {
++    return db`
++      select event_id as "eventId", payload as line from session_events
++      where thread_key = ${this.key} and execution_id = ${executionId}
++        and event_type = 'session.output.line'
++      order by event_id`
++  }
++
+   /** Bot messages posted after a turn's trigger and before the next turn's trigger. */
+   private async repliesTo(index: number): Promise<SlackMessage[]> {
+-    const { messages } = this.dm
++    const { messages } = this.dm && !this.agentView
+       ? await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.history', { channel: this.channel.id })
+       : await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.replies', {
+         channel: this.channel.id,
+@@ -546,7 +571,7 @@ async function registerScript(script: Script): Promise<void> {
+     headers: { 'content-type': 'application/json' },
+     body: JSON.stringify({
+       match: script.token, text: script.text, delayMs: script.delayMs, error: script.error, run: script.run,
+-      questions: script.questions
++      questions: script.questions, suggestion: script.suggestion, suggestionDelayMs: script.suggestionDelayMs
+     })
+   })
+   if (!response.ok) throw new Error(`registering the model script failed: ${response.status}`)
+diff --git a/e2e/tests/prompt-suggestions.test.ts b/e2e/tests/prompt-suggestions.test.ts
+new file mode 100644
+index 00000000..44ac80ca
+--- /dev/null
++++ b/e2e/tests/prompt-suggestions.test.ts
+@@ -0,0 +1,98 @@
++import { expect, test } from 'bun:test'
++import { eventually, model, slack, turnTimeoutMs, USER_B } from '../lib'
++
++// Run this suite with Slack Agent view and prompt suggestions enabled in the
++// isolated stack. The ordinary suites retain the legacy DM configuration.
++test.skipIf(process.env.E2E_PROMPT_SUGGESTIONS_ENABLED !== 'true')(
++  'Claude native suggestions survive the durable stream and reach Slack Agent view',
++  async () => {
++    const suggestion = 'Show me the test results'
++    const script = model.suggests('The change is ready to review.', suggestion)
++    const thread = await slack.dm('--sonnet Run the command, then report the result.', script, { agentView: true })
++    const turn = await thread.nextTurn()
++    expect(turn.execution.status).toBe('completed')
++    expect(turn.reply).toBe(script.text)
++    expect(turn.sandbox.harness).toBe('claudecode')
++
++    const output = (await thread.outputLines(turn.execution.execution_id)).flatMap(({ line }) => {
++      try { return [JSON.parse(line)] } catch { return [] }
++    })
++    const suggestions = output.filter(event => event.method === 'turn/promptSuggestion')
++    expect(suggestions).toHaveLength(1)
++    expect(suggestions[0].params.suggestion).toBe(suggestion)
++    const completion = output.find(event => event.method === 'turn/completed')
++    expect(completion).toBeDefined()
++    expect(suggestions[0].params.threadId).toBe(completion.params.threadId)
++    expect(suggestions[0].params.turnId).toBe(completion.params.turn.id)
++    expect(output.indexOf(suggestions[0])).toBeLessThan(output.indexOf(completion))
++
++    const published = await eventually('the native Slack suggested prompt', turnTimeoutMs, async () =>
++      (await slack.suggestedPrompts(thread.channel)).find(call => call.prompts[0]?.message === suggestion)
++    )
++    expect(published.prompts).toEqual([{ title: suggestion, message: suggestion }])
++    // Agent view silently ignores thread-scoped prompts; this call belongs to
++    // the DM's Messages surface and must omit thread_ts altogether.
++    expect(published).not.toHaveProperty('thread_ts')
++    expect(published.channel_id).toBe(thread.channel.id)
++
++    const requests = await model.requests(script)
++    expect(requests).toHaveLength(3)
++    expect(requests.every(request => request.provider === 'anthropic' && request.model === 'claude-sonnet-5-5')).toBe(true)
++    expect(requests[2]!.userText).toContain('[SUGGESTION MODE:')
++    // The real CLI makes one native prediction request. Rendering the button
++    // neither asks another model nor allocates another sandbox.
++    expect(await thread.sandboxes()).toHaveLength(1)
++    expect(await thread.executions()).toHaveLength(1)
++
++    const previousWrites = (await slack.suggestedPrompts(thread.channel)).length
++    const nextScript = model.says('A short answer with no suggestion.')
++    const next = await slack.dm('--sonnet Answer briefly.', nextScript, { agentView: true })
++    await eventually('the next DM clearing the old prompt', turnTimeoutMs, async () => {
++      const calls = await slack.suggestedPrompts(thread.channel)
++      return calls.length > previousWrites && calls.at(-1)?.prompts.length === 0 ? true : undefined
++    })
++    const nextTurn = await next.nextTurn()
++    expect(nextTurn.execution.status).toBe('completed')
++    expect(nextTurn.reply).toBe(nextScript.text)
++    expect(await model.requests(nextScript)).toHaveLength(1)
++    expect((await next.outputLines(nextTurn.execution.execution_id)).some(({ line }) =>
++      line.includes('turn/promptSuggestion')
++    )).toBe(false)
++    expect((await slack.suggestedPrompts(thread.channel)).at(-1)?.prompts).toEqual([])
++  },
++  2 * turnTimeoutMs
++)
++
++test.skipIf(process.env.E2E_PROMPT_SUGGESTIONS_ENABLED !== 'true')(
++  'a follow-up during Claude prediction finishes in the same execution',
++  async () => {
++    const staleSuggestion = 'Show the old result'
++    const first = model.suggests('The first part is ready.', staleSuggestion, { suggestionDelayMs: 10_000 })
++    const thread = await slack.dm('--sonnet Run the command, then report the result.', first, { as: USER_B, agentView: true })
++    // The native tail is only two seconds; poll its provider request more
++    // frequently than the ordinary one-second eventually helper.
++    const deadline = Date.now() + turnTimeoutMs
++    let predicting = false
++    while (Date.now() < deadline) {
++      predicting = (await model.requests(first)).some(request => request.userText.includes('[SUGGESTION MODE:'))
++      if (predicting) break
++      await Bun.sleep(25)
++    }
++    expect(predicting).toBe(true)
++    const followUp = model.says('The follow-up requirement is complete.')
++    await thread.interject('Also handle this follow-up requirement.', followUp, { as: USER_B })
++    const turn = await thread.nextTurn()
++    expect(turn.execution.status).toBe('completed')
++    expect(turn.reply).toContain(followUp.text)
++    expect(await thread.executions()).toHaveLength(1)
++    expect(await thread.sandboxes()).toHaveLength(1)
++    expect((await model.requests(followUp))[0]?.userMessage).toContain('Also handle this follow-up requirement.')
++    expect((await thread.outputLines(turn.execution.execution_id)).some(({ line }) =>
++      line.includes('turn/promptSuggestion') && line.includes(staleSuggestion)
++    )).toBe(false)
++    expect((await slack.suggestedPrompts(thread.channel)).some(call =>
++      call.prompts.some(prompt => prompt.message === staleSuggestion)
++    )).toBe(false)
++  },
++  2 * turnTimeoutMs
++)
+diff --git a/services/slackbotv2/README.md b/services/slackbotv2/README.md
+new file mode 100644
+index 00000000..afef8ca3
+--- /dev/null
++++ b/services/slackbotv2/README.md
+@@ -0,0 +1,26 @@
++# Slackbot v2
++
++## Claude prompt suggestions
++
++Set `SLACKBOTV2_PROMPT_SUGGESTIONS_ENABLED=true` to opt in to Claude Code's
++native next-prompt suggestions. It defaults to false and requires
++`SLACKBOTV2_AGENT_VIEW_ENABLED=true` plus Slack's `assistant:write` scope.
++Remove any static suggested prompts from the Slack app configuration, since
++Slack rejects dynamic updates when static prompts are configured.
++Only Claude executions in direct messages request suggestions; other harnesses
++and channel conversations keep their existing behavior.
++
++Claude may return one suggestion after its answer, or none. It uses a separate
++background model request with the current conversation, so enabling this feature
++adds model usage. Centaur does not generate replacement suggestions. The answer
++streams immediately; optional suggestions are collected for a bounded period.
++
++Slack's native `assistant.threads.setSuggestedPrompts` feature displays these
++at the top of the Agent view's Messages tab. Clicking one follows Slack's normal
++message flow and does not guarantee continuation in the original thread.
++Centaur clears its prior suggestions when a newer DM message is accepted and
++ignores suggestions from older executions. Suggested-prompt writes are
++best-effort and cannot fail answer delivery.
++
++References: [Claude prompt suggestions](https://code.claude.com/docs/en/interactive-mode#prompt-suggestions),
++[Slack suggested prompts](https://docs.slack.dev/reference/methods/assistant.threads.setSuggestedPrompts/).
+diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
+index 414b110e..9a499872 100644
+--- a/services/slackbotv2/src/index.ts
++++ b/services/slackbotv2/src/index.ts
+@@ -93,6 +93,12 @@ import {
+ } from './slack-events'
+ import { isSlackStopCommand } from './stop-command'
+ import { handleSessionUserInputInteraction, renderSessionUserInput, UserInputRenderError } from './user-input'
++import {
++  beginPromptSuggestionMessage,
++  bindPromptSuggestionExecution,
++  stopPromptSuggestions,
++  withPromptSuggestions
++} from './prompt-suggestions'
+ import {
+   createSteeringReactionController,
+   type SteeringReactionAck,
+@@ -621,6 +627,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+       threadId: thread.id
+     }
+     try {
++      await stopPromptSuggestions(thread.id, options, backgroundWaitUntil)
+       await interruptThreadExecution(thread, options, trace, 'agent_session_stopped')
+     } catch {
+       // Slack already shows the session as stopped, so say the stop may
+@@ -811,6 +818,7 @@ async function handleSlackMessageHandoff(
+   let assistantStatus = Promise.resolve(false)
+   let syncInput: SyncThreadMessageInput | undefined
+   try {
++    await beginPromptSuggestionMessage(thread.id, message.id, input.options, backgroundWaitUntil)
+     // Only a mention can stop a run; an accepted unmentioned "stop that"
+     // steers it like any other message.
+     if (!input.proactive && await handleStopCommand(thread, message, input.options, input.trigger)) {
+@@ -1972,6 +1980,10 @@ async function syncThreadMessageToSession(
+     latestExecutedMessageIds.add(serializedMessage.id)
+     const steeringReactionAck = input.steeringReactionAck
+     forwardInput.executionId = execution.execution_id
++    await bindPromptSuggestionExecution(
++      thread.id, serializedMessage.id, execution.execution_id,
++      forwardInput.metadataHarnessType, input.options
++    )
+     if (stopRequestedFor(latest, message)) {
+       // The stop landed while execute was in flight. Interrupt in the
+       // background; the live render shows the interrupted result.
+@@ -2332,7 +2344,8 @@ async function renderExecutionAttempt(
+       options,
+       trace,
+       assistantStatusVisible,
+-      responseContextBlock
++      responseContextBlock,
++      input.executionId
+     )
+     rendered = true
+     outcome = 'complete'
+@@ -2963,7 +2976,8 @@ async function recoverRenderObligation(
+       streamOpenedSession(input, openedStream),
+       obligation.message,
+       options,
+-      trace
++      trace,
++      obligation.executionId
+     )
+     rendered = true
+     renderOutcome = 'complete'
+@@ -3234,8 +3248,10 @@ async function renderExecutionStream(
+   options: SlackbotV2Options,
+   trace?: SlackbotV2Trace,
+   assistantStatusVisible = false,
+-  responseContextBlock?: SlackContextBlock
++  responseContextBlock?: SlackContextBlock,
++  executionId?: string
+ ): Promise<{ diverged: boolean; messageId?: string }> {
++  stream = withPromptSuggestions(stream, thread.id, message.id, executionId, options, backgroundWaitUntil)
+   const promptText = slackMessagePromptText(message)
+   if (isPlainTextOnlyRequest(promptText)) {
+     await renderPlainTextExecutionStream(
+@@ -3312,8 +3328,10 @@ async function renderRecoveredExecutionStream(
+   stream: AsyncIterable<SlackbotV2RendererSource>,
+   message: SlackbotV2ApiMessage,
+   options: SlackbotV2Options,
+-  trace?: SlackbotV2Trace
++  trace?: SlackbotV2Trace,
++  executionId?: string
+ ): Promise<{ diverged: boolean; messageId?: string }> {
++  stream = withPromptSuggestions(stream, thread.id, message.id, executionId, options, backgroundWaitUntil)
+   const promptText = slackMessagePromptText(message)
+   if (isPlainTextOnlyRequest(promptText)) {
+     await renderPlainTextExecutionStream(thread, stream, message, options, trace)
+diff --git a/services/slackbotv2/src/prompt-suggestions.ts b/services/slackbotv2/src/prompt-suggestions.ts
+new file mode 100644
+index 00000000..53e070fe
+--- /dev/null
++++ b/services/slackbotv2/src/prompt-suggestions.ts
+@@ -0,0 +1,214 @@
++import { randomUUID } from 'node:crypto'
++import { assertSlackOk, callSlackApi } from '@chat-adapter/slack/api'
++import type { StateAdapter } from 'chat'
++import { slackApiTimeoutMs, withSlackApiTimeout } from './session-api'
++import type { SlackbotV2Options, SlackbotV2RendererSource } from './types'
++import { errorMessage, isJsonObject } from './utils'
++
++const STATE_TTL_MS = 2 * 24 * 60 * 60 * 1000
++const LOCK_TTL_MS = 5_000
++const WRITE_TIMEOUT_MS = 2_000
++const METHOD = 'assistant.threads.setSuggestedPrompts'
++
++type Owner = {
++  threadId: string
++  messageId: string
++  revision: string
++  executionId?: string
++  harnessType?: string
++  stopped?: boolean
++  eventId?: number
++  suggestion?: string
++  publishedRevision?: string
++}
++
++type KeepAlive = (promise: Promise<unknown>) => void
++
++/** Agent-view prompts belong to the DM, not a particular message or thread. */
++function channelFor(threadId: string, options: SlackbotV2Options): string | undefined {
++  if (!options.promptSuggestionsEnabled || !options.agentViewEnabled || !options.state) return
++  return /^slack:(D[^:]+):[^:]+$/.exec(threadId)?.[1]
++}
++
++function key(channel: string): string { return `slackbotv2:prompt-suggestions:${channel}` }
++
++/** Called after Slack admission, including for a steer or stop. */
++export async function beginPromptSuggestionMessage(
++  threadId: string,
++  messageId: string,
++  options: SlackbotV2Options,
++  keepAlive: KeepAlive
++): Promise<void> {
++  const channel = channelFor(threadId, options)
++  if (!channel || !/^\d+\.\d+$/.test(messageId)) return
++  await bestEffort(options, async () => {
++    const changed = await withOwner(options.state!, channel, async current => {
++      // Slack retries and concurrent threads must not put an older DM back in charge.
++      if (current && Number(current.messageId) >= Number(messageId)) return false
++      await options.state!.set(key(channel), {
++        threadId, messageId, revision: randomUUID()
++      } satisfies Owner, STATE_TTL_MS)
++      return true
++    })
++    if (changed) keepAlive(reconcile(channel, options))
++  })
++}
++
++export async function bindPromptSuggestionExecution(
++  threadId: string,
++  messageId: string,
++  executionId: string,
++  harnessType: string | undefined,
++  options: SlackbotV2Options
++): Promise<void> {
++  const channel = channelFor(threadId, options)
++  if (!channel) return
++  await bestEffort(options, () => withOwner(options.state!, channel, async current => {
++    if (current?.threadId !== threadId || current.messageId !== messageId || current.stopped) return
++    await options.state!.set(key(channel), { ...current, executionId, harnessType }, STATE_TTL_MS)
++  }))
++}
++
++export async function stopPromptSuggestions(
++  threadId: string,
++  options: SlackbotV2Options,
++  keepAlive: KeepAlive
++): Promise<void> {
++  const channel = channelFor(threadId, options)
++  if (!channel) return
++  await bestEffort(options, async () => {
++    const changed = await withOwner(options.state!, channel, async current => {
++      if (current?.threadId !== threadId || current.stopped) return false
++      await options.state!.set(key(channel), {
++        threadId, messageId: current.messageId, stopped: true, revision: randomUUID()
++      } satisfies Owner, STATE_TTL_MS)
++      return true
++    })
++    if (changed) keepAlive(reconcile(channel, options))
++  })
++}
++
++/** Consume the optional notification without delaying answer rendering. */
++export async function* withPromptSuggestions(
++  stream: AsyncIterable<SlackbotV2RendererSource>,
++  threadId: string,
++  messageId: string,
++  executionId: string | undefined,
++  options: SlackbotV2Options,
++  keepAlive: KeepAlive
++): AsyncIterable<SlackbotV2RendererSource> {
++  for await (const event of stream) {
++    const payload = suggestionPayload(event)
++    if (payload) {
++      const channel = channelFor(threadId, options)
++      const eventId = 'eventId' in event ? event.eventId : undefined
++      if (channel && executionId && typeof eventId === 'number') {
++        keepAlive(bestEffort(options, async () => {
++          const changed = await withOwner(options.state!, channel, async current => {
++            if (current?.threadId !== threadId || current.messageId !== messageId
++              || current.stopped
++              || current.executionId !== executionId || current.harnessType !== 'claudecode'
++              || (current.eventId ?? -1) > eventId) return false
++            // Recovered output may replay a notification whose Slack write failed.
++            // Keep its desired revision and retry only while it remains unpublished.
++            if (current.eventId === eventId) {
++              return current.publishedRevision !== current.revision
++            }
++            await options.state!.set(key(channel), {
++              ...current, eventId, suggestion: payload, revision: randomUUID()
++            } satisfies Owner, STATE_TTL_MS)
++            return true
++          })
++          if (changed) await reconcile(channel, options)
++        }))
++      }
++      continue
++    }
++    yield event
++  }
++}
++
++function suggestionPayload(event: SlackbotV2RendererSource): string | undefined {
++  const kind = 'eventKind' in event ? event.eventKind : event.event
++  if (kind !== 'session.output.line' || typeof event.data !== 'string') return
++  let payload: unknown
++  try { payload = JSON.parse(event.data) } catch { return }
++  if (!isJsonObject(payload) || payload.method !== 'turn/promptSuggestion'
++    || !isJsonObject(payload.params)) return
++  const suggestion = payload.params.suggestion
++  if (typeof suggestion !== 'string') return
++  const text = suggestion.trim()
++  if (!text || [...text].length > 500 || /[\u0000-\u001f\u007f-\u009f]/.test(text)) return
++  return text
++}
++
++async function withOwner<T>(
++  state: StateAdapter,
++  channel: string,
++  operation: (current: Owner | null) => Promise<T>
++): Promise<T | undefined> {
++  let lock = await state.acquireLock(`${key(channel)}:lock`, LOCK_TTL_MS)
++  for (let attempt = 0; !lock && attempt < 20; attempt++) {
++    await new Promise(resolve => setTimeout(resolve, 25))
++    lock = await state.acquireLock(`${key(channel)}:lock`, LOCK_TTL_MS)
++  }
++  if (!lock) return
++  try { return await operation(await state.get<Owner>(key(channel))) }
++  finally { await state.releaseLock(lock) }
++}
++
++async function reconcile(channel: string, options: SlackbotV2Options): Promise<void> {
++  await bestEffort(options, async () => {
++    let force = false
++    for (let attempt = 0; attempt < 3; attempt++) {
++      const current = await options.state!.get<Owner>(key(channel))
++      if (!current || (!force && current.publishedRevision === current.revision)) return
++      let succeeded = false
++      const controller = new AbortController()
++      try {
++        const result = await withSlackApiTimeout({
++          ...options, slackApiTimeoutMs: Math.min(slackApiTimeoutMs(options), WRITE_TIMEOUT_MS)
++        }, METHOD, () => callSlackApi(METHOD, {
++          channel_id: channel,
++          // thread_ts silently fails in Slack's Agent view. Empty prompts clear
++          // our previous suggestions; rejection is harmless UI-only failure.
++          prompts: current.suggestion
++            ? [{ title: current.suggestion, message: current.suggestion }]
++            : []
++        }, {
++          apiUrl: options.slackApiUrl,
++          token: options.botToken,
++          fetch: ((input: RequestInfo | URL, init?: RequestInit) => (options.fetch ?? fetch)(
++            input, { ...init, signal: controller.signal }
++          )) as typeof fetch
++        }))
++        assertSlackOk(METHOD, result)
++        succeeded = true
++      } catch (error) {
++        warn(options, error)
++      } finally {
++        controller.abort()
++      }
++      const latest = await withOwner(options.state!, channel, async owner => {
++        if (succeeded && owner?.revision === current.revision) {
++          await options.state!.set(key(channel), {
++            ...owner, publishedRevision: owner.revision
++          } satisfies Owner, STATE_TTL_MS)
++        }
++        return owner
++      })
++      if (!latest || latest.revision === current.revision) return
++      // A slower old write may have landed after the latest clear/suggestion.
++      // Reapply the current desired value even if another worker published it.
++      force = true
++    }
++  })
++}
++
++async function bestEffort(options: SlackbotV2Options, operation: () => Promise<unknown>): Promise<void> {
++  try { await operation() } catch (error) { warn(options, error) }
++}
++
++function warn(options: SlackbotV2Options, error: unknown): void {
++  options.logger?.warn('slackbotv2_prompt_suggestions_failed', { error: errorMessage(error) })
++}
+diff --git a/services/slackbotv2/src/server.ts b/services/slackbotv2/src/server.ts
+index 1d1f6b15..2d04fbfb 100644
+--- a/services/slackbotv2/src/server.ts
++++ b/services/slackbotv2/src/server.ts
+@@ -58,6 +58,7 @@ const options: SlackbotV2Options = {
+   channelUserPolicy: parseChannelUserPolicy(process.env.SLACKBOTV2_CHANNEL_USER_POLICY),
+   apiUrl,
+   agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),
++  promptSuggestionsEnabled: booleanEnv('SLACKBOTV2_PROMPT_SUGGESTIONS_ENABLED', false),
+   apiKey: optionalEnv('SLACKBOT_API_KEY'),
+   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
+   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
+@@ -129,6 +130,7 @@ console.log(
+     event: 'slackbotv2_started',
+     service: 'slackbotv2',
+     agent_view_enabled: options.agentViewEnabled,
++    prompt_suggestions_enabled: options.promptSuggestionsEnabled,
+     activity_summary_status_enabled: options.activitySummaryStatusEnabled,
+     auto_join_created_channels_enabled: options.autoJoinCreatedChannels,
+     message_overrides_strategy: messageOverridesStrategyMode,
+diff --git a/services/slackbotv2/src/session-api.ts b/services/slackbotv2/src/session-api.ts
+index 468c7ea6..5fe141f0 100644
+--- a/services/slackbotv2/src/session-api.ts
++++ b/services/slackbotv2/src/session-api.ts
+@@ -1497,6 +1497,11 @@ async function executeSession(
+       {
+         action: 'execute',
+         supports_user_input: supportsNativeUserInput(threadId, options.channelUserPolicy, options.threadAdmissionUrl),
++        ...(options.promptSuggestionsEnabled === true
++          && options.agentViewEnabled === true
++          && metadataHarnessType === 'claudecode'
++          && /^slack:D[^:]+:[^:]+$/.test(threadId)
++          ? { supports_prompt_suggestions: true } : {}),
+         ...(recordedModel ? { model: recordedModel } : {}),
+         ...(metadataHarnessType ? { harness_type: metadataHarnessType } : {})
+       },
+diff --git a/services/slackbotv2/src/types.ts b/services/slackbotv2/src/types.ts
+index 1ac0997b..4a8d4113 100644
+--- a/services/slackbotv2/src/types.ts
++++ b/services/slackbotv2/src/types.ts
+@@ -152,6 +152,8 @@ export type SlackbotV2Options = {
+   apiUrl: string
+   /** Enable Slack's Agent messaging experience. Must match the app manifest. */
+   agentViewEnabled?: boolean
++  /** Opt in to Claude's native next-prompt suggestions in Agent-view DMs. */
++  promptSuggestionsEnabled?: boolean
+   assistantStatus?: string
+   /**
+    * When enabled, session.activity_summary events update Slack's assistant
+diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+index 96b73f7a..e1affcaa 100644
+--- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
++++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+@@ -237,6 +237,47 @@ describe('slackbotv2', () => {
+     expect(slackApi.calls.some(call => call.method === 'assistant.threads.setStatus')).toBe(false)
+   })
+ 
++  it('delivers a Claude DM answer and its native suggested prompt through the signed webhook', async () => {
++    const prompts: Array<Record<string, unknown>> = []
++    codexApi.autoRespond = false
++    bot = createTestBot({
++      agentViewEnabled: true,
++      promptSuggestionsEnabled: true,
++      defaultHarnessType: 'claudecode',
++      fetch: async (input, init) => {
++        if (String(input).endsWith('/assistant.threads.setSuggestedPrompts')) {
++          const form = new URLSearchParams(String(init?.body))
++          expect(form.has('thread_ts')).toBe(false)
++          prompts.push({
++            channel_id: form.get('channel_id'), prompts: JSON.parse(form.get('prompts')!)
++          })
++          return Response.json({ ok: true })
++        }
++        return globalThis.fetch(input, init)
++      }
++    })
++    const delivery = await sendDirectMessage('Review this change.')
++    expect(delivery.response.status).toBe(200)
++    await waitFor(() => codexApi.executes.length === 1)
++    expect(codexApi.executes[0]!.body.metadata).toMatchObject({ supports_prompt_suggestions: true })
++    const key = `slack:${delivery.channel}:${delivery.ts}`
++    const lines = sampleCodexOutputLines('The change looks good.')
++    lines.splice(lines.length - 1, 0, JSON.stringify({
++      method: 'turn/promptSuggestion',
++      params: { threadId: 'thread-1', turnId: 'turn-1', suggestion: 'Run the focused tests' }
++    }))
++    codexApi.emitOutputLines(key, lines)
++    await delivery.finished()
++    await waitFor(() => prompts.some(call => Array.isArray(call.prompts) && call.prompts.length === 1))
++    const replies = await slackBot.conversations.replies({ channel: delivery.channel, ts: delivery.ts })
++    expect((replies.messages ?? []).map(message => message.text ?? '').join('\n'))
++      .toContain('The change looks good.')
++    expect(prompts.at(-1)).toEqual({ channel_id: delivery.channel, prompts: [
++      { title: 'Run the focused tests', message: 'Run the focused tests' }
++    ] })
++    expect(codexApi.executes).toHaveLength(1)
++  })
++
+   it('uses native session lifecycle for agent-view channel mentions', async () => {
+     bot = createTestBot({ agentViewEnabled: true })
+     const parent = await postUserMessage('Channel context.')
+diff --git a/services/slackbotv2/test/prompt-suggestions.test.ts b/services/slackbotv2/test/prompt-suggestions.test.ts
+new file mode 100644
+index 00000000..0a90870b
+--- /dev/null
++++ b/services/slackbotv2/test/prompt-suggestions.test.ts
+@@ -0,0 +1,231 @@
++import { describe, expect, test } from 'bun:test'
++import { createMemoryState } from '@chat-adapter/state-memory'
++import {
++  beginPromptSuggestionMessage, bindPromptSuggestionExecution, stopPromptSuggestions,
++  withPromptSuggestions
++} from '../src/prompt-suggestions'
++import type { JsonObject, SlackbotV2Options, SlackbotV2RendererSource } from '../src/types'
++
++const THREAD = 'slack:D1:1700000000.000001'
++const MESSAGE = '1700000000.000001'
++
++function event(suggestion = 'Run the focused tests', eventId = 10): SlackbotV2RendererSource {
++  return {
++    eventKind: 'session.output.line', eventId,
++    data: JSON.stringify({ method: 'turn/promptSuggestion', params: {
++      threadId: 'native-thread', turnId: 'native-turn', suggestion
++    } })
++  }
++}
++
++function harness(overrides: Partial<SlackbotV2Options> = {}) {
++  const state = createMemoryState()
++  const calls: JsonObject[] = []
++  const applied: JsonObject[] = []
++  const pending: Promise<unknown>[] = []
++  let fail = false
++  let holdSuggestion: Promise<void> | undefined
++  const options: SlackbotV2Options = {
++    apiUrl: 'http://session.test', slackApiUrl: 'http://slack.test/api/',
++    botToken: 'test-token', signingSecret: 'test-signing-secret',
++    state, agentViewEnabled: true, promptSuggestionsEnabled: true,
++    fetch: async (input, init) => {
++      expect(String(input)).toBe('http://slack.test/api/assistant.threads.setSuggestedPrompts')
++      const form = new URLSearchParams(String(init?.body))
++      const body: JsonObject = {
++        channel_id: form.get('channel_id'), prompts: JSON.parse(form.get('prompts')!)
++      }
++      expect(form.has('thread_ts')).toBe(false)
++      calls.push(body)
++      if (Array.isArray(body.prompts) && body.prompts.length) await holdSuggestion
++      if (fail) return Response.json({ ok: false, error: 'static_prompts_configured' })
++      applied.push(body)
++      return Response.json({ ok: true })
++    },
++    ...overrides
++  }
++  const keepAlive = (promise: Promise<unknown>) => { pending.push(promise) }
++  const drain = async () => {
++    while (pending.length) await Promise.all(pending.splice(0))
++  }
++  const begin = async (thread = THREAD, message = MESSAGE, execution = 'execution-1', harnessType = 'claudecode') => {
++    await state.connect()
++    await beginPromptSuggestionMessage(thread, message, options, keepAlive)
++    await bindPromptSuggestionExecution(thread, message, execution, harnessType, options)
++    await drain()
++  }
++  const render = async (
++    events = [event()], thread = THREAD, message = MESSAGE, execution = 'execution-1'
++  ) => {
++    async function* source() { yield* events }
++    const output: SlackbotV2RendererSource[] = []
++    for await (const item of withPromptSuggestions(source(), thread, message, execution, options, keepAlive)) {
++      output.push(item)
++    }
++    return output
++  }
++  return {
++    options, state, calls, applied, begin, render, drain, keepAlive,
++    fail: (value = true) => { fail = value },
++    hold: (promise: Promise<void>) => { holdSuggestion = promise }
++  }
++}
++
++describe('native Slack prompt suggestions', () => {
++  test('publishes one Claude suggestion through the native DM API and deduplicates replay', async () => {
++    const h = harness()
++    await h.begin()
++    expect(h.calls).toEqual([{ channel_id: 'D1', prompts: [] }])
++    expect(await h.render()).toEqual([])
++    await h.drain()
++    expect(h.calls.at(-1)).toEqual({ channel_id: 'D1', prompts: [
++      { title: 'Run the focused tests', message: 'Run the focused tests' }
++    ] })
++    const count = h.calls.length
++    await h.render()
++    await h.drain()
++    expect(h.calls).toHaveLength(count)
++  })
++
++  test('keeps Codex, channels, legacy view, and disabled deployments out', async () => {
++    for (const [overrides, thread, harnessType] of [
++      [{}, THREAD, 'codex'],
++      [{}, 'slack:C1:1700000000.000001', 'claudecode'],
++      [{ agentViewEnabled: false }, THREAD, 'claudecode'],
++      [{ promptSuggestionsEnabled: false }, THREAD, 'claudecode']
++    ] as const) {
++      const h = harness(overrides)
++      await h.begin(thread, MESSAGE, 'execution-1', harnessType)
++      await h.render([event()], thread)
++      await h.drain()
++      expect(h.calls.filter(call => Array.isArray(call.prompts) && call.prompts.length)).toEqual([])
++    }
++  })
++
++  test('recovery retries an unpublished suggestion and then deduplicates successful replay', async () => {
++    const h = harness()
++    await h.begin()
++    h.fail()
++    await h.render()
++    await h.drain()
++    expect(h.applied.at(-1)?.prompts).toEqual([])
++    h.fail(false)
++    await h.render()
++    await h.drain()
++    expect(h.applied.at(-1)?.prompts).toEqual([
++      { title: 'Run the focused tests', message: 'Run the focused tests' }
++    ])
++    const count = h.calls.length
++    await h.render()
++    await h.drain()
++    expect(h.calls).toHaveLength(count)
++  })
++
++  test('newer DM threads own the global prompt list; older events and retries cannot replace it', async () => {
++    const h = harness()
++    const newerMessage = '1700000001.000001'
++    const newerThread = `slack:D1:${newerMessage}`
++    await h.begin()
++    await h.render()
++    await h.drain()
++    await h.begin(newerThread, newerMessage, 'execution-2')
++    await h.render([event('Stale suggestion', 11)])
++    await h.begin()
++    await h.render([event('Review the new change', 12)], newerThread, newerMessage, 'execution-2')
++    await h.drain()
++    expect(h.applied.at(-1)?.prompts).toEqual([
++      { title: 'Review the new change', message: 'Review the new change' }
++    ])
++    expect(JSON.stringify(h.calls)).not.toContain('Stale suggestion')
++  })
++
++  test('a steer or stop clears the old suggestion and rejects the old execution tail', async () => {
++    const h = harness()
++    await h.begin()
++    await h.render()
++    await h.drain()
++    await beginPromptSuggestionMessage(THREAD, '1700000001.000001', h.options, h.keepAlive)
++    await h.render([event('Old execution suggestion', 11)])
++    await h.drain()
++    expect(h.applied.at(-1)?.prompts).toEqual([])
++    expect(JSON.stringify(h.calls)).not.toContain('Old execution suggestion')
++  })
++
++  test('a slow old write is followed by the latest clear', async () => {
++    const h = harness()
++    await h.begin()
++    let release!: () => void
++    h.hold(new Promise<void>(resolve => { release = resolve }))
++    await h.render()
++    for (let attempt = 0; h.calls.length < 2 && attempt < 100; attempt++) {
++      await new Promise(resolve => setTimeout(resolve, 1))
++    }
++    expect(h.calls).toHaveLength(2)
++    await beginPromptSuggestionMessage(THREAD, '1700000001.000001', h.options, h.keepAlive)
++    for (let attempt = 0; h.applied.length < 2 && attempt < 100; attempt++) {
++      await new Promise(resolve => setTimeout(resolve, 1))
++    }
++    release()
++    await h.drain()
++    expect(h.applied.at(-1)?.prompts).toEqual([])
++  })
++
++  test('native Stop clears the owner and rejects a late execution binding or suggestion', async () => {
++    const h = harness()
++    await h.begin()
++    await h.render()
++    await h.drain()
++    await stopPromptSuggestions(THREAD, h.options, h.keepAlive)
++    await bindPromptSuggestionExecution(THREAD, MESSAGE, 'execution-1', 'claudecode', h.options)
++    await h.render([event('Late stopped suggestion', 11)])
++    await h.drain()
++    expect(h.applied.at(-1)?.prompts).toEqual([])
++    expect(JSON.stringify(h.calls)).not.toContain('Late stopped suggestion')
++  })
++
++  test('a pending or failed Slack suggestion write never holds the answer stream', async () => {
++    const h = harness()
++    await h.begin()
++    let release!: () => void
++    h.hold(new Promise<void>(resolve => { release = resolve }))
++    const answer = { eventKind: 'session.output.line', eventId: 9, data: 'answer' }
++    const terminal = { eventKind: 'session.output.line', eventId: 11, data: 'terminal' }
++    expect(await h.render([answer, event(), terminal])).toEqual([answer, terminal])
++    h.fail()
++    release()
++    await h.drain()
++  })
++
++  test('zero or invalid suggestions do not invent a replacement prompt', async () => {
++    const h = harness()
++    await h.begin()
++    await h.render([])
++    await h.render([event(''), event('x'.repeat(501)), event('two\nlines')])
++    await h.drain()
++    expect(h.calls).toEqual([{ channel_id: 'D1', prompts: [] }])
++  })
++
++  test('uses the producer character bound for Unicode suggestions', async () => {
++    const h = harness()
++    const suggestion = '🔎'.repeat(500)
++    await h.begin()
++    await h.render([event(suggestion)])
++    await h.drain()
++    expect(h.applied.at(-1)?.prompts).toEqual([{ title: suggestion, message: suggestion }])
++  })
++
++  test('bounds a stalled response body as well as the fetch', async () => {
++    let signal: AbortSignal | null | undefined
++    const h = harness({
++      slackApiTimeoutMs: 10,
++      fetch: async (_input, init) => {
++        signal = init?.signal
++        return new Response(new ReadableStream({ start() {} }))
++      }
++    })
++    await h.begin()
++    await h.render()
++    await h.drain()
++    expect(signal?.aborted).toBe(true)
++  })
++})
+diff --git a/services/slackbotv2/test/session-api.test.ts b/services/slackbotv2/test/session-api.test.ts
+index bff21d84..aedd276c 100644
+--- a/services/slackbotv2/test/session-api.test.ts
++++ b/services/slackbotv2/test/session-api.test.ts
+@@ -146,6 +146,27 @@ describe('native question deployment admission', () => {
+   })
+ })
+ 
++describe('Claude prompt suggestion capability', () => {
++  test('opts in only effective Claude executions in Agent-view DMs', async () => {
++    for (const [enabled, agentView, harnessType, channel, expected] of [
++      [true, true, 'claudecode', 'D1', true],
++      [false, true, 'claudecode', 'D1', undefined],
++      [true, false, 'claudecode', 'D1', undefined],
++      [true, true, 'codex', 'D1', undefined],
++      [true, true, 'claudecode', 'C1', undefined]
++    ] as const) {
++      const { fetchFn, requests } = fakeApi()
++      const threadId = `slack:${channel}:1700000000.000100`
++      await forwardToSessionApi({
++        ...options(fetchFn), promptSuggestionsEnabled: enabled,
++        agentViewEnabled: agentView, defaultHarnessType: harnessType
++      }, forwardInput(apiMessage('Check the change', { threadId }), { metadataHarnessType: harnessType }))
++      const execute = executeBody(requests)
++      expect((execute.metadata as JsonObject).supports_prompt_suggestions).toBe(expected)
++    }
++  })
++})
++
+ function executeBody(requests: RecordedRequest[]): Record<string, unknown> {
+   const execute = requests.find(request => request.url.endsWith('/execute'))
+   return (execute?.body ?? {}) as Record<string, unknown>
