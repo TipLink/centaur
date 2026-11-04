@@ -1,4 +1,5 @@
 mod cleanup;
+mod prompt_suggestions;
 mod retention;
 mod title_generator;
 mod user_input;
@@ -2258,6 +2259,11 @@ impl SessionRuntime {
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
             let requester_metadata = metadata.clone();
             let input_lines = user_input::input_lines_with_user_input_support(input_lines, metadata.as_ref());
+            let input_lines = prompt_suggestions::input_lines_with_prompt_suggestions_support(
+                input_lines,
+                &session.harness_type,
+                metadata.as_ref(),
+            );
             let persona_model = self.persona_model(&session);
             let input_lines = match persona_model {
                 Some(model) => input_lines_with_persona_model(input_lines, model),
@@ -8765,6 +8771,31 @@ mod tests {
         );
         assert_eq!(state.execution_for_line(None, delta), None);
         assert_eq!(state.execution_for_line(Some("exe-new"), delta), None);
+    }
+
+    #[test]
+    fn prompt_suggestions_keep_turn_attribution_without_becoming_answer_text() {
+        let mut state = StdoutPumpState::default();
+        let started = r#"{"method":"turn/started","params":{"turn":{"id":"turn-1"}}}"#;
+        let answer = r#"{"method":"item/completed","params":{"turnId":"turn-1","item":{"id":"answer-1","type":"agentMessage","phase":"final_answer","text":"The requested task is complete."}}}"#;
+        let suggestion = r#"{"method":"turn/promptSuggestion","params":{"threadId":"thread-1","turnId":"turn-1","suggestion":"Show the test results"}}"#;
+        let terminal =
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#;
+
+        for line in [started, answer, suggestion] {
+            assert_eq!(
+                state.execution_for_line(Some("exe-1"), line),
+                Some("exe-1".to_owned())
+            );
+            assert_eq!(state.observe("exe-1", line), None);
+        }
+        assert_eq!(
+            state.observe("exe-1", terminal),
+            Some(TerminalOutput::Completed {
+                reason: "turn_completed",
+                result_text: Some("The requested task is complete.".to_owned()),
+            })
+        );
     }
 
     #[test]

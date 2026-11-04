@@ -2,7 +2,6 @@ name: Validate CLI Packaging
 
 on:
   pull_request:
-    branches: [main, release/aws-core]
     paths:
       # Reviewed image publication requires packaging proof for every patch series.
       - .github/core-patches/**

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "889d62664770c8ae19e5052a4c2dce156915fe64",
-  "result_tree": "e781c19196d14490da8c9155be5fd84ba14c9437",
+  "result_tree": "5eea8b9dbc908a842c6520ef31a76a9972eb8a39",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -35,6 +35,10 @@
     {
       "file": "0008-native-user-questions.patch",
       "sha256": "77da88f0b8b36077fd0c9f87b39471c7cc8e823085430a6df102bee5e9d90ff1"
+    },
+    {
+      "file": "0009-claude-prompt-suggestions.patch",
+      "sha256": "5492e9f5b7dc6ff79c61728963ce9f7649cd16c7be5f02c11ef3e9bf4d2043af"
     }
   ]
 }

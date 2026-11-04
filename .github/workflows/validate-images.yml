@@ -2,7 +2,6 @@ name: Publish Images
 
 on:
   pull_request:
-    branches: [main, release/aws-core]
     paths:
       - .github/actions/prepare-patched-core/**
       - .github/core-patches/**

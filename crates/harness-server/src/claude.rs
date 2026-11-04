@@ -380,6 +380,9 @@ impl HarnessServer for ClaudeCodeHarness {
         if state.supports_user_input {
             command.args(["--permission-prompt-tool", "stdio"]);
         }
+        if state.supports_prompt_suggestions {
+            command.arg("--prompt-suggestions");
+        }
         if !state.model.is_empty() {
             command.args(["--model", &state.model]);
         }
@@ -552,6 +555,26 @@ impl HarnessServer for ClaudeCodeHarness {
     fn turn_hold(&self, normalizer: &Self::EventNormalizer) -> TurnHold {
         normalizer.turn_hold()
     }
+
+    fn prompt_suggestion_window(&self) -> Option<Duration> {
+        Some(Duration::from_secs(2))
+    }
+
+    fn prompt_suggestion(&self, line: &str, session_id: Option<&str>) -> Option<String> {
+        let value: Value = serde_json::from_str(line).ok()?;
+        if value["type"] != "prompt_suggestion" || value["session_id"].as_str() != Some(session_id?)
+        {
+            return None;
+        }
+        let suggestion = value["suggestion"].as_str()?.trim();
+        if suggestion.is_empty()
+            || suggestion.chars().count() > 500
+            || suggestion.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(suggestion.to_owned())
+    }
 }
 
 fn rejected_question_control(native_id: Value) -> Result<UserInputControl> {
@@ -575,6 +598,67 @@ mod tests {
 
     use super::{ClaudeCodeHarness, ClaudeEventNormalizer};
     use crate::user_input::UserInputControl;
+
+    #[test]
+    fn native_prompt_suggestions_are_opt_in() {
+        let mut state = ClaudeCodeHarness.thread_state(
+            &crate::protocol::ThreadStartParams::default(),
+            std::env::temp_dir(),
+        );
+        for enabled in [false, true] {
+            state.supports_prompt_suggestions = enabled;
+            let command = ClaudeCodeHarness.command_for_turn(&state);
+            assert_eq!(
+                command.get_args().any(|arg| arg == "--prompt-suggestions"),
+                enabled,
+            );
+        }
+    }
+
+    #[test]
+    fn native_prompt_suggestions_reject_malformed_or_foreign_output() {
+        let harness = ClaudeCodeHarness;
+        let valid = json!({
+            "type": "prompt_suggestion",
+            "session_id": "native-session",
+            "suggestion": "  Run the tests  ",
+        });
+        assert_eq!(
+            harness.prompt_suggestion(&valid.to_string(), Some("native-session")),
+            Some("Run the tests".to_string()),
+        );
+        assert_eq!(harness.prompt_suggestion(&valid.to_string(), None), None);
+        assert_eq!(
+            harness.prompt_suggestion(&valid.to_string(), Some("different-session")),
+            None,
+        );
+        for suggestion in [
+            json!(""),
+            json!(" \n "),
+            json!("x".repeat(501)),
+            json!("a\nb"),
+            json!(7),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["suggestion"] = suggestion;
+            assert_eq!(
+                harness.prompt_suggestion(&invalid.to_string(), Some("native-session")),
+                None,
+            );
+        }
+        assert_eq!(
+            harness.prompt_suggestion("not JSON", Some("native-session")),
+            None
+        );
+        assert_eq!(
+            harness.prompt_suggestion(
+                &json!({"type":"result","session_id":"native-session","suggestion":"ignored"})
+                    .to_string(),
+                Some("native-session"),
+            ),
+            None,
+        );
+    }
 
     #[test]
     fn native_questions_return_all_answers_in_claudes_original_shape() {

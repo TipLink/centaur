@@ -808,6 +808,261 @@ fn fake_amp_app_server_streams_codex_v2_notifications() {
     assert_codex_v2_turn(&run.turn);
 }
 
+const SUGGESTION_CLI: &str = r#"#!/usr/bin/env python3
+import json, os, pathlib, sys, threading, time
+generation = 0
+def emit(value):
+    print(json.dumps(value), flush=True)
+def suggest(text, session='suggestion-session'):
+    emit({'type':'prompt_suggestion', 'session_id':session, 'suggestion':text, 'uuid':'native-id'})
+def later(text, delay, owner, cancel):
+    time.sleep(delay)
+    if not cancel or owner == generation:
+        suggest(text)
+for raw in sys.stdin:
+    value = json.loads(raw)
+    if value.get('type') != 'user':
+        continue
+    generation += 1
+    if generation == 1:
+        emit({'type':'system','subtype':'init','session_id':'suggestion-session'})
+    mode = value['message']['content'][0]['text']
+    if mode == 'early':
+        suggest('Old prediction before the result')
+    emit({'type':'assistant','message':{'id':'answer-'+str(generation),'role':'assistant','content':[{'type':'text','text':'Answer '+mode}],'stop_reason':'end_turn'}})
+    if mode == 'next':
+        time.sleep(0.4)
+    emit({'type':'result','subtype':'success','result':'Answer '+mode})
+    if mode == 'delayed':
+        deadline = time.monotonic() + 8
+        while not pathlib.Path(os.environ['FAKE_SUGGESTION_RELEASE']).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        suggest('Foreign prediction', 'another-session')
+        suggest('')
+        suggest('x'*501)
+        suggest('Run the tests')
+        suggest('Duplicate prediction')
+    elif mode == 'queued':
+        threading.Thread(target=later, args=('Superseded prediction', 0.2, generation, True), daemon=True).start()
+    elif mode == 'late':
+        threading.Thread(target=later, args=('Prediction after deadline', 2.2, generation, False), daemon=True).start()
+    elif mode == 'next':
+        suggest('Next answer prediction')
+    elif mode == 'closed':
+        os.close(1)
+        time.sleep(60)
+"#;
+
+fn suggestion_bridge() -> (BridgeProcess, PathBuf, PathBuf) {
+    let script = temp_path("native-suggestion-cli.py");
+    let release = temp_path("native-suggestion-release");
+    std::fs::write(&script, SUGGESTION_CLI).unwrap();
+    let bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::ClaudeCode,
+        Some(format!("exec python3 {}", script.display())),
+        Some(("FAKE_SUGGESTION_RELEASE", release.to_str().unwrap())),
+    );
+    (bridge, script, release)
+}
+
+fn suggestion_user(mode: &str, enabled: bool) -> Value {
+    json!({
+        "type":"user",
+        "thread_key":"slack:T123:D123:123.456",
+        "trace_metadata":{"supports_prompt_suggestions":enabled},
+        "text":mode,
+    })
+}
+
+fn suggestion_notifications(lines: &[String]) -> Vec<Value> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line).unwrap();
+            (value["method"] == "turn/promptSuggestion").then_some(value)
+        })
+        .collect()
+}
+
+fn read_final_suggestion_answer(bridge: &mut BridgeProcess) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = bridge.read_json(deadline);
+        assert_ne!(
+            value["method"], "turn/completed",
+            "answer must flush before completion"
+        );
+        if value["method"] == "item/completed" && value["params"]["item"]["type"] == "agentMessage"
+        {
+            return value;
+        }
+    }
+}
+
+#[test]
+fn fake_claude_prompt_suggestion_follows_the_visible_answer_before_completion() {
+    let (mut bridge, script, release) = suggestion_bridge();
+    bridge.send(suggestion_user("delayed", true));
+    let answer = read_final_suggestion_answer(&mut bridge);
+    // The native fixture cannot emit its suggestion until the final answer
+    // has reached this client: no buffering the answer behind prediction.
+    std::fs::write(&release, "continue").unwrap();
+    let suggestion = read_question_method(&mut bridge, "turn/promptSuggestion");
+    assert_eq!(suggestion["params"]["suggestion"], "Run the tests");
+    assert_eq!(
+        suggestion["params"]["threadId"],
+        answer["params"]["threadId"]
+    );
+    assert_eq!(suggestion["params"]["turnId"], answer["params"]["turnId"]);
+    let done = read_question_method(&mut bridge, "turn/completed");
+    assert_eq!(done["params"]["turn"]["status"], "completed");
+    let lines = bridge.finish_successfully();
+    assert_eq!(suggestion_notifications(&lines).len(), 1);
+    let _ = std::fs::remove_file(script);
+    let _ = std::fs::remove_file(release);
+}
+
+#[test]
+fn fake_claude_prompt_suggestion_is_optional_and_requires_a_native_result() {
+    for mode in ["none", "early"] {
+        let (mut bridge, script, _) = suggestion_bridge();
+        let turn = bridge.run_blocks_user_line(suggestion_user(mode, true), Duration::from_secs(5));
+        assert_completed_turn(&turn);
+        assert_eq!(turn.text_from_deltas, format!("Answer {mode}"));
+        assert!(suggestion_notifications(&bridge.finish_successfully()).is_empty());
+        let _ = std::fs::remove_file(script);
+    }
+}
+
+#[test]
+fn fake_claude_prompt_suggestion_disabled_completes_without_waiting() {
+    let (mut bridge, script, _) = suggestion_bridge();
+    bridge.send(suggestion_user("delayed", false));
+    read_final_suggestion_answer(&mut bridge);
+    // The fixture is still waiting for a release marker that is never sent.
+    let done = bridge.read_blocks_turn(Instant::now() + Duration::from_secs(1));
+    assert_completed_turn(&done);
+    assert!(suggestion_notifications(&bridge.finish_successfully()).is_empty());
+    let _ = std::fs::remove_file(script);
+}
+
+#[test]
+fn fake_claude_prompt_suggestion_tail_is_interruptible() {
+    let (mut bridge, script, _) = suggestion_bridge();
+    bridge.send(suggestion_user("none", true));
+    read_final_suggestion_answer(&mut bridge);
+    thread::sleep(Duration::from_millis(100));
+    bridge.send(json!({"type":"interrupt"}));
+    let done = read_question_method(&mut bridge, "turn/completed");
+    assert_eq!(done["params"]["turn"]["status"], "interrupted");
+    assert!(suggestion_notifications(&bridge.finish_successfully()).is_empty());
+    let _ = std::fs::remove_file(script);
+}
+
+#[test]
+fn fake_claude_prompt_suggestion_eof_does_not_wait_for_a_live_child() {
+    let (mut bridge, script, _) = suggestion_bridge();
+    bridge.send(suggestion_user("closed", true));
+    read_final_suggestion_answer(&mut bridge);
+    let done = bridge.read_blocks_turn(Instant::now() + Duration::from_secs(1));
+    assert_completed_turn(&done);
+    assert!(suggestion_notifications(&bridge.finish_successfully()).is_empty());
+    let _ = std::fs::remove_file(script);
+}
+
+#[test]
+fn fake_claude_queued_input_supersedes_the_old_prompt_suggestion() {
+    let (mut bridge, script, _) = suggestion_bridge();
+    bridge.send(suggestion_user("queued", true));
+    read_final_suggestion_answer(&mut bridge);
+    bridge.send(suggestion_user("queued", true));
+    bridge.send(suggestion_user("next", true));
+    let first = read_question_method(&mut bridge, "turn/completed");
+    assert_eq!(first["params"]["turn"]["status"], "completed");
+    assert!(suggestion_notifications(&bridge.stdout_lines).is_empty());
+    let second = read_question_method(&mut bridge, "turn/completed");
+    assert_eq!(second["params"]["turn"]["status"], "completed");
+    assert!(suggestion_notifications(&bridge.stdout_lines).is_empty());
+    let suggestion = read_question_method(&mut bridge, "turn/promptSuggestion");
+    let third = read_question_method(&mut bridge, "turn/completed");
+    assert_ne!(
+        first["params"]["turn"]["id"],
+        second["params"]["turn"]["id"]
+    );
+    assert_eq!(
+        suggestion["params"]["turnId"],
+        third["params"]["turn"]["id"]
+    );
+    assert_eq!(suggestion["params"]["suggestion"], "Next answer prediction");
+    assert_eq!(
+        suggestion_notifications(&bridge.finish_successfully()).len(),
+        1
+    );
+    let _ = std::fs::remove_file(script);
+}
+
+#[test]
+fn fake_claude_runtime_steer_during_suggestion_tail_finishes_in_the_same_turn() {
+    let (mut bridge, script, _) = suggestion_bridge();
+    bridge.send(suggestion_user("queued", true));
+    let first = read_final_suggestion_answer(&mut bridge);
+    let mut steer = suggestion_user("next", true);
+    steer["trace_metadata"]["action"] = json!("steer_active_execution");
+    bridge.send(steer);
+    let second = read_final_suggestion_answer(&mut bridge);
+    assert_eq!(first["params"]["turnId"], second["params"]["turnId"]);
+    let suggestion = read_question_method(&mut bridge, "turn/promptSuggestion");
+    assert_eq!(suggestion["params"]["suggestion"], "Next answer prediction");
+    let done = read_question_method(&mut bridge, "turn/completed");
+    assert_eq!(done["params"]["turn"]["id"], first["params"]["turnId"]);
+    assert_eq!(done["params"]["turn"]["status"], "completed");
+    let lines = bridge.finish_successfully();
+    assert_eq!(suggestion_notifications(&lines).len(), 1);
+    let turns_started = lines
+        .iter()
+        .filter(|line| serde_json::from_str::<Value>(line).unwrap()["method"] == "turn/started")
+        .count();
+    assert_eq!(
+        turns_started, 1,
+        "consumed steer must not run again from queue"
+    );
+    let _ = std::fs::remove_file(script);
+}
+
+#[test]
+fn fake_claude_runtime_steer_after_suggestion_tail_keeps_its_queued_fallback() {
+    let (mut bridge, script, _) = suggestion_bridge();
+    let first = bridge.run_blocks_user_line(suggestion_user("none", true), Duration::from_secs(5));
+    assert_completed_turn(&first);
+    let mut steer = suggestion_user("next", true);
+    steer["trace_metadata"]["action"] = json!("steer_active_execution");
+    let second = bridge.run_blocks_user_line(steer, Duration::from_secs(5));
+    assert_completed_turn(&second);
+    assert_eq!(second.text_from_deltas, "Answer next");
+    assert_ne!(first.turn_id, second.turn_id);
+    let suggestions = suggestion_notifications(&bridge.finish_successfully());
+    assert_eq!(suggestions.len(), 1);
+    assert_eq!(suggestions[0]["params"]["turnId"], second.turn_id);
+    let _ = std::fs::remove_file(script);
+}
+
+#[test]
+fn fake_claude_prompt_suggestion_after_deadline_cannot_poison_the_next_answer() {
+    let (mut bridge, script, _) = suggestion_bridge();
+    let first = bridge.run_blocks_user_line(suggestion_user("late", true), Duration::from_secs(5));
+    assert_completed_turn(&first);
+    let second = bridge.run_blocks_user_line(suggestion_user("next", true), Duration::from_secs(5));
+    assert_completed_turn(&second);
+    let suggestions = suggestion_notifications(&bridge.finish_successfully());
+    assert_eq!(suggestions.len(), 1);
+    assert_eq!(suggestions[0]["params"]["turnId"], second.turn_id);
+    assert_eq!(
+        suggestions[0]["params"]["suggestion"],
+        "Next answer prediction"
+    );
+    let _ = std::fs::remove_file(script);
+}
+
 #[test]
 fn fake_claude_blocks_mode_accepts_user_blocks_by_default() {
     let fake_claude = concat!(
