@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 use crate::{HarnessServerError, Result};
 
+pub(crate) const QUESTION_GUIDANCE: &str = "When a requester decision is needed to continue, use the native question tool, group related choices, and resume the task after the answers; reuse information already provided.";
+
 pub type Answers = BTreeMap<String, UserInputAnswer>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

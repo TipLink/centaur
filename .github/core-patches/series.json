@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "fad924eb13035b977daa589c19fc815c5cbf91e3",
-  "result_tree": "53d4a3d78b7d6aa38d9c8d1195cd18da1a9298be",
+  "result_tree": "82ee48a29a8666bc872fd65b324c6b70f67d7b4d",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -43,6 +43,10 @@
     {
       "file": "0010-claude-monitor-follow-up.patch",
       "sha256": "5185f5d90c8974ce623215c58be8c34fd7a2d9d77c8072e4386507082e7e14b0"
+    },
+    {
+      "file": "0011-native-interaction-followups.patch",
+      "sha256": "c6d5998a04b1006d46a90655687f995a9fd778067d2da257e1e16d233309d052"
     }
   ]
 }

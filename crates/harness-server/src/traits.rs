@@ -199,6 +199,9 @@ pub enum TurnHold {
     Released,
     /// Background work is still live; its output belongs to this turn.
     Waiting,
+    /// Finite background work must finish by an absolute deadline, even if
+    /// the harness keeps emitting output.
+    Until(std::time::Instant),
     /// Background work has finished but its follow-up has not started. If the
     /// stream stays quiet this long, the follow-up is not coming.
     Idle(Duration),

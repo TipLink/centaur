@@ -19,7 +19,9 @@ use crate::server::{
     BlocksCommand, BlocksState, parse_blocks_line_with_state, usage_span_input_value,
     write_blocks_error,
 };
-use crate::user_input::{NativeUserInputRequest, PendingQuestions, Question, UserInputResponse};
+use crate::user_input::{
+    NativeUserInputRequest, PendingQuestions, QUESTION_GUIDANCE, Question, UserInputResponse,
+};
 use crate::{AppServerRuntime, HarnessServerError, Result};
 
 mod citations;
@@ -406,7 +408,7 @@ fn run_codex_user_turn<W: Write>(
     thread_id: &mut Option<String>,
     thread_model: &mut Option<String>,
     thread_provider: &mut Option<String>,
-    input: Vec<UserInput>,
+    mut input: Vec<UserInput>,
     client_user_message_id: Option<String>,
     model_and_provider: (Option<String>, String),
     requested_provider: Option<String>,
@@ -457,6 +459,15 @@ fn run_codex_user_turn<W: Write>(
         .expect("thread id was initialized")
         .clone();
 
+    if codex.supports_user_input {
+        input.insert(
+            0,
+            UserInput::Text {
+                text: format!("[Centaur interaction context] {QUESTION_GUIDANCE}"),
+                text_elements: Vec::new(),
+            },
+        );
+    }
     let mut params = json!({
         "threadId": current_thread_id,
         "input": input,
@@ -580,7 +591,6 @@ fn start_or_resume_thread<W: Write>(
     if let Some(model) = model {
         params["model"] = Value::String(model.to_owned());
     }
-
     let id = next_request_id(request_id);
     codex.send_request(id, method, params, traceparent)?;
     let result = codex.read_response_or_forward(id, stdout, None)?;

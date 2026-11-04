@@ -1,0 +1,609 @@
+diff --git a/crates/harness-server/src/claude.rs b/crates/harness-server/src/claude.rs
+index 12072cac..defc4d61 100644
+--- a/crates/harness-server/src/claude.rs
++++ b/crates/harness-server/src/claude.rs
+@@ -2,13 +2,15 @@ use std::collections::{HashMap, HashSet};
+ use std::env;
+ use std::path::PathBuf;
+ use std::process::Command as ProcessCommand;
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ use serde_json::{Value, json};
+ use uuid::Uuid;
+ 
+ use crate::protocol::UserInput;
+-use crate::user_input::{Answers, NativeUserInputRequest, Question, UserInputControl, json_line};
++use crate::user_input::{
++    Answers, NativeUserInputRequest, QUESTION_GUIDANCE, Question, UserInputControl, json_line,
++};
+ use crate::{
+     HarnessKind, HarnessServer, NormalizedContent, NormalizedEvent, NormalizedToolResult, Result,
+     ThreadState, TurnHold,
+@@ -30,7 +32,7 @@ const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"]
+ /// original delta chunks after an `AgentMessageStarted` carrying the stop reason,
+ /// so the item starts with the right phase and native chunking is preserved.
+ ///
+-/// Background subagents and Monitor watches outlive the
++/// Background subagents, Monitor watches, and explicitly timed shell tasks outlive the
+ /// message that launched them: Claude Code emits that turn's `result`, then
+ /// runs a follow-up turn on its own once a task's `task_notification`
+ /// lands. While main-chain tasks are running — or a notification has not
+@@ -50,6 +52,8 @@ pub struct ClaudeEventNormalizer {
+     /// Shell monitors have the same `local_bash` task type as detached servers.
+     /// Match their launch to the Monitor tool call instead of holding every shell.
+     monitor_calls: HashSet<String>,
++    /// An explicit timeout distinguishes finite background work from servers.
++    bounded_shell_calls: HashMap<String, Duration>,
+     awaiting_follow_up: bool,
+     /// Claude Code's own turn ended (its `result` was swallowed) and no
+     /// follow-up message has started since.
+@@ -62,6 +66,7 @@ struct BackgroundTask {
+     /// Listed by the latest `background_tasks_changed`. A task can drop out
+     /// just before its notification lands, so it is still owed one.
+     live: bool,
++    deadline: Option<Instant>,
+ }
+ 
+ /// How long a held turn waits for Claude Code's follow-up once no background
+@@ -151,6 +156,12 @@ impl ClaudeEventNormalizer {
+                 } => {
+                     if tool == "Monitor" {
+                         self.monitor_calls.insert(raw_id.clone());
++                    } else if tool == "Bash"
++                        && arguments["run_in_background"] == true
++                        && let Some(timeout) = arguments["timeout"].as_u64().filter(|ms| *ms > 0)
++                    {
++                        self.bounded_shell_calls
++                            .insert(raw_id.clone(), Duration::from_millis(timeout));
+                     }
+                     has_tool_use = true;
+                     passthrough.push(NormalizedContent::ToolUse {
+@@ -230,6 +241,13 @@ impl ClaudeEventNormalizer {
+     pub fn turn_hold(&self) -> TurnHold {
+         if !self.holding_turn() {
+             TurnHold::Released
++        } else if let Some(deadline) = self
++            .background_tasks
++            .values()
++            .filter_map(|task| task.deadline)
++            .min()
++        {
++            TurnHold::Until(deadline)
+         } else if self.result_held && !self.background_tasks.values().any(|task| task.live) {
+             TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
+         } else {
+@@ -263,8 +281,20 @@ impl ClaudeEventNormalizer {
+                     .tool_use_id
+                     .as_ref()
+                     .is_some_and(|id| self.monitor_calls.remove(id));
++                let deadline = task
++                    .tool_use_id
++                    .as_ref()
++                    .and_then(|id| self.bounded_shell_calls.remove(id))
++                    .filter(|_| {
++                        task.is_backgrounded && task.task_type.as_deref() == Some("local_bash")
++                    })
++                    .and_then(|timeout| Instant::now().checked_add(timeout))
++                    // Let Claude report the native timeout before expiring the execution.
++                    .and_then(|deadline| deadline.checked_add(FOLLOW_UP_IDLE_TIMEOUT));
+                 if task.owned_by_subagent
+-                    || !(monitor || task.is_backgrounded && task.is_main_chain_agent())
++                    || !(monitor
++                        || deadline.is_some()
++                        || task.is_backgrounded && task.is_main_chain_agent())
+                 {
+                     return;
+                 }
+@@ -275,6 +305,7 @@ impl ClaudeEventNormalizer {
+                     BackgroundTask {
+                         item_raw_id: item_raw_id.clone(),
+                         live: true,
++                        deadline,
+                     },
+                 );
+                 out.push(NormalizedEvent::AssistantMessage {
+@@ -284,6 +315,8 @@ impl ClaudeEventNormalizer {
+                         raw_id: item_raw_id,
+                         tool: if monitor {
+                             "BackgroundMonitor"
++                        } else if deadline.is_some() {
++                            "BackgroundCommand"
+                         } else {
+                             BACKGROUND_AGENT_TOOL
+                         }
+@@ -408,6 +441,14 @@ impl HarnessServer for ClaudeCodeHarness {
+         if state.supports_user_input {
+             command.args(["--permission-prompt-tool", "stdio"]);
+         }
++        let mut guidance = String::from(
++            "For short, bounded watches, use native Monitor and stop on the outcome or expiry; report actionable changes only. Use recurring schedules only for recurring requests.",
++        );
++        if state.supports_user_input {
++            guidance.push(' ');
++            guidance.push_str(QUESTION_GUIDANCE);
++        }
++        command.args(["--append-system-prompt", &guidance]);
+         if state.supports_prompt_suggestions {
+             command.arg("--prompt-suggestions");
+         }
+@@ -616,6 +657,8 @@ fn rejected_question_control(native_id: Value) -> Result<UserInputControl> {
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::time::{Duration, Instant};
++
+     use serde_json::{Value, json};
+ 
+     use crate::protocol::UserInput;
+@@ -624,7 +667,7 @@ mod tests {
+         anthropic::AnthropicStreamEvent,
+     };
+ 
+-    use super::{ClaudeCodeHarness, ClaudeEventNormalizer};
++    use super::{ClaudeCodeHarness, ClaudeEventNormalizer, FOLLOW_UP_IDLE_TIMEOUT};
+     use crate::user_input::UserInputControl;
+ 
+     #[test]
+@@ -1268,6 +1311,101 @@ mod tests {
+         assert!(events.iter().any(NormalizedEvent::is_terminal));
+     }
+ 
++    #[test]
++    fn bounded_shell_keeps_its_deadline_until_its_notification() {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        normalize(
++            &mut normalizer,
++            json!({"type":"assistant","message":{"id":"launch","content":[{"type":"tool_use","id":"shell","name":"Bash","input":{"run_in_background":true,"timeout":1000}}]}}),
++        );
++        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++        let started = json!({"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"shell","is_backgrounded":true,"task_type":"local_bash"});
++        normalize(&mut normalizer, started.clone());
++        let TurnHold::Until(deadline) = normalizer.turn_hold() else {
++            panic!("bounded shell should hold its execution");
++        };
++        assert!(deadline > Instant::now());
++        let events = normalize(
++            &mut normalizer,
++            json!({"type":"result","subtype":"success"}),
++        );
++        assert!(!events.iter().any(NormalizedEvent::is_terminal));
++        // Neither repeated lifecycle events nor chatter extends a finite task.
++        for event in [
++            started,
++            json!({"type":"system","subtype":"status"}),
++            json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
++        ] {
++            normalize(&mut normalizer, event);
++            assert_eq!(normalizer.turn_hold(), TurnHold::Until(deadline));
++        }
++        // A noisy expired task stays expired; the server checks Until before
++        // reading another line, without waiting for an idle receive timeout.
++        let expired = Instant::now() - Duration::from_secs(1);
++        normalizer.background_tasks.get_mut("b1").unwrap().deadline = Some(expired);
++        normalize(&mut normalizer, json!({"type":"system","subtype":"status"}));
++        assert!(
++            matches!(normalizer.turn_hold(), TurnHold::Until(deadline) if deadline < Instant::now())
++        );
++        let events = normalize(
++            &mut normalizer,
++            json!({"type":"system","subtype":"task_notification","task_id":"b1","status":"failed","summary":"command timed out"}),
++        );
++        assert!(matches!(&events[0], NormalizedEvent::ToolResults(results) if results[0].is_error));
++        assert_eq!(
++            normalizer.turn_hold(),
++            TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
++        );
++        normalize(
++            &mut normalizer,
++            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"answer","content":[]}}}),
++        );
++        let events = normalize(
++            &mut normalizer,
++            json!({"type":"result","subtype":"success"}),
++        );
++        assert!(events.iter().any(NormalizedEvent::is_terminal));
++    }
++
++    #[test]
++    fn only_correlated_explicitly_bounded_main_chain_shells_hold_the_turn() {
++        for (input, task) in [
++            (json!({"run_in_background":true}), json!({})),
++            (json!({"run_in_background":true,"timeout":0}), json!({})),
++            (json!({"run_in_background":true,"timeout":-1}), json!({})),
++            (
++                json!({"run_in_background":true,"timeout":"1000"}),
++                json!({}),
++            ),
++            (json!({"run_in_background":false,"timeout":1000}), json!({})),
++            (
++                json!({"run_in_background":true,"timeout":1000}),
++                json!({"tool_use_id":"unrelated"}),
++            ),
++            (
++                json!({"run_in_background":true,"timeout":1000}),
++                json!({"owned_by_subagent":true}),
++            ),
++            (
++                json!({"run_in_background":true,"timeout":1000}),
++                json!({"is_backgrounded":false}),
++            ),
++        ] {
++            let mut normalizer = ClaudeEventNormalizer::default();
++            normalize(
++                &mut normalizer,
++                json!({"type":"assistant","message":{"id":"launch","content":[{"type":"tool_use","id":"shell","name":"Bash","input":input}]}}),
++            );
++            let mut started = json!({"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"shell","is_backgrounded":true,"task_type":"local_bash"});
++            started
++                .as_object_mut()
++                .unwrap()
++                .extend(task.as_object().unwrap().clone());
++            assert!(normalize(&mut normalizer, started).is_empty());
++            assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++        }
++    }
++
+     #[test]
+     fn failed_result_ends_turn_even_with_background_agents_running() {
+         let mut normalizer = ClaudeEventNormalizer::default();
+diff --git a/crates/harness-server/src/codex.rs b/crates/harness-server/src/codex.rs
+index 26af63ac..f17823ef 100644
+--- a/crates/harness-server/src/codex.rs
++++ b/crates/harness-server/src/codex.rs
+@@ -19,7 +19,9 @@ use crate::server::{
+     BlocksCommand, BlocksState, parse_blocks_line_with_state, usage_span_input_value,
+     write_blocks_error,
+ };
+-use crate::user_input::{NativeUserInputRequest, PendingQuestions, Question, UserInputResponse};
++use crate::user_input::{
++    NativeUserInputRequest, PendingQuestions, QUESTION_GUIDANCE, Question, UserInputResponse,
++};
+ use crate::{AppServerRuntime, HarnessServerError, Result};
+ 
+ mod citations;
+@@ -406,7 +408,7 @@ fn run_codex_user_turn<W: Write>(
+     thread_id: &mut Option<String>,
+     thread_model: &mut Option<String>,
+     thread_provider: &mut Option<String>,
+-    input: Vec<UserInput>,
++    mut input: Vec<UserInput>,
+     client_user_message_id: Option<String>,
+     model_and_provider: (Option<String>, String),
+     requested_provider: Option<String>,
+@@ -457,6 +459,15 @@ fn run_codex_user_turn<W: Write>(
+         .expect("thread id was initialized")
+         .clone();
+ 
++    if codex.supports_user_input {
++        input.insert(
++            0,
++            UserInput::Text {
++                text: format!("[Centaur interaction context] {QUESTION_GUIDANCE}"),
++                text_elements: Vec::new(),
++            },
++        );
++    }
+     let mut params = json!({
+         "threadId": current_thread_id,
+         "input": input,
+@@ -580,7 +591,6 @@ fn start_or_resume_thread<W: Write>(
+     if let Some(model) = model {
+         params["model"] = Value::String(model.to_owned());
+     }
+-
+     let id = next_request_id(request_id);
+     codex.send_request(id, method, params, traceparent)?;
+     let result = codex.read_response_or_forward(id, stdout, None)?;
+diff --git a/crates/harness-server/src/error.rs b/crates/harness-server/src/error.rs
+index 410ba76b..1c5a803f 100644
+--- a/crates/harness-server/src/error.rs
++++ b/crates/harness-server/src/error.rs
+@@ -49,7 +49,7 @@ pub enum HarnessServerError {
+     },
+     #[error("Hermes exited with status {status}")]
+     HermesExited { status: ExitStatus },
+-    #[error("{kind:?} did not continue the turn after its background work finished")]
++    #[error("{kind:?} did not finish its background work or follow-up before the deadline")]
+     BackgroundFollowUpStalled { kind: HarnessKind },
+     #[error("{message}")]
+     UnknownModel { message: String },
+diff --git a/crates/harness-server/src/server.rs b/crates/harness-server/src/server.rs
+index c733f1f6..bdc971ee 100644
+--- a/crates/harness-server/src/server.rs
++++ b/crates/harness-server/src/server.rs
+@@ -1496,6 +1496,12 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+         }
+ 
+         let mut terminal = false;
++        if matches!(harness.turn_hold(&event_normalizer), TurnHold::Until(deadline) if Instant::now() >= deadline)
++        {
++            return Err(HarnessServerError::BackgroundFollowUpStalled {
++                kind: harness.kind(),
++            });
++        }
+         let received = if suggestion_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+             Err(RecvTimeoutError::Timeout)
+         } else {
+@@ -1628,6 +1634,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                 {
+                     (true, _) => None,
+                     (false, TurnHold::Idle(window)) => Some(Instant::now() + window),
++                    (false, TurnHold::Until(deadline)) => Some(deadline),
+                     (false, TurnHold::Released | TurnHold::Waiting) => None,
+                 };
+             }
+diff --git a/crates/harness-server/src/traits.rs b/crates/harness-server/src/traits.rs
+index fe4fe026..c2bf035b 100644
+--- a/crates/harness-server/src/traits.rs
++++ b/crates/harness-server/src/traits.rs
+@@ -199,6 +199,9 @@ pub enum TurnHold {
+     Released,
+     /// Background work is still live; its output belongs to this turn.
+     Waiting,
++    /// Finite background work must finish by an absolute deadline, even if
++    /// the harness keeps emitting output.
++    Until(std::time::Instant),
+     /// Background work has finished but its follow-up has not started. If the
+     /// stream stays quiet this long, the follow-up is not coming.
+     Idle(Duration),
+diff --git a/crates/harness-server/src/user_input.rs b/crates/harness-server/src/user_input.rs
+index a561ae6c..97d29f3d 100644
+--- a/crates/harness-server/src/user_input.rs
++++ b/crates/harness-server/src/user_input.rs
+@@ -8,6 +8,8 @@ use uuid::Uuid;
+ 
+ use crate::{HarnessServerError, Result};
+ 
++pub(crate) const QUESTION_GUIDANCE: &str = "When a requester decision is needed to continue, use the native question tool, group related choices, and resume the task after the answers; reuse information already provided.";
++
+ pub type Answers = BTreeMap<String, UserInputAnswer>;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+diff --git a/crates/harness-server/tests/app_server_stdio.rs b/crates/harness-server/tests/app_server_stdio.rs
+index 6c25c8a7..b33b435a 100644
+--- a/crates/harness-server/tests/app_server_stdio.rs
++++ b/crates/harness-server/tests/app_server_stdio.rs
+@@ -246,6 +246,27 @@ fn codex_question_capability_change_resumes_the_same_thread() {
+         .find(|request| request["method"] == "thread/resume")
+         .expect("capability change must resume context");
+     assert_eq!(resume["params"]["threadId"], "question-thread");
++    let turns: Vec<_> = requests
++        .iter()
++        .filter(|request| request["method"] == "turn/start")
++        .collect();
++    assert_eq!(turns.len(), 2);
++    assert!(
++        turns[0]["params"]["input"][0]["text"]
++            .as_str()
++            .is_some_and(|text| text.contains("native question tool"))
++    );
++    assert_eq!(turns[0]["params"]["input"][1]["text"], "Interactive task");
++    assert_eq!(turns[1]["params"]["input"].as_array().unwrap().len(), 1);
++    assert_eq!(
++        turns[1]["params"]["input"][0]["text"],
++        "Continue without UI"
++    );
++    assert!(
++        requests
++            .iter()
++            .all(|request| request["params"].get("developerInstructions").is_none())
++    );
+     let launches = requests
+         .iter()
+         .filter_map(|request| request["argv"].as_array())
+@@ -411,15 +432,24 @@ fn fake_claude_trailing_result_settles_the_turn_and_does_not_poison_the_next() {
+ 
+ #[test]
+ fn fake_claude_background_agent_follow_up_completes_the_turn() {
+-    background_task_follow_up("Agent", "local_agent");
++    background_task_follow_up("Agent", "local_agent", json!({}));
+ }
+ 
+ #[test]
+ fn fake_claude_monitor_follow_up_completes_the_turn() {
+-    background_task_follow_up("Monitor", "local_bash");
++    background_task_follow_up("Monitor", "local_bash", json!({}));
++}
++
++#[test]
++fn fake_claude_bounded_background_command_delivers_follow_up_in_the_original_turn() {
++    background_task_follow_up(
++        "Bash",
++        "local_bash",
++        json!({"command":"sleep 3", "run_in_background":true, "timeout":60000}),
++    );
+ }
+ 
+-fn background_task_follow_up(tool: &str, task_type: &str) {
++fn background_task_follow_up(tool: &str, task_type: &str, input: Value) {
+     // Claude Code ends the launching turn with its own `result`, then runs a
+     // follow-up turn once the background agent notifies (here after 3s, longer
+     // than the settle window). The follow-up's answer belongs to this turn.
+@@ -427,8 +457,9 @@ fn background_task_follow_up(tool: &str, task_type: &str) {
+         "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}'; ",
+         "IFS= read -r _; ",
+         "printf '%s\\n' ",
+-        "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_launch\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_launch\",\"name\":\"__TOOL__\",\"input\":{}}]}}' ",
++        "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_launch\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_launch\",\"name\":\"__TOOL__\",\"input\":__INPUT__}]}}' ",
+         "'{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"tool_use_id\":\"toolu_launch\",\"description\":\"Research\",\"is_backgrounded\":true,\"task_type\":\"__TASK_TYPE__\"}' ",
++        "'{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_launch\",\"content\":\"Background task started.\"}]}}' ",
+         "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}}' ",
+         "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"content\":[{\"type\":\"text\",\"text\":\"Started research.\"}]}}' ",
+         "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}}' ",
+@@ -442,7 +473,8 @@ fn background_task_follow_up(tool: &str, task_type: &str) {
+         "sleep 60"
+     )
+     .replace("__TOOL__", tool)
+-    .replace("__TASK_TYPE__", task_type);
++    .replace("__TASK_TYPE__", task_type)
++    .replace("__INPUT__", &input.to_string());
+ 
+     let run = run_bridge_turn(BridgeTurnConfig {
+         harness: Harness::ClaudeCode,
+@@ -454,10 +486,90 @@ fn background_task_follow_up(tool: &str, task_type: &str) {
+     assert_completed_turn(&run.turn);
+     assert_eq!(run.turn.text_from_deltas, "Started research.The answer.");
+     assert_codex_v2_turn(&run.turn);
++    if tool == "Bash" {
++        let notifications: Vec<Value> = run
++            .stdout_lines
++            .iter()
++            .map(|line| serde_json::from_str(line).unwrap())
++            .collect();
++        for method in ["item/started", "item/completed"] {
++            let command = notifications
++                .iter()
++                .find(|value| {
++                    value["method"] == method
++                        && value["params"]["item"]["tool"] == "BackgroundCommand"
++                })
++                .expect("bounded command lifecycle item");
++            assert_eq!(command["params"]["turnId"], run.turn.turn_id);
++        }
++        assert_eq!(
++            notifications
++                .iter()
++                .filter(|value| value["method"] == "turn/completed")
++                .count(),
++            1
++        );
++    }
++}
++
++#[test]
++fn fake_claude_unbounded_background_server_does_not_hold_the_turn() {
++    // The fake server remains alive and waits for another input. Holding the
++    // first turn would deadlock rather than yield a second user turn.
++    let fake_claude = concat!(
++        "IFS= read -r _; printf '%s\\n' ",
++        "'{\"type\":\"assistant\",\"message\":{\"id\":\"launch\",\"content\":[{\"type\":\"tool_use\",\"id\":\"server\",\"name\":\"Bash\",\"input\":{\"command\":\"serve\",\"run_in_background\":true}}]}}' ",
++        "'{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"server-task\",\"tool_use_id\":\"server\",\"is_backgrounded\":true,\"task_type\":\"local_bash\"}' ",
++        "'{\"type\":\"assistant\",\"message\":{\"id\":\"ready\",\"content\":[{\"type\":\"text\",\"text\":\"Server ready.\"}]}}' ",
++        "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Server ready.\"}'; ",
++        "IFS= read -r _; printf '%s\\n' ",
++        "'{\"type\":\"assistant\",\"message\":{\"id\":\"next\",\"content\":[{\"type\":\"text\",\"text\":\"Second answer.\"}]}}' ",
++        "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Second answer.\"}'; sleep 60"
++    );
++    let run = run_bridge_two_turns(BridgeTwoTurnConfig {
++        harness: Harness::ClaudeCode,
++        command_override: Some(fake_claude.to_string()),
++        first_prompt: "start server".to_string(),
++        second_prompt: "continue".to_string(),
++        timeout: Duration::from_secs(10),
++    });
++    assert_completed_turn(&run.turns[0]);
++    assert_eq!(run.turns[0].text_from_deltas, "Server ready.");
++    assert_completed_turn(&run.turns[1]);
++    assert_eq!(run.turns[1].text_from_deltas, "Second answer.");
+ }
+ 
+ #[test]
+ fn fake_claude_turn_ending_with_live_background_agent_does_not_poison_the_next() {
++    background_task_ending_does_not_poison_the_next("Agent", "local_agent", json!({}), false);
++}
++
++#[test]
++fn fake_claude_bounded_background_command_error_does_not_poison_the_next_turn() {
++    background_task_ending_does_not_poison_the_next(
++        "Bash",
++        "local_bash",
++        json!({"command":"sleep 1", "run_in_background":true, "timeout":60000}),
++        false,
++    );
++}
++
++#[test]
++fn fake_claude_bounded_background_command_cancellation_does_not_poison_the_next_turn() {
++    background_task_ending_does_not_poison_the_next(
++        "Bash",
++        "local_bash",
++        json!({"command":"sleep 1", "run_in_background":true, "timeout":60000}),
++        true,
++    );
++}
++
++fn background_task_ending_does_not_poison_the_next(
++    tool: &str,
++    task_type: &str,
++    input: Value,
++    interrupt: bool,
++) {
+     // An error result ends the turn while a background agent still runs. Its
+     // later follow-up must not be read as the next turn's answer: the process
+     // is stopped and the next turn resumes in a fresh one.
+@@ -470,8 +582,9 @@ fn fake_claude_turn_ending_with_live_background_agent_does_not_poison_the_next()
+             "'{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_3\",\"content\":[{{\"type\":\"text\",\"text\":\"second answer\"}}]}}}}' ",
+             "'{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"second answer\"}}'; sleep 60; fi; ",
+             "touch {marker}; printf '%s\\n' ",
+-            "'{{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"is_backgrounded\":true,\"task_type\":\"local_agent\"}}' ",
+-            "'{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}}'; ",
++            "'{{\"type\":\"assistant\",\"message\":{{\"id\":\"launch\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"launch-tool\",\"name\":\"{tool}\",\"input\":{input}}}]}}}}' ",
++            "'{{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"tool_use_id\":\"launch-tool\",\"is_backgrounded\":true,\"task_type\":\"{task_type}\"}}'; ",
++            "{ending}",
+             "sleep 1; printf '%s\\n' ",
+             "'{{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"a1\",\"status\":\"completed\"}}' ",
+             "'{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"content\":[{{\"type\":\"text\",\"text\":\"stale follow-up\"}}]}}}}' ",
+@@ -479,19 +592,53 @@ fn fake_claude_turn_ending_with_live_background_agent_does_not_poison_the_next()
+             "sleep 60"
+         ),
+         marker = shell_quote(&marker),
++        tool = tool,
++        input = input,
++        task_type = task_type,
++        ending = if interrupt {
++            ""
++        } else {
++            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}'; "
++        },
+     );
+ 
+-    let run = run_bridge_two_turns(BridgeTwoTurnConfig {
+-        harness: Harness::ClaudeCode,
+-        command_override: Some(fake_claude),
+-        first_prompt: "first".to_string(),
+-        second_prompt: "second".to_string(),
+-        timeout: Duration::from_secs(10),
+-    });
++    let timeout = Duration::from_secs(10);
++    let mut bridge = BridgeProcess::spawn_harness(Harness::ClaudeCode, Some(fake_claude), None);
++    let thread_id = bridge.initialize_and_start_thread(Harness::ClaudeCode, timeout);
++    if interrupt {
++        bridge.send(json!({"id":3,"method":"turn/start","params":{
++            "threadId":thread_id,"input":[{"type":"text","text":"first","text_elements":[]}]
++        }}));
++        let deadline = Instant::now() + timeout;
++        loop {
++            let value = bridge.read_json(deadline);
++            if value["method"] == "item/started"
++                && value["params"]["item"]["tool"] == "BackgroundCommand"
++            {
++                bridge.send(json!({"id":4,"method":"turn/interrupt","params":{
++                    "threadId":thread_id,"turnId":value["params"]["turnId"]
++                }}));
++                break;
++            }
++            assert_ne!(value["method"], "turn/completed", "command was not held");
++        }
++        loop {
++            let value = bridge.read_json(deadline);
++            if value["method"] == "turn/completed" {
++                assert_eq!(value["params"]["turn"]["status"], "interrupted");
++                break;
++            }
++        }
++    } else {
++        let failed = bridge.run_turn(&thread_id, 3, "first", None, timeout);
++        assert_eq!(failed.terminal_status.as_deref(), Some("failed"));
++    }
++    let second = bridge.run_turn(&thread_id, 5, "second", None, timeout);
++    bridge.finish_successfully();
+     let _ = std::fs::remove_file(&marker);
+ 
+-    assert_completed_turn(&run.turns[1]);
+-    assert_eq!(run.turns[1].text_from_deltas, "second answer");
++    assert_completed_turn(&second);
++    assert_eq!(second.text_from_deltas, "second answer");
+ }
+ 
+ #[test]

@@ -2,13 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::protocol::UserInput;
-use crate::user_input::{Answers, NativeUserInputRequest, Question, UserInputControl, json_line};
+use crate::user_input::{
+    Answers, NativeUserInputRequest, QUESTION_GUIDANCE, Question, UserInputControl, json_line,
+};
 use crate::{
     HarnessKind, HarnessServer, NormalizedContent, NormalizedEvent, NormalizedToolResult, Result,
     ThreadState, TurnHold,
@@ -30,7 +32,7 @@ const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"]
 /// original delta chunks after an `AgentMessageStarted` carrying the stop reason,
 /// so the item starts with the right phase and native chunking is preserved.
 ///
-/// Background subagents and Monitor watches outlive the
+/// Background subagents, Monitor watches, and explicitly timed shell tasks outlive the
 /// message that launched them: Claude Code emits that turn's `result`, then
 /// runs a follow-up turn on its own once a task's `task_notification`
 /// lands. While main-chain tasks are running — or a notification has not
@@ -50,6 +52,8 @@ pub struct ClaudeEventNormalizer {
     /// Shell monitors have the same `local_bash` task type as detached servers.
     /// Match their launch to the Monitor tool call instead of holding every shell.
     monitor_calls: HashSet<String>,
+    /// An explicit timeout distinguishes finite background work from servers.
+    bounded_shell_calls: HashMap<String, Duration>,
     awaiting_follow_up: bool,
     /// Claude Code's own turn ended (its `result` was swallowed) and no
     /// follow-up message has started since.
@@ -62,6 +66,7 @@ struct BackgroundTask {
     /// Listed by the latest `background_tasks_changed`. A task can drop out
     /// just before its notification lands, so it is still owed one.
     live: bool,
+    deadline: Option<Instant>,
 }
 
 /// How long a held turn waits for Claude Code's follow-up once no background
@@ -151,6 +156,12 @@ impl ClaudeEventNormalizer {
                 } => {
                     if tool == "Monitor" {
                         self.monitor_calls.insert(raw_id.clone());
+                    } else if tool == "Bash"
+                        && arguments["run_in_background"] == true
+                        && let Some(timeout) = arguments["timeout"].as_u64().filter(|ms| *ms > 0)
+                    {
+                        self.bounded_shell_calls
+                            .insert(raw_id.clone(), Duration::from_millis(timeout));
                     }
                     has_tool_use = true;
                     passthrough.push(NormalizedContent::ToolUse {
@@ -230,6 +241,13 @@ impl ClaudeEventNormalizer {
     pub fn turn_hold(&self) -> TurnHold {
         if !self.holding_turn() {
             TurnHold::Released
+        } else if let Some(deadline) = self
+            .background_tasks
+            .values()
+            .filter_map(|task| task.deadline)
+            .min()
+        {
+            TurnHold::Until(deadline)
         } else if self.result_held && !self.background_tasks.values().any(|task| task.live) {
             TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
         } else {
@@ -263,8 +281,20 @@ impl ClaudeEventNormalizer {
                     .tool_use_id
                     .as_ref()
                     .is_some_and(|id| self.monitor_calls.remove(id));
+                let deadline = task
+                    .tool_use_id
+                    .as_ref()
+                    .and_then(|id| self.bounded_shell_calls.remove(id))
+                    .filter(|_| {
+                        task.is_backgrounded && task.task_type.as_deref() == Some("local_bash")
+                    })
+                    .and_then(|timeout| Instant::now().checked_add(timeout))
+                    // Let Claude report the native timeout before expiring the execution.
+                    .and_then(|deadline| deadline.checked_add(FOLLOW_UP_IDLE_TIMEOUT));
                 if task.owned_by_subagent
-                    || !(monitor || task.is_backgrounded && task.is_main_chain_agent())
+                    || !(monitor
+                        || deadline.is_some()
+                        || task.is_backgrounded && task.is_main_chain_agent())
                 {
                     return;
                 }
@@ -275,6 +305,7 @@ impl ClaudeEventNormalizer {
                     BackgroundTask {
                         item_raw_id: item_raw_id.clone(),
                         live: true,
+                        deadline,
                     },
                 );
                 out.push(NormalizedEvent::AssistantMessage {
@@ -284,6 +315,8 @@ impl ClaudeEventNormalizer {
                         raw_id: item_raw_id,
                         tool: if monitor {
                             "BackgroundMonitor"
+                        } else if deadline.is_some() {
+                            "BackgroundCommand"
                         } else {
                             BACKGROUND_AGENT_TOOL
                         }
@@ -408,6 +441,14 @@ impl HarnessServer for ClaudeCodeHarness {
         if state.supports_user_input {
             command.args(["--permission-prompt-tool", "stdio"]);
         }
+        let mut guidance = String::from(
+            "For short, bounded watches, use native Monitor and stop on the outcome or expiry; report actionable changes only. Use recurring schedules only for recurring requests.",
+        );
+        if state.supports_user_input {
+            guidance.push(' ');
+            guidance.push_str(QUESTION_GUIDANCE);
+        }
+        command.args(["--append-system-prompt", &guidance]);
         if state.supports_prompt_suggestions {
             command.arg("--prompt-suggestions");
         }
@@ -616,6 +657,8 @@ fn rejected_question_control(native_id: Value) -> Result<UserInputControl> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use serde_json::{Value, json};
 
     use crate::protocol::UserInput;
@@ -624,7 +667,7 @@ mod tests {
         anthropic::AnthropicStreamEvent,
     };
 
-    use super::{ClaudeCodeHarness, ClaudeEventNormalizer};
+    use super::{ClaudeCodeHarness, ClaudeEventNormalizer, FOLLOW_UP_IDLE_TIMEOUT};
     use crate::user_input::UserInputControl;
 
     #[test]
@@ -1266,6 +1309,101 @@ mod tests {
             json!({"type": "result", "subtype": "success", "result": "server started"}),
         );
         assert!(events.iter().any(NormalizedEvent::is_terminal));
+    }
+
+    #[test]
+    fn bounded_shell_keeps_its_deadline_until_its_notification() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        normalize(
+            &mut normalizer,
+            json!({"type":"assistant","message":{"id":"launch","content":[{"type":"tool_use","id":"shell","name":"Bash","input":{"run_in_background":true,"timeout":1000}}]}}),
+        );
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+        let started = json!({"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"shell","is_backgrounded":true,"task_type":"local_bash"});
+        normalize(&mut normalizer, started.clone());
+        let TurnHold::Until(deadline) = normalizer.turn_hold() else {
+            panic!("bounded shell should hold its execution");
+        };
+        assert!(deadline > Instant::now());
+        let events = normalize(
+            &mut normalizer,
+            json!({"type":"result","subtype":"success"}),
+        );
+        assert!(!events.iter().any(NormalizedEvent::is_terminal));
+        // Neither repeated lifecycle events nor chatter extends a finite task.
+        for event in [
+            started,
+            json!({"type":"system","subtype":"status"}),
+            json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
+        ] {
+            normalize(&mut normalizer, event);
+            assert_eq!(normalizer.turn_hold(), TurnHold::Until(deadline));
+        }
+        // A noisy expired task stays expired; the server checks Until before
+        // reading another line, without waiting for an idle receive timeout.
+        let expired = Instant::now() - Duration::from_secs(1);
+        normalizer.background_tasks.get_mut("b1").unwrap().deadline = Some(expired);
+        normalize(&mut normalizer, json!({"type":"system","subtype":"status"}));
+        assert!(
+            matches!(normalizer.turn_hold(), TurnHold::Until(deadline) if deadline < Instant::now())
+        );
+        let events = normalize(
+            &mut normalizer,
+            json!({"type":"system","subtype":"task_notification","task_id":"b1","status":"failed","summary":"command timed out"}),
+        );
+        assert!(matches!(&events[0], NormalizedEvent::ToolResults(results) if results[0].is_error));
+        assert_eq!(
+            normalizer.turn_hold(),
+            TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
+        );
+        normalize(
+            &mut normalizer,
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"answer","content":[]}}}),
+        );
+        let events = normalize(
+            &mut normalizer,
+            json!({"type":"result","subtype":"success"}),
+        );
+        assert!(events.iter().any(NormalizedEvent::is_terminal));
+    }
+
+    #[test]
+    fn only_correlated_explicitly_bounded_main_chain_shells_hold_the_turn() {
+        for (input, task) in [
+            (json!({"run_in_background":true}), json!({})),
+            (json!({"run_in_background":true,"timeout":0}), json!({})),
+            (json!({"run_in_background":true,"timeout":-1}), json!({})),
+            (
+                json!({"run_in_background":true,"timeout":"1000"}),
+                json!({}),
+            ),
+            (json!({"run_in_background":false,"timeout":1000}), json!({})),
+            (
+                json!({"run_in_background":true,"timeout":1000}),
+                json!({"tool_use_id":"unrelated"}),
+            ),
+            (
+                json!({"run_in_background":true,"timeout":1000}),
+                json!({"owned_by_subagent":true}),
+            ),
+            (
+                json!({"run_in_background":true,"timeout":1000}),
+                json!({"is_backgrounded":false}),
+            ),
+        ] {
+            let mut normalizer = ClaudeEventNormalizer::default();
+            normalize(
+                &mut normalizer,
+                json!({"type":"assistant","message":{"id":"launch","content":[{"type":"tool_use","id":"shell","name":"Bash","input":input}]}}),
+            );
+            let mut started = json!({"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"shell","is_backgrounded":true,"task_type":"local_bash"});
+            started
+                .as_object_mut()
+                .unwrap()
+                .extend(task.as_object().unwrap().clone());
+            assert!(normalize(&mut normalizer, started).is_empty());
+            assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+        }
     }
 
     #[test]

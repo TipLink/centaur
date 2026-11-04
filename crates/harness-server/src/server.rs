@@ -1496,6 +1496,12 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
         }
 
         let mut terminal = false;
+        if matches!(harness.turn_hold(&event_normalizer), TurnHold::Until(deadline) if Instant::now() >= deadline)
+        {
+            return Err(HarnessServerError::BackgroundFollowUpStalled {
+                kind: harness.kind(),
+            });
+        }
         let received = if suggestion_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             Err(RecvTimeoutError::Timeout)
         } else {
@@ -1628,6 +1634,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 {
                     (true, _) => None,
                     (false, TurnHold::Idle(window)) => Some(Instant::now() + window),
+                    (false, TurnHold::Until(deadline)) => Some(deadline),
                     (false, TurnHold::Released | TurnHold::Waiting) => None,
                 };
             }
