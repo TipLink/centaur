@@ -1875,7 +1875,7 @@ async function syncThreadMessageToSession(
     try {
       context = shouldRefreshThreadContext
         ? await withSlackApiTimeout(input.options, 'collect Slack thread context', () =>
-            collectSlackThreadContext(input.options, message)
+            collectSlackThreadContext(thread.adapter, input.options, message)
           )
         : await withSlackApiTimeout(input.options, 'collect initial thread context', () =>
             collectInitialContext(thread, message, input.options)
@@ -4122,6 +4122,7 @@ function isSlackThreadReply(message: ChatMessage): boolean {
 }
 
 async function collectSlackThreadContext(
+  adapter: Adapter,
   options: SlackbotV2Options,
   currentMessage: ChatMessage
 ): Promise<SlackbotV2ApiMessage[]> {
@@ -4150,7 +4151,7 @@ async function collectSlackThreadContext(
       const messageTs = stringField(message.ts)
       if (!messageTs || compareSlackTs(messageTs, currentTs) > 0) continue
       if (isSelfSlackBotMessage(options, message)) continue
-      messages.push(await slackApiMessageFromSlack(options, message, currentMessage))
+      messages.push(await slackApiMessageFromSlack(adapter, options, message, currentMessage))
     }
     cursor = response.nextCursor
   } while (cursor)
@@ -4166,6 +4167,7 @@ async function collectSlackThreadContext(
 }
 
 async function slackApiMessageFromSlack(
+  adapter: Adapter,
   options: SlackbotV2Options,
   message: Record<string, unknown>,
   currentMessage: ChatMessage
@@ -4173,17 +4175,18 @@ async function slackApiMessageFromSlack(
   const rawCurrent = slackRawRecord(currentMessage)
   const id = stringField(message.ts) || randomUUID()
   const actorId = slackActorId(message)
+  const user = stringField(message.user) ? await adapter.getUser?.(actorId) : null
   const isBot = Boolean(message.bot_id || message.bot_profile)
   const text = normalizeSlackText(stringField(message.text))
   const displayText = renderSlackDisplayText({ raw: message, text })
   return {
     attachments: await slackApiAttachmentsFromFiles(options, message, rawCurrent),
     author: {
-      fullName: actorId,
+      fullName: user?.fullName || user?.userName || actorId,
       isBot,
       isMe: Boolean(actorId && options.botUserId && actorId === options.botUserId),
       userId: actorId,
-      userName: actorId
+      userName: user?.userName || actorId
     },
     displayText: displayText.text,
     displayTextSource: displayText.source,
