@@ -1,0 +1,116 @@
+diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
+index b9d3d517..49ba2c34 100644
+--- a/services/slackbotv2/src/index.ts
++++ b/services/slackbotv2/src/index.ts
+@@ -1875,7 +1875,7 @@ async function syncThreadMessageToSession(
+     try {
+       context = shouldRefreshThreadContext
+         ? await withSlackApiTimeout(input.options, 'collect Slack thread context', () =>
+-            collectSlackThreadContext(input.options, message)
++            collectSlackThreadContext(thread.adapter, input.options, message)
+           )
+         : await withSlackApiTimeout(input.options, 'collect initial thread context', () =>
+             collectInitialContext(thread, message, input.options)
+@@ -4122,6 +4122,7 @@ function isSlackThreadReply(message: ChatMessage): boolean {
+ }
+ 
+ async function collectSlackThreadContext(
++  adapter: Adapter,
+   options: SlackbotV2Options,
+   currentMessage: ChatMessage
+ ): Promise<SlackbotV2ApiMessage[]> {
+@@ -4150,7 +4151,7 @@ async function collectSlackThreadContext(
+       const messageTs = stringField(message.ts)
+       if (!messageTs || compareSlackTs(messageTs, currentTs) > 0) continue
+       if (isSelfSlackBotMessage(options, message)) continue
+-      messages.push(await slackApiMessageFromSlack(options, message, currentMessage))
++      messages.push(await slackApiMessageFromSlack(adapter, options, message, currentMessage))
+     }
+     cursor = response.nextCursor
+   } while (cursor)
+@@ -4166,6 +4167,7 @@ async function collectSlackThreadContext(
+ }
+ 
+ async function slackApiMessageFromSlack(
++  adapter: Adapter,
+   options: SlackbotV2Options,
+   message: Record<string, unknown>,
+   currentMessage: ChatMessage
+@@ -4173,17 +4175,18 @@ async function slackApiMessageFromSlack(
+   const rawCurrent = slackRawRecord(currentMessage)
+   const id = stringField(message.ts) || randomUUID()
+   const actorId = slackActorId(message)
++  const user = stringField(message.user) ? await adapter.getUser?.(actorId) : null
+   const isBot = Boolean(message.bot_id || message.bot_profile)
+   const text = normalizeSlackText(stringField(message.text))
+   const displayText = renderSlackDisplayText({ raw: message, text })
+   return {
+     attachments: await slackApiAttachmentsFromFiles(options, message, rawCurrent),
+     author: {
+-      fullName: actorId,
++      fullName: user?.fullName || user?.userName || actorId,
+       isBot,
+       isMe: Boolean(actorId && options.botUserId && actorId === options.botUserId),
+       userId: actorId,
+-      userName: actorId
++      userName: user?.userName || actorId
+     },
+     displayText: displayText.text,
+     displayTextSource: displayText.source,
+diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+index 2daf62c9..94dd91a3 100644
+--- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
++++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+@@ -1825,6 +1825,52 @@ describe('slackbotv2', () => {
+     expect(executeInput).not.toContain('data:image/png;base64')
+   })
+ 
++  it('resolves and caches prior thread authors before forwarding a mention', async () => {
++    slackApi.setUserProfile(USER_B_ID, {
++      name: 'builder',
++      real_name: 'Build User',
++      display_name: 'Builder'
++    })
++    const parent = await postUserMessage('The proposal.', undefined, slackB)
++    await postUserMessage('The clarification.', parent.ts, slackB)
++
++    const mention = await sendMessage(`<@${BOT_USER_ID}> summarize who proposed this`, {
++      threadTs: parent.ts
++    })
++    expect(mention.response.status).toBe(200)
++    await mention.finished()
++
++    expect(codexApi.executes).toHaveLength(1)
++    const input = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!)
++    const context = contentTextWithHeading(input.message.content, '# Slack Thread Context')
++    expect(context).toContain(`1. Build User (${USER_B_ID}):`)
++    expect(context).toContain(`2. Build User (${USER_B_ID}):`)
++    expect(context).toContain('The proposal.')
++    expect(context).toContain('The clarification.')
++    expect(slackApi.userProfileMethodRequestCount(USER_B_ID, '/api/users.info')).toBe(1)
++  })
++
++  it('keeps thread context when a prior author profile is unavailable', async () => {
++    const parent = await postUserMessage('Keep this prior context.', undefined, slackB)
++    const lookup = spyOn(bot.chat.getAdapter('slack')!, 'getUser').mockResolvedValue(null)
++    try {
++      const mention = await sendMessage(`<@${BOT_USER_ID}> summarize the thread`, {
++        threadTs: parent.ts
++      })
++      expect(mention.response.status).toBe(200)
++      await mention.finished()
++
++      expect(codexApi.executes).toHaveLength(1)
++      const input = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!)
++      const context = contentTextWithHeading(input.message.content, '# Slack Thread Context')
++      expect(context).toContain(`1. ${USER_B_ID}:`)
++      expect(context).toContain('Keep this prior context.')
++      expect(lookup).toHaveBeenCalledWith(USER_B_ID)
++    } finally {
++      lookup.mockRestore()
++    }
++  })
++
+   it('caches Slack requester identity across mentions from the same user', async () => {
+     slackApi.setUserProfile(USER_ID, {
+       name: 'akshaan',

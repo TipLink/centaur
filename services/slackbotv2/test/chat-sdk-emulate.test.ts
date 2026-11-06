@@ -1825,6 +1825,52 @@ describe('slackbotv2', () => {
     expect(executeInput).not.toContain('data:image/png;base64')
   })
 
+  it('resolves and caches prior thread authors before forwarding a mention', async () => {
+    slackApi.setUserProfile(USER_B_ID, {
+      name: 'builder',
+      real_name: 'Build User',
+      display_name: 'Builder'
+    })
+    const parent = await postUserMessage('The proposal.', undefined, slackB)
+    await postUserMessage('The clarification.', parent.ts, slackB)
+
+    const mention = await sendMessage(`<@${BOT_USER_ID}> summarize who proposed this`, {
+      threadTs: parent.ts
+    })
+    expect(mention.response.status).toBe(200)
+    await mention.finished()
+
+    expect(codexApi.executes).toHaveLength(1)
+    const input = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!)
+    const context = contentTextWithHeading(input.message.content, '# Slack Thread Context')
+    expect(context).toContain(`1. Build User (${USER_B_ID}):`)
+    expect(context).toContain(`2. Build User (${USER_B_ID}):`)
+    expect(context).toContain('The proposal.')
+    expect(context).toContain('The clarification.')
+    expect(slackApi.userProfileMethodRequestCount(USER_B_ID, '/api/users.info')).toBe(1)
+  })
+
+  it('keeps thread context when a prior author profile is unavailable', async () => {
+    const parent = await postUserMessage('Keep this prior context.', undefined, slackB)
+    const lookup = spyOn(bot.chat.getAdapter('slack')!, 'getUser').mockResolvedValue(null)
+    try {
+      const mention = await sendMessage(`<@${BOT_USER_ID}> summarize the thread`, {
+        threadTs: parent.ts
+      })
+      expect(mention.response.status).toBe(200)
+      await mention.finished()
+
+      expect(codexApi.executes).toHaveLength(1)
+      const input = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!)
+      const context = contentTextWithHeading(input.message.content, '# Slack Thread Context')
+      expect(context).toContain(`1. ${USER_B_ID}:`)
+      expect(context).toContain('Keep this prior context.')
+      expect(lookup).toHaveBeenCalledWith(USER_B_ID)
+    } finally {
+      lookup.mockRestore()
+    }
+  })
+
   it('caches Slack requester identity across mentions from the same user', async () => {
     slackApi.setUserProfile(USER_ID, {
       name: 'akshaan',
