@@ -18,6 +18,11 @@ def git(root, *argv):
 # The publication branch need not contain the official base in its history.
 git(source, 'fetch', '--depth=1', '--no-tags', str(prepared), manifest['upstream_revision'])
 
+# Overlay discovery deduplicates the mounted base by its exact contents.
+prompt = 'services/sandbox/SYSTEM_PROMPT.md'
+if git(source, 'show', f'HEAD:{prompt}') != git(prepared, 'show', f"{manifest['upstream_revision']}:{prompt}"):
+    raise SystemExit('Deployment guidance belongs in an overlay so the base prompt matches upstream')
+
 # Publication workflows and their image probe are build orchestration, not core
 # runtime patches. Everything else in the reviewed source must match exactly.
 diff = git(source, 'diff', '--binary', manifest['upstream_revision'], 'HEAD', '--',
