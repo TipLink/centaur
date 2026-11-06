@@ -1,25 +1,45 @@
 diff --git a/services/sandbox/compose_system_prompt.py b/services/sandbox/compose_system_prompt.py
-index db4a56c0..f8f9bba3 100644
+index db4a56c0..e093a5fb 100644
 --- a/services/sandbox/compose_system_prompt.py
 +++ b/services/sandbox/compose_system_prompt.py
-@@ -25,6 +25,9 @@ def _mounted_overlay_prompts(repo_mount: Path, baked_prompt: Path) -> list[Path]
-     if not repo_mount.is_dir():
-         return []
-     prompts = sorted(repo_mount.glob(f"*/*/{OVERLAY_PROMPT}"))
-+    # The official checkout is the base even when the image carries local patches.
-+    core_prompt = repo_mount / "paradigmxyz" / "centaur" / OVERLAY_PROMPT
-+    prompts = [prompt for prompt in prompts if prompt != core_prompt]
+@@ -28,8 +28,10 @@ def _mounted_overlay_prompts(repo_mount: Path, baked_prompt: Path) -> list[Path]
      if not baked_prompt.is_file():
          return prompts
  
++    # The official checkout is the base even when the image carries local patches.
++    core_prompt = repo_mount / "paradigmxyz" / "centaur" / OVERLAY_PROMPT
+     root_text = baked_prompt.read_text()
+-    return [prompt for prompt in prompts if prompt.read_text() != root_text]
++    return [prompt for prompt in prompts if prompt != core_prompt and prompt.read_text() != root_text]
+ 
+ 
+ def compose_system_prompt(
 diff --git a/services/sandbox/test_compose_system_prompt.py b/services/sandbox/test_compose_system_prompt.py
-index 7fe827f2..91b5bebf 100644
+index 7fe827f2..d3393499 100644
 --- a/services/sandbox/test_compose_system_prompt.py
 +++ b/services/sandbox/test_compose_system_prompt.py
-@@ -8,6 +8,30 @@ import compose_system_prompt
+@@ -8,6 +8,48 @@ import compose_system_prompt
  
  
  class ComposeSystemPromptTest(unittest.TestCase):
++    def test_keeps_mounted_prompt_when_only_base_override_exists(self) -> None:
++        with tempfile.TemporaryDirectory() as tmp:
++            home = Path(tmp)
++            (home / "AGENTS_BASE.md").write_text("custom base\n")
++            repo_mount = home / "github"
++            core = repo_mount / "paradigmxyz" / "centaur" / compose_system_prompt.OVERLAY_PROMPT
++            core.parent.mkdir(parents=True)
++            core.write_text("mounted guidance\n")
++            target = home / "effective.md"
++
++            compose_system_prompt.compose_system_prompt(
++                home_dir=home,
++                target_prompt=target,
++                repo_mount=repo_mount,
++            )
++
++            self.assertEqual(target.read_text(), "custom base\n\n\n---\n\nmounted guidance\n")
++
 +    def test_keeps_patched_base_without_appending_unpatched_core(self) -> None:
 +        with tempfile.TemporaryDirectory() as tmp:
 +            home = Path(tmp)

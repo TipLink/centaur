@@ -8,6 +8,24 @@ import compose_system_prompt
 
 
 class ComposeSystemPromptTest(unittest.TestCase):
+    def test_keeps_mounted_prompt_when_only_base_override_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "AGENTS_BASE.md").write_text("custom base\n")
+            repo_mount = home / "github"
+            core = repo_mount / "paradigmxyz" / "centaur" / compose_system_prompt.OVERLAY_PROMPT
+            core.parent.mkdir(parents=True)
+            core.write_text("mounted guidance\n")
+            target = home / "effective.md"
+
+            compose_system_prompt.compose_system_prompt(
+                home_dir=home,
+                target_prompt=target,
+                repo_mount=repo_mount,
+            )
+
+            self.assertEqual(target.read_text(), "custom base\n\n\n---\n\nmounted guidance\n")
+
     def test_keeps_patched_base_without_appending_unpatched_core(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
