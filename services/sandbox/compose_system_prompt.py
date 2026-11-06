@@ -25,6 +25,9 @@ def _mounted_overlay_prompts(repo_mount: Path, baked_prompt: Path) -> list[Path]
     if not repo_mount.is_dir():
         return []
     prompts = sorted(repo_mount.glob(f"*/*/{OVERLAY_PROMPT}"))
+    # The official checkout is the base even when the image carries local patches.
+    core_prompt = repo_mount / "paradigmxyz" / "centaur" / OVERLAY_PROMPT
+    prompts = [prompt for prompt in prompts if prompt != core_prompt]
     if not baked_prompt.is_file():
         return prompts
 

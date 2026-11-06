@@ -8,6 +8,30 @@ import compose_system_prompt
 
 
 class ComposeSystemPromptTest(unittest.TestCase):
+    def test_keeps_patched_base_without_appending_unpatched_core(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "AGENTS.md").write_text("base\napproval policy\n")
+            repo_mount = home / "github"
+            core = repo_mount / "paradigmxyz" / "centaur" / compose_system_prompt.OVERLAY_PROMPT
+            overlay = repo_mount / "acme" / "overlay" / compose_system_prompt.OVERLAY_PROMPT
+            core.parent.mkdir(parents=True)
+            overlay.parent.mkdir(parents=True)
+            core.write_text("base\n")
+            overlay.write_text("organization guidance\n")
+            target = home / "effective.md"
+
+            compose_system_prompt.compose_system_prompt(
+                home_dir=home,
+                target_prompt=target,
+                repo_mount=repo_mount,
+            )
+
+            self.assertEqual(
+                target.read_text(),
+                "base\napproval policy\n\n\n---\n\norganization guidance\n",
+            )
+
     def test_appends_multiple_overlay_prompts_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "fad924eb13035b977daa589c19fc815c5cbf91e3",
-  "result_tree": "eb47d3bd221b83a8d493636de387d87d3f27635f",
+  "result_tree": "3a30cfa39478d5c308b9b81a5f5742fc43664784",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -51,6 +51,10 @@
     {
       "file": "0012-cancel-scheduled-tasks-from-slack.patch",
       "sha256": "2ffb11a6b95fd6f6e35f717d41e3b877463de9256aae3657c7779a8d65a127ca"
+    },
+    {
+      "file": "0013-deduplicate-patched-core-prompt.patch",
+      "sha256": "d823fad7a4e4b11d551733d2fce4f94d1ea8828a4097f93a293dc5755434b684"
     }
   ]
 }
