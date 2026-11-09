@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "fad924eb13035b977daa589c19fc815c5cbf91e3",
-  "result_tree": "2c1f99670e119a9a7de15c19c9cfb477b46bc061",
+  "result_tree": "2275e02e8f9d49bea98acec74f533ca1d1956553",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -55,6 +55,10 @@
     {
       "file": "0013-slack-thread-author-names.patch",
       "sha256": "0cef1eb3896aebe2dcfcdeceea9975d3e2d765200be1c5a1d86de84ccaab34ad"
+    },
+    {
+      "file": "0014-claude-fable-5-2.patch",
+      "sha256": "c5ec5b4e71c2e59f00e45bd98e7ea0862e19a7a8342ad30e094cd1798c6a5b24"
     }
   ]
 }

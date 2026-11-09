@@ -1,0 +1,361 @@
+diff --git a/crates/harness-server/src/otel.rs b/crates/harness-server/src/otel.rs
+index b3d2fed72a1d11f7af42205a09aec9b3a50d5e64..75721464893f52ab0cedbbf866694496f8baa141 100644
+--- a/crates/harness-server/src/otel.rs
++++ b/crates/harness-server/src/otel.rs
+@@ -1134,6 +1134,15 @@ fn normalize_model_name(model: &str) -> String {
+ }
+ 
+ fn anthropic_pricing(model: &str) -> Option<TokenPricing> {
++    if model.contains("fable-5-2") || model.contains("mythos-5-2") {
++        return Some(TokenPricing {
++            input_per_mtok: 8.0,
++            cache_creation_per_mtok: 10.0,
++            cache_read_per_mtok: 0.2,
++            output_per_mtok: 40.0,
++            source: "centaur_estimate:anthropic:fable-mythos-5-2:5m-cache-write",
++        });
++    }
+     if model.contains("fable-5-1") || model.contains("mythos-5-1") {
+         return Some(TokenPricing {
+             input_per_mtok: 10.0,
+@@ -2032,6 +2041,12 @@ mod tests {
+                 2.5,
+                 "centaur_estimate:anthropic:opus-4.5-plus:5m-cache-write",
+             ),
++            (
++                "claude-fable-5-2",
++                6.64,
++                4.0,
++                "centaur_estimate:anthropic:fable-mythos-5-2:5m-cache-write",
++            ),
+             (
+                 "claude-fable-5-1",
+                 8.3,
+diff --git a/evals/message-overrides/cases.yaml b/evals/message-overrides/cases.yaml
+index 9672559fec85c130849bbe644fe9a15b84dcb7fd..fc1eecdf84afaa6cfb6e94d455ec8d5dff0dfcfd 100644
+--- a/evals/message-overrides/cases.yaml
++++ b/evals/message-overrides/cases.yaml
+@@ -47,7 +47,7 @@
+   vars:
+     text: 'using claude fable: draft the release notes'
+     harness: claudecode
+-    model: claude-fable-5-1
++    model: claude-fable-5-2
+ - description: versioned sonnet alias
+   vars:
+     text: please run this on sonnet 4.6
+@@ -99,7 +99,7 @@
+   vars:
+     text: "@bot ok so my high level thoughts after reading this are: the rollout plan is too aggressive and the rollback story is thin. can we just show a series of tradeoffs within a set of tables? one table per rollout stage, with risk and mitigation columns. continue using fable"
+     harness: claudecode
+-    model: claude-fable-5-1
++    model: claude-fable-5-2
+ - description: versioned fable at the end
+   vars:
+     text: "@bot can you rerun the load test scenarios at 2x and 5x traffic, showing both p50 / p99 latency? keep the same regions but make your best judgment use fable 5.1"
+@@ -109,17 +109,17 @@
+   vars:
+     text: "\"the smaller model was distilled from the larger one\" - what does that mean? @bot use fable also curious if there is any way to test for forms of distillation that isn't comparing probability distributions to a specific model, but any tells (e.g., breaking on novel / strange / longer-horizon tasks outside of the training set)"
+     harness: claudecode
+-    model: claude-fable-5-1
++    model: claude-fable-5-2
+ - description: fable at the end of a run-on sentence
+   vars:
+     text: "@bot what are the best public sources of data for us to understand enterprise adoption of postgres vs mysql? e.g., survey data is helpful one use fable"
+     harness: claudecode
+-    model: claude-fable-5-1
++    model: claude-fable-5-2
+ - description: bare fable prefix
+   vars:
+     text: "@bot using fable: what model are you?"
+     harness: claudecode
+-    model: claude-fable-5-1
++    model: claude-fable-5-2
+ - description: claude prefix after a mention
+   vars:
+     text: "@bot using claude: what model are you?"
+@@ -129,12 +129,12 @@
+   vars:
+     text: "@bot using claude fable: takeaways?"
+     harness: claudecode
+-    model: claude-fable-5-1
++    model: claude-fable-5-2
+ - description: claude fable alongside a persona
+   vars:
+     text: "@bot Using the reviewer persona and claude fable... generate a design review for the billing service based on: the design docs you can find in this slack channel"
+     harness: claudecode
+-    model: claude-fable-5-1
++    model: claude-fable-5-2
+ - description: codex with a version
+   vars:
+     text: "@bot retry with codex 5.5"
+@@ -236,12 +236,12 @@
+   vars:
+     text: "@bot can you help us understand how much of our CI time is going to builds vs. tests vs. deploys and how that has been changing over the last 8 weeks? fable xhigh"
+     harness: claudecode
+-    model: claude-fable-5-1
++    model: claude-fable-5-2
+ - description: claude model with high suffix
+   vars:
+     text: "@bot can u figure out what the key debates are on the auth service redesign RFC? use fable high"
+     harness: claudecode
+-    model: claude-fable-5-1
++    model: claude-fable-5-2
+ 
+ # Providers
+ - description: bedrock provider
+diff --git a/services/githubbot/src/overrides.ts b/services/githubbot/src/overrides.ts
+index 40c02c0e1f3cd370f00cdf3e207e7abc8cc204d5..f6e8c565543e2eff495433c431aa4d28203acae5 100644
+--- a/services/githubbot/src/overrides.ts
++++ b/services/githubbot/src/overrides.ts
+@@ -38,7 +38,7 @@ const HARNESS_FLAGS: Record<string, string> = {
+ // Claude model aliases, usable both as bare flags (--opus) and as --model
+ // values (--model opus). Bare-flag form also implies the claude-code harness.
+ const CLAUDE_MODEL_ALIASES: Record<string, string> = {
+-  fable: "claude-fable-5-1",
++  fable: "claude-fable-5-2",
+   haiku: "claude-haiku-5-5",
+   opus: "claude-opus-5-5",
+   sonnet: "claude-sonnet-5-5",
+diff --git a/services/githubbot/test/overrides.test.ts b/services/githubbot/test/overrides.test.ts
+index 66e8945658c58d7ff07b386cebc1e27ed1cd61d7..67d8886b2c09dfc11a5d0b0adfdc56c5822e6da4 100644
+--- a/services/githubbot/test/overrides.test.ts
++++ b/services/githubbot/test/overrides.test.ts
+@@ -109,7 +109,7 @@ describe("extractMessageOverrides", () => {
+       "claude-haiku-5-5",
+     );
+     expect(extractMessageOverrides("--fable fix it").model).toBe(
+-      "claude-fable-5-1",
++      "claude-fable-5-2",
+     );
+   });
+ 
+@@ -123,7 +123,7 @@ describe("extractMessageOverrides", () => {
+       "claude-sonnet-5-5",
+     );
+     expect(extractMessageOverrides("--model fable go").model).toBe(
+-      "claude-fable-5-1",
++      "claude-fable-5-2",
+     );
+   });
+ 
+diff --git a/services/linearbot/src/overrides.ts b/services/linearbot/src/overrides.ts
+index cd5f80e85d13f9aa4d4a300ce3bed117266b5bf6..5fd6f0ff5f781c8129b08d2990c05f74b0b3fd6a 100644
+--- a/services/linearbot/src/overrides.ts
++++ b/services/linearbot/src/overrides.ts
+@@ -45,7 +45,7 @@ const PROVIDER_FLAGS: Record<string, ProviderMapping> = {
+ // Claude model aliases, usable both as bare flags (--opus) and as --model
+ // values (--model opus). Bare-flag form also implies the claude-code harness.
+ const CLAUDE_MODEL_ALIASES: Record<string, string> = {
+-  fable: "claude-fable-5-1",
++  fable: "claude-fable-5-2",
+   haiku: "claude-haiku-5-5",
+   opus: "claude-opus-5-5",
+   sonnet: "claude-sonnet-5-5",
+diff --git a/services/linearbot/test/overrides.test.ts b/services/linearbot/test/overrides.test.ts
+index 4c7b13f0e8bf405cd086e0e89897532d289f8911..10ac22e51628bf273a6e45e2a6aa55f6e8fb9874 100644
+--- a/services/linearbot/test/overrides.test.ts
++++ b/services/linearbot/test/overrides.test.ts
+@@ -78,7 +78,7 @@ describe("extractMessageOverrides", () => {
+       "claude-haiku-5-5",
+     );
+     expect(extractMessageOverrides("--fable fix it").model).toBe(
+-      "claude-fable-5-1",
++      "claude-fable-5-2",
+     );
+   });
+ 
+@@ -132,7 +132,7 @@ describe("extractMessageOverrides", () => {
+       "claude-sonnet-5-5",
+     );
+     expect(extractMessageOverrides("--model fable go").model).toBe(
+-      "claude-fable-5-1",
++      "claude-fable-5-2",
+     );
+   });
+ 
+@@ -142,14 +142,14 @@ describe("extractMessageOverrides", () => {
+     ).toEqual({
+       cleanedText: "what model are you",
+       harnessType: "claudecode",
+-      model: "claude-fable-5-1",
++      model: "claude-fable-5-2",
+     });
+     expect(
+       extractMessageOverrides("@Centaur AI --claude --model=fable\r\nwhat model are you"),
+     ).toEqual({
+       cleanedText: "@Centaur AI what model are you",
+       harnessType: "claudecode",
+-      model: "claude-fable-5-1",
++      model: "claude-fable-5-2",
+     });
+   });
+ 
+@@ -159,7 +159,7 @@ describe("extractMessageOverrides", () => {
+     ).toEqual({
+       cleanedText: "what model are you",
+       harnessType: "claudecode",
+-      model: "claude-fable-5-1",
++      model: "claude-fable-5-2",
+     });
+   });
+ 
+diff --git a/services/sandbox/Dockerfile b/services/sandbox/Dockerfile
+index 3e0cfaf3d53ea5f782d47faf155a2e9db1d9470e..5d6c8204fe907373eae20d4af311b9c3e5d7e208 100644
+--- a/services/sandbox/Dockerfile
++++ b/services/sandbox/Dockerfile
+@@ -93,7 +93,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+ RUN useradd -m -s /bin/bash -u 1001 agent \
+     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
+ 
+-ARG CLAUDE_CODE_VERSION=2.1.310
++ARG CLAUDE_CODE_VERSION=2.1.321
+ ARG CODEX_VERSION=0.165.0
+ ARG PI_CODING_AGENT_VERSION=1.4.0
+ # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
+diff --git a/services/slackbotv2/src/message-overrides-strategy.ts b/services/slackbotv2/src/message-overrides-strategy.ts
+index bb2a5afe7fdf9277c8b95f40d63246108cb99360..b65d8b66fa19eb0c5d0bb35bbb560fa7aa4a0bc1 100644
+--- a/services/slackbotv2/src/message-overrides-strategy.ts
++++ b/services/slackbotv2/src/message-overrides-strategy.ts
+@@ -55,8 +55,9 @@ const REASONING_CHOICES: Choice[] = [
+ // Descriptions carry the user-facing aliases. Each states exactly when it
+ // applies so a bare family name ("sol") resolves to its default generation.
+ const MODEL_CHOICES: Choice[] = [
+-  { value: 'claude-fable-5', description: 'Only when the user says "fable 5" (not 5.1).' },
+-  { value: 'claude-fable-5-1', description: 'Fable: plain "fable", "claude fable", or "fable 5.1".' },
++  { value: 'claude-fable-5', description: 'Only when the user says "fable 5" (not 5.1 or 5.2).' },
++  { value: 'claude-fable-5-1', description: 'Only when the user says "fable 5.1".' },
++  { value: 'claude-fable-5-2', description: 'Fable: plain "fable", "claude fable", or "fable 5.2".' },
+   { value: 'claude-haiku-4-5', description: 'Only when the user says "haiku 4.5".' },
+   { value: 'claude-haiku-5-5', description: 'Haiku: plain "haiku" or "haiku 5.5".' },
+   { value: 'claude-opus-4-7', description: 'Only when the user says "opus 4.7".' },
+diff --git a/services/slackbotv2/src/overrides.ts b/services/slackbotv2/src/overrides.ts
+index a2f65d4d13f749f9ececcc34e84b62eae888a276..71a78a8af57606543b6e45731f0d370588585e3b 100644
+--- a/services/slackbotv2/src/overrides.ts
++++ b/services/slackbotv2/src/overrides.ts
+@@ -75,7 +75,7 @@ const PROVIDER_FLAGS: Record<string, ProviderMapping> = {
+ // Claude model aliases, usable both as bare flags (--opus) and as --model
+ // values (--model opus). Bare-flag form also implies the claude-code harness.
+ const CLAUDE_MODEL_ALIASES: Record<string, string> = {
+-  fable: 'claude-fable-5-1',
++  fable: 'claude-fable-5-2',
+   haiku: 'claude-haiku-5-5',
+   opus: 'claude-opus-5-5',
+   sonnet: 'claude-sonnet-5-5'
+@@ -105,6 +105,7 @@ const STRATEGY_REASONING_EFFORTS = new Set([
+ const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
+   'claude-fable-5': 'claudecode',
+   'claude-fable-5-1': 'claudecode',
++  'claude-fable-5-2': 'claudecode',
+   'claude-haiku-4-5': 'claudecode',
+   'claude-haiku-5-5': 'claudecode',
+   'claude-opus-4-7': 'claudecode',
+diff --git a/services/slackbotv2/test/channel-defaults.test.ts b/services/slackbotv2/test/channel-defaults.test.ts
+index 09f5d4ec84fcef1ee49dbb114cdf6a5aebb63309..e8dbcb0875ee54149bb161fe462703194f45e16a 100644
+--- a/services/slackbotv2/test/channel-defaults.test.ts
++++ b/services/slackbotv2/test/channel-defaults.test.ts
+@@ -67,7 +67,7 @@ describe('parseChannelDefaults', () => {
+       )
+     ).toEqual({
+       C0A: { model: 'claude-opus-5-5' },
+-      C0F: { model: 'claude-fable-5-1' },
++      C0F: { model: 'claude-fable-5-2' },
+       C0S: { model: 'claude-sonnet-5-5' },
+       C0H: { model: 'claude-haiku-5-5' },
+       C0B: { model: 'gpt-5.2' }
+diff --git a/services/slackbotv2/test/overrides.test.ts b/services/slackbotv2/test/overrides.test.ts
+index 3c209584a7eda773612d84959d533b57e30509f3..af638a126e85fe42b0aa73d191a436b6a08b3fc0 100644
+--- a/services/slackbotv2/test/overrides.test.ts
++++ b/services/slackbotv2/test/overrides.test.ts
+@@ -87,7 +87,7 @@ describe('extractMessageOverrides', () => {
+     })
+     expect(extractMessageOverrides('--sonnet fix it').model).toBe('claude-sonnet-5-5')
+     expect(extractMessageOverrides('--haiku fix it').model).toBe('claude-haiku-5-5')
+-    expect(extractMessageOverrides('--fable fix it').model).toBe('claude-fable-5-1')
++    expect(extractMessageOverrides('--fable fix it').model).toBe('claude-fable-5-2')
+   })
+ 
+   test('--meta selects the Meta provider and codex harness', () => {
+@@ -136,14 +136,14 @@ describe('extractMessageOverrides', () => {
+       model: 'claude-opus-5-5'
+     })
+     expect(extractMessageOverrides('--model Sonnet go').model).toBe('claude-sonnet-5-5')
+-    expect(extractMessageOverrides('--model fable go').model).toBe('claude-fable-5-1')
++    expect(extractMessageOverrides('--model fable go').model).toBe('claude-fable-5-2')
+   })
+ 
+   test('--model accepts a newline immediately after the value', () => {
+     expect(extractMessageOverrides('--claude --model=fable\nwhat model are you')).toEqual({
+       cleanedText: 'what model are you',
+       harnessType: 'claudecode',
+-      model: 'claude-fable-5-1',
++      model: 'claude-fable-5-2',
+       reasoning: undefined
+     })
+     expect(
+@@ -151,7 +151,7 @@ describe('extractMessageOverrides', () => {
+     ).toEqual({
+       cleanedText: '@Centaur AI what model are you',
+       harnessType: 'claudecode',
+-      model: 'claude-fable-5-1',
++      model: 'claude-fable-5-2',
+       reasoning: undefined
+     })
+   })
+@@ -160,7 +160,7 @@ describe('extractMessageOverrides', () => {
+     expect(extractMessageOverrides('--claude --model=fable<br>what model are you')).toEqual({
+       cleanedText: 'what model are you',
+       harnessType: 'claudecode',
+-      model: 'claude-fable-5-1',
++      model: 'claude-fable-5-2',
+       reasoning: undefined
+     })
+   })
+@@ -479,7 +479,7 @@ describe('validateStrategyOverrides', () => {
+       provider: undefined,
+       reasoning: undefined
+     })
+-    for (const model of ['claude-fable-5-1', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
++    for (const model of ['claude-fable-5-1', 'claude-fable-5-2', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+       expect(validateStrategyOverrides({ model })).toEqual({
+         harnessType: 'claudecode',
+         model,
+@@ -578,7 +578,7 @@ describe('messageOverridesForText strategy invocation', () => {
+       cleanedText: 'review this',
+       overrides: {
+         harnessType: 'claudecode',
+-        model: 'claude-fable-5-1',
++        model: 'claude-fable-5-2',
+         personaId: 'invest',
+         provider: undefined,
+         reasoning: undefined
+@@ -908,7 +908,7 @@ describe('SlackFormatConverter.extractPlainText + extractMessageOverrides', () =
+     expect(extractMessageOverrides(text)).toEqual({
+       cleanedText: 'examine github.com/paradigmxyz/centaur/pull/921. cross reference that PR.',
+       harnessType: 'claudecode',
+-      model: 'claude-fable-5-1',
++      model: 'claude-fable-5-2',
+       reasoning: undefined
+     })
+   })
+diff --git a/services/slackbotv2/test/response-context.test.ts b/services/slackbotv2/test/response-context.test.ts
+index a445e6be07a37b4f18cdcbcf4e352630545d33d9..835678b3c23663330b239a55adf49f209f62a184 100644
+--- a/services/slackbotv2/test/response-context.test.ts
++++ b/services/slackbotv2/test/response-context.test.ts
+@@ -100,7 +100,7 @@ describe('reasoningForModel', () => {
+ 
+   test('forwards Claude Code effort levels and rejects Codex-only efforts', () => {
+     for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+-      for (const model of ['claude-opus-5-5', 'claude-fable-5-1', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
++      for (const model of ['claude-opus-5-5', 'claude-fable-5-2', 'claude-fable-5-1', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+         expect(reasoningForModel('claudecode', model, effort)).toBe(effort)
+       }
+     }
+@@ -215,6 +215,7 @@ describe('modelDisplayName', () => {
+     expect(modelDisplayName('claude-opus-5-5')).toBe('Opus 5.5')
+     expect(modelDisplayName('claude-fable-5')).toBe('Fable 5')
+     expect(modelDisplayName('claude-fable-5-1')).toBe('Fable 5.1')
++    expect(modelDisplayName('claude-fable-5-2')).toBe('Fable 5.2')
+     expect(modelDisplayName('claude-sonnet-5-5')).toBe('Sonnet 5.5')
+     expect(modelDisplayName('claude-haiku-5-5')).toBe('Haiku 5.5')
+     expect(modelDisplayName('gpt-6.1-sol')).toBe('Sol 6.1')
