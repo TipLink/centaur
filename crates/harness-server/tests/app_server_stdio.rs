@@ -3678,10 +3678,10 @@ fn fake_codex_blocks_mode_switches_provider_by_forking_the_thread() {
     assert_eq!(
         launches.lines().collect::<Vec<_>>(),
         [
-            r#"app-server --listen stdio:// -c model_provider="original""#,
-            r#"app-server --listen stdio:// -c model_provider="other""#,
-            r#"app-server --listen stdio:// -c model_provider="other""#,
-            r#"app-server --listen stdio:// -c model_provider="openai""#,
+            r#"app-server --listen stdio:// -c model_provider="original" -c features.default_mode_request_user_input=false"#,
+            r#"app-server --listen stdio:// -c model_provider="other" -c features.default_mode_request_user_input=false"#,
+            r#"app-server --listen stdio:// -c model_provider="other" -c features.default_mode_request_user_input=false"#,
+            r#"app-server --listen stdio:// -c model_provider="openai" -c features.default_mode_request_user_input=false"#,
         ]
     );
     let _ = std::fs::remove_file(format!("{}.args", log.display()));

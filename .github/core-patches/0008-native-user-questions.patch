@@ -2692,7 +2692,7 @@ index 00000000..a561ae6c
 +    }
 +}
 diff --git a/crates/harness-server/tests/app_server_stdio.rs b/crates/harness-server/tests/app_server_stdio.rs
-index 1f4112d4..f12d0716 100644
+index 1f4112d4..14c1a69f 100644
 --- a/crates/harness-server/tests/app_server_stdio.rs
 +++ b/crates/harness-server/tests/app_server_stdio.rs
 @@ -104,6 +104,219 @@ fn fake_claude_app_server_streams_codex_v2_notifications() {
@@ -2927,6 +2927,21 @@ index 1f4112d4..f12d0716 100644
          assert!(
              value.get("params").is_some_and(Value::is_object),
              "notification without params: {value}"
+@@ -3048,10 +3264,10 @@ fn fake_codex_blocks_mode_switches_provider_by_forking_the_thread() {
+     assert_eq!(
+         launches.lines().collect::<Vec<_>>(),
+         [
+-            r#"app-server --listen stdio:// -c model_provider="original""#,
+-            r#"app-server --listen stdio:// -c model_provider="other""#,
+-            r#"app-server --listen stdio:// -c model_provider="other""#,
+-            r#"app-server --listen stdio:// -c model_provider="openai""#,
++            r#"app-server --listen stdio:// -c model_provider="original" -c features.default_mode_request_user_input=false"#,
++            r#"app-server --listen stdio:// -c model_provider="other" -c features.default_mode_request_user_input=false"#,
++            r#"app-server --listen stdio:// -c model_provider="other" -c features.default_mode_request_user_input=false"#,
++            r#"app-server --listen stdio:// -c model_provider="openai" -c features.default_mode_request_user_input=false"#,
+         ]
+     );
+     let _ = std::fs::remove_file(format!("{}.args", log.display()));
 diff --git a/e2e/fakes/fake-slack.ts b/e2e/fakes/fake-slack.ts
 index 3a22f283..e81f0a08 100644
 --- a/e2e/fakes/fake-slack.ts
