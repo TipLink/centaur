@@ -123,7 +123,7 @@ jobs:
             target: ""
           - service: console
             image: centaur-console
-            context: services/console
+            context: .
             dockerfile: services/console/Dockerfile
             target: ""
 

@@ -1,8 +1,8 @@
 diff --git a/crates/centaur-api-server/src/args.rs b/crates/centaur-api-server/src/args.rs
-index 8d013bc6..762359f3 100644
+index 4e9261bb..e072a2ff 100644
 --- a/crates/centaur-api-server/src/args.rs
 +++ b/crates/centaur-api-server/src/args.rs
-@@ -89,6 +89,10 @@ pub(crate) struct Args {
+@@ -90,6 +90,10 @@ pub(crate) struct Args {
  }
  
  impl Args {
@@ -14,10 +14,10 @@ index 8d013bc6..762359f3 100644
          self.sandbox.runtime().await
      }
 diff --git a/crates/centaur-api-server/src/lib.rs b/crates/centaur-api-server/src/lib.rs
-index 8d8f86b3..d10585fe 100644
+index e114f0b0..8411a021 100644
 --- a/crates/centaur-api-server/src/lib.rs
 +++ b/crates/centaur-api-server/src/lib.rs
-@@ -660,6 +660,117 @@ mod tests {
+@@ -676,6 +676,117 @@ mod tests {
          }
      }
  
@@ -136,37 +136,41 @@ index 8d8f86b3..d10585fe 100644
      async fn principal_jwt_is_capability_scoped() {
          let principal = principal_token("prn_sandbox");
 diff --git a/crates/centaur-api-server/src/main.rs b/crates/centaur-api-server/src/main.rs
-index 33ce239e..44f19f1b 100644
+index f64d5b7f..514cb475 100644
 --- a/crates/centaur-api-server/src/main.rs
 +++ b/crates/centaur-api-server/src/main.rs
-@@ -35,7 +35,8 @@ async fn main() -> Result<(), ServerError> {
+@@ -40,7 +40,8 @@ async fn main() -> Result<(), ServerError> {
          "starting centaur api-rs server"
      );
  
--    let app_state = AppState::unready(api_auth);
-+    let app_state =
+-    let mut app_state = AppState::unready(api_auth);
++    let mut app_state =
 +        AppState::unready(api_auth).with_scheduled_task_controls(args.scheduled_task_controls());
-     let app = build_router_with_app_state(app_state.clone());
-     warm_slack_public_channel_cache();
-     let shutdown_state = app_state.clone();
+     if let Some(pool) = args.console_db() {
+         app_state = app_state.with_console_db(pool);
+     }
 diff --git a/crates/centaur-api-server/src/routes.rs b/crates/centaur-api-server/src/routes.rs
-index 4b53b2b2..9b2bf985 100644
+index 147dd9c1..5e8ff88a 100644
 --- a/crates/centaur-api-server/src/routes.rs
 +++ b/crates/centaur-api-server/src/routes.rs
-@@ -66,6 +66,7 @@ pub struct AppState {
-     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
-     metrics: PrometheusHandle,
+@@ -72,6 +72,7 @@ pub struct AppState {
      auth: ApiAuthConfig,
+     /// Console's database, read for API client authentication.
+     console_db: Option<PgPool>,
 +    scheduled_task_controls: Option<centaur_iron_control::IronControlClient>,
  }
  
  #[derive(Clone)]
-@@ -81,9 +82,18 @@ impl AppState {
-             initialized: Arc::new(RwLock::new(None)),
+@@ -88,6 +89,7 @@ impl AppState {
              metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
              auth,
+             console_db: None,
 +            scheduled_task_controls: None,
          }
+     }
+ 
+@@ -107,6 +109,14 @@ impl AppState {
+         })
      }
  
 +    pub fn with_scheduled_task_controls(
@@ -180,8 +184,8 @@ index 4b53b2b2..9b2bf985 100644
      pub fn ready(
          runtime: SessionRuntime,
          workflows: Option<WorkflowRuntime>,
-@@ -237,6 +247,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
-             post(pause_session_sandbox),
+@@ -264,6 +274,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
+             delete(release_session_sandbox),
          )
          .route("/api/sandboxes/drain", post(drain_sandboxes))
 +        .route(
@@ -191,15 +195,15 @@ index 4b53b2b2..9b2bf985 100644
          .route(
              "/api/slack/external-team-ids",
              get(get_slack_external_team_ids).put(replace_slack_external_team_ids),
-@@ -402,6 +416,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
+@@ -434,6 +448,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
  #[derive(Clone, Copy)]
  enum RouteAccess {
      ConsoleOnly,
 +    SlackIngressOnly,
      Capability(Capability),
      PrincipalOnly,
- }
-@@ -439,6 +454,9 @@ async fn authorize_api_request(
+     /// Session write access, held by an API client (confined to its own
+@@ -489,6 +504,9 @@ async fn authorize_api_request(
  
      let allowed = match access {
          RouteAccess::ConsoleOnly => caller.class() == CallerClass::Console,
@@ -208,8 +212,8 @@ index 4b53b2b2..9b2bf985 100644
 +        }
          RouteAccess::Capability(capability) => caller.has_capability(capability),
          RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
-     };
-@@ -487,6 +505,10 @@ async fn authorize_api_request(
+         RouteAccess::ApiClientOrOperatorSessionWrite => {
+@@ -572,6 +590,10 @@ pub(crate) fn api_client_may_touch(
  fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
      let capability = |capability| Some(RouteAccess::Capability(capability));
      match (method, route) {
@@ -220,7 +224,7 @@ index 4b53b2b2..9b2bf985 100644
          (&Method::POST, "/api/tool-approvals/context")
          | (&Method::POST, "/api/tool-approvals/request")
          | (&Method::POST, "/api/tool-approvals/{id}/read")
-@@ -2514,6 +2536,73 @@ async fn invoke_workflow_button(
+@@ -2687,6 +2709,73 @@ async fn invoke_workflow_button(
      Ok(Json(serde_json::to_value(run)?))
  }
  
@@ -295,7 +299,7 @@ index 4b53b2b2..9b2bf985 100644
      State(state): State<AppState>,
      Extension(caller): Extension<AuthenticatedCaller>,
 diff --git a/crates/centaur-iron-control/src/client.rs b/crates/centaur-iron-control/src/client.rs
-index fc3f109c..526001bf 100644
+index 8af4b714..7ab7a170 100644
 --- a/crates/centaur-iron-control/src/client.rs
 +++ b/crates/centaur-iron-control/src/client.rs
 @@ -61,6 +61,25 @@ impl IronControlClient {
@@ -543,7 +547,7 @@ index 29e683a0..08cc296a 100644
    end
  end
 diff --git a/services/console/app/models/scheduled_task.rb b/services/console/app/models/scheduled_task.rb
-index ec7786af..e250d7e8 100644
+index d4adaa72..788fed2b 100644
 --- a/services/console/app/models/scheduled_task.rb
 +++ b/services/console/app/models/scheduled_task.rb
 @@ -2,6 +2,7 @@ require "fugit"
@@ -554,19 +558,13 @@ index ec7786af..e250d7e8 100644
  
    oid_prefix "tsk"
  
-@@ -129,6 +130,25 @@ class ScheduledTask < ApplicationRecord
-     }
+@@ -139,8 +140,38 @@ class ScheduledTask < ApplicationRecord
+     }.compact
    end
  
 +  def cancel_from_slack!(team_id:, user_id:, channel_id:)
 +    with_lock do
-+      policy = SlackDeliveryPolicy.new(author)
-+      destination_matches = delivery_channel == channel_id ||
-+        (delivery_channel == user_id && channel_id.start_with?("D"))
-+      unless author.active? && policy.slack_team_id == team_id &&
-+          policy.slack_user_id == user_id && destination_matches
-+        raise SlackCancellationNotAllowed
-+      end
++      raise SlackCancellationNotAllowed unless slack_cancellation_allowed?(team_id:, user_id:, channel_id:)
 +
 +      # Cancellation must still work after the delivery channel becomes unavailable.
 +      # Only stop future runs; preserve the task and any execution already dispatched.
@@ -579,27 +577,46 @@ index ec7786af..e250d7e8 100644
 +
    private
  
++  # A user-owned task is cancelled only by its linked Slack author, from its
++  # delivery channel or a DM. A channel-owned task belongs to the channel, whose
++  # members already manage it from channel threads, so a click from that channel
++  # in its workspace is enough.
++  def slack_cancellation_allowed?(team_id:, user_id:, channel_id:)
++    if principal
++      return principal.slack_team_id == team_id &&
++        principal.slack_channel_id == channel_id && delivery_channel == channel_id
++    end
++    return false unless author&.active?
++
++    policy = SlackDeliveryPolicy.new(author)
++    destination_matches = delivery_channel == channel_id ||
++      (delivery_channel == user_id && channel_id.start_with?("D"))
++    policy.slack_team_id == team_id && policy.slack_user_id == user_id && destination_matches
++  end
++
    def simple_weekly_schedule
-diff --git a/services/console/config/routes.rb b/services/console/config/routes.rb
-index e632a8bd..092e6d22 100644
---- a/services/console/config/routes.rb
-+++ b/services/console/config/routes.rb
-@@ -228,7 +228,9 @@ Rails.application.routes.draw do
-       resources :grants, only: %i[show create destroy]
-       resources :api_keys, only: %i[index show create destroy]
-       resources :proxies, only: %i[index show create update destroy]
--      resources :scheduled_tasks, only: %i[show]
-+      resources :scheduled_tasks, only: %i[show] do
-+        post :cancel, on: :member
-+      end
-       # Operator-managed broker credentials (ApiKey auth). CRUD + lookup; the
-       # rotating token blob is never serialized back.
-       resources :broker_credentials, only: %i[index show create update destroy] do
+     fields = cron_expression.to_s.split
+     return unless fields.length == 5 && fields[2] == "*" && fields[3] == "*"
+diff --git a/services/console/config/routes/api.rb b/services/console/config/routes/api.rb
+index 9cf5dac7..a59250c3 100644
+--- a/services/console/config/routes/api.rb
++++ b/services/console/config/routes/api.rb
+@@ -90,7 +90,9 @@ namespace :api do
+     resources :grants, only: %i[show create destroy]
+     resources :api_keys, only: %i[index show create destroy]
+     resources :proxies, only: %i[index show create update destroy]
+-    resources :scheduled_tasks, only: %i[show]
++    resources :scheduled_tasks, only: %i[show] do
++      post :cancel, on: :member
++    end
+     # Operator-managed broker credentials (ApiKey auth). CRUD + lookup; the
+     # rotating token blob is never serialized back.
+     resources :broker_credentials, only: %i[index show create update destroy] do
 diff --git a/services/console/docs/API.md b/services/console/docs/API.md
-index 7fa8420d..c5392bf8 100644
+index 20bbb3e3..fd51c0b0 100644
 --- a/services/console/docs/API.md
 +++ b/services/console/docs/API.md
-@@ -1485,6 +1485,14 @@ These endpoints use the sandbox entitlement JWT injected by `iron-proxy`. Every
+@@ -1577,6 +1577,14 @@ When the sandbox principal is a Slack channel, the endpoints manage that channel
  
  The admin API also exposes `GET /api/v1/scheduled_tasks/:id` for scheduled workflows to read the task's current ID, enabled state, and delivery channel. It requires an active admin API key, returns `404` for deleted tasks, and sets `Cache-Control: no-store`.
  
@@ -615,10 +632,10 @@ index 7fa8420d..c5392bf8 100644
  
  ## Skills
 diff --git a/services/console/test/controllers/api/v1/scheduled_tasks_controller_test.rb b/services/console/test/controllers/api/v1/scheduled_tasks_controller_test.rb
-index 5fcdbd30..c7b13501 100644
+index 5fcdbd30..28fe7992 100644
 --- a/services/console/test/controllers/api/v1/scheduled_tasks_controller_test.rb
 +++ b/services/console/test/controllers/api/v1/scheduled_tasks_controller_test.rb
-@@ -64,8 +64,133 @@ module Api
+@@ -64,8 +64,166 @@ module Api
          assert_response :forbidden
        end
  
@@ -683,6 +700,39 @@ index 5fcdbd30..c7b13501 100644
 +          cancel_task
 +        end
 +        assert_response :forbidden
++      end
++
++      test "channel-owned tasks are cancelled from their channel only" do
++        channel = principals(:acme_channel)
++        channel.update_columns(slack_team_id: "T0123456789")
++        task = ScheduledTask.new(
++          name: "Channel digest",
++          prompt: "Summarize the channel",
++          principal: channel,
++          delivery_channel: "C0123456789",
++          cron_expression: "*/5 * * * *",
++          next_run_at: 5.minutes.from_now,
++          enabled: true
++        )
++        # Skips the live Slack bot-membership check; ownership is what matters here.
++        task.save!(validate: false)
++        path = "/api/v1/scheduled_tasks/#{task.oid}"
++
++        [ { team_id: "T2222222222" }, { channel_id: "C2222222222" }, { channel_id: "D0123456789" } ].each do |context|
++          assert_no_changes -> { task.reload.attributes } do
++            post "#{path}/cancel",
++                 params: { data: { team_id: "T0123456789", user_id: "U2222222222", channel_id: "C0123456789" }.merge(context) },
++                 headers: auth_headers, as: :json
++          end
++          assert_response :forbidden
++        end
++
++        post "#{path}/cancel",
++             params: { data: { team_id: "T0123456789", user_id: "U2222222222", channel_id: "C0123456789" } },
++             headers: auth_headers, as: :json
++        assert_response :success
++        assert_not task.reload.enabled?
++        assert_nil task.next_run_at
 +      end
 +
 +      test "user-addressed reports can be cancelled by that owner in a DM" do
@@ -753,10 +803,10 @@ index 5fcdbd30..c7b13501 100644
          { "Authorization" => "Bearer #{token}" }
        end
 diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
-index 9a499872..b9d3d517 100644
+index 06b37423..224302ad 100644
 --- a/services/slackbotv2/src/index.ts
 +++ b/services/slackbotv2/src/index.ts
-@@ -60,6 +60,7 @@ import {
+@@ -73,6 +73,7 @@ import {
    SESSION_USER_INPUT_RESOLVED_EVENT,
    sessionStreamError,
    slackApiTimeoutMs,
@@ -764,9 +814,9 @@ index 9a499872..b9d3d517 100644
    WORKFLOW_ACTION_PREFIX,
    workflowActionFeedback,
    withSlackApiTimeout
-@@ -397,9 +398,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
-   chat.onAction(async event => {
-     const payload = slackBlockActionPayload(event)
+@@ -421,9 +422,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+       return
+     }
      const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
 -    // Workflow starts deduplicate durably using the Slack click identity.
 +    const scheduleCancel = payload.action_id === SCHEDULE_CANCEL_ACTION
@@ -777,7 +827,7 @@ index 9a499872..b9d3d517 100644
      const leaseToken = randomUUID()
      if (
        dedupeKey
-@@ -416,9 +418,25 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+@@ -440,9 +442,25 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
      }
      try {
        const result = await dispatchSlackBlockAction(options, payload)
@@ -804,7 +854,7 @@ index 9a499872..b9d3d517 100644
        if (feedback && payload.channel_id) {
          backgroundWaitUntil(
            withSlackApiTimeout(options, 'post workflow action feedback', () =>
-@@ -441,7 +459,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+@@ -465,7 +483,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
        }
      } catch (error) {
        const context = requestContext.getStore()
@@ -813,7 +863,7 @@ index 9a499872..b9d3d517 100644
        try {
          if (dedupeKey && (await state.get(dedupeKey)) === leaseToken) {
            await state.delete(dedupeKey)
-@@ -480,7 +498,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+@@ -504,7 +522,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
        message_ts: payload.message_ts,
        team_id: payload.team_id,
        thread_ts: payload.thread_ts,
@@ -822,7 +872,7 @@ index 9a499872..b9d3d517 100644
      })
    })
  
-@@ -703,12 +721,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+@@ -727,12 +745,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
        }
        const userInputResponse = await handleSessionUserInputInteraction(interaction, options, stateConnected, keepAlive)
        if (userInputResponse) return userInputResponse
@@ -838,7 +888,7 @@ index 9a499872..b9d3d517 100644
        const handoffTasks: Promise<unknown>[] = []
        const context: SlackbotV2RequestContext = { waitUntil: keepAlive }
        const response = await requestContext.run(context, () => {
-@@ -755,9 +773,9 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+@@ -779,9 +797,9 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
              phase_ms: elapsedMs(waitStartedAtMs)
            })
          }
@@ -850,7 +900,7 @@ index 9a499872..b9d3d517 100644
          }
        }
        const lateFileTask = response.ok ? lateSlackFiles.repairFromWebhook(rawBody) : null
-@@ -1347,7 +1365,7 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
+@@ -1448,7 +1466,7 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
    const messageTs = stringValue(message.ts) ?? stringValue(container.message_ts)
    const messageId = event.messageId.startsWith('ephemeral:') ? (messageTs ?? '') : event.messageId
    return removeUndefinedValues({
@@ -859,7 +909,7 @@ index 9a499872..b9d3d517 100644
        ? { workflow_message: { text: stringValue(message.text) ?? '', blocks: message.blocks } }
        : {}),
      action_id: event.actionId,
-@@ -1356,7 +1374,9 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
+@@ -1457,7 +1475,9 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
      channel_id: stringValue(channel.id) ?? stringValue(container.channel_id),
      message_id: messageId,
      message_ts: messageTs,
@@ -870,7 +920,7 @@ index 9a499872..b9d3d517 100644
      thread_id: event.threadId,
      thread_ts: stringValue(message.thread_ts) ?? stringValue(container.thread_ts) ?? messageTs,
      type: 'block_actions',
-@@ -1366,6 +1386,24 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
+@@ -1467,6 +1487,24 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
    }) as SlackbotV2BlockActionPayload
  }
  
@@ -896,10 +946,10 @@ index 9a499872..b9d3d517 100644
    if (!payload.action_ts) return undefined
    return [
 diff --git a/services/slackbotv2/src/session-api.ts b/services/slackbotv2/src/session-api.ts
-index 5fe141f0..5541f14f 100644
+index 600bfee4..12d40164 100644
 --- a/services/slackbotv2/src/session-api.ts
 +++ b/services/slackbotv2/src/session-api.ts
-@@ -567,6 +567,7 @@ export async function forwardToSessionApi(
+@@ -568,6 +568,7 @@ export async function forwardToSessionApi(
  }
  
  export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
@@ -907,7 +957,7 @@ index 5fe141f0..5541f14f 100644
  /** Emitted by api-rs once a follow-up message reaches an active execution. */
  export const SESSION_STEERING_DELIVERED_EVENT = 'session.steering_delivered'
  /** Emitted by api-rs when a follow-up could not reach the still-running execution. */
-@@ -654,6 +655,7 @@ export async function dispatchSlackBlockAction(
+@@ -655,6 +656,7 @@ export async function dispatchSlackBlockAction(
    options: SlackbotV2Options,
    payload: SlackbotV2BlockActionPayload
  ): Promise<JsonObject | undefined> {
@@ -915,7 +965,7 @@ index 5fe141f0..5541f14f 100644
    const action = `dispatch Slack block action ${payload.action_id}`
    const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
    let body: JsonObject = { event_name: `slack.block_action.${payload.action_id}`, payload }
-@@ -718,6 +720,39 @@ export async function dispatchSlackBlockAction(
+@@ -719,6 +721,39 @@ export async function dispatchSlackBlockAction(
    }
  }
  
@@ -956,7 +1006,7 @@ index 5fe141f0..5541f14f 100644
    options: SlackbotV2Options,
    input: Pick<ForwardSessionInput, 'afterEventId' | 'executionId' | 'onEventId' | 'threadId' | 'trace'>
 diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
-index e1affcaa..2daf62c9 100644
+index b7623411..a42f0c96 100644
 --- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
 +++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
 @@ -711,6 +711,131 @@ describe('slackbotv2', () => {
@@ -1092,7 +1142,7 @@ index e1affcaa..2daf62c9 100644
      { name: 'untrusted button', status: 403, body: { error: 'invalid or untrusted workflow button' }, expected: 'could not be verified' },
      ...[
 diff --git a/services/slackbotv2/test/session-api.test.ts b/services/slackbotv2/test/session-api.test.ts
-index aedd276c..d9a4f1e2 100644
+index 7a2cab20..a1f4f7cd 100644
 --- a/services/slackbotv2/test/session-api.test.ts
 +++ b/services/slackbotv2/test/session-api.test.ts
 @@ -3,6 +3,7 @@ import {
@@ -1103,7 +1153,7 @@ index aedd276c..d9a4f1e2 100644
    forwardToSessionApi,
    harnessRestartPreamble,
    interruptSessionExecution,
-@@ -19,6 +20,7 @@ import type {
+@@ -20,6 +21,7 @@ import type {
    JsonObject,
    JsonValue,
    SlackbotV2ApiMessage,
@@ -1111,7 +1161,7 @@ index aedd276c..d9a4f1e2 100644
    SlackbotV2Options
  } from '../src/types'
  
-@@ -128,6 +130,42 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
+@@ -129,6 +131,42 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
    }
  }
  

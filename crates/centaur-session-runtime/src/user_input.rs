@@ -117,9 +117,11 @@ impl SessionRuntime {
             execution_traceparent(&execution).map(ToOwned::to_owned),
             Some(execution_id),
         );
+        // A control line like interrupt: no sandbox-access note to prepend.
         let input_lines = input_lines_with_session_context(
             thread_key,
             &trace,
+            None,
             &[json!({
                 "type":"user_input_response",
                 "thread_key":thread_key.as_str(),
