@@ -47,7 +47,7 @@ jobs:
 
   web:
     name: Console web (typecheck, lint, test, build)
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
     defaults:
