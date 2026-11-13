@@ -1,5 +1,5 @@
 diff --git a/crates/centaur-api-server/src/error.rs b/crates/centaur-api-server/src/error.rs
-index e6797fdc..79ffd6ca 100644
+index 8de33642..98735796 100644
 --- a/crates/centaur-api-server/src/error.rs
 +++ b/crates/centaur-api-server/src/error.rs
 @@ -4,7 +4,7 @@ use axum::{
@@ -28,10 +28,10 @@ index e6797fdc..79ffd6ca 100644
              Self::Runtime(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {
                  StatusCode::NOT_FOUND
 diff --git a/crates/centaur-api-server/src/lib.rs b/crates/centaur-api-server/src/lib.rs
-index d6101fb4..8d8f86b3 100644
+index 8ff78a20..e114f0b0 100644
 --- a/crates/centaur-api-server/src/lib.rs
 +++ b/crates/centaur-api-server/src/lib.rs
-@@ -298,6 +298,66 @@ mod tests {
+@@ -299,6 +299,66 @@ mod tests {
          }
      }
  
@@ -99,10 +99,10 @@ index d6101fb4..8d8f86b3 100644
      async fn console_service_jwt_passes_every_capability_route_family() {
          for request in [
 diff --git a/crates/centaur-api-server/src/routes.rs b/crates/centaur-api-server/src/routes.rs
-index 0e10da99..4b53b2b2 100644
+index 9e3b4d91..147dd9c1 100644
 --- a/crates/centaur-api-server/src/routes.rs
 +++ b/crates/centaur-api-server/src/routes.rs
-@@ -52,12 +52,12 @@ use crate::{
+@@ -56,12 +56,12 @@ use crate::{
      slack_external_teams::{get_slack_external_team_ids, replace_slack_external_team_ids},
      slack_proxy::slack_proxy_router,
      types::{
@@ -121,7 +121,7 @@ index 0e10da99..4b53b2b2 100644
      },
  };
  
-@@ -224,6 +224,14 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
+@@ -247,6 +247,14 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
              post(interrupt_session_execution),
          )
          .route("/api/session/{thread_key}/events", get(stream_events))
@@ -136,7 +136,7 @@ index 0e10da99..4b53b2b2 100644
          .route(
              "/api/session/{thread_key}/pause",
              post(pause_session_sandbox),
-@@ -484,13 +492,16 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
+@@ -569,13 +577,16 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
          | (&Method::POST, "/api/tool-approvals/{id}/read")
          | (&Method::POST, "/api/tool-approvals/{id}/cancel") => Some(RouteAccess::ConsoleOnly),
          (&Method::GET, "/api/session/{thread_key}")
@@ -154,8 +154,8 @@ index 0e10da99..4b53b2b2 100644
 +        | (&Method::POST, "/api/session/{thread_key}/user-input/{request_id}") => {
              capability(Capability::SessionsWrite)
          }
-         (&Method::POST, "/api/sandboxes/drain")
-@@ -789,6 +800,62 @@ async fn interrupt_session_execution(
+         (&Method::DELETE, "/api/session/{thread_key}/sandbox") => {
+@@ -933,6 +944,62 @@ async fn interrupt_session_execution(
      }))
  }
  
@@ -219,10 +219,10 @@ index 0e10da99..4b53b2b2 100644
  struct DrainQuery {
      /// When true, stop every non-terminal sandbox. Defaults to false, which
 diff --git a/crates/centaur-api-server/src/types.rs b/crates/centaur-api-server/src/types.rs
-index f910a3e2..eb6a3790 100644
+index d8b22113..596cd8f7 100644
 --- a/crates/centaur-api-server/src/types.rs
 +++ b/crates/centaur-api-server/src/types.rs
-@@ -130,6 +130,13 @@ pub struct InterruptSessionExecutionRequest {
+@@ -134,6 +134,13 @@ pub struct InterruptSessionExecutionRequest {
      pub reason: Option<String>,
  }
  
@@ -420,7 +420,7 @@ index 00000000..4cedec20
 +    }
 +}
 diff --git a/crates/centaur-session-runtime/src/lib.rs b/crates/centaur-session-runtime/src/lib.rs
-index 12349cc7..ae9b9190 100644
+index 39e963ee..52678300 100644
 --- a/crates/centaur-session-runtime/src/lib.rs
 +++ b/crates/centaur-session-runtime/src/lib.rs
 @@ -1,6 +1,7 @@
@@ -439,7 +439,7 @@ index 12349cc7..ae9b9190 100644
  
  pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
  pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
-@@ -2255,6 +2257,7 @@ impl SessionRuntime {
+@@ -2416,6 +2418,7 @@ impl SessionRuntime {
              validate_input_lines(&input_lines)?;
              let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
              let requester_metadata = metadata.clone();
@@ -447,7 +447,7 @@ index 12349cc7..ae9b9190 100644
              let persona_model = self.persona_model(&session);
              let input_lines = match persona_model {
                  Some(model) => input_lines_with_persona_model(input_lines, model),
-@@ -5141,6 +5144,12 @@ async fn run_stdout_pump(
+@@ -5382,6 +5385,12 @@ async fn run_stdout_pump(
              else {
                  continue;
              };
@@ -460,7 +460,7 @@ index 12349cc7..ae9b9190 100644
              let first_token_execution = active_execution
                  .as_ref()
                  .filter(|execution| {
-@@ -6285,6 +6294,7 @@ fn execution_duration(execution: &SessionExecution) -> Option<Duration> {
+@@ -6496,6 +6505,7 @@ fn execution_duration(execution: &SessionExecution) -> Option<Duration> {
  fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
      match error {
          SessionRuntimeError::BadRequest(_) => "bad_request",
@@ -468,7 +468,7 @@ index 12349cc7..ae9b9190 100644
          SessionRuntimeError::ShuttingDown => "shutting_down",
          SessionRuntimeError::Store(_) => "store",
          SessionRuntimeError::Sandbox(SandboxError::NotFound(_)) => "sandbox_not_found",
-@@ -6914,9 +6924,12 @@ fn input_line_with_session_context(
+@@ -7126,9 +7136,12 @@ fn input_line_with_session_context(
              .entry("trace_metadata")
              .or_insert_with(|| Value::Object(serde_json::Map::new()));
          if let Value::Object(metadata) = trace_metadata {
@@ -483,8 +483,8 @@ index 12349cc7..ae9b9190 100644
 +            );
          }
      }
-     prepend_chat_surface_note(map, thread_key);
-@@ -7607,6 +7620,8 @@ fn terminal_output_from_lines(lines: &[String]) -> Option<TerminalOutput> {
+     if let Some(capabilities) = capabilities {
+@@ -7829,6 +7842,8 @@ fn terminal_output_from_lines(lines: &[String]) -> Option<TerminalOutput> {
  pub enum SessionRuntimeError {
      #[error("{0}")]
      BadRequest(String),
@@ -493,16 +493,16 @@ index 12349cc7..ae9b9190 100644
      #[error("control plane is shutting down")]
      ShuttingDown,
      #[error(transparent)]
-@@ -9096,7 +9111,7 @@ mod tests {
-         let line = input_line_with_session_context(
+@@ -9318,7 +9333,7 @@ mod tests {
              &thread_key,
              &trace,
+             None,
 -            r#"{"type":"user","trace_metadata":{"action":"execute"}}"#,
 +            r#"{"type":"user","trace_metadata":{"action":"execute","execution_id":"caller-supplied"}}"#,
          );
          let value: Value = serde_json::from_str(&line).unwrap();
  
-@@ -10047,6 +10062,139 @@ mod adoption_tests {
+@@ -10381,6 +10396,139 @@ mod adoption_tests {
          )
      }
  
@@ -644,10 +644,10 @@ index 12349cc7..ae9b9190 100644
          let Some(store) = test_store().await else {
 diff --git a/crates/centaur-session-runtime/src/user_input.rs b/crates/centaur-session-runtime/src/user_input.rs
 new file mode 100644
-index 00000000..ea27546c
+index 00000000..96bafd7f
 --- /dev/null
 +++ b/crates/centaur-session-runtime/src/user_input.rs
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,265 @@
 +use centaur_session_core::user_input::{
 +    SessionUserInputRequest, UserInputAnswers, UserInputQuestion, validate_user_input_questions,
 +};
@@ -767,9 +767,11 @@ index 00000000..ea27546c
 +            execution_traceparent(&execution).map(ToOwned::to_owned),
 +            Some(execution_id),
 +        );
++        // A control line like interrupt: no sandbox-access note to prepend.
 +        let input_lines = input_lines_with_session_context(
 +            thread_key,
 +            &trace,
++            None,
 +            &[json!({
 +                "type":"user_input_response",
 +                "thread_key":thread_key.as_str(),
@@ -966,7 +968,7 @@ index 00000000..bbe6b0b1
 +    after update of status on session_executions
 +    for each row execute function cancel_execution_user_input_requests();
 diff --git a/crates/centaur-session-sqlx/src/lib.rs b/crates/centaur-session-sqlx/src/lib.rs
-index e3d44c8f..87e1c6c9 100644
+index 11623ebd..dfd91119 100644
 --- a/crates/centaur-session-sqlx/src/lib.rs
 +++ b/crates/centaur-session-sqlx/src/lib.rs
 @@ -23,6 +23,9 @@ use time::{Duration as TimeDuration, OffsetDateTime};
@@ -1674,7 +1676,7 @@ index d57a0ad6..f12f9939 100644
      fn normalize(normalizer: &mut ClaudeEventNormalizer, event: Value) -> Vec<NormalizedEvent> {
          normalizer.normalize(serde_json::from_value(event).unwrap())
 diff --git a/crates/harness-server/src/codex.rs b/crates/harness-server/src/codex.rs
-index 16389531..26af63ac 100644
+index 6251798a..9ace7867 100644
 --- a/crates/harness-server/src/codex.rs
 +++ b/crates/harness-server/src/codex.rs
 @@ -19,6 +19,7 @@ use crate::server::{
@@ -1685,7 +1687,7 @@ index 16389531..26af63ac 100644
  use crate::{AppServerRuntime, HarnessServerError, Result};
  
  mod citations;
-@@ -159,6 +160,14 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
+@@ -157,6 +158,14 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
                  }
  
                  match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
@@ -1700,21 +1702,21 @@ index 16389531..26af63ac 100644
                      Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
                          if active_turn_tx
                              .send(CodexActiveTurnRequest::Interrupt)
-@@ -228,6 +237,11 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
-                 trace_context,
+@@ -227,6 +236,11 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
              }) => {
+                 crate::session_prompt::run_session_prompt_hooks(Some(&trace_context), "codex");
                  let traceparent = trace_context.effective_traceparent();
 +                let supports_user_input = trace_context
 +                    .metadata
 +                    .get("supports_user_input")
 +                    .and_then(Value::as_bool)
 +                    .unwrap_or(false);
-                 let model = model.or_else(|| config.default_model());
-                 let model_provider =
-                     config.model_provider_for(provider.as_deref(), model.as_deref());
-@@ -242,12 +256,13 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
-                 turn_active.store(true, Ordering::SeqCst);
-                 let result = (|| -> Result<()> {
+                 let requested_provider = provider
+                     .as_deref()
+                     .map(str::trim)
+@@ -267,12 +281,14 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
+                         codex = None;
+                     }
                      if let Some(child) = codex.as_mut()
 -                        && child.child.try_wait()?.is_some()
 +                        && (child.child.try_wait()?.is_some()
@@ -1723,12 +1725,13 @@ index 16389531..26af63ac 100644
                          codex = None;
                      }
                      if codex.is_none() {
--                        let mut child = CodexJsonRpcChild::spawn()?;
-+                        let mut child = CodexJsonRpcChild::spawn(supports_user_input)?;
+-                        let mut child = CodexJsonRpcChild::spawn(&model_provider)?;
++                        let mut child =
++                            CodexJsonRpcChild::spawn(&model_provider, supports_user_input)?;
                          initialize_codex(
                              &mut child,
                              &mut stdout,
-@@ -290,6 +305,10 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
+@@ -331,6 +347,10 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
                          &active_turn_rx,
                          traceparent.as_deref(),
                          &mut telemetry,
@@ -1739,7 +1742,7 @@ index 16389531..26af63ac 100644
                      )
                  })();
                  telemetry.finish(if result.is_ok() {
-@@ -319,6 +338,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
+@@ -360,6 +380,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()>
                  eprintln!("Codex blocks interrupt ignored: no active turn runs");
              }
              CodexBlocksReaderInput::Command(BlocksCommand::AttachmentChunk) => {}
@@ -1747,7 +1750,7 @@ index 16389531..26af63ac 100644
              CodexBlocksReaderInput::Error(error) => {
                  eprintln!("invalid Codex blocks input: {error}");
                  write_blocks_error(
-@@ -340,6 +360,7 @@ enum CodexBlocksReaderInput {
+@@ -381,6 +402,7 @@ enum CodexBlocksReaderInput {
  }
  
  enum CodexActiveTurnRequest {
@@ -1755,7 +1758,7 @@ index 16389531..26af63ac 100644
      Interrupt,
      Steer {
          input: Vec<UserInput>,
-@@ -393,7 +414,9 @@ fn run_codex_user_turn<W: Write>(
+@@ -433,7 +455,9 @@ fn run_codex_user_turn<W: Write>(
      active_turn_rx: &Receiver<CodexActiveTurnRequest>,
      traceparent: Option<&str>,
      telemetry: &mut TurnTelemetry,
@@ -1765,20 +1768,21 @@ index 16389531..26af63ac 100644
      let (model, model_provider) = model_and_provider;
      if thread_id.is_none() {
          let thread = start_or_resume_thread(
-@@ -586,13 +609,19 @@ struct CodexJsonRpcChild {
-     stdin: ChildStdin,
-     stdout: Receiver<io::Result<String>>,
-     citations: CodexCitationFilter,
+@@ -667,14 +691,20 @@ struct CodexJsonRpcChild {
+     /// The provider this app-server was launched on. Codex 0.166+ rejects
+     /// resume and input for a thread whose provider differs from it.
+     model_provider: String,
 +    questions: PendingQuestions,
 +    supports_user_input: bool,
  }
  
  impl CodexJsonRpcChild {
--    fn spawn() -> Result<Self> {
-+    fn spawn(supports_user_input: bool) -> Result<Self> {
+-    fn spawn(model_provider: &str) -> Result<Self> {
++    fn spawn(model_provider: &str, supports_user_input: bool) -> Result<Self> {
          let bin = codex_bin();
          let mut child = ProcessCommand::new(&bin)
-             .args(["app-server", "--listen", "stdio://"])
+             .args(["app-server", "--listen", "stdio://", "-c"])
+             .arg(model_provider_override(model_provider))
 +            .args([
 +                "-c",
 +                &format!("features.default_mode_request_user_input={supports_user_input}"),
@@ -1786,16 +1790,16 @@ index 16389531..26af63ac 100644
              .stdin(Stdio::piped())
              .stdout(Stdio::piped())
              .stderr(Stdio::piped())
-@@ -638,6 +667,8 @@ impl CodexJsonRpcChild {
-             stdin,
+@@ -721,6 +751,8 @@ impl CodexJsonRpcChild {
              stdout: stdout_rx,
              citations: CodexCitationFilter::default(),
+             model_provider: model_provider.to_owned(),
 +            questions: PendingQuestions::new(None, supports_user_input),
 +            supports_user_input,
          })
      }
  
-@@ -671,6 +702,64 @@ impl CodexJsonRpcChild {
+@@ -754,6 +786,64 @@ impl CodexJsonRpcChild {
          }))
      }
  
@@ -1860,7 +1864,7 @@ index 16389531..26af63ac 100644
      fn write_value(&mut self, value: &Value) -> Result<()> {
          let mut line = serde_json::to_vec(value)?;
          line.push(b'\n');
-@@ -693,7 +782,11 @@ impl CodexJsonRpcChild {
+@@ -776,7 +866,11 @@ impl CodexJsonRpcChild {
          loop {
              let value = self.read_value()?;
              if is_server_request(&value) {
@@ -1873,7 +1877,7 @@ index 16389531..26af63ac 100644
                  continue;
              }
              if response_id(&value) == Some(expected_id) {
-@@ -709,7 +802,23 @@ impl CodexJsonRpcChild {
+@@ -792,7 +886,23 @@ impl CodexJsonRpcChild {
                      .or(thread_id);
                  let turn_id = result.pointer("/turn/id").and_then(Value::as_str);
                  for notification in notifications {
@@ -1898,7 +1902,7 @@ index 16389531..26af63ac 100644
                          self.citations.write_value(stdout, &notification)?;
                      }
                  }
-@@ -738,7 +847,10 @@ impl CodexJsonRpcChild {
+@@ -821,7 +931,10 @@ impl CodexJsonRpcChild {
          traceparent: Option<&str>,
          telemetry: &mut TurnTelemetry,
      ) -> Result<TurnTermination> {
@@ -1910,7 +1914,7 @@ index 16389531..26af63ac 100644
          let mut interrupt_request_id = None;
          let mut steer_request_ids = HashSet::new();
          loop {
-@@ -750,13 +862,31 @@ impl CodexJsonRpcChild {
+@@ -833,13 +946,31 @@ impl CodexJsonRpcChild {
                  thread_id,
                  turn_id,
                  traceparent,
@@ -1943,7 +1947,7 @@ index 16389531..26af63ac 100644
                  continue;
              }
              if let Some(id) = response_id(&value) {
-@@ -795,6 +925,9 @@ impl CodexJsonRpcChild {
+@@ -878,6 +1009,9 @@ impl CodexJsonRpcChild {
                      }
                  }
                  GuardStep::ForwardThenDone(values) => {
@@ -1953,7 +1957,7 @@ index 16389531..26af63ac 100644
                      for value in &values {
                          telemetry.observe_wire_value(value);
                          self.citations.write_value(stdout, value)?;
-@@ -806,7 +939,7 @@ impl CodexJsonRpcChild {
+@@ -889,7 +1023,7 @@ impl CodexJsonRpcChild {
      }
  
      #[allow(clippy::too_many_arguments)]
@@ -1962,7 +1966,7 @@ index 16389531..26af63ac 100644
          &mut self,
          active_turn_rx: &Receiver<CodexActiveTurnRequest>,
          interrupt_request_id: &mut Option<i64>,
-@@ -815,9 +948,29 @@ impl CodexJsonRpcChild {
+@@ -898,9 +1032,29 @@ impl CodexJsonRpcChild {
          thread_id: &str,
          turn_id: &str,
          traceparent: Option<&str>,
@@ -1993,10 +1997,10 @@ index 16389531..26af63ac 100644
                      if interrupt_request_id.is_some() {
                          eprintln!("Codex blocks interrupt ignored: interrupt already requested");
 diff --git a/crates/harness-server/src/hermes.rs b/crates/harness-server/src/hermes.rs
-index d3912a22..6dbb9145 100644
+index 3cdd0148..4c8b5caf 100644
 --- a/crates/harness-server/src/hermes.rs
 +++ b/crates/harness-server/src/hermes.rs
-@@ -121,6 +121,9 @@ pub fn run_hermes_blocks_server() -> Result<()> {
+@@ -122,6 +122,9 @@ pub fn run_hermes_blocks_server() -> Result<()> {
                  eprintln!("Hermes blocks interrupt ignored: no active turn runs");
              }
              Ok(BlocksCommand::AttachmentChunk) => {}
@@ -2007,11 +2011,11 @@ index d3912a22..6dbb9145 100644
                  eprintln!("invalid Hermes blocks input: {error}");
                  write_blocks_error(&mut stdout, &thread_id, "input", error)?;
 diff --git a/crates/harness-server/src/lib.rs b/crates/harness-server/src/lib.rs
-index f9f0549d..d19daa09 100644
+index 665e9f73..f9b446c1 100644
 --- a/crates/harness-server/src/lib.rs
 +++ b/crates/harness-server/src/lib.rs
-@@ -13,6 +13,7 @@ pub mod protocol;
- mod server;
+@@ -15,6 +15,7 @@ mod server;
+ mod session_prompt;
  mod traits;
  mod turn;
 +pub mod user_input;
@@ -2019,7 +2023,7 @@ index f9f0549d..d19daa09 100644
  pub mod wire;
  
 diff --git a/crates/harness-server/src/server.rs b/crates/harness-server/src/server.rs
-index 6fae72c3..20e7abdc 100644
+index b52a9ddb..1f45bec6 100644
 --- a/crates/harness-server/src/server.rs
 +++ b/crates/harness-server/src/server.rs
 @@ -38,6 +38,7 @@ use crate::traits::{
@@ -2045,10 +2049,10 @@ index 6fae72c3..20e7abdc 100644
                      Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
                          if request_tx.send(ActiveTurnRequest::BlocksInterrupt).is_err() {
                              break;
-@@ -137,6 +146,15 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
-                 reasoning,
-                 trace_context,
-             }) => {
+@@ -141,6 +150,15 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
+                     Some(&trace_context),
+                     crate::otel::harness_name(harness.kind()),
+                 );
 +                let supports_user_input = trace_context
 +                    .metadata
 +                    .get("supports_user_input")
@@ -2061,7 +2065,7 @@ index 6fae72c3..20e7abdc 100644
                  if let Some(model) = model {
                      state.model = model;
                  }
-@@ -166,6 +184,7 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
+@@ -170,6 +188,7 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                  eprintln!("blocks interrupt ignored: no active turn runs");
              }
              BlocksReaderInput::Command(BlocksCommand::AttachmentChunk) => {}
@@ -2069,7 +2073,7 @@ index 6fae72c3..20e7abdc 100644
              BlocksReaderInput::Error(error) => {
                  eprintln!("invalid blocks input: {error}");
                  write_blocks_error(&mut stdout, &state.id, "input", error)?;
-@@ -222,6 +241,9 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
+@@ -226,6 +245,9 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
              ActiveTurnRequest::BlocksInterrupt => {
                  eprintln!("blocks interrupt ignored: no active turn runs");
              }
@@ -2079,7 +2083,7 @@ index 6fae72c3..20e7abdc 100644
          }
      }
  
-@@ -270,6 +292,7 @@ enum BlocksReaderInput {
+@@ -274,6 +296,7 @@ enum BlocksReaderInput {
  enum ActiveTurnRequest {
      JsonRpc(JSONRPCRequest),
      BlocksInterrupt,
@@ -2087,7 +2091,7 @@ index 6fae72c3..20e7abdc 100644
  }
  
  fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
-@@ -279,6 +302,7 @@ fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
+@@ -283,6 +306,7 @@ fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
  #[derive(Debug)]
  #[allow(clippy::large_enum_variant)]
  pub(crate) enum BlocksCommand {
@@ -2095,7 +2099,7 @@ index 6fae72c3..20e7abdc 100644
      User {
          input: Vec<UserInput>,
          client_user_message_id: Option<String>,
-@@ -431,6 +455,9 @@ pub(crate) fn parse_blocks_line_with_state(
+@@ -435,6 +459,9 @@ pub(crate) fn parse_blocks_line_with_state(
          })?;
  
      match parsed.kind.as_str() {
@@ -2105,7 +2109,7 @@ index 6fae72c3..20e7abdc 100644
          "user" => {
              let trace_context = parsed.trace_context();
              let content = parsed
-@@ -1026,6 +1053,7 @@ fn resumed_thread_state<H: HarnessServer>(
+@@ -1030,6 +1057,7 @@ fn resumed_thread_state<H: HarnessServer>(
          completed_turns: Vec::new(),
          process: None,
          thread_started_sent: false,
@@ -2113,7 +2117,7 @@ index 6fae72c3..20e7abdc 100644
      })
  }
  
-@@ -1182,6 +1210,9 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
+@@ -1186,6 +1214,9 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
          stdout,
          request_rx,
          &mut telemetry,
@@ -2123,7 +2127,7 @@ index 6fae72c3..20e7abdc 100644
      ) {
          Ok(Some(turn)) => {
              telemetry.finish(TelemetryTurnStatus::Completed);
-@@ -1241,6 +1272,7 @@ fn finish_turn_with_error<W: Write>(
+@@ -1245,6 +1276,7 @@ fn finish_turn_with_error<W: Write>(
      Ok(())
  }
  
@@ -2131,7 +2135,7 @@ index 6fae72c3..20e7abdc 100644
  fn run_harness_turn<H: HarnessServer, W: Write>(
      harness: &H,
      state: &mut ThreadState,
-@@ -1249,6 +1281,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+@@ -1253,6 +1285,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
      stdout: &mut W,
      request_rx: &Receiver<ActiveTurnRequest>,
      telemetry: &mut TurnTelemetry,
@@ -2139,7 +2143,7 @@ index 6fae72c3..20e7abdc 100644
  ) -> Result<Option<Turn>> {
      ensure_harness_process(harness, state)?;
      {
-@@ -1284,13 +1317,38 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+@@ -1288,13 +1321,38 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
      let mut last_session_id = state.harness_session_id.clone();
      let mut event_normalizer = H::EventNormalizer::default();
      let mut completed_turn = None;
@@ -2178,7 +2182,7 @@ index 6fae72c3..20e7abdc 100644
                  state.process = None;
                  return Err(HarnessServerError::TurnInterrupted {
                      kind: harness.kind(),
-@@ -1317,6 +1375,48 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+@@ -1321,6 +1379,48 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                  if trimmed.is_empty() {
                      continue;
                  }
@@ -2227,7 +2231,7 @@ index 6fae72c3..20e7abdc 100644
                  let event = harness.parse_stdout_line(trimmed)?;
                  let normalized_events = harness.normalize_events(&mut event_normalizer, event)?;
                  let mut terminal_stop = false;
-@@ -1335,7 +1435,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+@@ -1339,7 +1439,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                      terminal_stop |=
                          settle_window.is_some() && normalized.is_terminal_assistant_stop();
                  }
@@ -2236,7 +2240,7 @@ index 6fae72c3..20e7abdc 100644
                      match settle_window {
                          Some(window) if terminal_stop && window.is_zero() => terminal = true,
                          Some(window) if terminal_stop || settle_deadline.is_some() => {
-@@ -1344,9 +1444,11 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+@@ -1348,9 +1448,11 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                          _ => {}
                      }
                  }
@@ -2251,7 +2255,7 @@ index 6fae72c3..20e7abdc 100644
                  };
              }
              Err(RecvTimeoutError::Timeout)
-@@ -1383,6 +1485,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+@@ -1387,6 +1489,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
              }
          }
          if terminal {
@@ -2688,7 +2692,7 @@ index 00000000..a561ae6c
 +    }
 +}
 diff --git a/crates/harness-server/tests/app_server_stdio.rs b/crates/harness-server/tests/app_server_stdio.rs
-index bac4aa95..14dc8b1a 100644
+index 1f4112d4..f12d0716 100644
 --- a/crates/harness-server/tests/app_server_stdio.rs
 +++ b/crates/harness-server/tests/app_server_stdio.rs
 @@ -104,6 +104,219 @@ fn fake_claude_app_server_streams_codex_v2_notifications() {
@@ -2911,7 +2915,7 @@ index bac4aa95..14dc8b1a 100644
  #[test]
  fn fake_claude_app_server_completes_on_stop_sequence_without_result() {
      let fake_claude = concat!(
-@@ -2522,7 +2735,10 @@ impl RawProcess {
+@@ -2659,7 +2872,10 @@ impl RawProcess {
  fn validate_jsonrpc_value(value: &Value, allow_error: bool) {
      let has_id = value.get("id").is_some();
      if value.get("method").is_some() {
@@ -2983,7 +2987,7 @@ index 3a22f283..e81f0a08 100644
      type: 'block_actions',
      team: { id: TEAM.id, domain: TEAM.domain },
 diff --git a/e2e/fakes/model-server.ts b/e2e/fakes/model-server.ts
-index 8cff5783..c764d810 100644
+index 98cdfbdb..e93ea52e 100644
 --- a/e2e/fakes/model-server.ts
 +++ b/e2e/fakes/model-server.ts
 @@ -16,7 +16,8 @@ import { randomUUID } from 'node:crypto'
@@ -2996,7 +3000,7 @@ index 8cff5783..c764d810 100644
  /** A request a tool command made to the echo path, and the test credential it carried. */
  type Echo = { at: string; match: string; credential?: string }
  type Recorded = {
-@@ -148,7 +149,10 @@ function openaiEvents(
+@@ -150,7 +151,10 @@ function openaiEvents(
    const text = reply?.text ?? 'ok'
    const responseId = `resp_${randomUUID()}`
    const itemId = `msg_${randomUUID()}`
@@ -3008,7 +3012,7 @@ index 8cff5783..c764d810 100644
    if (toolCall) {
      const output = (status: string) => ({
        id: responseId, object: 'response', model: body.model, status, output: [toolCall],
-@@ -220,6 +224,20 @@ async function anthropicMessage(path: string, caller: Caller, body: any): Promis
+@@ -222,6 +226,20 @@ async function anthropicMessage(path: string, caller: Caller, body: any): Promis
      content: [] as unknown[], stop_reason: null as string | null, stop_sequence: null,
      usage: { input_tokens: 0, output_tokens: 0 }
    }
@@ -3029,7 +3033,7 @@ index 8cff5783..c764d810 100644
    if (!body.stream) {
      return Response.json({ ...message, content: [{ type: 'text', text }], stop_reason: 'end_turn' })
    }
-@@ -240,7 +258,10 @@ function record(
+@@ -242,7 +260,10 @@ function record(
    body: any,
    conversation: unknown[]
  ): Reply | undefined {
@@ -3041,7 +3045,7 @@ index 8cff5783..c764d810 100644
    requests.push({
      at: new Date().toISOString(),
      provider,
-@@ -255,6 +276,12 @@ function record(
+@@ -258,6 +279,12 @@ function record(
    return reply
  }
  
@@ -3054,7 +3058,7 @@ index 8cff5783..c764d810 100644
  /** Whether this request returns the output of a tool call the model made. */
  function hasToolOutput(input: unknown): boolean {
    return Array.isArray(input) && input.some((item: any) => String(item?.type ?? '').endsWith('_call_output'))
-@@ -270,6 +297,15 @@ function declaredTools(conversation: unknown[]): any[] {
+@@ -273,6 +300,15 @@ function declaredTools(conversation: unknown[]): any[] {
    return flatten(conversation.flatMap((item: any) => (item?.type === 'additional_tools' ? item.tools ?? [] : [])))
  }
  
@@ -3071,7 +3075,7 @@ index 8cff5783..c764d810 100644
  function shellCall(tools: any[], command: string): Record<string, unknown> {
    const callId = `call_${randomUUID()}`
 diff --git a/e2e/lib/index.ts b/e2e/lib/index.ts
-index 87de2a4c..c0cf9c6f 100644
+index de014f1b..7b8c2189 100644
 --- a/e2e/lib/index.ts
 +++ b/e2e/lib/index.ts
 @@ -30,7 +30,8 @@ export type ProviderError = { status: number; type: string; code?: string; messa
@@ -3084,7 +3088,7 @@ index 87de2a4c..c0cf9c6f 100644
  
  export type Execution = { execution_id: string; status: string; error: string | null }
  
-@@ -80,7 +81,7 @@ export type SlackMessage = {
+@@ -81,7 +82,7 @@ export type SlackMessage = {
    bot_id?: string
    thread_ts?: string
    streaming?: boolean
@@ -3093,9 +3097,9 @@ index 87de2a4c..c0cf9c6f 100644
    reactions?: Array<{ name: string; users: string[] }>
  }
  
-@@ -127,6 +128,10 @@ export const model = {
-   runs(command: string, text = 'Ran it.'): Script {
-     return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: command }
+@@ -148,6 +149,10 @@ export const model = {
+     }
+     throw new Error(`the harness returned no command output for script ${script.token}`)
    },
 +  /** Ask through the harness's native question tool, then finish after its answer. */
 +  asks(questions: Question[], text = 'Thanks. The task continued.'): Script {
@@ -3104,7 +3108,7 @@ index 87de2a4c..c0cf9c6f 100644
    /**
     * The X-E2E-Credential header of each request a command made to
     * https://<provider host>/_e2e/echo/<match>, oldest first.
-@@ -277,6 +282,15 @@ export const slack = {
+@@ -313,6 +318,15 @@ export const slack = {
      const response = await fetch(`${slackUrl}/_e2e/ephemeral?user=${encodeURIComponent(user.id)}`)
      return response.json()
    },
@@ -3120,7 +3124,7 @@ index 87de2a4c..c0cf9c6f 100644
    /**
     * Clicks a block element on a message, as `as` (USER by default). `value`
     * forges the element's value; `actionTs` repeats an earlier click's delivery.
-@@ -441,7 +455,7 @@ export class Thread {
+@@ -581,7 +595,7 @@ export class Thread {
      const seen = `execution ${JSON.stringify(execution)}`
      let lastReplies: SlackMessage[] = []
      const replies = await eventually(`reply to turn ${index + 1} of ${this.key}`, renderTimeoutMs, async () => {
@@ -3129,7 +3133,7 @@ index 87de2a4c..c0cf9c6f 100644
        return lastReplies.length > 0 && lastReplies.every(reply => !reply.streaming) ? lastReplies : undefined
      }).catch(error => {
        throw new Error(`${error.message}; ${seen}; replies ${JSON.stringify(lastReplies.map(({ ts, text, streaming }) => ({ ts, text, streaming })))}`)
-@@ -482,7 +496,12 @@ export class Thread {
+@@ -632,7 +646,12 @@ export class Thread {
        ) ready order by event_id`
    }
  
@@ -3143,7 +3147,7 @@ index 87de2a4c..c0cf9c6f 100644
      return db`
        select execution_id, status, error from session_executions
        where thread_key = ${this.key} order by created_at`
-@@ -526,12 +545,17 @@ async function registerScript(script: Script): Promise<void> {
+@@ -676,12 +695,17 @@ async function registerScript(script: Script): Promise<void> {
      method: 'POST',
      headers: { 'content-type': 'application/json' },
      body: JSON.stringify({
@@ -3363,10 +3367,10 @@ index 41e249d0..23efe474 100644
    return true
  }
 diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
-index 406e37ac..414b110e 100644
+index 4c314440..17e21b91 100644
 --- a/services/slackbotv2/src/index.ts
 +++ b/services/slackbotv2/src/index.ts
-@@ -56,6 +56,8 @@ import {
+@@ -69,6 +69,8 @@ import {
    SESSION_PROGRESS_UPDATE_EVENT,
    SESSION_STEERING_DELIVERED_EVENT,
    SESSION_STEERING_FAILED_EVENT,
@@ -3375,7 +3379,7 @@ index 406e37ac..414b110e 100644
    sessionStreamError,
    slackApiTimeoutMs,
    WORKFLOW_ACTION_PREFIX,
-@@ -90,6 +92,7 @@ import {
+@@ -110,6 +112,7 @@ import {
    slackStreamRecipientUserId
  } from './slack-events'
  import { isSlackStopCommand } from './stop-command'
@@ -3383,7 +3387,7 @@ index 406e37ac..414b110e 100644
  import {
    createSteeringReactionController,
    type SteeringReactionAck,
-@@ -687,6 +690,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+@@ -711,6 +714,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
          return new globalThis.Response('ok', { status: 200 })
        }
        const interaction = parseSlackWebhookPayload(rawBody)
@@ -3396,7 +3400,7 @@ index 406e37ac..414b110e 100644
        const workflowAction = interaction?.type === 'block_actions'
          && Array.isArray(interaction.actions)
          && interaction.actions.some(action => isJsonObject(action)
-@@ -694,10 +703,6 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+@@ -718,10 +727,6 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
            && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
        const awaitHandoff = workflowAction || shouldAwaitSlackHandoff(rawBody)
        const handoffTasks: Promise<unknown>[] = []
@@ -3407,7 +3411,7 @@ index 406e37ac..414b110e 100644
        const context: SlackbotV2RequestContext = { waitUntil: keepAlive }
        const response = await requestContext.run(context, () => {
          return chat.webhooks.slack(c.req.raw, {
-@@ -2366,7 +2371,7 @@ async function renderExecutionAttempt(
+@@ -2543,7 +2548,7 @@ async function renderExecutionAttempt(
      // otherwise be misclassified as retryable session API errors and re-render
      // the whole stream instead of posting the durable final answer.
      const answerLost = slackAnswerLost(error)
@@ -3416,15 +3420,15 @@ index 406e37ac..414b110e 100644
        retry = true
        outcome = 'retry'
        traceLog(
-@@ -2947,6 +2952,7 @@ async function recoverRenderObligation(
-   }
+@@ -3197,6 +3202,7 @@ async function recoverRenderObligation(
  
    let rendered = false
+   const generativeUi = newGenerativeUiCapture(options)
 +  let questionsDeferred = false
    try {
      await thread.setState({
        activeExecution: true,
-@@ -2987,6 +2993,11 @@ async function recoverRenderObligation(
+@@ -3241,6 +3247,11 @@ async function recoverRenderObligation(
        divergence_reconciled: divergenceReconciled
      })
    } catch (error) {
@@ -3436,7 +3440,7 @@ index 406e37ac..414b110e 100644
      const answerLost = slackAnswerLost(error)
      if (answerLost === false) {
        // The recovered stream broke only after the final answer became
-@@ -3047,7 +3058,7 @@ async function recoverRenderObligation(
+@@ -3304,7 +3315,7 @@ async function recoverRenderObligation(
    } finally {
      const latest = (await thread.state) ?? {}
      await thread.setState({
@@ -3445,7 +3449,7 @@ index 406e37ac..414b110e 100644
        lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
        ...(rendered ? { renderObligation: null } : {})
      })
-@@ -4398,6 +4409,16 @@ async function* restoreAssistantStatusAfterSteering(
+@@ -4815,6 +4826,16 @@ async function* restoreAssistantStatusAfterSteering(
    answerStream?: AnswerStreamProgress
  ): AsyncIterable<SlackbotV2RendererSource> {
    for await (const event of stream) {
@@ -3463,7 +3467,7 @@ index 406e37ac..414b110e 100644
        await postProgressUpdate(thread, event, tracker, options, trace, answerStream)
        continue
 diff --git a/services/slackbotv2/src/session-api.ts b/services/slackbotv2/src/session-api.ts
-index 679c5f0c..468c7ea6 100644
+index 0e729ef5..130ab8c1 100644
 --- a/services/slackbotv2/src/session-api.ts
 +++ b/services/slackbotv2/src/session-api.ts
 @@ -1,5 +1,6 @@
@@ -3473,7 +3477,7 @@ index 679c5f0c..468c7ea6 100644
  import { isRetryableCodexErrorNotification } from '@centaur/rendering'
  import type { Attachment, LinkPreview, Message } from 'chat'
  import { isHarnessEnabled } from './overrides'
-@@ -573,6 +574,47 @@ export const SESSION_STEERING_FAILED_EVENT = 'session.steering_failed'
+@@ -574,6 +575,47 @@ export const SESSION_STEERING_FAILED_EVENT = 'session.steering_failed'
  /** Emitted by api-rs while a long execution is still running. */
  export const SESSION_PROGRESS_UPDATE_EVENT = 'session.progress_update'
  
@@ -3521,7 +3525,7 @@ index 679c5f0c..468c7ea6 100644
  const approvalDecisionMessages: Record<string, string> = {
    not_approver: 'You are not an approver for this action. Ask a designated approver to review it.',
    self_approval_not_allowed: 'You requested this action, and self-approval is disabled. Ask another designated approver to decide, or have someone else submit a new request.',
-@@ -1454,6 +1496,7 @@ async function executeSession(
+@@ -1456,6 +1498,7 @@ async function executeSession(
        message,
        {
          action: 'execute',
@@ -3529,7 +3533,7 @@ index 679c5f0c..468c7ea6 100644
          ...(recordedModel ? { model: recordedModel } : {}),
          ...(metadataHarnessType ? { harness_type: metadataHarnessType } : {})
        },
-@@ -1776,7 +1819,10 @@ function toCodexInputLineWithStaged(
+@@ -1783,7 +1826,10 @@ function toCodexInputLineWithStaged(
    return JSON.stringify({
      type: 'user',
      thread_key: threadId,
@@ -3541,7 +3545,7 @@ index 679c5f0c..468c7ea6 100644
      ...(model ? { model } : {}),
      ...(provider ? { provider } : {}),
      ...(reasoning ? { reasoning } : {}),
-@@ -2103,6 +2149,8 @@ async function* parseSessionEventStream(
+@@ -2115,6 +2161,8 @@ async function* parseSessionEventStream(
      if (
        event.event === 'session.activity_summary' ||
        event.event === SESSION_PROGRESS_UPDATE_EVENT ||
@@ -3585,10 +3589,10 @@ index e158707e..d67124ef 100644
    // Channel-level controls/buttons cannot establish or switch a thread owner.
    if (payload?.type !== 'event_callback') return false
 diff --git a/services/slackbotv2/src/types.ts b/services/slackbotv2/src/types.ts
-index 16bcc3d5..1ac0997b 100644
+index 3f32e0aa..6830b9ab 100644
 --- a/services/slackbotv2/src/types.ts
 +++ b/services/slackbotv2/src/types.ts
-@@ -106,6 +106,26 @@ export type SlackbotV2InterruptSessionResponse = {
+@@ -107,6 +107,26 @@ export type SlackbotV2InterruptSessionResponse = {
  
  export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
  
@@ -4101,10 +4105,10 @@ index aabf60d0..b19aac34 100644
 +  })
  })
 diff --git a/services/slackbotv2/test/session-api.test.ts b/services/slackbotv2/test/session-api.test.ts
-index dc9542d3..bff21d84 100644
+index e6db2021..57a57336 100644
 --- a/services/slackbotv2/test/session-api.test.ts
 +++ b/services/slackbotv2/test/session-api.test.ts
-@@ -128,6 +128,24 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
+@@ -129,6 +129,24 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
    }
  }
  
@@ -4129,7 +4133,7 @@ index dc9542d3..bff21d84 100644
  function executeBody(requests: RecordedRequest[]): Record<string, unknown> {
    const execute = requests.find(request => request.url.endsWith('/execute'))
    return (execute?.body ?? {}) as Record<string, unknown>
-@@ -228,8 +246,9 @@ describe('Slack home team API metadata', () => {
+@@ -229,8 +247,9 @@ describe('Slack home team API metadata', () => {
      expect(create.metadata?.slack_home_team_id).toBe('T_HOME')
      expect(append.messages?.[0]?.metadata?.slack_home_team_id).toBe('T_HOME')
      expect(execute.metadata?.slack_home_team_id).toBe('T_HOME')

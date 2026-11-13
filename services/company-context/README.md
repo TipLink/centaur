@@ -6,7 +6,7 @@ It also indexes Google Calendar events through the same Google broker credential
 
 It also indexes Granola meeting notes (title, summary, owner, and attendees) through each user's Granola MCP OAuth credential. Each sync lists the account's meetings from its checkpoint onward, fetches their details ten meetings at a time, and republishes a note only when its content changes. Transcripts are not indexed; the Granola tool fetches them on demand. Notes that no live Granola credential still observes are removed.
 
-It also discovers the public and private Slack channels (and, when enabled, direct messages) each user belongs to, through the same per-user Slack broker credentials the Rails Console Slack DM sync uses. The app's bot token (`SLACK_BOT_TOKEN`) is synced as one more credential: it discovers the public and private channels the bot is a member of and can sync their history and files, but never its direct messages. While `COMPANY_CONTEXT_SLACK_USER_IDS` is set, the bot is synced only if the limit lists the bot's Slack user ID. Each discovery records the credential's Slack identity and its channel memberships; channels that no live Slack credential still observes are removed, along with their messages. The first discovery each cycle to list a conversation syncs its members and message history. Each sync replaces the conversation's members with those `conversations.members` lists, so everyone in a conversation can read it, including users without a Slack credential of their own and channels only the bot observes. A sync reads the conversation's configured history days (`COMPANY_CONTEXT_SLACK_HISTORY_DAYS`, overridden per conversation by `COMPANY_CONTEXT_SLACK_CHANNEL_HISTORY_DAYS`) whenever part of that span has not been synchronized yet, so raising a value backfills the older history; lowering one keeps messages already synchronized. Otherwise it reads from its previous sync, always rereading the last 72 hours so edits within that window are picked up. Threads are synced whenever a parent message read this way shows a new reply; replies to threads started more than 72 hours earlier are not picked up. Only one sync reads a conversation at a time. Messages are stored privately in the system schema. Each discovery cycle also lists the workspace users through the app's bot token (`SLACK_BOT_TOKEN`), so documents show names instead of user IDs; the bot token needs the `users:read` scope and belongs to the same Slack app, so it shares the same rate-limit schedule. Users are removed once no live credential in their workspace remains. Slack tasks run on their own `company_context_slack` queue and worker, except thread syncs, which run in order on the `company_context_slack_threads` queue so a large backlog of threads does not delay discovery and history syncs.
+It also discovers the public and private Slack channels (and, when enabled, direct messages) each user belongs to, through the same per-user Slack broker credentials the Rails Console Slack DM sync uses. The app's bot token (`SLACK_BOT_TOKEN`) is synced as one more credential: it discovers the public and private channels the bot is a member of and can sync their history and files, but never its direct messages. While `COMPANY_CONTEXT_SLACK_USER_IDS` is set, the bot is synced only if the limit lists the bot's Slack user ID. Each discovery records the credential's Slack identity and its channel memberships; channels that no live Slack credential still observes are removed, along with their messages. The first discovery each cycle to list a conversation syncs its members and message history. Each sync replaces the conversation's members with those `conversations.members` lists, so everyone in a conversation can read it, including users without a Slack credential of their own and channels only the bot observes. A sync reads the conversation's configured history days (`COMPANY_CONTEXT_SLACK_HISTORY_DAYS`, overridden per conversation by `COMPANY_CONTEXT_SLACK_CHANNEL_HISTORY_DAYS`) whenever part of that span has not been synchronized yet, so raising a value backfills the older history; lowering one keeps messages already synchronized. Otherwise it reads from its previous sync, always rereading the last `COMPANY_CONTEXT_SLACK_THREAD_REFRESH_DAYS` days so edits within that window are picked up. Threads are synced whenever a parent message read this way shows a new reply; replies to threads started before that window are not picked up. Only one sync reads a conversation at a time. Messages are stored privately in the system schema. Each discovery cycle also lists the workspace users through the app's bot token (`SLACK_BOT_TOKEN`), so documents show names instead of user IDs; the bot token needs the `users:read` scope and belongs to the same Slack app, so it shares the same rate-limit schedule. Users are removed once no live credential in their workspace remains. Slack tasks run on their own `company_context_slack` queue and worker, except thread syncs, which run in order on the `company_context_slack_threads` queue so a large backlog of threads does not delay discovery and history syncs.
 
 It also projects custom documents, such as imports, notes, and memory, that
 principals write through the [custom documents API](#custom-documents-api) or
@@ -105,7 +105,6 @@ users or conversations still observed.
 Common optional settings:
 
 - `IRON_CONTROL_DATABASE_NAME`
-- `CENTAUR_API_JWT_AUDIENCE` (default `centaur-api`) and `CENTAUR_API_JWT_ISSUER` (default `centaur-console`): must match the Console's API JWT settings
 - `COMPANY_CONTEXT_GOOGLE_OAUTH_APP_SLUG` (default `google`)
 - `COMPANY_CONTEXT_GRANOLA_OAUTH_APP_SLUG` (default `granola`)
 - `COMPANY_CONTEXT_SLACK_OAUTH_APP_SLUG` (default `slack`)
@@ -125,6 +124,7 @@ Common optional settings:
 - `COMPANY_CONTEXT_SLACK_DISCOVERY_INTERVAL_SECONDS` (default `1800`)
 - `COMPANY_CONTEXT_SLACK_HISTORY_DAYS` (default `90`, at most `36500`)
 - `COMPANY_CONTEXT_SLACK_CHANNEL_HISTORY_DAYS`: comma-separated `CONVERSATION_ID=DAYS` overrides, e.g. `C0123456789=3650`
+- `COMPANY_CONTEXT_SLACK_THREAD_REFRESH_DAYS` (default `7`, at most `36500`)
 - `COMPANY_CONTEXT_SLACK_RATE_LIMIT_SHARE` (default `0.3`, greater than 0 and at most 1)
 - `COMPANY_CONTEXT_SLACK_WORKER_CONCURRENCY` (default `4`)
 - `COMPANY_CONTEXT_SLACK_THREAD_WORKER_CONCURRENCY` (default `1`)
@@ -138,6 +138,7 @@ Common optional settings:
 - `COMPANY_CONTEXT_WORKER_CONCURRENCY` (default `4`)
 - `COMPANY_CONTEXT_EMBEDDINGS_MODEL` (default `text-embedding-3-small`)
 - `COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS` (currently required to be `1536`)
+- `COMPANY_CONTEXT_EMBEDDINGS_MAX_QUERY_DISTANCE` (default `0.8`, greater than 0 and at most 2): the largest cosine distance from the query at which a document counts as a semantic match
 
 ## Backfilling newly supported Drive file types
 
@@ -210,11 +211,14 @@ documents, Calendar events, Granola notes, and custom documents.
     "sources": ["archive"],
     "metadata": { "author": "Ada" }
   },
-  "limit": 10
+  "mode": "hybrid",
+  "limit": 10,
+  "cursor": null
 }
 ```
 
-`filters`, each filter, and `limit` are optional; unknown fields are rejected.
+`mode`, `filters`, each filter, `limit`, and `cursor` are optional; unknown
+fields are rejected.
 Filters combine with AND:
 
 - `types`: the data types to search. Absent or empty searches every type.
@@ -241,9 +245,21 @@ Filters combine with AND:
 
 `channel_ids`, `file_ids`, `sources`, and `metadata` restrict the search to the types they apply to; a
 request whose types cannot satisfy every filter is rejected. `limit` defaults
-to 10 and is at most 50; there is no pagination, so narrow the filters instead.
-Keyword (BM25) and embedding similarity ranks are combined with reciprocal rank
-fusion; if the query cannot be embedded, keyword ranks alone are used.
+to 10 and is at most 50.
+
+`mode` is `hybrid` (the default) or `keyword`. A `keyword` search returns every
+matching document containing all of the query's terms, without ranking or
+embedding similarity, ordered by `occurred_at` (documents without one last)
+and then `document_id`, both descending; its results have no `score`. When more
+results follow, the response's `next_cursor` is passed as `cursor`, with the
+same query, mode, and filters, to fetch the next page; the cursor is valid only
+in `keyword` mode.
+
+A `hybrid` search is not paged, so narrow its filters instead. Keyword (BM25) and embedding similarity ranks, each taken across every
+searched type, are combined with reciprocal rank fusion. A keyword match is
+ranked by its similarity too, and a document farther from the query than
+`COMPANY_CONTEXT_EMBEDDINGS_MAX_QUERY_DISTANCE` gets no similarity rank. If the
+query cannot be embedded, keyword ranks alone are used.
 Calendar events have only a keyword rank, so they tend to rank below other
 types' documents that match both ways. A result's `score` is its fused rank
 score, comparable only within one response.
@@ -261,9 +277,12 @@ score, comparable only within one response.
       "score": 0.0325,
       "metadata": { "conversation_id": "C0123456789", "channel_name": "general" }
     }
-  ]
+  ],
+  "next_cursor": "2024-01-02T09:00:00Z|slack:C0123456789:2024-01-02:000000"
 }
 ```
+
+`next_cursor` is present only in a `keyword` response with more results.
 
 `text` is the full document chunk. `metadata` holds type-specific fields:
 conversation, channel, and message times for `slack_message`; file ID and file
@@ -305,8 +324,8 @@ one and returns it:
 ```
 
 `body` is required and must not be blank; the other fields are optional and unknown fields are
-rejected. `readers` defaults to the writer alone, and may name only the writer
-and its roles, by opaque or foreign ID, never `public`. The table's limits
+rejected. `readers` defaults to the writer alone, and may name only `public`,
+the writer, and its roles, by opaque or foreign ID. The table's limits
 apply. The service names each document by a UUIDv7, its `external_id`:
 
 ```json

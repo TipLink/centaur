@@ -62,9 +62,10 @@ my-tool --help
 The open-source tool inventory lives in this `tools/` tree and changes over time. To see what ships in a running sandbox, use `centaur-tools list`; private deployments may mount additional overlay tool directories.
 
 - `centaur-console`: inspect sandbox permissions and configured OAuth apps,
-  manage the linked user's scheduled tasks, and use `approvals` to request
-  configured guarded actions with complete payloads and Accept/Decline in Slack.
-  Approvals use the sandbox's Console entitlement, not provider secrets.
+  manage the linked user's or current Slack channel's scheduled tasks, and use
+  `approvals` to request configured guarded actions with complete payloads and
+  Accept/Decline in Slack. Approvals use the sandbox's Console entitlement, not
+  provider secrets.
 - `centaur-skills`: discover merged repository and overlay skills alongside
   private and public Console-authored skills, and manage Console skills.
 - `datadog`: query Datadog logs, metrics, monitors, hosts, and dashboards

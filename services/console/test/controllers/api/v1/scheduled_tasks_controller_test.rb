@@ -127,6 +127,39 @@ module Api
         assert_response :forbidden
       end
 
+      test "channel-owned tasks are cancelled from their channel only" do
+        channel = principals(:acme_channel)
+        channel.update_columns(slack_team_id: "T0123456789")
+        task = ScheduledTask.new(
+          name: "Channel digest",
+          prompt: "Summarize the channel",
+          principal: channel,
+          delivery_channel: "C0123456789",
+          cron_expression: "*/5 * * * *",
+          next_run_at: 5.minutes.from_now,
+          enabled: true
+        )
+        # Skips the live Slack bot-membership check; ownership is what matters here.
+        task.save!(validate: false)
+        path = "/api/v1/scheduled_tasks/#{task.oid}"
+
+        [ { team_id: "T2222222222" }, { channel_id: "C2222222222" }, { channel_id: "D0123456789" } ].each do |context|
+          assert_no_changes -> { task.reload.attributes } do
+            post "#{path}/cancel",
+                 params: { data: { team_id: "T0123456789", user_id: "U2222222222", channel_id: "C0123456789" }.merge(context) },
+                 headers: auth_headers, as: :json
+          end
+          assert_response :forbidden
+        end
+
+        post "#{path}/cancel",
+             params: { data: { team_id: "T0123456789", user_id: "U2222222222", channel_id: "C0123456789" } },
+             headers: auth_headers, as: :json
+        assert_response :success
+        assert_not task.reload.enabled?
+        assert_nil task.next_run_at
+      end
+
       test "user-addressed reports can be cancelled by that owner in a DM" do
         @task.update!(delivery_channel: "U0123456789")
 

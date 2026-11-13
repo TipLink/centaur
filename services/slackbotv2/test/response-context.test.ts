@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  buildProactiveMuteBlock,
   buildSlackResponseContextBlock,
   defaultModelForHarness,
   defaultReasoningForHarness,
@@ -8,6 +9,7 @@ import {
   harnessDisplayName,
   modelDisplayName,
   personaFallbackNotice,
+  proactiveMutedBlocks,
   reasoningForModel
 } from '../src/response-context'
 import claudeSettings from '../../../harness/claude/settings.json'
@@ -333,4 +335,23 @@ test('personaFallbackNotice describes the resolved fallback', () => {
     `Persona "honk" isn't available. Continuing without a persona.`
   )
   expect(personaFallbackNotice(undefined, 'eng')).toBeUndefined()
+})
+
+test('proactiveMutedBlocks relabels the mute button as muted', () => {
+  const answer = { type: 'section', text: { type: 'mrkdwn', text: 'Answer' } }
+  const footer = { type: 'context', elements: [{ type: 'mrkdwn', text: 'GPT-5' }] }
+  const mute = buildProactiveMuteBlock()
+  expect(proactiveMutedBlocks([answer, footer, mute])).toEqual([
+    answer,
+    footer,
+    {
+      ...mute,
+      elements: [{
+        ...mute.elements[0],
+        accessibility_label: 'Proactive replies are muted in this thread',
+        text: { type: 'plain_text', text: ':mute: Muted', emoji: true }
+      }]
+    }
+  ])
+  expect(proactiveMutedBlocks([answer, footer])).toBeUndefined()
 })

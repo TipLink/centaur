@@ -17,15 +17,15 @@ use axum::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
 use centaur_session_core::{ChatDestination, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SandboxRuntime, SessionPrincipalRegistrar,
-    SessionRuntime,
+    SessionRuntime, SessionRuntimeError,
 };
-use centaur_session_sqlx::PgSessionStore;
+use centaur_session_sqlx::{PgSessionStore, SessionStoreError};
 use centaur_telemetry::{
     PrometheusHandle, http_status_class, prometheus_handle, record_api_authentication,
     record_http_request_finished, record_http_request_started,
@@ -46,6 +46,10 @@ use tracing::Span;
 
 use crate::{
     ApiError,
+    api_clients::{
+        ApiClientContext, api_client_metadata, api_client_read_access_ended, end_events_when,
+        issue_api_client_token, refresh_api_client, select_principal,
+    },
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
     auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability},
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
@@ -66,6 +70,8 @@ pub struct AppState {
     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
     metrics: PrometheusHandle,
     auth: ApiAuthConfig,
+    /// Console's database, read for API client authentication.
+    console_db: Option<PgPool>,
     scheduled_task_controls: Option<centaur_iron_control::IronControlClient>,
 }
 
@@ -82,8 +88,25 @@ impl AppState {
             initialized: Arc::new(RwLock::new(None)),
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             auth,
+            console_db: None,
             scheduled_task_controls: None,
         }
+    }
+
+    /// Enables API clients, which Console stores in its database.
+    pub fn with_console_db(mut self, pool: PgPool) -> Self {
+        self.console_db = Some(pool);
+        self
+    }
+
+    pub(crate) fn auth(&self) -> &ApiAuthConfig {
+        &self.auth
+    }
+
+    pub(crate) fn console_db(&self) -> Result<PgPool, ApiError> {
+        self.console_db.clone().ok_or_else(|| {
+            ApiError::ServiceUnavailable("API clients are not configured".to_owned())
+        })
     }
 
     pub fn with_scheduled_task_controls(
@@ -246,6 +269,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/api/session/{thread_key}/pause",
             post(pause_session_sandbox),
         )
+        .route(
+            "/api/session/{thread_key}/sandbox",
+            delete(release_session_sandbox),
+        )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .route(
             "/api/slack/scheduled-tasks/{task_id}/cancel",
@@ -320,6 +347,11 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         )
         .route("/api/webhooks/{slug}", any(invoke_workflow_webhook))
         .merge(protected);
+    let app = if state.auth().api_clients_enabled() {
+        app.route("/oauth/token", post(issue_api_client_token))
+    } else {
+        app
+    };
 
     app.layer(
         TraceLayer::new_for_http()
@@ -419,6 +451,9 @@ enum RouteAccess {
     SlackIngressOnly,
     Capability(Capability),
     PrincipalOnly,
+    /// Session write access, held by an API client (confined to its own
+    /// namespace) or an operator; ingress keys are excluded.
+    ApiClientOrOperatorSessionWrite,
 }
 
 async fn authorize_api_request(
@@ -428,12 +463,27 @@ async fn authorize_api_request(
 ) -> Response {
     let route = matched_route(&request);
     let method = request.method().clone();
-    let caller = match state.auth.authenticate(request.headers()) {
+    let mut caller = match state.auth.authenticate(request.headers()) {
         Ok(caller) => caller,
         Err(error) => {
             record_api_authentication("unknown", "unauthorized");
             return error.into_response();
         }
+    };
+    let api_client = if caller.class() == CallerClass::ApiClient {
+        let refreshed = match state.console_db() {
+            Ok(pool) => refresh_api_client(&pool, &mut caller).await,
+            Err(error) => Err(error),
+        };
+        match refreshed {
+            Ok(client) => Some(client),
+            Err(error) => {
+                record_api_authentication(caller.class().as_str(), "unauthorized");
+                return error.into_response();
+            }
+        }
+    } else {
+        None
     };
     let Some(access) = route_access(&method, &route) else {
         record_api_authentication(caller.class().as_str(), "forbidden");
@@ -459,6 +509,13 @@ async fn authorize_api_request(
         }
         RouteAccess::Capability(capability) => caller.has_capability(capability),
         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
+        RouteAccess::ApiClientOrOperatorSessionWrite => {
+            caller.has_capability(Capability::SessionsWrite)
+                && matches!(
+                    caller.class(),
+                    CallerClass::ApiClient | CallerClass::Admin | CallerClass::Console
+                )
+        }
     };
     if !allowed {
         record_api_authentication(caller.class().as_str(), "forbidden");
@@ -497,9 +554,37 @@ async fn authorize_api_request(
             .into_response();
     }
 
+    if let Some(client) = &api_client
+        && !api_client_may_touch(client, &route, session_thread_key_from_request(&request))
+    {
+        record_api_authentication(caller.class().as_str(), "forbidden");
+        tracing::warn!(
+            caller_class = caller.class().as_str(),
+            caller_identity = caller.identity(),
+            http_route = route,
+            "API client denied outside its session namespace"
+        );
+        return ApiError::Forbidden("caller is not authorized for this session".to_owned())
+            .into_response();
+    }
+
     record_api_authentication(caller.class().as_str(), "authorized");
     request.extensions_mut().insert(caller);
+    if let Some(client) = api_client {
+        request.extensions_mut().insert(client);
+    }
     next.run(request).await
+}
+
+/// API clients reach only session routes, and only for thread keys in their
+/// own `api:<client id>:` namespace.
+pub(crate) fn api_client_may_touch(
+    client: &ApiClientContext,
+    route: &str,
+    thread_key: Option<ThreadKey>,
+) -> bool {
+    route.starts_with("/api/session/")
+        && thread_key.is_some_and(|thread_key| client.owns_thread_key(&thread_key))
 }
 
 fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
@@ -525,6 +610,9 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         | (&Method::POST, "/api/session/{thread_key}/interrupt")
         | (&Method::POST, "/api/session/{thread_key}/user-input/{request_id}") => {
             capability(Capability::SessionsWrite)
+        }
+        (&Method::DELETE, "/api/session/{thread_key}/sandbox") => {
+            Some(RouteAccess::ApiClientOrOperatorSessionWrite)
         }
         (&Method::POST, "/api/sandboxes/drain")
         | (&Method::POST, "/api/session/{thread_key}/pause") => {
@@ -612,6 +700,7 @@ fn session_thread_key_from_path(path: &str) -> Option<ThreadKey> {
 
 async fn create_or_get_session(
     State(state): State<AppState>,
+    api_client: Option<Extension<ApiClientContext>>,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
@@ -622,15 +711,44 @@ async fn create_or_get_session(
         Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
     };
-    let outcome = runtime
-        .create_or_get_admitted_session(
-            &thread_key,
-            &harness_type,
-            request.persona_id.as_deref(),
-            request.metadata,
-            on_harness_conflict,
-        )
-        .await?;
+    let outcome = match api_client {
+        Some(Extension(client)) => {
+            let bound = match runtime.session(&thread_key).await {
+                Ok(session) => session.iron_control_principal,
+                Err(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => None,
+                Err(error) => return Err(error.into()),
+            };
+            let attached = client.principals(&state.console_db()?).await?;
+            let principal =
+                select_principal(&attached, request.principal.as_deref(), bound.as_deref())?;
+            runtime
+                .create_or_get_session_with_principal(
+                    &thread_key,
+                    &harness_type,
+                    request.persona_id.as_deref(),
+                    Some(api_client_metadata(client.client_id(), request.metadata)),
+                    on_harness_conflict,
+                    Some(&principal),
+                )
+                .await?
+        }
+        None if request.principal.is_some() => {
+            return Err(ApiError::BadRequest(
+                "principal is accepted only from API clients".to_owned(),
+            ));
+        }
+        None => {
+            runtime
+                .create_or_get_admitted_session(
+                    &thread_key,
+                    &harness_type,
+                    request.persona_id.as_deref(),
+                    request.metadata,
+                    on_harness_conflict,
+                )
+                .await?
+        }
+    };
     let persona_model = runtime.persona_model(&outcome.session).map(str::to_owned);
     Ok(Json(CreateSessionResponse {
         session: outcome.session,
@@ -756,13 +874,20 @@ async fn append_messages(
 async fn execute_session(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedCaller>,
+    api_client: Option<Extension<ApiClientContext>>,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<ExecuteSessionRequest>,
 ) -> Result<Json<ExecuteSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let metadata = sanitize_execute_metadata(caller.class(), request.metadata);
-    let execution = state
-        .runtime()?
+    let runtime = state.runtime()?;
+    let metadata = match api_client {
+        Some(Extension(client)) => {
+            admit_api_client_execution(&state, &runtime, &client, &thread_key).await?;
+            Some(api_client_metadata(client.client_id(), request.metadata))
+        }
+        None => sanitize_execute_metadata(caller.class(), request.metadata),
+    };
+    let execution = runtime
         .enqueue_session_execution(
             &thread_key,
             ExecuteSessionInput {
@@ -780,6 +905,25 @@ async fn execute_session(
         thread_key: execution.thread_key,
         status: execution.status.to_string(),
     }))
+}
+
+/// An API client may start a turn only while the session's principal is still
+/// attached to it.
+async fn admit_api_client_execution(
+    state: &AppState,
+    runtime: &SessionRuntime,
+    client: &ApiClientContext,
+    thread_key: &ThreadKey,
+) -> Result<(), ApiError> {
+    let session = runtime.session(thread_key).await?;
+    let Some(bound) = session.iron_control_principal.as_deref() else {
+        return Err(ApiError::Forbidden(
+            "the session has no principal attached to this API client".to_owned(),
+        ));
+    };
+    let attached = client.principals(&state.console_db()?).await?;
+    select_principal(&attached, None, Some(bound))?;
+    Ok(())
 }
 
 /// `requester_principal_foreign_id` is an identity assertion made by the
@@ -917,6 +1061,27 @@ async fn pause_session_sandbox(
     Ok(Json(json!({ "ok": true, "paused": paused })))
 }
 
+/// Stops and deletes a session's sandbox for a caller that will not use it
+/// again, such as an eval run; a later turn gets a fresh sandbox. Refused
+/// while a turn is queued or running, or for a workflow-owned session. API
+/// clients reach only sessions in their own namespace, so they release only
+/// sandboxes they created.
+async fn release_session_sandbox(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let sandbox_id = state
+        .runtime()?
+        .release_session_sandbox(&thread_key)
+        .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "released": sandbox_id.is_some(),
+        "sandbox_id": sandbox_id,
+    })))
+}
+
 async fn stream_events(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedCaller>,
@@ -952,6 +1117,14 @@ async fn stream_events(
         };
         Ok(sse)
     });
+    // An API client's access is checked per request; an open stream re-checks
+    // it so revocation and token expiry also end long-lived streams.
+    let stream = if caller.class() == CallerClass::ApiClient {
+        let ended = api_client_read_access_ended(state.console_db()?, caller.clone());
+        end_events_when(stream, ended).boxed()
+    } else {
+        stream.boxed()
+    };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
