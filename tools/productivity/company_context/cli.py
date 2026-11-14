@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.json import JSON
 from rich.table import Table
 
 from .client import CompanyContextClient
@@ -66,7 +66,8 @@ console = Console()
 
 
 def _print_json(data: dict[str, Any]) -> None:
-    console.print(JSON(json.dumps(data, default=str)))
+    # Plain print: Rich wraps long lines, which splits JSON strings and escapes.
+    print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
 
 
 def _require_ok(result: dict[str, Any]) -> None:
@@ -397,8 +398,25 @@ def latest_date(
 
 _V2_TYPES_HELP = (
     "Data type to search; repeat for several: slack_message, slack_file, drive_doc, "
-    "calendar_event, granola_note, or custom_doc. Defaults to every type."
+    "calendar_event, granola_note, or custom_doc (slack is an alias for slack_message). "
+    "Defaults to every type."
 )
+
+_V2_TYPE_ALIASES = {"slack": "slack_message"}
+_PLAIN_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _v2_types(values: list[str] | None) -> list[str] | None:
+    if values is None:
+        return None
+    return [_V2_TYPE_ALIASES.get(value, value) for value in values]
+
+
+def _rfc3339_time(value: str | None) -> str | None:
+    """Expand a plain YYYY-MM-DD date to midnight UTC; pass other values through."""
+    if value is not None and _PLAIN_DATE.fullmatch(value.strip()):
+        return f"{value.strip()}T00:00:00Z"
+    return value
 
 
 def _json_object(value: str | None) -> dict[str, Any] | None:
@@ -419,12 +437,20 @@ def v2_search(
     limit: int | None = typer.Option(
         None, "--limit", "-n", help="Max results (API default 10, at most 50)."
     ),
-    types: list[str] | None = typer.Option(None, "--type", help=_V2_TYPES_HELP),  # noqa: B008
+    types: list[str] | None = typer.Option(  # noqa: B008
+        None, "--type", callback=_v2_types, help=_V2_TYPES_HELP
+    ),
     occurred_after: str | None = typer.Option(
-        None, "--after", help="Only documents on/after this RFC 3339 time."
+        None,
+        "--after",
+        callback=_rfc3339_time,
+        help="Only documents on/after this RFC 3339 time or YYYY-MM-DD date (midnight UTC).",
     ),
     occurred_before: str | None = typer.Option(
-        None, "--before", help="Only documents before this RFC 3339 time."
+        None,
+        "--before",
+        callback=_rfc3339_time,
+        help="Only documents before this RFC 3339 time or YYYY-MM-DD date (midnight UTC).",
     ),
     channel_ids: list[str] | None = typer.Option(  # noqa: B008
         None, "--channel-id", help="Only Slack messages and files in this conversation; repeatable."
@@ -444,6 +470,17 @@ def v2_search(
             """e.g. '{"author": "Ada"}'. Matches exactly and case-sensitively."""
         ),
     ),
+    keyword: bool = typer.Option(
+        False,
+        "--keyword",
+        help=(
+            "Return every document containing all query terms, newest first and unranked, "
+            "instead of ranking by relevance. Page with --cursor to enumerate history."
+        ),
+    ),
+    cursor: str | None = typer.Option(
+        None, "--cursor", help="next_cursor from the previous --keyword page."
+    ),
     json_output: bool = typer.Option(
         True,
         "--json/--table",
@@ -461,6 +498,8 @@ def v2_search(
         file_ids=file_ids,
         sources=sources,
         metadata=metadata,
+        keyword=keyword,
+        cursor=cursor,
     )
     _require_ok(result)
     if json_output:
@@ -485,6 +524,8 @@ def v2_search(
             " ".join(str(item.get("text") or "").split())[:200],
         )
     console.print(table)
+    if result.get("next_cursor"):
+        console.print(f"Next page: --cursor '{result['next_cursor']}'")
 
 
 @v2_app.command("read")
@@ -510,8 +551,8 @@ def v2_read(
 
 _SOURCE_HELP = "Custom document source, e.g. memory."
 _READERS_HELP = (
-    "Who can read the document; repeat for several: principal:<your ID> or role:<one of "
-    "your roles>. Defaults to you alone."
+    "Who can read the document; repeat for several: public, principal:<your ID>, or "
+    "role:<one of your roles>. Defaults to you alone."
 )
 
 

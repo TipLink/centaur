@@ -226,20 +226,6 @@ pub struct Config {
         hide_env_values = true
     )]
     pub jwt_signing_secret: String,
-    #[arg(
-        long,
-        env = "CENTAUR_API_JWT_AUDIENCE",
-        default_value = "centaur-api",
-        value_parser = nonempty
-    )]
-    pub jwt_audience: String,
-    #[arg(
-        long,
-        env = "CENTAUR_API_JWT_ISSUER",
-        default_value = "centaur-console",
-        value_parser = nonempty
-    )]
-    pub jwt_issuer: String,
     #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0:8080")]
     pub bind_addr: SocketAddr,
     #[arg(
@@ -299,6 +285,15 @@ pub struct Config {
         value_parser = embeddings_dimensions
     )]
     pub embeddings_dimensions: usize,
+    /// The largest cosine distance from the query at which a document still
+    /// counts as a semantic match. Depends on the embeddings model.
+    #[arg(
+        long,
+        env = "COMPANY_CONTEXT_EMBEDDINGS_MAX_QUERY_DISTANCE",
+        default_value = "0.8",
+        value_parser = cosine_distance
+    )]
+    pub embeddings_max_query_distance: f64,
     #[arg(
         long = "scan-interval-seconds",
         env = "COMPANY_CONTEXT_SCAN_INTERVAL_SECONDS",
@@ -367,6 +362,15 @@ pub struct Config {
         value_parser = channel_history_days
     )]
     pub slack_channel_history_days: Vec<(String, usize)>,
+    /// Days of recent Slack history each sync rereads, so edits and new
+    /// replies to threads started within them are picked up.
+    #[arg(
+        long,
+        env = "COMPANY_CONTEXT_SLACK_THREAD_REFRESH_DAYS",
+        default_value = "7",
+        value_parser = history_days
+    )]
+    pub slack_thread_refresh_days: usize,
     /// Fraction of each Slack method's documented rate limit that ingestion
     /// may use. Other services calling Slack as the same app share the rest.
     #[arg(
@@ -541,6 +545,17 @@ fn rate_limit_share(value: &str) -> Result<f64, String> {
     Ok(value)
 }
 
+fn cosine_distance(value: &str) -> Result<f64, String> {
+    let value = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| "value must be a number".to_owned())?;
+    if !(value > 0.0 && value <= 2.0) {
+        return Err("value must be greater than 0 and at most 2".to_owned());
+    }
+    Ok(value)
+}
+
 fn embeddings_dimensions(value: &str) -> Result<usize, String> {
     let value = positive_usize(value)?;
     if value != 1_536 {
@@ -582,6 +597,7 @@ mod tests {
         assert_eq!(config.scan_interval, Duration::from_secs(300));
         assert_eq!(config.slack_rate_limit_share, 0.3);
         assert_eq!(config.calendar_history_days, 90);
+        assert_eq!(config.slack_thread_refresh_days, 7);
         assert!(
             config.drive_enabled
                 && config.calendar_enabled
@@ -628,6 +644,8 @@ mod tests {
             "im, public_channel",
             "--slack-channel-history-days",
             "C1=3650, G2=365",
+            "--slack-thread-refresh-days",
+            "14",
         ]);
         let config = Config::try_parse_from(args).unwrap();
         assert_eq!(
@@ -640,6 +658,13 @@ mod tests {
             config.slack_channel_history_days,
             [("C1".to_owned(), 3650), ("G2".to_owned(), 365)]
         );
+        assert_eq!(config.slack_thread_refresh_days, 14);
+
+        for invalid in ["0", "36501"] {
+            let mut args = required_args();
+            args.extend(["--slack-thread-refresh-days", invalid]);
+            assert!(Config::try_parse_from(args).is_err(), "{invalid}");
+        }
 
         let mut args = required_args();
         args.extend(["--slack-conversation-types", "mpim"]);
@@ -658,5 +683,13 @@ mod tests {
         assert!(rate_limit_share("0").is_err());
         assert!(rate_limit_share("1.5").is_err());
         assert!(rate_limit_share("NaN").is_err());
+    }
+
+    #[test]
+    fn max_query_distance_is_a_cosine_distance() {
+        assert_eq!(cosine_distance("2"), Ok(2.0));
+        assert!(cosine_distance("0").is_err());
+        assert!(cosine_distance("2.5").is_err());
+        assert!(cosine_distance("NaN").is_err());
     }
 }

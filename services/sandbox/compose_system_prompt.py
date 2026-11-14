@@ -3,15 +3,32 @@ from __future__ import annotations
 
 import argparse
 import os
+import tempfile
 from pathlib import Path
 
 
 SEPARATOR = "\n\n---\n\n"
 OVERLAY_PROMPT = Path("services/sandbox/SYSTEM_PROMPT.md")
 PERSONA_PROMPT = Path("AGENTS_PERSONA.md")
-OBSERVABILITY_DISABLED_PROMPT = """[Observability access]
-This sandbox does not have Centaur observability access. Do not use vlogs, vmetrics, Grafana, or related internal logs/metrics tools.
-"""
+
+
+def _write_atomically(target: Path, text: str) -> None:
+    """Replace `target` only once `text` is fully written.
+
+    harness-server recomposes the prompt while a session is live, so a failed
+    write must leave the previous prompt intact rather than a truncated one.
+    """
+    mode = target.stat().st_mode & 0o777 if target.is_file() else 0o644
+    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as tmp_file:
+            tmp_file.write(text)
+        tmp.chmod(mode)
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _append_file_fragment(fragments: list[str], source: Path) -> bool:
@@ -37,7 +54,7 @@ def compose_system_prompt(
     home_dir: Path,
     target_prompt: Path,
     repo_mount: Path,
-    observability_enabled: bool = True,
+    session_prompts: list[Path] | None = None,
 ) -> None:
     base_prompt = home_dir / "AGENTS_BASE.md"
     baked_prompt = home_dir / "AGENTS.md"
@@ -61,15 +78,16 @@ def compose_system_prompt(
         if _append_file_fragment(fragments, prompt_path):
             appended.add(resolved)
 
+    # Overlay session-prompt hook output, written by harness-server.
+    for prompt_path in session_prompts or []:
+        _append_file_fragment(fragments, prompt_path)
+
     persona_prompt_path = home_dir / PERSONA_PROMPT
     if persona_prompt_path.is_file():
         fragments.append(persona_prompt_path.read_text())
 
-    if not observability_enabled:
-        fragments.append(OBSERVABILITY_DISABLED_PROMPT)
-
     effective_prompt = SEPARATOR.join(fragments)
-    target_prompt.write_text(effective_prompt)
+    _write_atomically(target_prompt, effective_prompt)
 
 
 def main() -> int:
@@ -77,6 +95,12 @@ def main() -> int:
     parser.add_argument("--home-dir", default=os.path.expanduser("~"))
     parser.add_argument("--repo-mount")
     parser.add_argument("--target-prompt", required=True)
+    parser.add_argument(
+        "--session-prompt",
+        action="append",
+        default=[],
+        help="fragment to append before the persona prompt; repeatable",
+    )
     args = parser.parse_args()
 
     home_dir = Path(args.home_dir)
@@ -84,10 +108,7 @@ def main() -> int:
         home_dir=home_dir,
         target_prompt=Path(args.target_prompt),
         repo_mount=Path(args.repo_mount) if args.repo_mount else home_dir / "github",
-        observability_enabled=os.environ.get(
-            "CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true"
-        ).lower()
-        != "false",
+        session_prompts=[Path(path) for path in args.session_prompt],
     )
     return 0
 

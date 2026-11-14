@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1-bookworm AS builder
-ARG SCCACHE_VERSION=0.18.0
+ARG SCCACHE_VERSION=0.19.0
 ARG TARGETARCH
 RUN case "$TARGETARCH" in \
-      amd64) archive_arch=x86_64; checksum=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89 ;; \
-      arm64) archive_arch=aarch64; checksum=2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a ;; \
+      amd64) archive_arch=x86_64; checksum=aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd ;; \
+      arm64) archive_arch=aarch64; checksum=3e47fc4a71b1ddd1b4294a0de9d34498922fdf41e3cd0bda5df3954e3d6deb9d ;; \
       *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 2 ;; \
     esac && \
     archive="sccache-v${SCCACHE_VERSION}-${archive_arch}-unknown-linux-musl.tar.gz" && \
@@ -34,9 +34,10 @@ RUN --mount=type=cache,id=proxy-sync-cargo-registry-${TARGETARCH},target=/usr/lo
     sccache --show-stats
 
 FROM debian:bookworm-slim
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN --mount=type=cache,id=proxy-sync-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=proxy-sync-apt-lib,target=/var/lib/apt,sharing=locked \
+    printf '%s\n' "Acquire::Retries \"5\";" "Acquire::http::Timeout \"30\";" "Acquire::https::Timeout \"30\";" > /etc/apt/apt.conf.d/80-network-retries \
+    && apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/centaur-proxy-sync /usr/local/bin/centaur-proxy-sync
 USER 65532:65532

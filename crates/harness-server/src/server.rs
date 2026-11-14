@@ -184,6 +184,10 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 reasoning,
                 trace_context,
             }) => {
+                crate::session_prompt::run_session_prompt_hooks(
+                    Some(&trace_context),
+                    crate::otel::harness_name(harness.kind()),
+                );
                 turn_active.store(true, Ordering::SeqCst);
                 if queued_user_inputs.fetch_sub(1, Ordering::SeqCst) > 1 {
                     // Earlier turns may have consumed the reader's markers

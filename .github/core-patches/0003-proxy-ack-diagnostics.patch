@@ -1,8 +1,8 @@
 diff --git a/crates/centaur-sandbox-agent-k8s/src/iron_proxy.rs b/crates/centaur-sandbox-agent-k8s/src/iron_proxy.rs
-index 14c40433..e194b70d 100644
+index de9556e5..ed15ac5f 100644
 --- a/crates/centaur-sandbox-agent-k8s/src/iron_proxy.rs
 +++ b/crates/centaur-sandbox-agent-k8s/src/iron_proxy.rs
-@@ -388,8 +388,10 @@ impl AgentSandboxBackend {
+@@ -414,8 +414,10 @@ impl AgentSandboxBackend {
          let (Some(resolved), Some(iron_proxy)) = (resolved, self.config.iron_proxy.as_ref()) else {
              return Ok(());
          };
@@ -13,11 +13,29 @@ index 14c40433..e194b70d 100644
          self.services()
              .create(
                  &PostParams::default(),
-@@ -447,9 +449,23 @@ impl AgentSandboxBackend {
+@@ -472,6 +474,17 @@ impl AgentSandboxBackend {
              )
              .await
              .map_err(|err| map_kube_error("create iron-proxy pod", err))?;
 +        let resources_created_at = Instant::now();
++        tracing::info!(
++            event = "proxy_resources_started",
++            sandbox_id = id.as_str(),
++            registration_ms = registered_at.duration_since(started).as_millis() as u64,
++            resource_creation_ms = resources_created_at
++                .duration_since(registered_at)
++                .as_millis() as u64,
++            total_ms = started.elapsed().as_millis() as u64,
++            "proxy resources started"
++        );
+         Ok(())
+     }
+ 
+@@ -485,9 +498,19 @@ impl AgentSandboxBackend {
+         let (Some(resolved), Some(_)) = (resolved, self.config.iron_proxy.as_ref()) else {
+             return Ok(());
+         };
++        let started = Instant::now();
          self.wait_until_proxy_running(resolved).await?;
 +        let ready_at = Instant::now();
          self.wait_for_cold_proxy_principal_applied(id, &resolved.principal_id)
@@ -25,19 +43,15 @@ index 14c40433..e194b70d 100644
 +        tracing::info!(
 +            event = "proxy_startup_completed",
 +            sandbox_id = id.as_str(),
-+            registration_ms = registered_at.duration_since(started).as_millis() as u64,
-+            resource_creation_ms = resources_created_at
-+                .duration_since(registered_at)
-+                .as_millis() as u64,
-+            pod_readiness_ms = ready_at.duration_since(resources_created_at).as_millis() as u64,
++            pod_readiness_ms = ready_at.duration_since(started).as_millis() as u64,
 +            acknowledgement_ms = ready_at.elapsed().as_millis() as u64,
-+            total_ms = started.elapsed().as_millis() as u64,
++            wait_total_ms = started.elapsed().as_millis() as u64,
 +            "proxy startup phases completed"
 +        );
          Ok(())
      }
  
-@@ -1079,7 +1095,7 @@ impl AgentSandboxBackend {
+@@ -1103,7 +1126,7 @@ impl AgentSandboxBackend {
                  "failed to build iron-proxy management client",
              ));
          };
@@ -46,7 +60,7 @@ index 14c40433..e194b70d 100644
              &client,
              &endpoint,
              principal_id,
-@@ -1088,7 +1104,31 @@ impl AgentSandboxBackend {
+@@ -1112,7 +1135,31 @@ impl AgentSandboxBackend {
              PROXY_ACK_PROBE_WINDOW,
              PROXY_ACK_POLL_INTERVAL,
          )
@@ -79,7 +93,7 @@ index 14c40433..e194b70d 100644
      }
  
      /// Locate the management API of the sandbox's running proxy pod. The
-@@ -1301,6 +1341,32 @@ fn proxy_fallback_delay_remaining(elapsed: Duration) -> Duration {
+@@ -1367,6 +1414,32 @@ fn proxy_fallback_delay_remaining(elapsed: Duration) -> Duration {
      PROXY_REASSIGN_FALLBACK_DELAY.saturating_sub(elapsed)
  }
  
@@ -112,7 +126,7 @@ index 14c40433..e194b70d 100644
  /// Poll the proxy's management API until it reports `principal_id`'s config
  /// applied by at least `fresh_syncs` syncs completed after the first status
  /// read, poking an immediate sync for each. `probe_window` bounds how long an
-@@ -1315,63 +1381,106 @@ async fn wait_for_proxy_ack(
+@@ -1381,63 +1454,106 @@ async fn wait_for_proxy_ack(
      ack_timeout: Duration,
      probe_window: Duration,
      poll_interval: Duration,
@@ -252,7 +266,7 @@ index 14c40433..e194b70d 100644
  }
  
  /// The management endpoint advertised by a running proxy pod: pod IP plus the
-@@ -3391,6 +3500,7 @@ mod tests {
+@@ -3474,6 +3590,7 @@ mod tests {
          api_key: &str,
          mismatches: usize,
          completable_syncs: usize,
@@ -260,7 +274,7 @@ index 14c40433..e194b70d 100644
      ) -> (
          String,
          std::sync::Arc<std::sync::atomic::AtomicUsize>,
-@@ -3406,6 +3516,7 @@ mod tests {
+@@ -3489,6 +3606,7 @@ mod tests {
          let status_calls = Arc::new(AtomicUsize::new(0));
          let completed_syncs = Arc::new(AtomicUsize::new(0));
          let auth = format!("authorization: bearer {}", api_key.to_lowercase());
@@ -268,7 +282,7 @@ index 14c40433..e194b70d 100644
          let handle = tokio::spawn({
              let sync_calls = sync_calls.clone();
              async move {
-@@ -3440,9 +3551,9 @@ mod tests {
+@@ -3523,9 +3641,9 @@ mod tests {
                          let synced = completed_syncs.load(Ordering::SeqCst);
                          (
                              "200 OK",
@@ -280,7 +294,7 @@ index 14c40433..e194b70d 100644
                          )
                      } else {
                          ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
-@@ -3470,7 +3581,8 @@ mod tests {
+@@ -3553,7 +3671,8 @@ mod tests {
  
      #[tokio::test]
      async fn proxy_ack_waits_until_claimed_principal_is_applied() {
@@ -290,7 +304,7 @@ index 14c40433..e194b70d 100644
          let endpoint = ProxyManagementEndpoint {
              base_url,
              api_key: "test-key".to_owned(),
-@@ -3487,7 +3599,16 @@ mod tests {
+@@ -3570,7 +3689,16 @@ mod tests {
          )
          .await;
  
@@ -308,7 +322,7 @@ index 14c40433..e194b70d 100644
          assert!(
              sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= REASSIGN_FRESH_SYNCS,
              "the barrier should poke an immediate sync for each fresh sync"
-@@ -3498,7 +3619,7 @@ mod tests {
+@@ -3581,7 +3709,7 @@ mod tests {
      #[tokio::test]
      async fn proxy_ack_times_out_when_principal_never_applies() {
          let (base_url, _sync_calls, server) =
@@ -317,7 +331,7 @@ index 14c40433..e194b70d 100644
          let endpoint = ProxyManagementEndpoint {
              base_url,
              api_key: "test-key".to_owned(),
-@@ -3515,7 +3636,12 @@ mod tests {
+@@ -3598,7 +3726,12 @@ mod tests {
          )
          .await;
  
@@ -331,7 +345,7 @@ index 14c40433..e194b70d 100644
          server.abort();
      }
  
-@@ -3524,7 +3650,7 @@ mod tests {
+@@ -3607,7 +3740,7 @@ mod tests {
          // The proxy already reports the right principal, as after a requester
          // or label change. One completed sync may have started before the
          // assignment committed, so it is not enough.
@@ -340,7 +354,7 @@ index 14c40433..e194b70d 100644
          let endpoint = ProxyManagementEndpoint {
              base_url,
              api_key: "test-key".to_owned(),
-@@ -3551,8 +3677,10 @@ mod tests {
+@@ -3634,8 +3767,10 @@ mod tests {
          )
          .await;
  
@@ -353,7 +367,7 @@ index 14c40433..e194b70d 100644
          assert!(sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
          server.abort();
      }
-@@ -3580,7 +3708,90 @@ mod tests {
+@@ -3663,7 +3798,90 @@ mod tests {
          )
          .await;
  
@@ -446,10 +460,10 @@ index 14c40433..e194b70d 100644
  
      #[test]
 diff --git a/crates/centaur-sandbox-agent-k8s/src/lib.rs b/crates/centaur-sandbox-agent-k8s/src/lib.rs
-index 5d53b1bf..ed1849fb 100644
+index 138b6c9a..569b258e 100644
 --- a/crates/centaur-sandbox-agent-k8s/src/lib.rs
 +++ b/crates/centaur-sandbox-agent-k8s/src/lib.rs
-@@ -616,12 +616,14 @@ impl SandboxBackend for AgentSandboxBackend {
+@@ -619,12 +619,14 @@ impl SandboxBackend for AgentSandboxBackend {
      }
  
      async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
@@ -461,22 +475,30 @@ index 5d53b1bf..ed1849fb 100644
              iron_proxy::apply_proxy_env(&mut spec, resolved);
          }
 +        let resolved_at = Instant::now();
-         if let Err(err) = self
-             .create_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
-             .await
-@@ -629,6 +631,7 @@ impl SandboxBackend for AgentSandboxBackend {
+         // Start the proxy but create the Sandbox before waiting for it, so the
+         // proxy boot overlaps volume provisioning and scheduling. The egress
+         // policies still exist before the sandbox pod; tools-bootstrap retries
+@@ -636,6 +638,7 @@ impl SandboxBackend for AgentSandboxBackend {
              self.unwind_iron_proxy_resources(&id).await;
              return Err(err);
          }
-+        let proxy_ready_at = Instant::now();
++        let proxy_started_at = Instant::now();
          if let Err(error) = self.create_sandbox_files_config_map(&id, &spec).await {
              self.unwind_iron_proxy_resources(&id).await;
              return Err(error);
-@@ -670,10 +673,23 @@ impl SandboxBackend for AgentSandboxBackend {
+@@ -677,6 +680,7 @@ impl SandboxBackend for AgentSandboxBackend {
                  "failed to set ownerReference on sandbox files config map"
              );
          }
 +        let resources_created_at = Instant::now();
+         if let Err(err) = self
+             .wait_for_iron_proxy(&id, resolved_iron_proxy.as_ref())
+             .await
+@@ -684,10 +688,26 @@ impl SandboxBackend for AgentSandboxBackend {
+             let _ = self.stop(&id).await;
+             return Err(err);
+         }
++        let proxy_ready_at = Instant::now();
          if let Err(err) = self.wait_until_running(&id).await {
              let _ = self.stop(&id).await;
              return Err(err);
@@ -485,11 +507,14 @@ index 5d53b1bf..ed1849fb 100644
 +            event = "sandbox_startup_phases_completed",
 +            sandbox_id = id.as_str(),
 +            config_resolution_ms = resolved_at.duration_since(started).as_millis() as u64,
-+            proxy_startup_ms = proxy_ready_at.duration_since(resolved_at).as_millis() as u64,
++            proxy_start_ms = proxy_started_at.duration_since(resolved_at).as_millis() as u64,
 +            sandbox_resource_creation_ms = resources_created_at
-+                .duration_since(proxy_ready_at)
++                .duration_since(proxy_started_at)
 +                .as_millis() as u64,
-+            sandbox_pod_readiness_ms = resources_created_at.elapsed().as_millis() as u64,
++            proxy_wait_ms = proxy_ready_at
++                .duration_since(resources_created_at)
++                .as_millis() as u64,
++            sandbox_pod_readiness_ms = proxy_ready_at.elapsed().as_millis() as u64,
 +            total_ms = started.elapsed().as_millis() as u64,
 +            "sandbox startup phases completed"
 +        );

@@ -248,7 +248,7 @@ index 12072cac..defc4d61 100644
      fn failed_result_ends_turn_even_with_background_agents_running() {
          let mut normalizer = ClaudeEventNormalizer::default();
 diff --git a/crates/harness-server/src/codex.rs b/crates/harness-server/src/codex.rs
-index 26af63ac..f17823ef 100644
+index 9ace7867..fab478fc 100644
 --- a/crates/harness-server/src/codex.rs
 +++ b/crates/harness-server/src/codex.rs
 @@ -19,7 +19,9 @@ use crate::server::{
@@ -262,7 +262,7 @@ index 26af63ac..f17823ef 100644
  use crate::{AppServerRuntime, HarnessServerError, Result};
  
  mod citations;
-@@ -406,7 +408,7 @@ fn run_codex_user_turn<W: Write>(
+@@ -448,7 +450,7 @@ fn run_codex_user_turn<W: Write>(
      thread_id: &mut Option<String>,
      thread_model: &mut Option<String>,
      thread_provider: &mut Option<String>,
@@ -270,8 +270,8 @@ index 26af63ac..f17823ef 100644
 +    mut input: Vec<UserInput>,
      client_user_message_id: Option<String>,
      model_and_provider: (Option<String>, String),
-     requested_provider: Option<String>,
-@@ -457,6 +459,15 @@ fn run_codex_user_turn<W: Write>(
+     reasoning: Option<String>,
+@@ -484,6 +486,15 @@ fn run_codex_user_turn<W: Write>(
          .expect("thread id was initialized")
          .clone();
  
@@ -287,14 +287,6 @@ index 26af63ac..f17823ef 100644
      let mut params = json!({
          "threadId": current_thread_id,
          "input": input,
-@@ -580,7 +591,6 @@ fn start_or_resume_thread<W: Write>(
-     if let Some(model) = model {
-         params["model"] = Value::String(model.to_owned());
-     }
--
-     let id = next_request_id(request_id);
-     codex.send_request(id, method, params, traceparent)?;
-     let result = codex.read_response_or_forward(id, stdout, None)?;
 diff --git a/crates/harness-server/src/error.rs b/crates/harness-server/src/error.rs
 index 410ba76b..1c5a803f 100644
 --- a/crates/harness-server/src/error.rs
@@ -309,10 +301,10 @@ index 410ba76b..1c5a803f 100644
      #[error("{message}")]
      UnknownModel { message: String },
 diff --git a/crates/harness-server/src/server.rs b/crates/harness-server/src/server.rs
-index c733f1f6..bdc971ee 100644
+index 0cc4d8b9..41675129 100644
 --- a/crates/harness-server/src/server.rs
 +++ b/crates/harness-server/src/server.rs
-@@ -1496,6 +1496,12 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+@@ -1500,6 +1500,12 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
          }
  
          let mut terminal = false;
@@ -325,7 +317,7 @@ index c733f1f6..bdc971ee 100644
          let received = if suggestion_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
              Err(RecvTimeoutError::Timeout)
          } else {
-@@ -1628,6 +1634,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+@@ -1632,6 +1638,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                  {
                      (true, _) => None,
                      (false, TurnHold::Idle(window)) => Some(Instant::now() + window),
@@ -361,7 +353,7 @@ index a561ae6c..97d29f3d 100644
  
  #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 diff --git a/crates/harness-server/tests/app_server_stdio.rs b/crates/harness-server/tests/app_server_stdio.rs
-index 6c25c8a7..b33b435a 100644
+index 3043a722..659ac860 100644
 --- a/crates/harness-server/tests/app_server_stdio.rs
 +++ b/crates/harness-server/tests/app_server_stdio.rs
 @@ -246,6 +246,27 @@ fn codex_question_capability_change_resumes_the_same_thread() {
