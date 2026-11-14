@@ -354,6 +354,8 @@ type ClickRequest = {
   value?: string
   /** Reuses an earlier click's action_ts, as a redelivered click would. */
   action_ts?: string
+  /** What the user entered in the message's input blocks, by block and action id. */
+  state_values?: Record<string, unknown>
 }
 
 /**
@@ -388,6 +390,7 @@ async function clickAction(click: ClickRequest) {
     channel: { id: message.channel },
     message: withReplies(message),
     response_url: `https://hooks.slack.com/actions/${TEAM.id}/${actionTs}/e2e-response-token`,
+    ...(click.state_values ? { state: { values: click.state_values } } : {}),
     actions: [{
       action_id: element.action_id,
       block_id: element.block_id ?? 'e2e-block',

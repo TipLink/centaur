@@ -343,13 +343,14 @@ export const slack = {
   },
   /**
    * Clicks a block element on a message, as `as` (USER by default). `value`
-   * forges the element's value; `actionTs` repeats an earlier click's delivery.
+   * forges the element's value; `actionTs` repeats an earlier click's delivery;
+   * `stateValues` is what the user entered in the message's input blocks.
    */
   async click(
     channel: Channel,
     ts: string,
     actionId: string,
-    options: { as?: SlackUser; value?: string; actionTs?: string } = {}
+    options: { as?: SlackUser; value?: string; actionTs?: string; stateValues?: Record<string, unknown> } = {}
   ): Promise<{ status: number; actionTs: string }> {
     const response = await fetch(`${slackUrl}/_e2e/actions`, {
       method: 'POST',
@@ -360,7 +361,8 @@ export const slack = {
         message_ts: ts,
         action_id: actionId,
         value: options.value,
-        action_ts: options.actionTs
+        action_ts: options.actionTs,
+        state_values: options.stateValues
       })
     })
     const result = (await response.json()) as { ok: boolean; error?: string; status: number; action_ts: string }

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "82e8153689fec428d2a42ad4522492905fd61fa1",
-  "result_tree": "cabf0c09495f084482d6763366f6caa172f90ce7",
+  "result_tree": "3f716cbd0a135e4fe3bb00ebdeb6102c1d52505d",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -59,6 +59,10 @@
     {
       "file": "0014-claude-fable-5-2.patch",
       "sha256": "a00516a057da69787495e285c2e4217c6af0dbc2d79a97f1e9b175cff15f0030"
+    },
+    {
+      "file": "0015-question-card-single-form.patch",
+      "sha256": "ef45318c8ab152c62e298ac84db6b54bf049316806cdcccaf8ca96a2b475624b"
     }
   ]
 }

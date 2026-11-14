@@ -22,33 +22,31 @@ for (const harness of ['codex', 'claudecode']) {
     })
     expect(request.requester_user_id).toBe(USER.id)
     expect(request.questions).toHaveLength(2)
-    const card = await eventually('the first question card', turnTimeoutMs, async () =>
+    const card = await eventually('the question card', turnTimeoutMs, async () =>
       (await thread.questionCards())[0]
     )
-    expect(card.text).toContain('Question 1 of 2')
+    expect(card.text).toContain('Answer these 2 questions to continue.')
     expect((await model.requests(script)).length).toBe(1)
 
+    const custom = 'Retry "429" responses without duplicate work'
+    const submit = 'centaur.user_input:submit'
+    const first = { q0: { selected: { type: 'radio_buttons', selected_option: { value: '0' } } } }
+    const both = { ...first, c1: { text: { type: 'plain_text_input', value: custom } } }
     // Another channel member cannot supply the requester's decision.
-    await slack.click(thread.channel, card.ts, 'centaur.user_input:0', { as: USER_B })
-    expect((await slack.message(thread.channel, card.ts)).text).toContain('Question 1 of 2')
-    await slack.click(thread.channel, card.ts, 'centaur.user_input:0')
-    const second = await eventually('the second question on the same card', turnTimeoutMs, async () => {
+    await slack.click(thread.channel, card.ts, submit, { as: USER_B, stateValues: both })
+    expect((await api.ok('GET', `${path}/${request.request_id}`)).status).toBe('pending')
+
+    // One answered question is not enough: the same card asks for the rest.
+    await slack.click(thread.channel, card.ts, submit, { stateValues: first })
+    const reminded = await eventually('the card naming the unanswered question', turnTimeoutMs, async () => {
       const message = await slack.message(thread.channel, card.ts)
-      return message.text?.includes('Question 2 of 2') ? message : undefined
+      return JSON.stringify(message.blocks).includes('Still needed: Title') ? message : undefined
     })
-    expect(second.ts).toBe(card.ts)
+    expect(reminded.ts).toBe(card.ts)
     expect((await model.requests(script)).length).toBe(1)
     expect((await api.ok('GET', `${path}/${request.request_id}`)).status).toBe('pending')
 
-    await slack.click(thread.channel, card.ts, 'centaur.user_input:other')
-    const view = await eventually('the typed-answer modal', turnTimeoutMs, async () => {
-      const views = await slack.views()
-      return views.find(view => String(view.view.private_metadata).includes(request.request_id))
-    })
-    const custom = 'Retry "429" responses without duplicate work'
-    const submitted = await slack.submitView(view.id, { custom: { text: { value: custom } } })
-    expect(submitted.status).toBe(200)
-    expect(JSON.parse(submitted.body)).toEqual({ response_action: 'clear' })
+    expect((await slack.click(thread.channel, card.ts, submit, { stateValues: both })).status).toBe(200)
 
     const turn = await thread.nextTurn()
     expect(turn.execution.status).toBe('completed')
