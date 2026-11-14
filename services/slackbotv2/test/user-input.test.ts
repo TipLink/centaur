@@ -28,7 +28,6 @@ function harness(questionChanges: Partial<SessionUserInputRequest> = {}) {
   }
   const posts: JsonObject[] = []
   const updates: JsonObject[] = []
-  const views: JsonObject[] = []
   const submissions: JsonObject[] = []
   const calls: string[] = []
   let failSubmitOnce = false
@@ -79,10 +78,6 @@ function harness(questionChanges: Partial<SessionUserInputRequest> = {}) {
         updates.push(body)
         return Response.json({ ok: true })
       }
-      if (method === 'views.open') {
-        views.push(body.view as JsonObject)
-        return Response.json({ ok: true, view: { id: 'V1' } })
-      }
       if (method === 'conversations.replies') return Response.json({ ok: true, messages: posts })
       throw new Error(`Unexpected Slack method ${method}`)
     }
@@ -97,23 +92,26 @@ function harness(questionChanges: Partial<SessionUserInputRequest> = {}) {
     if (drain) await bot.drain(5000)
     return response
   }
-  const click = (index: number, choice: number | 'other' | 'edit', extra: JsonObject = {}, drain = true) => deliver({
+  const act = (action: JsonObject, extra: JsonObject = {}, drain = true) => deliver({
     type: 'block_actions', team: { id: 'T1' }, user: { id: 'U1' }, channel: { id: 'C1' },
     message: { ts: '1700000001.000001', thread_ts: '1700000000.000001' }, trigger_id: 'trigger-1',
-    actions: [{ action_id: `centaur.user_input:${choice}`, value: JSON.stringify({ request: REQUEST, index, choice }) }],
-    ...extra
+    actions: [action], ...extra
   }, true, drain)
-  const submitModal = (value: string, extra: JsonObject = {}) => deliver({
-    type: 'view_submission', team: { id: 'T1' }, user: { id: 'U1' },
-    view: { ...views.at(-1), state: { values: { custom: { text: { value } } } } }, ...extra
-  })
+  /** Clicks Submit with the form state Slack attaches to a message's block action. */
+  const submit = (values: JsonObject, extra: JsonObject = {}, drain = true) => act(
+    { action_id: 'centaur.user_input:submit', value: JSON.stringify({ request: REQUEST }) },
+    { state: { values }, ...extra }, drain)
   return {
-    state, request, options, bot, render, click, deliver, submitModal, posts, updates, views, submissions, calls,
+    state, request, options, bot, render, act, submit, deliver, posts, updates, submissions, calls,
     failSubmit: () => { failSubmitOnce = true }, failUpdate: () => { failUpdateOnce = true },
     failWrite: () => { failWriteOnce = true }, failPost: () => { failPostOnce = true },
     holdSubmit: (gate: Promise<void>) => { submitGate = gate },
     holdUpdate: (gate: Promise<void>) => { updateGate = gate }
   }
+}
+
+function isNotice(block: JsonObject, text: string): boolean {
+  return block.type === 'section' && (block.text as JsonObject).text === text
 }
 
 function signedRequest(payload: JsonObject, signed: boolean): RequestInit {
@@ -126,19 +124,38 @@ function signedRequest(payload: JsonObject, signed: boolean): RequestInit {
   } }
 }
 
+const pick = (index: number, value: string): JsonObject => ({
+  [`q${index}`]: { selected: { type: 'radio_buttons', selected_option: { value } } }
+})
+const write = (index: number, value: string | null): JsonObject => ({
+  [`c${index}`]: { text: { type: 'plain_text_input', value } }
+})
+const block = (message: JsonObject, id: string) =>
+  (message.blocks as JsonObject[]).find(candidate => candidate.block_id === id) as JsonObject | undefined
+const buttons = (message: JsonObject) => (message.blocks as JsonObject[])
+  .flatMap(candidate => candidate.type === 'actions' ? candidate.elements as JsonObject[] : [])
+
 describe('native questions in Slack', () => {
-  test('signed buttons and typed answer collect a batch before resuming the original execution', async () => {
+  test('one form shows every question and resumes the original execution on submit', async () => {
     const h = harness()
     await h.render()
     expect(h.posts).toHaveLength(1)
-    expect(h.posts[0]!.text).toContain('Question 1 of 2')
-    expect((await h.click(0, 1)).status).toBe(200)
-    expect(h.submissions).toHaveLength(0)
-    expect(h.updates.at(-1)!.text).toContain('Question 2 of 2')
-    expect((await h.click(1, 'other')).status).toBe(200)
-    expect(h.views.at(-1)!.title).toEqual({ type: 'plain_text', text: 'Question 2 of 2' })
-    const response = await h.submitModal('Only the gateway service')
-    expect(await response.json()).toEqual({ response_action: 'clear' })
+    const card = h.posts[0]!
+    expect(card.text).toContain('Answer these 2 questions to continue.')
+    for (const [index, name] of [[0, 'Project'], [1, 'Scope']] as const) {
+      expect(block(card, `q${index}`)).toMatchObject({
+        type: 'input', label: { type: 'plain_text', text: name }, element: { type: 'radio_buttons', action_id: 'selected' }
+      })
+      expect(block(card, `c${index}`)).toMatchObject({
+        type: 'input', optional: true, element: { type: 'plain_text_input', action_id: 'text' }
+      })
+    }
+    expect((block(card, 'q0')!.element as JsonObject).options).toEqual([
+      { text: { type: 'plain_text', text: 'Payments' }, description: { type: 'plain_text', text: 'Payment processing work' }, value: '0' },
+      { text: { type: 'plain_text', text: 'Platform' }, description: { type: 'plain_text', text: 'Shared platform work' }, value: '1' }
+    ])
+    expect(buttons(card).map(button => button.action_id)).toEqual(['centaur.user_input:submit'])
+    expect((await h.submit({ ...pick(0, '1'), ...write(0, null), ...write(1, 'Only the gateway service') })).status).toBe(200)
     expect(h.submissions).toEqual([{
       execution_id: 'execution-1', responder_user_id: 'U1', answers: {
         project: { answers: ['Platform'] }, scope: { answers: ['Only the gateway service'] }
@@ -148,23 +165,24 @@ describe('native questions in Slack', () => {
     await h.render({ eventKind: 'session.user_input.resolved', data: { request_id: REQUEST } })
     expect(h.updates.at(-1)!.text).toBe('Answers received. Continuing the task.')
     expect(h.calls.some(call => call.endsWith('/execute'))).toBe(false)
-    await h.submitModal('Only the gateway service')
+    await h.submit({ ...pick(0, '0'), ...pick(1, '0') })
     expect(h.submissions).toHaveLength(1)
   })
 
-  test('rejects unsigned, different requester, wrong message and old-page clicks', async () => {
+  test('rejects unsigned, different requester and wrong message submissions', async () => {
     const h = harness()
     await h.render()
     const before = h.calls.length
+    const answers = { ...pick(0, '0'), ...pick(1, '0') }
     expect((await h.deliver({ type: 'block_actions' }, false)).status).toBe(401)
     expect(h.calls).toHaveLength(before)
-    await h.click(0, 0, { user: { id: 'U2' } })
-    await h.click(0, 0, { channel: { id: 'C2' } })
-    await h.click(0, 0, { message: { ts: 'wrong', thread_ts: '1700000000.000001' } })
+    await h.submit(answers, { user: { id: 'U2' } })
+    await h.submit(answers, { channel: { id: 'C2' } })
+    await h.submit(answers, { message: { ts: 'wrong', thread_ts: '1700000000.000001' } })
     expect(h.calls).toHaveLength(before)
-    await h.click(0, 0)
-    await h.click(0, 1)
-    await h.click(1, 0)
+    expect((await h.act({ action_id: 'centaur.user_input:submit', value: 'not json' }, { state: { values: answers } })).status).toBe(400)
+    expect(h.submissions).toHaveLength(0)
+    await h.submit(answers)
     expect(h.submissions[0]!.answers).toEqual({ project: { answers: ['Payments'] }, scope: { answers: ['Small'] } })
   })
 
@@ -188,7 +206,7 @@ describe('native questions in Slack', () => {
     h.request.status = 'cancelled'
     await h.render({ eventKind: 'session.user_input.resolved', data: { request_id: REQUEST } })
     expect(h.updates.at(-1)!.text).toContain('no longer waiting')
-    await h.click(0, 0)
+    await h.submit({ ...pick(0, '0'), ...pick(1, '0') })
     expect(h.submissions).toHaveLength(0)
     const stale = harness({ status: 'resolved' })
     await stale.render()
@@ -208,62 +226,85 @@ describe('native questions in Slack', () => {
     await h.render()
     expect(h.posts).toHaveLength(1)
     expect(h.posts[0]!.client_msg_id).toBe(REQUEST)
-    await h.click(0, 0)
-    await h.click(1, 0)
+    await h.submit({ ...pick(0, '0'), ...pick(1, '0') })
     expect(h.submissions).toHaveLength(1)
   })
 
-  test('retries a saved final answer after transient API failure without changing earlier answers', async () => {
+  test('an incomplete submission keeps the entries and names what is still needed', async () => {
     const h = harness()
     await h.render()
-    await h.click(0, 0)
-    await h.click(1, 'other')
-    h.failSubmit()
-    expect((await (await h.submitModal('One service')).json()).response_action).toBe('errors')
+    expect((await h.submit({ ...pick(0, '1'), ...write(1, '   ') })).status).toBe(200)
     expect(h.submissions).toHaveLength(0)
-    expect((await (await h.submitModal('One service')).json()).response_action).toBe('clear')
+    const form = h.updates.at(-1)!
+    expect((form.blocks as JsonObject[]).some(candidate => isNotice(candidate, 'Still needed: Scope. Answer and submit again.'))).toBe(true)
+    expect((block(form, 'q0')!.element as JsonObject).initial_option).toMatchObject({ value: '1' })
+    expect((block(form, 'q1')!.element as JsonObject).initial_option).toBeUndefined()
+    expect(buttons(form)).toHaveLength(1)
+    await h.submit({ ...pick(0, '1'), ...write(1, 'Two services') })
+    expect(h.submissions[0]!.answers).toEqual({ project: { answers: ['Platform'] }, scope: { answers: ['Two services'] } })
+    expect((await h.state.get<Record<string, unknown>>(`slackbotv2:user-input:${REQUEST}`))!.notice).toBeUndefined()
+  })
+
+  test('a typed answer replaces the selection for a single choice and pre-fills a re-rendered form', async () => {
+    const h = harness()
+    await h.render()
+    await h.submit({ ...pick(0, '0'), ...write(0, ' Billing ') })
+    const form = h.updates.at(-1)!
+    expect((block(form, 'c0')!.element as JsonObject).initial_value).toBe('Billing')
+    expect((block(form, 'q0')!.element as JsonObject).initial_option).toBeUndefined()
+    await h.submit({ ...pick(0, '0'), ...write(0, 'Billing'), ...pick(1, '1') })
+    expect(h.submissions[0]!.answers).toEqual({ project: { answers: ['Billing'] }, scope: { answers: ['Large'] } })
+  })
+
+  test('retries a submission after transient API failure', async () => {
+    const h = harness()
+    await h.render()
+    const answers = { ...pick(0, '0'), ...write(1, 'One service') }
+    h.failSubmit()
+    expect((await h.submit(answers)).status).toBe(503)
+    expect(h.submissions).toHaveLength(0)
+    expect((await h.submit(answers)).status).toBe(200)
     expect(h.submissions).toHaveLength(1)
   })
 
-  test('retries a failed page update after acknowledging the saved choice', async () => {
+  test('retries a failed card update after acknowledging the answers', async () => {
     const h = harness()
     await h.render()
     h.failUpdate()
-    expect((await h.click(0, 0)).status).toBe(200)
-    expect((await h.click(0, 0)).status).toBe(200)
-    expect(h.updates.at(-1)!.text).toContain('Question 2 of 2')
-    expect(h.submissions).toHaveLength(0)
+    expect((await h.submit({ ...pick(0, '0'), ...pick(1, '0') })).status).toBe(200)
+    expect(h.submissions).toHaveLength(1)
+    expect(h.updates.at(-1)!.text).toContain('Answers sent')
   })
 
-  test('acknowledges a saved choice before Slack finishes rendering it', async () => {
+  test('acknowledges the answers before Slack finishes rendering them', async () => {
     const h = harness()
     await h.render()
     let release!: () => void
     h.holdUpdate(new Promise<void>(resolve => { release = resolve }))
     const started = Date.now()
-    const response = await h.click(0, 0, {}, false)
+    const response = await h.submit({ ...pick(0, '0'), ...pick(1, '0') }, {}, false)
     expect(response.status).toBe(200)
     expect(Date.now() - started).toBeLessThan(1000)
     expect(h.updates).toHaveLength(0)
     release()
     await h.bot.drain(5000)
-    expect(h.updates.at(-1)!.text).toContain('Question 2 of 2')
+    expect(h.updates.at(-1)!.text).toContain('Answers sent')
   })
 
   test('returns a retryable response before Slack times out a slow durable handoff', async () => {
     const h = harness()
     await h.render()
-    await h.click(0, 0)
+    const answers = { ...pick(0, '0'), ...pick(1, '0') }
     let release!: () => void
     h.holdSubmit(new Promise<void>(resolve => { release = resolve }))
     const started = Date.now()
-    const response = await h.click(1, 0, {}, false)
+    const response = await h.submit(answers, {}, false)
     expect(response.status).toBe(503)
     expect(Date.now() - started).toBeLessThan(2800)
     expect(h.submissions).toHaveLength(0)
     release()
     await h.bot.drain(5000)
-    await h.click(1, 0)
+    await h.submit(answers)
     expect(h.submissions).toHaveLength(1)
   })
 
@@ -284,13 +325,14 @@ describe('native questions in Slack', () => {
   test('retries answers persisted by the API when writing to the harness failed', async () => {
     const h = harness()
     await h.render()
-    await h.click(0, 0)
     h.failWrite()
-    expect((await h.click(1, 0)).status).toBe(503)
+    expect((await h.submit({ ...pick(0, '0'), ...pick(1, '0') })).status).toBe(503)
     expect(h.request.status).toBe('submitted')
     expect(h.submissions).toHaveLength(0)
-    expect((await h.click(1, 0)).status).toBe(200)
+    // The API already stored the first answer set; a changed form cannot replace it.
+    expect((await h.submit({ ...pick(0, '1'), ...pick(1, '1') })).status).toBe(200)
     expect(h.submissions).toHaveLength(1)
+    expect(h.submissions[0]!.answers).toEqual({ project: { answers: ['Payments'] }, scope: { answers: ['Small'] } })
     expect(h.request.status).toBe('resolved')
   })
 
@@ -298,15 +340,15 @@ describe('native questions in Slack', () => {
     const h = harness({ questions: [{ id: 'targets', header: 'Targets', question: 'Which services?', multiSelect: true,
       options: [{ label: 'API', description: '' }, { label: 'Worker', description: '' }] }] })
     await h.render()
-    await h.click(0, 'edit')
-    const response = await h.deliver({
-      type: 'view_submission', team: { id: 'T1' }, user: { id: 'U1' },
-      view: { ...h.views.at(-1), state: { values: {
-        choices: { selected: { selected_options: [{ value: '0' }, { value: '1' }] } },
-        custom: { text: { value: 'Scheduler' } }
-      } } }
+    expect(h.posts[0]!.text).toContain('Answer this question to continue.')
+    expect(block(h.posts[0]!, 'q0')!.element).toEqual({ type: 'checkboxes', action_id: 'selected', options: [
+      { text: { type: 'plain_text', text: 'API' }, value: '0' }, { text: { type: 'plain_text', text: 'Worker' }, value: '1' }
+    ] })
+    expect(block(h.posts[0]!, 'c0')!.hint).toBeUndefined()
+    await h.submit({
+      q0: { selected: { type: 'checkboxes', selected_options: [{ value: '0' }, { value: '1' }] } },
+      ...write(0, 'Scheduler')
     })
-    expect((await response.json()).response_action).toBe('clear')
     expect(h.submissions[0]!.answers).toEqual({ targets: { answers: ['API', 'Worker', 'Scheduler'] } })
   })
 
@@ -314,24 +356,41 @@ describe('native questions in Slack', () => {
     const h = harness({ questions: [{ id: '__proto__', header: 'Target', question: 'Which target?',
       options: Array.from({ length: 10 }, (_, index) => ({ label: `Target ${index}`, description: '' })) }] })
     await h.render()
-    expect((await h.click(0, 9)).status).toBe(200)
+    expect((await h.submit(pick(0, '9'))).status).toBe(200)
     expect(Object.keys(h.submissions[0]!.answers as JsonObject)).toEqual(['__proto__'])
     expect((h.submissions[0]!.answers as JsonObject).__proto__).toEqual({ answers: ['Target 9'] })
   })
 
-  test('a modal from a different channel cannot answer an otherwise valid request', async () => {
+  test('a question that allows no custom answer has no text field and ignores forged text', async () => {
+    const h = harness({ questions: [{ id: 'q', header: '', question: 'Proceed?', allowOther: false,
+      options: [{ label: 'Yes', description: '' }, { label: 'No', description: '' }] }] })
+    await h.render()
+    expect(block(h.posts[0]!, 'c0')).toBeUndefined()
+    expect(block(h.posts[0]!, 'q0')!.label).toEqual({ type: 'plain_text', text: 'Question 1' })
+    await h.submit(write(0, 'Maybe'))
+    expect(h.submissions).toHaveLength(0)
+    await h.submit({ ...pick(0, '1'), ...write(0, 'Maybe') })
+    expect(h.submissions[0]!.answers).toEqual({ q: { answers: ['No'] } })
+  })
+
+  test('a button or modal from the earlier paged card answers nothing and shows the form', async () => {
     const h = harness()
     await h.render()
-    await h.click(0, 'other')
-    const view = h.views.at(-1)!
-    const metadata = JSON.parse(String(view.private_metadata))
-    metadata.channel_id = 'C_OTHER'
-    const response = await h.deliver({ type: 'view_submission', team: { id: 'T1' }, user: { id: 'U1' },
-      view: { ...view, private_metadata: JSON.stringify(metadata),
-        state: { values: { custom: { text: { value: 'Wrong channel' } } } } } })
-    expect((await response.json()).response_action).toBe('errors')
+    const legacy = { action_id: 'centaur.user_input:0', value: JSON.stringify({ request: REQUEST, index: 0, choice: 0 }) }
+    expect((await h.act(legacy)).status).toBe(200)
     expect(h.submissions).toHaveLength(0)
-    expect(h.updates).toHaveLength(0)
+    expect(buttons(h.updates.at(-1)!).map(button => button.action_id)).toEqual(['centaur.user_input:submit'])
+    const before = h.calls.length
+    const response = await h.deliver({ type: 'view_submission', team: { id: 'T1' }, user: { id: 'U1' }, view: {
+      callback_id: 'centaur.user_input:answer', blocks: [{ type: 'input', block_id: 'custom' }],
+      private_metadata: JSON.stringify({ request: REQUEST, index: 0, choice: 'other', channel_id: 'C1' }),
+      state: { values: { custom: { text: { value: 'Typed in the old window' } } } }
+    } })
+    expect(await response.json()).toEqual({ response_action: 'errors', errors: {
+      custom: 'Close this window and answer on the question card in the thread.'
+    } })
+    expect(h.calls).toHaveLength(before)
+    expect(h.submissions).toHaveLength(0)
   })
 
   test('preserves literal question content rather than interpreting Slack mentions', async () => {
@@ -339,6 +398,27 @@ describe('native questions in Slack', () => {
     await h.render()
     const blocks = h.posts[0]!.blocks as JsonObject[]
     expect(blocks[1]!.text).toEqual({ type: 'plain_text', text: 'Use <!channel> or <https://example.com|this>?' })
+    expect(block(h.posts[0]!, 'q0')).toBeUndefined()
+    expect(block(h.posts[0]!, 'c0')).toMatchObject({
+      label: { type: 'plain_text', text: 'Choice' }, element: { type: 'plain_text_input', multiline: true }
+    })
+    await h.submit(write(0, 'Use <!channel>'))
+    expect(h.submissions[0]!.answers).toEqual({ q: { answers: ['Use <!channel>'] } })
+  })
+
+  test('lists choices in full when one exceeds the length Slack allows on a choice', async () => {
+    const long = 'Covers every service that reads the ledger, including the reconciliation and export jobs.'
+    const h = harness({ questions: [{ id: 'q', header: 'Scope', question: 'Which scope?', options: [
+      { label: 'Wide', description: long }, { label: 'Narrow', description: 'One service' }
+    ] }] })
+    await h.render()
+    const blocks = h.posts[0]!.blocks as JsonObject[]
+    expect(blocks[1]!.text).toEqual({ type: 'plain_text', text: `Which scope?\n\n1. Wide\n${long}\n\n2. Narrow\nOne service` })
+    expect((block(h.posts[0]!, 'q0')!.element as JsonObject).options).toEqual([
+      { text: { type: 'plain_text', text: '1. Wide' }, value: '0' }, { text: { type: 'plain_text', text: '2. Narrow' }, value: '1' }
+    ])
+    await h.submit(pick(0, '0'))
+    expect(h.submissions[0]!.answers).toEqual({ q: { answers: ['Wide'] } })
   })
 
   test('the SSE parser passes requested and resolved events to live and recovery renders', async () => {
