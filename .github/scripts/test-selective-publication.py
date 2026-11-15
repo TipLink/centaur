@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("planner", Path(__file__).with_name("plan-reviewed-images.py"))
 planner = importlib.util.module_from_spec(spec)
@@ -84,6 +85,23 @@ def test(work):
         assert command("docker", "run", "--rm", f"{image(service)}:reviewed-{second}", "cat", "/payload") == expected
     Path("notes").write_text("outside both images")
     expect_build(second, commit(), [])
+    with patch.object(planner, "inspect", return_value={}):
+        expect_build(second, command("git", "rev-parse", "HEAD"), services)
+    lookup = planner.manifest
+
+    def moved_material(reference):
+        if reference == "busybox:1.37":
+            return "sha256:" + "0" * 64, {}
+        return lookup(reference)
+
+    with patch.object(planner, "manifest", moved_material):
+        expect_build(second, command("git", "rev-parse", "HEAD"), services)
+    recipe = directory("agent") / "Dockerfile"
+    recipe.write_text(recipe.read_text() + "\nENV EXAMPLE=1\n")
+    expect_build(second, commit(), ["agent"])
+    Path(".dockerignore").write_text("notes\n")
+    expect_build(second, commit(), services)
+    Path(".dockerignore").unlink()
     Path("shared").unlink()
     expect_build(second, commit(), services)
     print("PASS: native runtime reads, identical reused index, isolated change, all-reuse and shared deletion")

@@ -80,7 +80,7 @@ def material_reference(material):
     return image + ":" + tag, digest
 
 
-def context_paths(definition):
+def context_paths(definition, material_digests):
     paths = set()
     for step in definition["internalParameters"]["buildConfig"]["llbDefinition"]:
         op = step["op"]["Op"] or {}
@@ -88,13 +88,16 @@ def context_paths(definition):
             continue
         src = op["source"]
         if src["identifier"].startswith("docker-image://"):
+            base_digest = src["identifier"].rsplit("@", 1)[-1]
+            require(base_digest in material_digests, "base image missing from resolved materials")
             continue
         require(src["identifier"] == "local://context", "external or unknown build source")
         followed = json.loads(src.get("attrs", {}).get("local.followpaths", "null"))
         require(isinstance(followed, list) and followed, "unbounded local build context")
         for path in followed:
             require(isinstance(path, str) and re.fullmatch(r"[A-Za-z0-9_./-]+", path)
-                    and not path.startswith("/") and ".." not in PurePosixPath(path).parts and path != ".",
+                    and str(PurePosixPath(path)) == path and not path.startswith("/")
+                    and ".." not in PurePosixPath(path).parts and path != ".",
                     "unbounded or nonliteral source path")
             paths.add(path)
     require(paths, "missing local source evidence")
@@ -121,14 +124,13 @@ def reusable(service, previous, current):
         require(manifest(repo + ":reviewed-" + origin)[0] == digest, "original index differs")
         paths = changed_paths(origin, current)
         definition = attestations[platform]["SLSA"]["buildDefinition"]
-        inputs = context_paths(definition) | {recipe, recipe + ".dockerignore", ".dockerignore"}
+        materials = [material_reference(m) for m in definition["resolvedDependencies"]]
+        require(materials, "no resolved build materials")
+        inputs = context_paths(definition, {digest for _, digest in materials}) | {recipe, recipe + ".dockerignore", ".dockerignore"}
         for path in sorted(paths):
             require(not any(path == p or path.startswith(p + "/") or p.startswith(path + "/") for p in inputs),
                     f"build input changed: {path}")
-        materials = definition["resolvedDependencies"]
-        require(materials, "no resolved build materials")
-        for material in materials:
-            name, expected = material_reference(material)
+        for name, expected in materials:
             require(manifest(name)[0] == expected, f"registry input changed: {name}")
     children = [m["digest"] for m in index["manifests"]
                 if m.get("platform", {}).get("os") == "linux" and m["platform"]["architecture"] == "arm64"]
@@ -145,7 +147,7 @@ def plan(previous, current, services=SERVICES):
             require(previous and re.fullmatch(SHA, previous), "full build")
             reuse[image] = reusable(service, previous, current)
             print(f"{image}: reuse {reuse[image]['digest']}", file=sys.stderr)
-        except (ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError, OSError) as exc:
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError, subprocess.SubprocessError, OSError) as exc:
             print(f"{image}: rebuild ({exc})", file=sys.stderr)
             for platform in PLATFORMS:
                 name = "sandbox" if service == "agent" else service
