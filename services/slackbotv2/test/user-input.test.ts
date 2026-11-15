@@ -110,10 +110,6 @@ function harness(questionChanges: Partial<SessionUserInputRequest> = {}) {
   }
 }
 
-function isNotice(block: JsonObject, text: string): boolean {
-  return block.type === 'section' && (block.text as JsonObject).text === text
-}
-
 function signedRequest(payload: JsonObject, signed: boolean): RequestInit {
   const timestamp = Math.floor(Date.now() / 1000)
   const body = new URLSearchParams({ payload: JSON.stringify(payload) }).toString()
@@ -236,7 +232,7 @@ describe('native questions in Slack', () => {
     expect((await h.submit({ ...pick(0, '1'), ...write(1, '   ') })).status).toBe(200)
     expect(h.submissions).toHaveLength(0)
     const form = h.updates.at(-1)!
-    expect((form.blocks as JsonObject[]).some(candidate => isNotice(candidate, 'Still needed: Scope. Answer and submit again.'))).toBe(true)
+    expect((form.blocks as JsonObject[])[0]).toMatchObject({ text: { text: expect.stringContaining('Still needed: Scope.') } })
     expect((block(form, 'q0')!.element as JsonObject).initial_option).toMatchObject({ value: '1' })
     expect((block(form, 'q1')!.element as JsonObject).initial_option).toBeUndefined()
     expect(buttons(form)).toHaveLength(1)
@@ -419,6 +415,32 @@ describe('native questions in Slack', () => {
     ])
     await h.submit(pick(0, '0'))
     expect(h.submissions[0]!.answers).toEqual({ q: { answers: ['Wide'] } })
+  })
+
+  test('keeps all details and controls within 50 blocks for four maximum-size questions', async () => {
+    const questions = Array.from({ length: 4 }, (_, q) => ({
+      id: String(q), header: `Question ${q}`, question: 'x'.repeat(2999) + '😀' + 'x'.repeat(2997),
+      options: Array.from({ length: 10 }, (_, i) => ({
+        label: String(i).repeat(300), description: String.fromCharCode(65 + i).repeat(2000)
+      }))
+    }))
+    const h = harness({ questions })
+    await h.render()
+    await h.submit({})
+    for (const message of [h.posts[0]!, h.updates.at(-1)!]) {
+      const blocks = message.blocks as JsonObject[]
+      expect(blocks.length).toBeLessThanOrEqual(50)
+      expect(buttons(message)).toHaveLength(1)
+      const sections = blocks.slice(1).filter(b => b.type === 'section').map(b => (b.text as JsonObject).text as string)
+      for (const section of sections) {
+        expect([...section].length).toBeLessThanOrEqual(3000)
+        expect(section).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/)
+      }
+      const expected = questions.map(q => [q.question, ...q.options.map((o, i) =>
+        `${i + 1}. ${o.label}\n${o.description}`)].join('\n\n')).join('')
+      expect(sections.join('')).toBe(expected)
+      expect(blocks.filter(b => b.type === 'input')).toHaveLength(8)
+    }
   })
 
   test('the SSE parser passes requested and resolved events to live and recovery renders', async () => {

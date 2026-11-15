@@ -19,7 +19,6 @@ const SUBMIT_ACTION = `${PREFIX}submit`
 const LEGACY_MODAL_ID = `${PREFIX}answer`
 const OPTION_TEXT_LIMIT = 75
 const ANSWER_TEXT_LIMIT = 2000
-const QUESTION_TEXT_LIMIT = 8400
 const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const LOCK_TTL_MS = 120_000
 const POST_RETRY_INTERVAL_MS = 30_000
@@ -41,7 +40,7 @@ type QuestionCard = {
   postingAt?: number
   /** The latest submitted form values; a partial set pre-fills the re-rendered form. */
   answers: SessionUserInputAnswers
-  /** Shown above the submit button after an incomplete submission. */
+  /** Shown at the top of the form after an incomplete submission. */
   notice?: string
   closed?: boolean
 }
@@ -283,13 +282,11 @@ function optionsFit(question: SessionUserInputQuestion): boolean {
 function questionSections(question: SessionUserInputQuestion): JsonObject[] {
   const lines = optionsFit(question) ? [] : question.options.map((option, index) =>
     `${index + 1}. ${option.label}${option.description ? `\n${option.description}` : ''}`)
-  let content = [question.question, ...lines].join('\n\n')
-  if (content.length > QUESTION_TEXT_LIMIT) content = `${content.slice(0, QUESTION_TEXT_LIMIT - 1)}…`
-  const blocks: JsonObject[] = []
-  for (let start = 0; start < content.length; start += 2800) {
-    blocks.push({ type: 'section', text: { type: 'plain_text', text: content.slice(start, start + 2800) } })
-  }
-  return blocks
+  const content = [question.question, ...lines].join('\n\n')
+  // Each section allows 3000 characters. Match code points so a split cannot bisect an emoji.
+  return (content.match(/.{1,3000}/gsu) ?? []).map(text => ({
+    type: 'section', text: { type: 'plain_text', text }
+  }))
 }
 
 function questionInputs(question: SessionUserInputQuestion, index: number, saved: string[]): JsonObject[] {
@@ -341,20 +338,18 @@ function cardMessage(card: QuestionCard): JsonObject {
   const questions = card.request.questions
   const title = questions.length === 1
     ? 'Answer this question to continue.' : `Answer these ${questions.length} questions to continue.`
-  const blocks: JsonObject[] = [{ type: 'section', block_id: marker, text: { type: 'plain_text', text: title } }]
+  const heading = [title, 'The person who requested this task can answer.', card.notice].filter(Boolean).join('\n')
+  // Four maximum-size questions can need ten text sections and two inputs each.
+  // Keeping the heading and Submit to two blocks leaves room for all 50.
+  const blocks: JsonObject[] = [{ type: 'section', block_id: marker, text: { type: 'plain_text', text: heading } }]
   questions.forEach((question, index) => {
-    if (index > 0) blocks.push({ type: 'divider' })
     const saved = Object.hasOwn(card.answers, question.id) ? card.answers[question.id]!.answers : []
     blocks.push(...questionSections(question), ...questionInputs(question, index, saved))
   })
-  if (card.notice) blocks.push({ type: 'section', text: { type: 'plain_text', text: card.notice } })
-  blocks.push(
-    { type: 'actions', elements: [{
-      type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Submit' }, action_id: SUBMIT_ACTION,
-      value: JSON.stringify({ request: card.request.request_id })
-    }] },
-    { type: 'context', elements: [{ type: 'plain_text', text: 'The person who requested this task can answer.' }] }
-  )
+  blocks.push({ type: 'actions', elements: [{
+    type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Submit' }, action_id: SUBMIT_ACTION,
+    value: JSON.stringify({ request: card.request.request_id })
+  }] })
   return {
     mrkdwn: false, unfurl_links: false, unfurl_media: false,
     text: `${title} ${questions.map(question => question.question).join(' · ')}`.slice(0, 3000),
