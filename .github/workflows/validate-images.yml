@@ -29,6 +29,13 @@ on:
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
       - .agents/skills/**
+      - .github/scripts/plan-reviewed-images.py
+      - .github/scripts/test-selective-publication.py
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - contrib/chart/charts/agent-sandbox/crds/**
+      - patches/**
 
 concurrency:
   group: validate-images-${{ github.ref }}
@@ -49,6 +56,15 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - name: Test selective publication against a local OCI registry
+        if: github.event.pull_request.base.ref == 'release/aws-core'
+        run: |
+          set -euo pipefail
+          docker run -d --name test-registry -p 127.0.0.1:5000:5000 registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          printf '[registry."localhost:5000"]\n  http = true\n' > "$RUNNER_TEMP/registry.toml"
+          docker buildx create --use --buildkitd-config "$RUNNER_TEMP/registry.toml" --driver docker-container --driver-opt network=host,image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+          python3 .github/scripts/test-selective-publication.py
+
       - name: Reject unsigned, unchecked, or unrelated release candidates
         run: python3 .github/scripts/test-reviewed-image-release.py
 
