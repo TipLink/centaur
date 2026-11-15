@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "82e8153689fec428d2a42ad4522492905fd61fa1",
-  "result_tree": "3f716cbd0a135e4fe3bb00ebdeb6102c1d52505d",
+  "result_tree": "52cd0284857dee70b284e164b2d8dd6fc7ad0cef",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -63,6 +63,10 @@
     {
       "file": "0015-question-card-single-form.patch",
       "sha256": "ef45318c8ab152c62e298ac84db6b54bf049316806cdcccaf8ca96a2b475624b"
+    },
+    {
+      "file": "0016-preserve-question-details.patch",
+      "sha256": "9cca51d5245d965b92f34aa60ae7317eefff0be5c40dc51af2bd7e7d9e617918"
     }
   ]
 }
