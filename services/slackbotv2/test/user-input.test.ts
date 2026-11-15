@@ -165,6 +165,42 @@ describe('native questions in Slack', () => {
     expect(h.submissions).toHaveLength(1)
   })
 
+  test('ticket planning accepts a blank note and preserves a typed note across a partial submission', async () => {
+    const project = { id: 'project', header: 'Project', question: 'Which project?', options: [{ label: 'Payouts', description: '' }] }
+    const details = { id: 'question_2', header: 'Details', question: 'Additional details (optional)',
+      options: [{ label: 'No additional details', description: '' }, { label: 'Write a note', description: '' }] }
+    for (const note of ['', 'Only bank payouts.\nKeep it on the confirmation screen.']) {
+      const h = harness({ questions: [project, details] })
+      await h.render()
+      const card = h.posts[0]!
+      expect(card.text).toContain('Answer this question to continue.')
+      expect(block(card, 'q1')).toBeUndefined()
+      expect(block(card, 'c1')).toMatchObject({ type: 'input', optional: true,
+        label: { text: 'Additional details' }, element: { type: 'plain_text_input', multiline: true } })
+      expect(buttons(card)).toHaveLength(1)
+      await h.submit(write(1, note))
+      expect(h.submissions).toHaveLength(0)
+      if (note) expect(block(h.updates.at(-1)!, 'c1')!.element).toMatchObject({ initial_value: note })
+      await h.submit({ ...pick(0, '0'), ...(note ? write(1, note) : {}) })
+      expect(h.submissions[0]!.answers).toEqual({
+        project: { answers: ['Payouts'] }, question_2: { answers: [note || 'No additional details'] }
+      })
+    }
+  })
+
+  test('the free-text-only details field can be skipped without skipping ordinary text questions', async () => {
+    const freeText = { id: 'details', header: 'Details', question: 'Additional details (optional)', options: [] }
+    const h = harness({ questions: [freeText] })
+    await h.render()
+    expect(block(h.posts[0]!, 'c0')!.label).toEqual({ type: 'plain_text', text: 'Additional details' })
+    await h.submit({})
+    expect(h.submissions[0]!.answers).toEqual({ details: { answers: ['No additional details'] } })
+    const required = harness({ questions: [{ ...freeText, question: 'Which account should receive the payout?' }] })
+    await required.render()
+    await required.submit({})
+    expect(required.submissions).toHaveLength(0)
+  })
+
   test('rejects unsigned, different requester and wrong message submissions', async () => {
     const h = harness()
     await h.render()

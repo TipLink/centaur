@@ -326,6 +326,16 @@ function questionInputs(question: SessionUserInputQuestion, index: number, saved
   return blocks
 }
 
+const NO_DETAILS = 'No additional details'
+
+// Native question tools have a required answer map and some require two options.
+// This explicit prompt reserves a text-only field while keeping the native reply valid.
+function isAdditionalDetails(question: SessionUserInputQuestion): boolean {
+  return question.question === 'Additional details (optional)' && question.allowOther !== false && !question.multiSelect
+    && (question.options.length === 0 || (question.options.length === 2
+      && question.options[0]?.label === NO_DETAILS && question.options[1]?.label === 'Write a note'))
+}
+
 function cardMessage(card: QuestionCard): JsonObject {
   const marker = `${PREFIX}${card.request.request_id}`
   if (card.closed) {
@@ -336,15 +346,25 @@ function cardMessage(card: QuestionCard): JsonObject {
     return { text, blocks: [{ type: 'section', block_id: marker, text: { type: 'plain_text', text } }] }
   }
   const questions = card.request.questions
-  const title = questions.length === 1
-    ? 'Answer this question to continue.' : `Answer these ${questions.length} questions to continue.`
+  const requiredCount = questions.filter(question => !isAdditionalDetails(question)).length
+  const title = requiredCount === 0 ? 'Add any details, then submit to continue.'
+    : requiredCount === 1 ? 'Answer this question to continue.' : `Answer these ${requiredCount} questions to continue.`
   const heading = [title, 'The person who requested this task can answer.', card.notice].filter(Boolean).join('\n')
   // Four maximum-size questions can need ten text sections and two inputs each.
   // Keeping the heading and Submit to two blocks leaves room for all 50.
   const blocks: JsonObject[] = [{ type: 'section', block_id: marker, text: { type: 'plain_text', text: heading } }]
   questions.forEach((question, index) => {
     const saved = Object.hasOwn(card.answers, question.id) ? card.answers[question.id]!.answers : []
-    blocks.push(...questionSections(question), ...questionInputs(question, index, saved))
+    if (isAdditionalDetails(question)) {
+      const note = saved[0]
+      blocks.push({
+        type: 'input', block_id: `c${index}`, optional: true, label: { type: 'plain_text', text: 'Additional details' },
+        element: { type: 'plain_text_input', action_id: 'text', multiline: true, max_length: ANSWER_TEXT_LIMIT,
+          ...(note && note !== NO_DETAILS ? { initial_value: note } : {}) }
+      })
+    } else {
+      blocks.push(...questionSections(question), ...questionInputs(question, index, saved))
+    }
   })
   blocks.push({ type: 'actions', elements: [{
     type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Submit' }, action_id: SUBMIT_ACTION,
@@ -379,6 +399,14 @@ function formAnswers(
     })
     const custom = isJsonObject(values[`c${index}`]) ? values[`c${index}`] as JsonObject : {}
     const text = isJsonObject(custom.text) ? custom.text.value : undefined
+    if (isAdditionalDetails(question)) {
+      if (typeof text === 'string' && text.length > ANSWER_TEXT_LIMIT) {
+        missing.push('Additional details (maximum 2000 characters)')
+      } else {
+        answers[question.id] = { answers: [typeof text === 'string' && text.trim() ? text.trim() : NO_DETAILS] }
+      }
+      return
+    }
     const typed = question.allowOther !== false && typeof text === 'string' && text.trim()
       && text.length <= ANSWER_TEXT_LIMIT ? [text.trim()] : []
     // One answer for a single choice: the requester's own text replaces a selection.
