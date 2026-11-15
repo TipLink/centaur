@@ -359,11 +359,13 @@ jobs:
     needs: [tag-absence-gate, merge]
     if: ${{ !cancelled() && needs.merge.result == 'success' }}
     steps:
-      - name: Download this run's runnable linux/arm64 child digests
+      - name: Download this run's runnable platform child digests
         if: needs.tag-absence-gate.outputs.has_build == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: runnable-child-digests-*-linux-arm64
+          # A single match is extracted flat. Every rebuilt image has both platform
+          # artifacts, so this keeps the per-image directories even for one rebuild.
+          pattern: runnable-child-digests-*-linux-*
           path: ${{ runner.temp }}/arm64-runnable-child-digests
 
       - name: Set up Docker Buildx
