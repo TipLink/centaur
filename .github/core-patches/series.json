@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "82e8153689fec428d2a42ad4522492905fd61fa1",
-  "result_tree": "52cd0284857dee70b284e164b2d8dd6fc7ad0cef",
+  "result_tree": "2f6190b543377349ea152fdf69240647a453e106",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -67,6 +67,10 @@
     {
       "file": "0016-preserve-question-details.patch",
       "sha256": "9cca51d5245d965b92f34aa60ae7317eefff0be5c40dc51af2bd7e7d9e617918"
+    },
+    {
+      "file": "0017-optional-additional-details.patch",
+      "sha256": "6b82f36b4d84239a22924dc79eac5da403a2acc7c48ff1b223eb827f5d4f3f50"
     }
   ]
 }
