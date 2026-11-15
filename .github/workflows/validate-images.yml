@@ -2,40 +2,6 @@ name: Publish Images
 
 on:
   pull_request:
-    paths:
-      - .github/actions/prepare-patched-core/**
-      - .github/core-patches/**
-      - .github/scripts/prepare-centaur-core.py
-      - .github/scripts/verify-core-patch-source.py
-      - .github/workflows/validate-images.yml
-      - .github/workflows/publish-images.yml
-      - .github/scripts/resolve-runnable-image-digest.sh
-      - .github/scripts/verify-registry-tag-absent.sh
-      - .github/scripts/verify-reviewed-image-release.sh
-      - .github/scripts/test-reviewed-image-release.py
-      - .github/scripts/test-resolve-runnable-image-digest.sh
-      - .github/scripts/test-verify-registry-tag-absent.sh
-      - .github/scripts/test-verify-reviewed-image-release.sh
-      - services/**
-      - crates/**
-      - harness/**
-      - centaur_sdk/**
-      - packages/**
-      - tools/**
-      - workflows/**
-      - scripts/bootstrap-k8s-secrets.sh
-      - scripts/probe-agent-harness-image.sh
-      - package.json
-      - pnpm-lock.yaml
-      - pnpm-workspace.yaml
-      - .agents/skills/**
-      - .github/scripts/plan-reviewed-images.py
-      - .github/scripts/test-selective-publication.py
-      - .dockerignore
-      - Cargo.toml
-      - Cargo.lock
-      - contrib/chart/charts/agent-sandbox/crds/**
-      - patches/**
 
 concurrency:
   group: validate-images-${{ github.ref }}
@@ -65,83 +31,52 @@ jobs:
           docker buildx create --use --buildkitd-config "$RUNNER_TEMP/registry.toml" --driver docker-container --driver-opt network=host,image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
           python3 .github/scripts/test-selective-publication.py
 
+      - name: Test PR image selection
+        run: python3 .github/scripts/test-pr-images.py
+
       - name: Reject unsigned, unchecked, or unrelated release candidates
         run: python3 .github/scripts/test-reviewed-image-release.py
 
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_build: ${{ steps.select.outputs.has_build }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Prove the effective build tree even when every image check is reused.
+      - uses: ./.github/actions/prepare-patched-core
+      - name: Select affected image checks
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/plan-pr-images.py --carry "$RUNNER_TEMP/inherited" > "$RUNNER_TEMP/plan.json"
+          jq -r '"matrix=" + (.matrix|tojson), "has_build=" + (.has_build|tostring)' "$RUNNER_TEMP/plan.json" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr-inputs-inherited
+          path: ${{ runner.temp }}/inherited/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
   build:
+    needs: plan
+    if: needs.plan.outputs.has_build == 'true'
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
-      matrix:
-        service: [api-rs, company-context, proxy-sync, token-broker, slackbotv2, linearbot, discordbot, githubbot, teamsbot, agent, iron-proxy, console]
-        platform: [linux/amd64]
-        include:
-          - service: api-rs
-            image: centaur-api-rs
-            context: .
-            dockerfile: services/api-rs/Dockerfile
-            target: ""
-          - service: company-context
-            image: centaur-company-context
-            context: .
-            dockerfile: services/company-context/Dockerfile
-            target: ""
-          - service: proxy-sync
-            image: centaur-proxy-sync
-            context: .
-            dockerfile: services/proxy-sync/Dockerfile
-            target: ""
-          - service: token-broker
-            image: centaur-token-broker
-            context: .
-            dockerfile: services/token-broker/Dockerfile
-            target: ""
-          - service: slackbotv2
-            image: centaur-slackbotv2
-            context: .
-            dockerfile: services/slackbotv2/Dockerfile
-            target: ""
-          - service: linearbot
-            image: centaur-linearbot
-            context: .
-            dockerfile: services/linearbot/Dockerfile
-            target: ""
-          - service: discordbot
-            image: centaur-discordbot
-            context: .
-            dockerfile: services/discordbot/Dockerfile
-            target: ""
-          - service: githubbot
-            image: centaur-githubbot
-            context: .
-            dockerfile: services/githubbot/Dockerfile
-            target: ""
-          - service: teamsbot
-            image: centaur-teamsbot
-            context: .
-            dockerfile: services/teamsbot/Dockerfile
-            target: ""
-          - service: agent
-            image: centaur-agent
-            context: .
-            dockerfile: services/sandbox/Dockerfile
-            target: sandbox
-          - service: agent
-            platform: linux/arm64
-            image: centaur-agent
-            context: .
-            dockerfile: services/sandbox/Dockerfile
-            target: sandbox
-          - service: iron-proxy
-            image: centaur-iron-proxy
-            context: .
-            dockerfile: services/iron-proxy/Dockerfile
-            target: ""
-          - service: console
-            image: centaur-console
-            context: .
-            dockerfile: services/console/Dockerfile
-            target: ""
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -172,9 +107,10 @@ jobs:
           echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
 
       - name: Build ${{ matrix.image }} without registry credentials
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: _core/${{ matrix.context }}
+          context: _core
           file: _core/${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
@@ -196,19 +132,48 @@ jobs:
           AGENT_IMAGE: ${{ matrix.image }}:validate-${{ env.PLATFORM_SLUG }}
         run: bash scripts/probe-agent-harness-image.sh "$AGENT_IMAGE"
 
+      - name: Record validated BuildKit inputs
+        env:
+          BUILD_REF: ${{ fromJSON(steps.build.outputs.metadata)['buildx.build.ref'] }}
+          SERVICE: ${{ matrix.service }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/proof"
+          python3 .github/scripts/plan-pr-images.py --record "$RUNNER_TEMP/proof" "$SERVICE" "$PLATFORM" "$BUILD_REF"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr-inputs-${{ matrix.service }}-${{ env.PLATFORM_SLUG }}
+          path: ${{ runner.temp }}/proof/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
   image-validation-success:
     name: Image validation success
     runs-on: ubuntu-latest
     if: always()
-    needs: [build, release-policy]
+    needs: [plan, build, release-policy]
     steps:
       - name: Require every image validation build to succeed
         env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          HAS_BUILD: ${{ needs.plan.outputs.has_build }}
           BUILD_RESULT: ${{ needs.build.result }}
           POLICY_RESULT: ${{ needs.release-policy.result }}
         run: |
           set -euo pipefail
-          if [[ "$BUILD_RESULT" != "success" || "$POLICY_RESULT" != "success" ]]; then
-            echo "image validation matrix result is $BUILD_RESULT; expected success" >&2
-            exit 1
-          fi
+          [[ "$PLAN_RESULT" == success && "$POLICY_RESULT" == success ]]
+          [[ "$HAS_BUILD/$BUILD_RESULT" == true/success || "$HAS_BUILD/$BUILD_RESULT" == false/skipped ]]
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: pr-inputs-*
+          path: ${{ runner.temp }}/validated
+          merge-multiple: true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr-image-validation-v1
+          path: ${{ runner.temp }}/validated/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
