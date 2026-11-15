@@ -42,20 +42,22 @@ class ValidationTests(unittest.TestCase):
         (self.directory / "agent-arm64.json").unlink()
         self.assertEqual(self.select([]), {("agent", "linux/arm64")})
 
-    def test_fork_or_unmerged_workflow_cannot_supply_inputs(self):
-        repo = "example/project"
-        artifact = {"expired": False, "workflow_run": {"id": 1}}
-        run = {"event": "pull_request", "conclusion": "success", "path": planner.WORKFLOW,
-               "head_repository": {"full_name": repo}, "head_sha": "abc"}
-        pull = {"merged_at": None, "head": {"sha": "abc", "repo": {"full_name": repo}},
-                "base": {"repo": {"full_name": repo}, "ref": "main"}}
-        for head_repo in (repo, "fork/project"):
-            run["head_repository"]["full_name"] = head_repo
-            with patch.dict(os.environ, GITHUB_REPOSITORY=repo, GITHUB_BASE_REF="main", PR_BASE_SHA="base"), \
-                 patch.object(planner, "gh", side_effect=[{"artifacts": [artifact]}, run, [pull]]), \
-                 patch.object(planner.images, "run") as download, self.assertRaises(ValueError):
-                planner.merged_snapshot(self.directory)
-            download.assert_not_called()
+    def test_only_successful_base_push_runs_can_seed_other_prs(self):
+        calls = []
+        def result(*args):
+            calls.append(args)
+            if args[:3] == ("gh", "run", "list"):
+                return b'[{"databaseId": 1, "headSha": "landed", "url": "example"}]'
+            if args[:3] == ("gh", "run", "download"):
+                (self.directory / "revision").write_text("landed")
+            return b""
+        with patch.dict(os.environ, GITHUB_REPOSITORY="example/project", BASE_BRANCH="main", BASE_SHA="base"), \
+             patch.object(planner.images, "run", side_effect=result):
+            self.assertEqual(planner.base_snapshot(self.directory), "landed")
+        lookup = calls[0]
+        for option, value in (("--event", "push"), ("--status", "success"), ("--branch", "main")):
+            self.assertEqual(lookup[lookup.index(option) + 1], value)
+        self.assertEqual(calls[1], ("git", "merge-base", "--is-ancestor", "landed", "base"))
 
 
 if __name__ == "__main__":

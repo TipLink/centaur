@@ -1,4 +1,4 @@
-"""Select PR image checks from native BuildKit inputs of a merged, passing PR run."""
+"""Select PR image checks from native BuildKit inputs of a passing run on the target branch."""
 import argparse
 import importlib
 import json
@@ -11,42 +11,24 @@ import tempfile
 images = importlib.import_module("plan-reviewed-images")
 SNAPSHOT = "pr-image-validation-v1"
 PROBE = "scripts/probe-agent-harness-image.sh"
-WORKFLOW = ".github/workflows/validate-images.yml"
 UNKNOWN = (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, subprocess.SubprocessError)
 
 
-def gh(*args):
-    return json.loads(images.run("gh", "api", *args))
-
-
-def merged_snapshot(directory):
+def base_snapshot(directory):
     repo = os.environ["GITHUB_REPOSITORY"]
-    base = os.environ["GITHUB_BASE_REF"]
-    base_sha = os.environ["PR_BASE_SHA"]
-    artifacts = gh(f"repos/{repo}/actions/artifacts?name={SNAPSHOT}&per_page=10")["artifacts"]
-    for artifact in artifacts:
-        if artifact["expired"]:
-            continue
-        run_id = artifact["workflow_run"]["id"]
-        run = gh(f"repos/{repo}/actions/runs/{run_id}")
-        if (run["event"] != "pull_request" or run["conclusion"] != "success" or
-                run["path"] != WORKFLOW or run["head_repository"]["full_name"] != repo):
-            continue
-        pulls = gh(f"repos/{repo}/commits/{run['head_sha']}/pulls")
-        for pr in pulls:
-            if not (pr["merged_at"] and pr["base"]["ref"] == base and pr["base"]["repo"]["full_name"] == repo
-                    and pr["head"]["sha"] == run["head_sha"] and pr["head"]["repo"]["full_name"] == repo):
-                continue
-            merged = pr["merge_commit_sha"]
-            if subprocess.run(["git", "merge-base", "--is-ancestor", merged, base_sha]).returncode:
-                continue
-            images.run("gh", "run", "download", str(run_id), "-R", repo, "-n", SNAPSHOT, "-D", str(directory))
-            tree = (directory / "tree").read_text().strip()
-            images.require(tree == images.run("git", "rev-parse", merged + "^{tree}").decode().strip(),
-                           "tested merge tree differs from landed tree")
-            print(f"Comparing with validation {run['html_url']}", file=sys.stderr)
-            return tree
-    raise ValueError("no passing validation from a merged PR on this branch")
+    # Push runs execute the target branch's own workflow. A PR cannot write a
+    # baseline for other PRs, even if it changes the workflow or its artifacts.
+    runs = json.loads(images.run("gh", "run", "list", "-R", repo, "--workflow", "validate-images.yml",
+                                 "--branch", os.environ["BASE_BRANCH"], "--event", "push", "--status", "success",
+                                 "--limit", "1", "--json", "databaseId,headSha,url"))
+    images.require(runs, "no passing validation on the base branch")
+    baseline = runs[0]["headSha"]
+    images.run("git", "merge-base", "--is-ancestor", baseline, os.environ["BASE_SHA"])
+    images.run("gh", "run", "download", str(runs[0]["databaseId"]), "-R", repo,
+               "-n", SNAPSHOT, "-D", str(directory))
+    images.require((directory / "revision").read_text().strip() == baseline, "wrong validation revision")
+    print(f"Comparing with {runs[0]['url']} at {baseline}", file=sys.stderr)
+    return baseline
 
 
 def record(destination, service, platform, build_ref):
@@ -105,7 +87,7 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             try:
-                baseline = merged_snapshot(directory)
+                baseline = base_snapshot(directory)
             except UNKNOWN as error:
                 print(f"Full validation: {error}", file=sys.stderr)
                 baseline = None
@@ -116,5 +98,6 @@ if __name__ == "__main__":
                 for proof in directory.glob("*.json"):
                     if proof.name not in rebuilt:
                         proof.rename(args.carry / proof.name)
-                (args.carry / "tree").write_bytes(images.run("git", "rev-parse", "HEAD^{tree}"))
+                # Keep the inherited artifact present even on a full build.
+                (args.carry / "revision").write_text(images.run("git", "rev-parse", "HEAD").decode())
         print(json.dumps({"matrix": {"include": selected}, "has_build": bool(selected)}))

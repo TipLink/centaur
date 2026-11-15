@@ -2,6 +2,8 @@ name: Publish Images
 
 on:
   pull_request:
+  push:
+    branches: [main, release/aws-core]
 
 concurrency:
   group: validate-images-${{ github.ref }}
@@ -23,7 +25,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Test selective publication against a local OCI registry
-        if: github.event.pull_request.base.ref == 'release/aws-core'
+        if: github.base_ref == 'release/aws-core' || github.ref == 'refs/heads/release/aws-core'
         run: |
           set -euo pipefail
           docker run -d --name test-registry -p 127.0.0.1:5000:5000 registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
@@ -42,7 +44,6 @@ jobs:
     permissions:
       contents: read
       actions: read
-      pull-requests: read
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       has_build: ${{ steps.select.outputs.has_build }}
@@ -57,12 +58,14 @@ jobs:
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+          BASE_BRANCH: ${{ github.base_ref || github.ref_name }}
         run: |
           set -euo pipefail
           python3 .github/scripts/plan-pr-images.py --carry "$RUNNER_TEMP/inherited" > "$RUNNER_TEMP/plan.json"
           jq -r '"matrix=" + (.matrix|tojson), "has_build=" + (.has_build|tostring)' "$RUNNER_TEMP/plan.json" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: pr-inputs-inherited
           path: ${{ runner.temp }}/inherited/
@@ -133,6 +136,7 @@ jobs:
         run: bash scripts/probe-agent-harness-image.sh "$AGENT_IMAGE"
 
       - name: Record validated BuildKit inputs
+        if: github.event_name == 'push'
         env:
           BUILD_REF: ${{ fromJSON(steps.build.outputs.metadata)['buildx.build.ref'] }}
           SERVICE: ${{ matrix.service }}
@@ -141,7 +145,8 @@ jobs:
           set -euo pipefail
           mkdir "$RUNNER_TEMP/proof"
           python3 .github/scripts/plan-pr-images.py --record "$RUNNER_TEMP/proof" "$SERVICE" "$PLATFORM" "$BUILD_REF"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: pr-inputs-${{ matrix.service }}-${{ env.PLATFORM_SLUG }}
           path: ${{ runner.temp }}/proof/
@@ -165,12 +170,14 @@ jobs:
           set -euo pipefail
           [[ "$PLAN_RESULT" == success && "$POLICY_RESULT" == success ]]
           [[ "$HAS_BUILD/$BUILD_RESULT" == true/success || "$HAS_BUILD/$BUILD_RESULT" == false/skipped ]]
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - if: github.event_name == 'push'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: pr-inputs-*
           path: ${{ runner.temp }}/validated
           merge-multiple: true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: pr-image-validation-v1
           path: ${{ runner.temp }}/validated/
