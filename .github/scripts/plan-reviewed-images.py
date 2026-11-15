@@ -104,6 +104,14 @@ def context_paths(definition, material_digests):
     return paths
 
 
+def verify_inputs(paths, inputs, materials):
+    for path in sorted(paths):
+        require(not any(path == p or path.startswith(p + "/") or p.startswith(path + "/") for p in inputs),
+                f"build input changed: {path}")
+    for name, expected in materials:
+        require(manifest(name)[0] == expected, f"registry input changed: {name}")
+
+
 def reusable(service, previous, current):
     repo = REGISTRY_NAMESPACE + "/centaur-" + service
     digest, index = manifest(repo + ":reviewed-" + previous)
@@ -127,11 +135,7 @@ def reusable(service, previous, current):
         materials = [material_reference(m) for m in definition["resolvedDependencies"]]
         require(materials, "no resolved build materials")
         inputs = context_paths(definition, {digest for _, digest in materials}) | {recipe, recipe + ".dockerignore", ".dockerignore"}
-        for path in sorted(paths):
-            require(not any(path == p or path.startswith(p + "/") or p.startswith(path + "/") for p in inputs),
-                    f"build input changed: {path}")
-        for name, expected in materials:
-            require(manifest(name)[0] == expected, f"registry input changed: {name}")
+        verify_inputs(paths, inputs, materials)
     children = [m["digest"] for m in index["manifests"]
                 if m.get("platform", {}).get("os") == "linux" and m["platform"]["architecture"] == "arm64"]
     require(len(children) == 1 and re.fullmatch(DIGEST, children[0]), "missing arm64 child")
