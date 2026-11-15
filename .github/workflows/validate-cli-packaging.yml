@@ -3,6 +3,9 @@ name: Validate CLI Packaging
 on:
   pull_request:
     paths:
+      # Publisher-only releases also require the packaging check on their signed head.
+      - .github/workflows/publish-images.yml
+      - .github/scripts/plan-reviewed-images.py
       # Reviewed image publication requires packaging proof for every patch series.
       - .github/core-patches/**
       - .github/workflows/validate-cli-packaging.yml
