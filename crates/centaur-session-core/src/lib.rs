@@ -3,6 +3,7 @@
 //! A session is the public control-plane object for one ongoing agent
 //! conversation. `thread_key` is the canonical identifier.
 
+pub mod ticket_form;
 pub mod user_input;
 
 use std::{collections::BTreeMap, fmt, str::FromStr};

@@ -497,3 +497,65 @@ describe('native questions in Slack', () => {
     ])
   })
 })
+
+describe('create ticket form v1', () => {
+  const teamAction = 'centaur.user_input:team:' + REQUEST
+  const form = { title: 'Release the client', summary: 'Publish the desktop client.',
+    team: 'ENG', project: 'p12', due: '2028-02-29', teams: {
+      ENG: Array.from({ length: 105 }, (_, i) => ({ id: 'p' + i, name: 'Project ' + i })),
+      OPS: [{ id: 'ops', name: 'Operations' }]
+    } }
+  const questions = [{ id: 'ticket', header: 'Ticket form', question: 'centaur:ticket-form:v1:' + REQUEST,
+    options: [], ticketForm: form }]
+  const selection = (value: string) => ({ type: 'static_select', selected_option: { value } })
+  const values = (source: string, team: string, project: string) => ({
+    ['team.' + source]: { [teamAction]: selection(team) },
+    ['project.' + source]: { project: selection(project) },
+    due: { date: { type: 'datepicker', selected_date: null } },
+    context: { note: { type: 'plain_text_input', value: 'First line\nSecond line' } }
+  })
+  test('one strictly ordered container, selected predictions, and the full project menu', async () => {
+    const h = harness({ questions })
+    await h.render()
+    const blocks = h.posts[0]!.blocks as JsonObject[]
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]).toMatchObject({ type: 'container', block_id: 'centaur.user_input:' + REQUEST,
+      title: { text: 'Create Ticket Form: Release the client' } })
+    expect(blocks[0]!.subtitle).toBeUndefined()
+    const children = blocks[0]!.child_blocks as JsonObject[]
+    expect(children.map(b => b.type)).toEqual(['section', 'input', 'input', 'input', 'input', 'actions'])
+    expect(children.slice(1, 5).map(b => (b.label as JsonObject).text)).toEqual(['Team', 'Project', 'Due date', 'Additional context'])
+    expect(children[0]!.text).toMatchObject({ text: form.summary })
+    expect(children[1]!.element).toMatchObject({ type: 'static_select', initial_option: { value: 'ENG' } })
+    const project = children[2]!.element as JsonObject
+    expect(project.initial_option).toMatchObject({ value: 'p12' })
+    const groups = project.option_groups as { options: { value: string }[] }[]
+    expect(groups.flatMap(g => g.options.map(o => o.value))).toEqual([...form.teams.ENG.map(p => p.id), 'none'])
+    expect(children[3]!.element).toMatchObject({ type: 'datepicker', initial_date: form.due })
+    expect(children[4]!.element).toMatchObject({ type: 'plain_text_input', multiline: true })
+    expect(children[5]!.elements).toMatchObject([{ text: { text: 'Submit answers' } }])
+  })
+
+  test('changing teams preserves edits, rejects stale or foreign projects, and submits once', async () => {
+    const h = harness({ questions })
+    await h.render()
+    const switchTeam = { block_id: 'team.ENG', action_id: teamAction, ...selection('OPS') }
+    const edit = { state: { values: values('ENG', 'OPS', 'p12') } }
+    await h.act(switchTeam, { ...edit, user: { id: 'other' } })
+    expect(h.updates).toHaveLength(0)
+    await h.act(switchTeam, edit)
+    expect(h.submissions).toHaveLength(0)
+    const [container] = h.updates.at(-1)!.blocks as JsonObject[]
+    const children = container!.child_blocks as JsonObject[]
+    expect(children[2]!.element).toMatchObject({ options: [{ value: 'ops' }, { value: 'none' }], initial_option: { value: 'none' } })
+    expect(children[4]!.element).toMatchObject({ initial_value: 'First line\nSecond line' })
+    await h.submit(values('ENG', 'OPS', 'p12'))
+    await h.submit(values('OPS', 'OPS', 'p12'))
+    expect(h.submissions).toHaveLength(0)
+    await h.submit(values('OPS', 'OPS', 'ops'))
+    const answers = h.submissions[0]!.answers as SessionUserInputAnswers
+    expect(JSON.parse(answers.ticket!.answers[0]!)).toEqual({ team: 'OPS', project: 'ops', due: null, context: 'First line\nSecond line' })
+    await h.submit(values('OPS', 'OPS', 'none'))
+    expect(h.submissions).toHaveLength(1)
+  })
+})

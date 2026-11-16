@@ -19,6 +19,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 #[command(rename_all = "kebab-case")]
 enum CliCommand {
+    /// Validate a ticket form from stdin and print its native question reference.
+    PrepareTicketForm,
     Codex(HarnessCommand),
     #[command(alias = "claude")]
     ClaudeCode(HarnessCommand),
@@ -60,6 +62,12 @@ fn run() -> Result<()> {
         .unwrap_or(CliCommand::Codex(HarnessCommand {
             mode: ServerMode::Blocks,
         })) {
+        CliCommand::PrepareTicketForm => {
+            let reference =
+                harness_server::user_input::prepare_ticket_form(std::io::stdin().lock())?;
+            println!("{reference}");
+            Ok(())
+        }
         CliCommand::Codex(command) => run_mode(HarnessKind::Codex, command.mode),
         CliCommand::ClaudeCode(command) => run_mode(HarnessKind::ClaudeCode, command.mode),
         CliCommand::Amp(command) => run_mode(HarnessKind::Amp, command.mode),

@@ -2198,6 +2198,7 @@ version = "0.1.0"
 dependencies = [
  "allocative",
  "base64 0.23.1",
+ "centaur-session-core",
  "clap",
  "image",
  "libc",

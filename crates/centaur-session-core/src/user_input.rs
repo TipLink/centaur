@@ -11,6 +11,8 @@ pub struct UserInputQuestion {
     #[serde(default)]
     pub header: String,
     pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_form: Option<crate::ticket_form::TicketForm>,
     #[serde(default)]
     pub options: Vec<UserInputOption>,
     #[serde(default)]
@@ -64,6 +66,19 @@ pub fn validate_user_input_questions(questions: &[UserInputQuestion]) -> Result<
         {
             return Err("question text or options exceed supported limits".to_owned());
         }
+        let ticket_reference = question
+            .question
+            .starts_with(crate::ticket_form::TICKET_FORM_PREFIX);
+        if ticket_reference != question.ticket_form.is_some()
+            || question.ticket_form.as_ref().is_some_and(|form| {
+                questions.len() != 1
+                    || !question.allow_other
+                    || question.multi_select
+                    || !form.valid()
+            })
+        {
+            return Err("invalid ticket form".to_owned());
+        }
         let mut labels = BTreeSet::new();
         for option in &question.options {
             if option.label.trim().is_empty()
@@ -104,6 +119,13 @@ pub fn validate_user_input_answers(
         for value in &answer.answers {
             if value.trim().is_empty() || value.len() > 16000 || !unique.insert(value) {
                 return Err("answers must be nonempty, bounded, and unique".to_owned());
+            }
+            if question
+                .ticket_form
+                .as_ref()
+                .is_some_and(|form| !form.valid_answer(value))
+            {
+                return Err("invalid ticket form answer".to_owned());
             }
             if !question.allow_other
                 && !question.options.iter().any(|option| &option.label == value)

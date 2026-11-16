@@ -2,6 +2,10 @@
 //! persistence; this map only correlates a live native request with its reply.
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use centaur_session_core::ticket_form::{MAX_FORM_BYTES, TICKET_FORM_PREFIX, TicketForm};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -125,9 +129,21 @@ impl PendingQuestions {
         // Native ids can repeat after a CLI restart. Never expose them as the
         // durable answer key: a late click must not answer a different call.
         let request_id = Uuid::new_v4().to_string();
+        let mut questions = serde_json::to_value(&request.questions)?;
+        for (index, question) in request.questions.iter().enumerate() {
+            if let Some(reference) = question.question.strip_prefix(TICKET_FORM_PREFIX) {
+                if request.questions.len() != 1 || question.multi_select || !question.allow_other {
+                    return Err(HarnessServerError::Protocol(
+                        "invalid ticket form request".into(),
+                    ));
+                }
+                questions[index]["ticketForm"] =
+                    serde_json::to_value(read_ticket_form(reference)?)?;
+            }
+        }
         let wire = json!({"id":request_id,"method":"item/tool/requestUserInput","params":{
             "requestId":request_id,"threadId":thread_id,"turnId":turn_id,
-            "itemId":request.item_id,"questions":request.questions,"isBlocking":request.is_blocking
+            "itemId":request.item_id,"questions":questions,"isBlocking":request.is_blocking
         }});
         self.pending.insert(request_id, request);
         Ok(wire)
@@ -220,6 +236,64 @@ impl PendingQuestions {
     }
 }
 
+fn parse_ticket_form(input: impl Read) -> Result<TicketForm> {
+    let invalid = || HarnessServerError::Protocol("invalid ticket form manifest".into());
+    let mut bytes = Vec::new();
+    input
+        .take(MAX_FORM_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_FORM_BYTES {
+        return Err(invalid());
+    }
+    let form: TicketForm = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if !form.valid() {
+        return Err(invalid());
+    }
+    Ok(form)
+}
+
+pub fn prepare_ticket_form(input: impl Read) -> Result<String> {
+    let form = parse_ticket_form(input)?;
+    let id = Uuid::new_v4();
+    let path = format!("/tmp/centaur-ticket-form-{id}.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    if let Err(error) = file.write_all(&serde_json::to_vec(&form)?) {
+        let _ = std::fs::remove_file(path);
+        return Err(error.into());
+    }
+    Ok(format!("{TICKET_FORM_PREFIX}{id}"))
+}
+
+// Only an owner-private, regular manifest at the fixed sandbox path is eligible.
+fn read_ticket_form(reference: &str) -> Result<TicketForm> {
+    let invalid = || HarnessServerError::Protocol("invalid ticket form manifest".into());
+    let id = Uuid::parse_str(reference).map_err(|_| invalid())?;
+    if id.to_string() != reference {
+        return Err(invalid());
+    }
+    let path = format!("/tmp/centaur-ticket-form-{id}.json");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|_| invalid())?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > MAX_FORM_BYTES as u64
+    {
+        return Err(invalid());
+    }
+    let form = parse_ticket_form(file)?;
+    std::fs::remove_file(path)?;
+    Ok(form)
+}
+
 fn invalid_answer<T>() -> Result<T> {
     Err(HarnessServerError::Protocol(
         "invalid or incomplete user input answers".into(),
@@ -289,6 +363,26 @@ mod tests {
                 allow_other: true,
             }],
         }
+    }
+
+    #[test]
+    fn ticket_manifest_is_consumed_and_only_the_validated_form_enters_the_event() {
+        let form = json!({"title":"Release the client","summary":"Publish the desktop client.",
+            "team":"ENG","project":null,"due":null,"teams":{"ENG":[]}});
+        let reference = prepare_ticket_form(form.to_string().as_bytes()).unwrap();
+        let id = reference.strip_prefix(TICKET_FORM_PREFIX).unwrap();
+        let path = format!("/tmp/centaur-ticket-form-{id}.json");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let mut request = request();
+        request.questions[0].question = reference;
+        let mut pending = PendingQuestions::new(Some("execution"), true);
+        let wire = pending.register(request, "thread", "turn").unwrap();
+        assert_eq!(wire["params"]["questions"][0]["ticketForm"], form);
+        assert!(!std::path::Path::new(&path).exists());
+        let stored: Vec<centaur_session_core::user_input::UserInputQuestion> =
+            serde_json::from_value(wire["params"]["questions"].clone()).unwrap();
+        assert!(centaur_session_core::user_input::validate_user_input_questions(&stored).is_ok());
+        assert!(read_ticket_form("../manifest").is_err());
     }
 
     #[test]

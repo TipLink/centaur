@@ -1,3 +1,4 @@
+import { TEAM_ACTION, initialTicketSelection, readTicketSelection, ticketMessage, type TicketSelection } from './ticket-form'
 import { assertSlackOk, callSlackApi, fetchSlackThreadReplies } from '@chat-adapter/slack/api'
 import type { StateAdapter, Thread } from 'chat'
 import {
@@ -36,6 +37,7 @@ type QuestionCard = {
   threadId: string
   channel: string
   threadTs: string
+  ticketDraft?: TicketSelection
   messageTs?: string
   postingAt?: number
   /** The latest submitted form values; a partial set pre-fills the re-rendered form. */
@@ -150,7 +152,9 @@ export async function handleSessionUserInputInteraction(
   const user = isJsonObject(payload.user) ? stringValue(payload.user.id) : undefined
   let requestId: string
   try {
-    requestId = parseRequestId(action.value)
+    requestId = typeof action.action_id === 'string' && action.action_id.startsWith(TEAM_ACTION)
+      ? parseRequestId(JSON.stringify({ request: action.action_id.slice(TEAM_ACTION.length) }))
+      : parseRequestId(action.value)
   } catch {
     return new Response('Invalid question choice', { status: 400 })
   }
@@ -201,22 +205,37 @@ export async function handleSessionUserInputInteraction(
           await refresh(card)
           return ok()
         }
-        if (action.action_id !== SUBMIT_ACTION) {
+        const question = current.questions[0]!
+        const ticket = question.ticketForm
+        if (ticket && (action.action_id === TEAM_ACTION + requestId || action.action_id === SUBMIT_ACTION)) {
+          const switching = action.action_id === TEAM_ACTION + requestId
+          const selection = readTicketSelection(ticket, card.ticketDraft ?? initialTicketSelection(ticket), requestId,
+            payload, switching ? action : undefined)
+          card.ticketDraft = selection.draft
+          if (switching || !selection.ready) {
+            card.notice = switching ? undefined : 'Review the current selections and submit again.'
+            await saveCard(card, options)
+            await refresh(card)
+            return ok()
+          }
+          card.answers = { [question.id]: { answers: [JSON.stringify(selection.draft)] } }
+        } else if (action.action_id !== SUBMIT_ACTION) {
           // A button from the earlier one-question-per-page card. Replace that
           // card with the form; the click itself answers nothing.
           await refresh(card)
           return ok()
-        }
-        const form = formAnswers(card.request.questions, payload)
-        // Save before updating Slack or calling the API. The API accepts one
-        // answer set per request id, so a repeated submission cannot change an
-        // answer set it has already stored.
-        card.answers = form.answers
-        if (form.missing.length) {
-          card.notice = `Still needed: ${form.missing.join(', ')}. Answer and submit again.`.slice(0, 3000)
-          await saveCard(card, options)
-          await refresh(card)
-          return ok()
+        } else {
+          const form = formAnswers(card.request.questions, payload)
+          // Save before updating Slack or calling the API. The API accepts one
+          // answer set per request id, so a repeated submission cannot change an
+          // answer set it has already stored.
+          card.answers = form.answers
+          if (form.missing.length) {
+            card.notice = `Still needed: ${form.missing.join(', ')}. Answer and submit again.`.slice(0, 3000)
+            await saveCard(card, options)
+            await refresh(card)
+            return ok()
+          }
         }
         delete card.notice
         await saveCard(card, options)
@@ -346,6 +365,13 @@ function cardMessage(card: QuestionCard): JsonObject {
     return { text, blocks: [{ type: 'section', block_id: marker, text: { type: 'plain_text', text } }] }
   }
   const questions = card.request.questions
+  const ticket = questions[0]?.ticketForm
+  const submit = { type: 'actions', elements: [{
+    type: 'button', style: 'primary', text: { type: 'plain_text', text: ticket ? 'Submit answers' : 'Submit' }, action_id: SUBMIT_ACTION,
+    value: JSON.stringify({ request: card.request.request_id })
+  }] }
+  if (ticket) return ticketMessage(ticket, card.ticketDraft ?? initialTicketSelection(ticket),
+    card.request.request_id, marker, submit, card.notice)
   const requiredCount = questions.filter(question => !isAdditionalDetails(question)).length
   const title = requiredCount === 0 ? 'Add any details, then submit to continue.'
     : requiredCount === 1 ? 'Answer this question to continue.' : `Answer these ${requiredCount} questions to continue.`
@@ -366,10 +392,7 @@ function cardMessage(card: QuestionCard): JsonObject {
       blocks.push(...questionSections(question), ...questionInputs(question, index, saved))
     }
   })
-  blocks.push({ type: 'actions', elements: [{
-    type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Submit' }, action_id: SUBMIT_ACTION,
-    value: JSON.stringify({ request: card.request.request_id })
-  }] })
+  blocks.push(submit)
   return {
     mrkdwn: false, unfurl_links: false, unfurl_media: false,
     text: `${title} ${questions.map(question => question.question).join(' · ')}`.slice(0, 3000),

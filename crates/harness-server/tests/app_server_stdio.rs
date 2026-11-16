@@ -126,7 +126,7 @@ for line in sys.stdin:
         emit({'id':value['id'],'result':{'thread':{'id':'question-thread'},'model':'fake'}})
     elif (claude and value.get('type') == 'user') or method == 'turn/start':
         turn += 1
-        question = {'header':'Project','question':'Which project?','options':[{'label':'Alpha','description':'First fit'},{'label':'Beta','description':'Second fit'}],'multiSelect':False}
+        question = {'header':'Project','question':os.environ.get('FAKE_QUESTION_TEXT') or 'Which project?','options':[{'label':'Alpha','description':'First fit'},{'label':'Beta','description':'Second fit'}],'multiSelect':False}
         if claude:
             emit({'type':'control_request','request_id':'native-reused-id','request':{'subtype':'can_use_tool','tool_name':'AskUserQuestion','tool_use_id':'tool-'+str(turn),'input':{'questions':[question]}}})
         else:
@@ -143,6 +143,10 @@ for line in sys.stdin:
 "#;
 
 fn question_bridge(harness: Harness) -> (BridgeProcess, PathBuf, PathBuf) {
+    question_bridge_with_text(harness, "")
+}
+
+fn question_bridge_with_text(harness: Harness, text: &str) -> (BridgeProcess, PathBuf, PathBuf) {
     let script = temp_path("native-question-cli.py");
     let log = temp_path("native-question-responses.jsonl");
     std::fs::write(&script, QUESTION_CLI).unwrap();
@@ -153,6 +157,7 @@ fn question_bridge(harness: Harness) -> (BridgeProcess, PathBuf, PathBuf) {
         Some(("CODEX_BIN", script.to_str().unwrap())),
         &[
             ("FAKE_QUESTION_HARNESS", harness.name()),
+            ("FAKE_QUESTION_TEXT", text),
             ("FAKE_QUESTION_LOG", log.to_str().unwrap()),
         ],
     );
@@ -220,6 +225,42 @@ fn assert_native_questions_resume_once(harness: Harness) {
     let _ = std::fs::remove_file(format!("{}.requests", log.display()));
     let _ = std::fs::remove_file(script);
     let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn ticket_form_reference_resumes_both_native_providers_with_a_structured_answer() {
+    for harness in [Harness::ClaudeCode, Harness::Codex] {
+        let spec = json!({"title":"Publish app","summary":"Make the client available.",
+            "team":"ENG","project":null,"due":null,"teams":{"ENG":[]}});
+        let reference =
+            harness_server::user_input::prepare_ticket_form(spec.to_string().as_bytes()).unwrap();
+        let (mut process, script, log) = question_bridge_with_text(harness, &reference);
+        process.send(json!({"type":"user","text":"Create a ticket","trace_metadata":{"execution_id":"e1","supports_user_input":true}}));
+        let request = read_question_method(&mut process, "item/tool/requestUserInput");
+        let question = &request["params"]["questions"][0];
+        assert_eq!(question["ticketForm"], spec);
+        let answer =
+            json!({"team":"ENG","project":null,"due":null,"context":"Some detail"}).to_string();
+        process.send(
+            json!({"type":"user_input_response","request_id":request["id"],"execution_id":"e1",
+            "answers":{question["id"].as_str().unwrap():{"answers":[answer]}}}),
+        );
+        read_question_method(&mut process, "serverRequest/resolved");
+        read_question_method(&mut process, "turn/completed");
+        process.finish_successfully();
+        let responses = read_requests(&log);
+        assert_eq!(responses.len(), 1);
+        let value = match harness {
+            Harness::ClaudeCode => {
+                &responses[0]["response"]["response"]["updatedInput"]["answers"][&reference]
+            }
+            _ => &responses[0]["result"]["answers"]["project"]["answers"][0],
+        };
+        assert_eq!(value, &answer);
+        let _ = std::fs::remove_file(format!("{}.requests", log.display()));
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(log);
+    }
 }
 
 #[test]

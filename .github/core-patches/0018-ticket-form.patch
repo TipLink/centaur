@@ -1,0 +1,805 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1792e3fb..9b004267 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2198,6 +2198,7 @@ version = "0.1.0"
+ dependencies = [
+  "allocative",
+  "base64 0.23.1",
++ "centaur-session-core",
+  "clap",
+  "image",
+  "libc",
+diff --git a/crates/centaur-session-core/src/lib.rs b/crates/centaur-session-core/src/lib.rs
+index 6274af58..c40f50a6 100644
+--- a/crates/centaur-session-core/src/lib.rs
++++ b/crates/centaur-session-core/src/lib.rs
+@@ -3,6 +3,7 @@
+ //! A session is the public control-plane object for one ongoing agent
+ //! conversation. `thread_key` is the canonical identifier.
+ 
++pub mod ticket_form;
+ pub mod user_input;
+ 
+ use std::{collections::BTreeMap, fmt, str::FromStr};
+diff --git a/crates/centaur-session-core/src/ticket_form.rs b/crates/centaur-session-core/src/ticket_form.rs
+new file mode 100644
+index 00000000..ffdb56b9
+--- /dev/null
++++ b/crates/centaur-session-core/src/ticket_form.rs
+@@ -0,0 +1,136 @@
++//! The versioned ticket intake contract. Clients supply data; Slack owns the layout.
++use serde::{Deserialize, Serialize};
++use std::collections::{BTreeMap, BTreeSet};
++
++pub const TICKET_FORM_PREFIX: &str = "centaur:ticket-form:v1:";
++pub const MAX_FORM_BYTES: usize = 128 * 1024;
++
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct TicketForm {
++    pub title: String,
++    pub summary: String,
++    pub team: String,
++    pub project: Option<String>,
++    pub due: Option<String>,
++    /// Complete eligible projects by team, including teams with no eligible projects.
++    pub teams: BTreeMap<String, Vec<Project>>,
++}
++
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Project {
++    pub id: String,
++    pub name: String,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct TicketAnswer {
++    team: String,
++    #[serde(deserialize_with = "Option::deserialize")]
++    project: Option<String>,
++    #[serde(deserialize_with = "Option::deserialize")]
++    due: Option<String>,
++    context: String,
++}
++
++fn valid_date(value: &str) -> bool {
++    let b = value.as_bytes();
++    if b.len() != 10
++        || !b.iter().enumerate().all(|(i, c)| {
++            if i == 4 || i == 7 {
++                *c == b'-'
++            } else {
++                c.is_ascii_digit()
++            }
++        })
++    {
++        return false;
++    }
++    let year = value[..4].parse::<i32>().unwrap();
++    let month = value[5..7].parse::<u8>().unwrap();
++    let day = value[8..].parse::<u8>().unwrap();
++    year > 0
++        && time::Month::try_from(month)
++            .and_then(|m| time::Date::from_calendar_date(year, m, day))
++            .is_ok()
++}
++
++impl TicketForm {
++    fn valid_selection(&self, team: &str, project: Option<&str>, due: Option<&str>) -> bool {
++        self.teams
++            .get(team)
++            .is_some_and(|choices| project.is_none_or(|id| choices.iter().any(|p| p.id == id)))
++            && due.is_none_or(valid_date)
++    }
++
++    pub fn valid(&self) -> bool {
++        !self.title.trim().is_empty()
++            && self.title.trim() == self.title
++            && !self.title.contains(['\r', '\n'])
++            && self.title.chars().count() <= 130
++            && !self.summary.trim().is_empty()
++            && self.summary.chars().count() <= 3000
++            && self.teams.len() <= 100
++            && self.valid_selection(&self.team, self.project.as_deref(), self.due.as_deref())
++            && self.teams.iter().all(|(team, projects)| {
++                let mut ids = BTreeSet::new();
++                !team.is_empty()
++                    && team.len() <= 75
++                    && team
++                        .bytes()
++                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
++                    && projects.len() < 10_000
++                    && projects.iter().all(|p| {
++                        !p.id.is_empty()
++                            && p.id != "none"
++                            && p.id.len() <= 75
++                            && ids.insert(&p.id)
++                            && !p.name.trim().is_empty()
++                    })
++            })
++            && serde_json::to_vec(self).is_ok_and(|data| data.len() <= MAX_FORM_BYTES)
++    }
++
++    pub fn valid_answer(&self, value: &str) -> bool {
++        serde_json::from_str::<TicketAnswer>(value).is_ok_and(|a| {
++            self.valid_selection(&a.team, a.project.as_deref(), a.due.as_deref())
++                && a.context.chars().count() <= 2000
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn reject_cross_team_projects_invalid_dates_and_extra_fields() {
++        let form: TicketForm = serde_json::from_value(json!({
++            "title":"Fix loading", "summary":"The first page should open.",
++            "team":"ENG","project":"p","due":null,
++            "teams":{"ENG":[{"id":"p","name":"Client"}],"OPS":[]}
++        }))
++        .unwrap();
++        assert!(form.valid());
++        let answer = json!({"team":"ENG","project":"p","due":"2028-02-29","context":"Details"});
++        assert!(form.valid_answer(&answer.to_string()));
++        for (key, value) in [
++            ("team", "OPS"),
++            ("project", "deleted"),
++            ("due", "2027-02-29"),
++            ("scope", "injected"),
++        ] {
++            let mut invalid = answer.clone();
++            invalid[key] = json!(value);
++            assert!(!form.valid_answer(&invalid.to_string()));
++        }
++        let mut incomplete = answer.clone();
++        incomplete.as_object_mut().unwrap().remove("project");
++        assert!(!form.valid_answer(&incomplete.to_string()));
++        let none = json!({"team":"OPS","project":null,"due":null,"context":""});
++        assert!(form.valid_answer(&none.to_string()));
++    }
++}
+diff --git a/crates/centaur-session-core/src/user_input.rs b/crates/centaur-session-core/src/user_input.rs
+index 4cedec20..cb7f9d6b 100644
+--- a/crates/centaur-session-core/src/user_input.rs
++++ b/crates/centaur-session-core/src/user_input.rs
+@@ -11,6 +11,8 @@ pub struct UserInputQuestion {
+     #[serde(default)]
+     pub header: String,
+     pub question: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub ticket_form: Option<crate::ticket_form::TicketForm>,
+     #[serde(default)]
+     pub options: Vec<UserInputOption>,
+     #[serde(default)]
+@@ -64,6 +66,19 @@ pub fn validate_user_input_questions(questions: &[UserInputQuestion]) -> Result<
+         {
+             return Err("question text or options exceed supported limits".to_owned());
+         }
++        let ticket_reference = question
++            .question
++            .starts_with(crate::ticket_form::TICKET_FORM_PREFIX);
++        if ticket_reference != question.ticket_form.is_some()
++            || question.ticket_form.as_ref().is_some_and(|form| {
++                questions.len() != 1
++                    || !question.allow_other
++                    || question.multi_select
++                    || !form.valid()
++            })
++        {
++            return Err("invalid ticket form".to_owned());
++        }
+         let mut labels = BTreeSet::new();
+         for option in &question.options {
+             if option.label.trim().is_empty()
+@@ -105,6 +120,13 @@ pub fn validate_user_input_answers(
+             if value.trim().is_empty() || value.len() > 16000 || !unique.insert(value) {
+                 return Err("answers must be nonempty, bounded, and unique".to_owned());
+             }
++            if question
++                .ticket_form
++                .as_ref()
++                .is_some_and(|form| !form.valid_answer(value))
++            {
++                return Err("invalid ticket form answer".to_owned());
++            }
+             if !question.allow_other
+                 && !question.options.iter().any(|option| &option.label == value)
+             {
+diff --git a/crates/centaur-session-runtime/src/lib.rs b/crates/centaur-session-runtime/src/lib.rs
+index 4c6872c2..bd9d9315 100644
+--- a/crates/centaur-session-runtime/src/lib.rs
++++ b/crates/centaur-session-runtime/src/lib.rs
+@@ -10429,6 +10429,25 @@ mod adoption_tests {
+ 
+     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+     async fn native_user_input_round_trip_preserves_execution_and_replays_request() {
++        check_native_question_round_trip(
++            json!({"id":"project","header":"Project","question":"Which project?",
++                "options":[{"label":"Project A","description":"Matches the work"}]}),
++            "Project A".to_owned(),
++        )
++        .await;
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn ticket_form_round_trip_preserves_catalogue_and_submitted_choices() {
++        check_native_question_round_trip(
++            json!({"id":"project","header":"Ticket form","question":format!("centaur:ticket-form:v1:{}", Uuid::new_v4()),
++                "options":[],"ticketForm":{"title":"Publish client","summary":"Publish the client.",
++                "team":"ENG","project":null,"due":null,"teams":{"ENG":[]}}}),
++            json!({"team":"ENG","project":null,"due":null,"context":"Ship the preview."}).to_string(),
++        ).await;
++    }
++
++    async fn check_native_question_round_trip(native_question: Value, answer: String) {
+         use centaur_session_core::user_input::UserInputAnswers;
+         use tokio::io::AsyncBufReadExt;
+         let Some(store) = test_store().await else {
+@@ -10470,8 +10489,7 @@ mod adoption_tests {
+             "id":request_id,"method":"item/tool/requestUserInput",
+             "params":{"requestId":request_id,"threadId":"native-thread","turnId":"native-turn",
+                 "requester_user_id":"model-must-not-set-owner",
+-                "questions":[{"id":"project","header":"Project","question":"Which project?",
+-                    "options":[{"label":"Project A","description":"Matches the work"}]}]}
++                "questions":[native_question]}
+         });
+         stdout
+             .write_all(format!("{question}\n").as_bytes())
+@@ -10486,8 +10504,12 @@ mod adoption_tests {
+         assert_eq!(pending.len(), 1);
+         assert_eq!(pending[0].execution_id, execution.execution_id);
+         assert_eq!(pending[0].requester_user_id.as_deref(), Some("U-requester"));
++        assert_eq!(
++            serde_json::to_value(&pending[0].questions[0]).unwrap()["ticketForm"],
++            native_question["ticketForm"]
++        );
+         let answers: UserInputAnswers =
+-            serde_json::from_value(json!({"project":{"answers":["Project A"]}})).unwrap();
++            serde_json::from_value(json!({"project":{"answers":[answer]}})).unwrap();
+         assert!(matches!(
+             runtime
+                 .answer_user_input(
+@@ -10524,7 +10546,7 @@ mod adoption_tests {
+             line["trace_metadata"]["execution_id"],
+             execution.execution_id
+         );
+-        assert_eq!(line["answers"]["project"]["answers"][0], "Project A");
++        assert_eq!(line["answers"]["project"]["answers"][0], answer);
+         stdout.write_all(format!("{}\n", json!({"method":"serverRequest/resolved","params":{"requestId":request_id,"reason":"answered"}})).as_bytes()).await.unwrap();
+         wait_for_event(&store, &thread_key, "session.user_input.resolved").await;
+         stdout
+diff --git a/crates/harness-server/Cargo.toml b/crates/harness-server/Cargo.toml
+index d1d85be4..1ce6ecf2 100644
+--- a/crates/harness-server/Cargo.toml
++++ b/crates/harness-server/Cargo.toml
+@@ -9,6 +9,7 @@ name = "harness-server"
+ path = "src/main.rs"
+ 
+ [dependencies]
++centaur-session-core.workspace = true
+ # Starlark 0.13 uses hashbrown 0.14, which is no longer supported by
+ # allocative 0.3.6's hashbrown integration.
+ allocative = "=0.3.4"
+diff --git a/crates/harness-server/src/main.rs b/crates/harness-server/src/main.rs
+index 23add738..cd704be6 100644
+--- a/crates/harness-server/src/main.rs
++++ b/crates/harness-server/src/main.rs
+@@ -19,6 +19,8 @@ struct Cli {
+ #[derive(Debug, Subcommand)]
+ #[command(rename_all = "kebab-case")]
+ enum CliCommand {
++    /// Validate a ticket form from stdin and print its native question reference.
++    PrepareTicketForm,
+     Codex(HarnessCommand),
+     #[command(alias = "claude")]
+     ClaudeCode(HarnessCommand),
+@@ -60,6 +62,12 @@ fn run() -> Result<()> {
+         .unwrap_or(CliCommand::Codex(HarnessCommand {
+             mode: ServerMode::Blocks,
+         })) {
++        CliCommand::PrepareTicketForm => {
++            let reference =
++                harness_server::user_input::prepare_ticket_form(std::io::stdin().lock())?;
++            println!("{reference}");
++            Ok(())
++        }
+         CliCommand::Codex(command) => run_mode(HarnessKind::Codex, command.mode),
+         CliCommand::ClaudeCode(command) => run_mode(HarnessKind::ClaudeCode, command.mode),
+         CliCommand::Amp(command) => run_mode(HarnessKind::Amp, command.mode),
+diff --git a/crates/harness-server/src/user_input.rs b/crates/harness-server/src/user_input.rs
+index 97d29f3d..b155cb84 100644
+--- a/crates/harness-server/src/user_input.rs
++++ b/crates/harness-server/src/user_input.rs
+@@ -2,6 +2,10 @@
+ //! persistence; this map only correlates a live native request with its reply.
+ use std::collections::{BTreeMap, HashMap, HashSet};
+ 
++use centaur_session_core::ticket_form::{MAX_FORM_BYTES, TICKET_FORM_PREFIX, TicketForm};
++use std::io::{Read, Write};
++use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++
+ use serde::{Deserialize, Serialize};
+ use serde_json::{Value, json};
+ use uuid::Uuid;
+@@ -125,9 +129,21 @@ impl PendingQuestions {
+         // Native ids can repeat after a CLI restart. Never expose them as the
+         // durable answer key: a late click must not answer a different call.
+         let request_id = Uuid::new_v4().to_string();
++        let mut questions = serde_json::to_value(&request.questions)?;
++        for (index, question) in request.questions.iter().enumerate() {
++            if let Some(reference) = question.question.strip_prefix(TICKET_FORM_PREFIX) {
++                if request.questions.len() != 1 || question.multi_select || !question.allow_other {
++                    return Err(HarnessServerError::Protocol(
++                        "invalid ticket form request".into(),
++                    ));
++                }
++                questions[index]["ticketForm"] =
++                    serde_json::to_value(read_ticket_form(reference)?)?;
++            }
++        }
+         let wire = json!({"id":request_id,"method":"item/tool/requestUserInput","params":{
+             "requestId":request_id,"threadId":thread_id,"turnId":turn_id,
+-            "itemId":request.item_id,"questions":request.questions,"isBlocking":request.is_blocking
++            "itemId":request.item_id,"questions":questions,"isBlocking":request.is_blocking
+         }});
+         self.pending.insert(request_id, request);
+         Ok(wire)
+@@ -220,6 +236,64 @@ impl PendingQuestions {
+     }
+ }
+ 
++fn parse_ticket_form(input: impl Read) -> Result<TicketForm> {
++    let invalid = || HarnessServerError::Protocol("invalid ticket form manifest".into());
++    let mut bytes = Vec::new();
++    input
++        .take(MAX_FORM_BYTES as u64 + 1)
++        .read_to_end(&mut bytes)?;
++    if bytes.len() > MAX_FORM_BYTES {
++        return Err(invalid());
++    }
++    let form: TicketForm = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
++    if !form.valid() {
++        return Err(invalid());
++    }
++    Ok(form)
++}
++
++pub fn prepare_ticket_form(input: impl Read) -> Result<String> {
++    let form = parse_ticket_form(input)?;
++    let id = Uuid::new_v4();
++    let path = format!("/tmp/centaur-ticket-form-{id}.json");
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .mode(0o600)
++        .open(&path)?;
++    if let Err(error) = file.write_all(&serde_json::to_vec(&form)?) {
++        let _ = std::fs::remove_file(path);
++        return Err(error.into());
++    }
++    Ok(format!("{TICKET_FORM_PREFIX}{id}"))
++}
++
++// Only an owner-private, regular manifest at the fixed sandbox path is eligible.
++fn read_ticket_form(reference: &str) -> Result<TicketForm> {
++    let invalid = || HarnessServerError::Protocol("invalid ticket form manifest".into());
++    let id = Uuid::parse_str(reference).map_err(|_| invalid())?;
++    if id.to_string() != reference {
++        return Err(invalid());
++    }
++    let path = format!("/tmp/centaur-ticket-form-{id}.json");
++    let file = std::fs::OpenOptions::new()
++        .read(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
++        .open(&path)
++        .map_err(|_| invalid())?;
++    let metadata = file.metadata()?;
++    if !metadata.is_file()
++        || metadata.uid() != unsafe { libc::geteuid() }
++        || metadata.mode() & 0o077 != 0
++        || metadata.len() > MAX_FORM_BYTES as u64
++    {
++        return Err(invalid());
++    }
++    let form = parse_ticket_form(file)?;
++    std::fs::remove_file(path)?;
++    Ok(form)
++}
++
+ fn invalid_answer<T>() -> Result<T> {
+     Err(HarnessServerError::Protocol(
+         "invalid or incomplete user input answers".into(),
+@@ -291,6 +365,26 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn ticket_manifest_is_consumed_and_only_the_validated_form_enters_the_event() {
++        let form = json!({"title":"Release the client","summary":"Publish the desktop client.",
++            "team":"ENG","project":null,"due":null,"teams":{"ENG":[]}});
++        let reference = prepare_ticket_form(form.to_string().as_bytes()).unwrap();
++        let id = reference.strip_prefix(TICKET_FORM_PREFIX).unwrap();
++        let path = format!("/tmp/centaur-ticket-form-{id}.json");
++        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
++        let mut request = request();
++        request.questions[0].question = reference;
++        let mut pending = PendingQuestions::new(Some("execution"), true);
++        let wire = pending.register(request, "thread", "turn").unwrap();
++        assert_eq!(wire["params"]["questions"][0]["ticketForm"], form);
++        assert!(!std::path::Path::new(&path).exists());
++        let stored: Vec<centaur_session_core::user_input::UserInputQuestion> =
++            serde_json::from_value(wire["params"]["questions"].clone()).unwrap();
++        assert!(centaur_session_core::user_input::validate_user_input_questions(&stored).is_ok());
++        assert!(read_ticket_form("../manifest").is_err());
++    }
++
+     #[test]
+     fn user_input_answers_are_complete_execution_scoped_and_idempotent() {
+         let mut pending = PendingQuestions::new(Some("execution-1"), true);
+diff --git a/crates/harness-server/tests/app_server_stdio.rs b/crates/harness-server/tests/app_server_stdio.rs
+index eaaf6c62..940312c4 100644
+--- a/crates/harness-server/tests/app_server_stdio.rs
++++ b/crates/harness-server/tests/app_server_stdio.rs
+@@ -126,7 +126,7 @@ for line in sys.stdin:
+         emit({'id':value['id'],'result':{'thread':{'id':'question-thread'},'model':'fake'}})
+     elif (claude and value.get('type') == 'user') or method == 'turn/start':
+         turn += 1
+-        question = {'header':'Project','question':'Which project?','options':[{'label':'Alpha','description':'First fit'},{'label':'Beta','description':'Second fit'}],'multiSelect':False}
++        question = {'header':'Project','question':os.environ.get('FAKE_QUESTION_TEXT') or 'Which project?','options':[{'label':'Alpha','description':'First fit'},{'label':'Beta','description':'Second fit'}],'multiSelect':False}
+         if claude:
+             emit({'type':'control_request','request_id':'native-reused-id','request':{'subtype':'can_use_tool','tool_name':'AskUserQuestion','tool_use_id':'tool-'+str(turn),'input':{'questions':[question]}}})
+         else:
+@@ -143,6 +143,10 @@ for line in sys.stdin:
+ "#;
+ 
+ fn question_bridge(harness: Harness) -> (BridgeProcess, PathBuf, PathBuf) {
++    question_bridge_with_text(harness, "")
++}
++
++fn question_bridge_with_text(harness: Harness, text: &str) -> (BridgeProcess, PathBuf, PathBuf) {
+     let script = temp_path("native-question-cli.py");
+     let log = temp_path("native-question-responses.jsonl");
+     std::fs::write(&script, QUESTION_CLI).unwrap();
+@@ -153,6 +157,7 @@ fn question_bridge(harness: Harness) -> (BridgeProcess, PathBuf, PathBuf) {
+         Some(("CODEX_BIN", script.to_str().unwrap())),
+         &[
+             ("FAKE_QUESTION_HARNESS", harness.name()),
++            ("FAKE_QUESTION_TEXT", text),
+             ("FAKE_QUESTION_LOG", log.to_str().unwrap()),
+         ],
+     );
+@@ -222,6 +227,42 @@ fn assert_native_questions_resume_once(harness: Harness) {
+     let _ = std::fs::remove_file(log);
+ }
+ 
++#[test]
++fn ticket_form_reference_resumes_both_native_providers_with_a_structured_answer() {
++    for harness in [Harness::ClaudeCode, Harness::Codex] {
++        let spec = json!({"title":"Publish app","summary":"Make the client available.",
++            "team":"ENG","project":null,"due":null,"teams":{"ENG":[]}});
++        let reference =
++            harness_server::user_input::prepare_ticket_form(spec.to_string().as_bytes()).unwrap();
++        let (mut process, script, log) = question_bridge_with_text(harness, &reference);
++        process.send(json!({"type":"user","text":"Create a ticket","trace_metadata":{"execution_id":"e1","supports_user_input":true}}));
++        let request = read_question_method(&mut process, "item/tool/requestUserInput");
++        let question = &request["params"]["questions"][0];
++        assert_eq!(question["ticketForm"], spec);
++        let answer =
++            json!({"team":"ENG","project":null,"due":null,"context":"Some detail"}).to_string();
++        process.send(
++            json!({"type":"user_input_response","request_id":request["id"],"execution_id":"e1",
++            "answers":{question["id"].as_str().unwrap():{"answers":[answer]}}}),
++        );
++        read_question_method(&mut process, "serverRequest/resolved");
++        read_question_method(&mut process, "turn/completed");
++        process.finish_successfully();
++        let responses = read_requests(&log);
++        assert_eq!(responses.len(), 1);
++        let value = match harness {
++            Harness::ClaudeCode => {
++                &responses[0]["response"]["response"]["updatedInput"]["answers"][&reference]
++            }
++            _ => &responses[0]["result"]["answers"]["project"]["answers"][0],
++        };
++        assert_eq!(value, &answer);
++        let _ = std::fs::remove_file(format!("{}.requests", log.display()));
++        let _ = std::fs::remove_file(script);
++        let _ = std::fs::remove_file(log);
++    }
++}
++
+ #[test]
+ fn codex_question_capability_change_resumes_the_same_thread() {
+     let (mut process, script, log) = question_bridge(Harness::Codex);
+diff --git a/services/slackbotv2/src/ticket-form.ts b/services/slackbotv2/src/ticket-form.ts
+new file mode 100644
+index 00000000..15fd762b
+--- /dev/null
++++ b/services/slackbotv2/src/ticket-form.ts
+@@ -0,0 +1,94 @@
++// The durable request carries a validated catalogue. User-facing text is always plain text.
++import type { JsonObject } from './types'
++import { isJsonObject } from './utils'
++
++export type TicketForm = {
++  title: string
++  summary: string
++  team: string
++  project: string | null
++  due: string | null
++  teams: Record<string, { id: string; name: string }[]>
++}
++export type TicketSelection = Pick<TicketForm, 'team' | 'project' | 'due'> & { context: string }
++
++export const TEAM_ACTION = 'centaur.user_input:team:'
++const plain = (text: string) => ({ type: 'plain_text', text })
++const option = (value: string, label: string) => ({ value, text: plain([...label].slice(0, 75).join('')) })
++
++function input(block_id: string, label: string, element: JsonObject, optional = false) {
++  return { type: 'input', block_id, label: plain(label), optional, element }
++}
++
++function select(action_id: string, choices: ReturnType<typeof option>[], value: string) {
++  const initial_option = choices.find(choice => choice.value === value)
++  if (choices.length <= 100) return { type: 'static_select', action_id, initial_option, options: choices }
++  const option_groups = []
++  for (let start = 0; start < choices.length; start += 100) {
++    const options = choices.slice(start, start + 100)
++    option_groups.push({ label: plain(`Projects ${start + 1}–${start + options.length}`), options })
++  }
++  return { type: 'static_select', action_id, initial_option, option_groups }
++}
++
++export function initialTicketSelection(form: TicketForm): TicketSelection {
++  return { team: form.team, project: form.project, due: form.due, context: '' }
++}
++
++export function ticketMessage(form: TicketForm, draft: TicketSelection, id: string, marker: string, submit: JsonObject, notice?: string) {
++  const title = `Create Ticket Form: ${form.title}`
++  const teams = Object.keys(form.teams).sort().map(team => option(team, team))
++  const projects = form.teams[draft.team]!.map(p => option(p.id, p.name))
++  projects.push(option('none', 'No project'))
++  const team = input(`team.${draft.team}`, 'Team', select(TEAM_ACTION + id, teams, draft.team))
++  const children = [
++    { type: 'section', text: plain(form.summary) },
++    ...(notice ? [{ type: 'context', elements: [plain(notice)] }] : []),
++    { ...team, dispatch_action: true },
++    input(`project.${draft.team}`, 'Project', select('project', projects, draft.project ?? 'none')),
++    input('due', 'Due date', { type: 'datepicker', action_id: 'date', placeholder: plain('Choose a date'),
++      ...(draft.due ? { initial_date: draft.due } : {}) }, true),
++    input('context', 'Additional context', { type: 'plain_text_input', action_id: 'note', multiline: true,
++      placeholder: plain("Add anything the thread hasn’t covered."), max_length: 2000, ...(draft.context ? { initial_value: draft.context } : {}) }, true),
++    submit
++  ]
++  return { text: [title, form.summary, draft.team, form.teams[draft.team]!.find(p => p.id === draft.project)?.name ?? 'No project',
++    draft.due, notice].filter(Boolean).join('\n'), mrkdwn: false, unfurl_links: false, unfurl_media: false,
++    blocks: [{ type: 'container', block_id: marker, title: plain(title), has_header_divider: true, child_blocks: children }] }
++}
++
++function actionValue(values: JsonObject, block: string, action: string): JsonObject {
++  const group = values[block]
++  if (!isJsonObject(group)) return {}
++  const element = group[action]
++  return isJsonObject(element) ? element : {}
++}
++
++function selected(action: JsonObject): unknown {
++  return isJsonObject(action.selected_option) ? action.selected_option.value : undefined
++}
++
++// Read the project from the menu for the *selected* team. A click on Submit can race
++// the team-change webhook, so a stale menu can never authorize a different team's project.
++export function readTicketSelection(form: TicketForm, previous: TicketSelection, id: string, payload: Record<string, unknown>,
++  teamAction?: JsonObject): { draft: TicketSelection; ready: boolean } {
++  const state = isJsonObject(payload.state) ? payload.state : {}
++  const values = isJsonObject(state.values) ? state.values : {}
++  const teamBlock = `team.${previous.team}`
++  const team = selected(teamAction ?? actionValue(values, teamBlock, TEAM_ACTION + id))
++  if (typeof team !== 'string' || !Object.hasOwn(form.teams, team) || (teamAction && teamAction.block_id !== teamBlock)) {
++    return { draft: previous, ready: false }
++  }
++  const project = selected(actionValue(values, `project.${team}`, 'project'))
++  const validProject = project === 'none' || form.teams[team]!.some(p => p.id === project)
++  const date = actionValue(values, 'due', 'date').selected_date
++  const validDate = date === null || (typeof date === 'string' && /^\d{4}-\d\d-\d\d$/.test(date)
++    && Number.isFinite(Date.parse(date)) && new Date(date).toISOString().slice(0, 10) === date && !date.startsWith('0000'))
++  const note = actionValue(values, 'context', 'note').value
++  const validNote = note === null || (typeof note === 'string' && [...note].length <= 2000)
++  const draft = { team, project: validProject ? (project === 'none' ? null : project as string)
++    : team === previous.team ? previous.project : team === form.team ? form.project : null,
++    due: validDate ? date as string | null : previous.due,
++    context: validNote ? (note as string | null) ?? '' : previous.context }
++  return { draft, ready: team === previous.team && validProject && validDate && validNote }
++}
+diff --git a/services/slackbotv2/src/types.ts b/services/slackbotv2/src/types.ts
+index 69c6d874..3a6a443f 100644
+--- a/services/slackbotv2/src/types.ts
++++ b/services/slackbotv2/src/types.ts
+@@ -108,6 +108,7 @@ export type SlackbotV2InterruptSessionResponse = {
+ export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+ 
+ export type SessionUserInputQuestion = {
++  ticketForm?: import('./ticket-form').TicketForm
+   id: string
+   header: string
+   question: string
+diff --git a/services/slackbotv2/src/user-input.ts b/services/slackbotv2/src/user-input.ts
+index 8fcb3beb..1137871a 100644
+--- a/services/slackbotv2/src/user-input.ts
++++ b/services/slackbotv2/src/user-input.ts
+@@ -1,3 +1,4 @@
++import { TEAM_ACTION, initialTicketSelection, readTicketSelection, ticketMessage, type TicketSelection } from './ticket-form'
+ import { assertSlackOk, callSlackApi, fetchSlackThreadReplies } from '@chat-adapter/slack/api'
+ import type { StateAdapter, Thread } from 'chat'
+ import {
+@@ -36,6 +37,7 @@ type QuestionCard = {
+   threadId: string
+   channel: string
+   threadTs: string
++  ticketDraft?: TicketSelection
+   messageTs?: string
+   postingAt?: number
+   /** The latest submitted form values; a partial set pre-fills the re-rendered form. */
+@@ -150,7 +152,9 @@ export async function handleSessionUserInputInteraction(
+   const user = isJsonObject(payload.user) ? stringValue(payload.user.id) : undefined
+   let requestId: string
+   try {
+-    requestId = parseRequestId(action.value)
++    requestId = typeof action.action_id === 'string' && action.action_id.startsWith(TEAM_ACTION)
++      ? parseRequestId(JSON.stringify({ request: action.action_id.slice(TEAM_ACTION.length) }))
++      : parseRequestId(action.value)
+   } catch {
+     return new Response('Invalid question choice', { status: 400 })
+   }
+@@ -201,22 +205,37 @@ export async function handleSessionUserInputInteraction(
+           await refresh(card)
+           return ok()
+         }
+-        if (action.action_id !== SUBMIT_ACTION) {
++        const question = current.questions[0]!
++        const ticket = question.ticketForm
++        if (ticket && (action.action_id === TEAM_ACTION + requestId || action.action_id === SUBMIT_ACTION)) {
++          const switching = action.action_id === TEAM_ACTION + requestId
++          const selection = readTicketSelection(ticket, card.ticketDraft ?? initialTicketSelection(ticket), requestId,
++            payload, switching ? action : undefined)
++          card.ticketDraft = selection.draft
++          if (switching || !selection.ready) {
++            card.notice = switching ? undefined : 'Review the current selections and submit again.'
++            await saveCard(card, options)
++            await refresh(card)
++            return ok()
++          }
++          card.answers = { [question.id]: { answers: [JSON.stringify(selection.draft)] } }
++        } else if (action.action_id !== SUBMIT_ACTION) {
+           // A button from the earlier one-question-per-page card. Replace that
+           // card with the form; the click itself answers nothing.
+           await refresh(card)
+           return ok()
+-        }
+-        const form = formAnswers(card.request.questions, payload)
+-        // Save before updating Slack or calling the API. The API accepts one
+-        // answer set per request id, so a repeated submission cannot change an
+-        // answer set it has already stored.
+-        card.answers = form.answers
+-        if (form.missing.length) {
+-          card.notice = `Still needed: ${form.missing.join(', ')}. Answer and submit again.`.slice(0, 3000)
+-          await saveCard(card, options)
+-          await refresh(card)
+-          return ok()
++        } else {
++          const form = formAnswers(card.request.questions, payload)
++          // Save before updating Slack or calling the API. The API accepts one
++          // answer set per request id, so a repeated submission cannot change an
++          // answer set it has already stored.
++          card.answers = form.answers
++          if (form.missing.length) {
++            card.notice = `Still needed: ${form.missing.join(', ')}. Answer and submit again.`.slice(0, 3000)
++            await saveCard(card, options)
++            await refresh(card)
++            return ok()
++          }
+         }
+         delete card.notice
+         await saveCard(card, options)
+@@ -346,6 +365,13 @@ function cardMessage(card: QuestionCard): JsonObject {
+     return { text, blocks: [{ type: 'section', block_id: marker, text: { type: 'plain_text', text } }] }
+   }
+   const questions = card.request.questions
++  const ticket = questions[0]?.ticketForm
++  const submit = { type: 'actions', elements: [{
++    type: 'button', style: 'primary', text: { type: 'plain_text', text: ticket ? 'Submit answers' : 'Submit' }, action_id: SUBMIT_ACTION,
++    value: JSON.stringify({ request: card.request.request_id })
++  }] }
++  if (ticket) return ticketMessage(ticket, card.ticketDraft ?? initialTicketSelection(ticket),
++    card.request.request_id, marker, submit, card.notice)
+   const requiredCount = questions.filter(question => !isAdditionalDetails(question)).length
+   const title = requiredCount === 0 ? 'Add any details, then submit to continue.'
+     : requiredCount === 1 ? 'Answer this question to continue.' : `Answer these ${requiredCount} questions to continue.`
+@@ -366,10 +392,7 @@ function cardMessage(card: QuestionCard): JsonObject {
+       blocks.push(...questionSections(question), ...questionInputs(question, index, saved))
+     }
+   })
+-  blocks.push({ type: 'actions', elements: [{
+-    type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Submit' }, action_id: SUBMIT_ACTION,
+-    value: JSON.stringify({ request: card.request.request_id })
+-  }] })
++  blocks.push(submit)
+   return {
+     mrkdwn: false, unfurl_links: false, unfurl_media: false,
+     text: `${title} ${questions.map(question => question.question).join(' · ')}`.slice(0, 3000),
+diff --git a/services/slackbotv2/test/user-input.test.ts b/services/slackbotv2/test/user-input.test.ts
+index cc323bb1..90e706e5 100644
+--- a/services/slackbotv2/test/user-input.test.ts
++++ b/services/slackbotv2/test/user-input.test.ts
+@@ -497,3 +497,65 @@ describe('native questions in Slack', () => {
+     ])
+   })
+ })
++
++describe('create ticket form v1', () => {
++  const teamAction = 'centaur.user_input:team:' + REQUEST
++  const form = { title: 'Release the client', summary: 'Publish the desktop client.',
++    team: 'ENG', project: 'p12', due: '2028-02-29', teams: {
++      ENG: Array.from({ length: 105 }, (_, i) => ({ id: 'p' + i, name: 'Project ' + i })),
++      OPS: [{ id: 'ops', name: 'Operations' }]
++    } }
++  const questions = [{ id: 'ticket', header: 'Ticket form', question: 'centaur:ticket-form:v1:' + REQUEST,
++    options: [], ticketForm: form }]
++  const selection = (value: string) => ({ type: 'static_select', selected_option: { value } })
++  const values = (source: string, team: string, project: string) => ({
++    ['team.' + source]: { [teamAction]: selection(team) },
++    ['project.' + source]: { project: selection(project) },
++    due: { date: { type: 'datepicker', selected_date: null } },
++    context: { note: { type: 'plain_text_input', value: 'First line\nSecond line' } }
++  })
++  test('one strictly ordered container, selected predictions, and the full project menu', async () => {
++    const h = harness({ questions })
++    await h.render()
++    const blocks = h.posts[0]!.blocks as JsonObject[]
++    expect(blocks).toHaveLength(1)
++    expect(blocks[0]).toMatchObject({ type: 'container', block_id: 'centaur.user_input:' + REQUEST,
++      title: { text: 'Create Ticket Form: Release the client' } })
++    expect(blocks[0]!.subtitle).toBeUndefined()
++    const children = blocks[0]!.child_blocks as JsonObject[]
++    expect(children.map(b => b.type)).toEqual(['section', 'input', 'input', 'input', 'input', 'actions'])
++    expect(children.slice(1, 5).map(b => (b.label as JsonObject).text)).toEqual(['Team', 'Project', 'Due date', 'Additional context'])
++    expect(children[0]!.text).toMatchObject({ text: form.summary })
++    expect(children[1]!.element).toMatchObject({ type: 'static_select', initial_option: { value: 'ENG' } })
++    const project = children[2]!.element as JsonObject
++    expect(project.initial_option).toMatchObject({ value: 'p12' })
++    const groups = project.option_groups as { options: { value: string }[] }[]
++    expect(groups.flatMap(g => g.options.map(o => o.value))).toEqual([...form.teams.ENG.map(p => p.id), 'none'])
++    expect(children[3]!.element).toMatchObject({ type: 'datepicker', initial_date: form.due })
++    expect(children[4]!.element).toMatchObject({ type: 'plain_text_input', multiline: true })
++    expect(children[5]!.elements).toMatchObject([{ text: { text: 'Submit answers' } }])
++  })
++
++  test('changing teams preserves edits, rejects stale or foreign projects, and submits once', async () => {
++    const h = harness({ questions })
++    await h.render()
++    const switchTeam = { block_id: 'team.ENG', action_id: teamAction, ...selection('OPS') }
++    const edit = { state: { values: values('ENG', 'OPS', 'p12') } }
++    await h.act(switchTeam, { ...edit, user: { id: 'other' } })
++    expect(h.updates).toHaveLength(0)
++    await h.act(switchTeam, edit)
++    expect(h.submissions).toHaveLength(0)
++    const [container] = h.updates.at(-1)!.blocks as JsonObject[]
++    const children = container!.child_blocks as JsonObject[]
++    expect(children[2]!.element).toMatchObject({ options: [{ value: 'ops' }, { value: 'none' }], initial_option: { value: 'none' } })
++    expect(children[4]!.element).toMatchObject({ initial_value: 'First line\nSecond line' })
++    await h.submit(values('ENG', 'OPS', 'p12'))
++    await h.submit(values('OPS', 'OPS', 'p12'))
++    expect(h.submissions).toHaveLength(0)
++    await h.submit(values('OPS', 'OPS', 'ops'))
++    const answers = h.submissions[0]!.answers as SessionUserInputAnswers
++    expect(JSON.parse(answers.ticket!.answers[0]!)).toEqual({ team: 'OPS', project: 'ops', due: null, context: 'First line\nSecond line' })
++    await h.submit(values('OPS', 'OPS', 'none'))
++    expect(h.submissions).toHaveLength(1)
++  })
++})

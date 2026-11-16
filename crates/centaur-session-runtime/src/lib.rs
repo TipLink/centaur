@@ -10429,6 +10429,25 @@ mod adoption_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_user_input_round_trip_preserves_execution_and_replays_request() {
+        check_native_question_round_trip(
+            json!({"id":"project","header":"Project","question":"Which project?",
+                "options":[{"label":"Project A","description":"Matches the work"}]}),
+            "Project A".to_owned(),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ticket_form_round_trip_preserves_catalogue_and_submitted_choices() {
+        check_native_question_round_trip(
+            json!({"id":"project","header":"Ticket form","question":format!("centaur:ticket-form:v1:{}", Uuid::new_v4()),
+                "options":[],"ticketForm":{"title":"Publish client","summary":"Publish the client.",
+                "team":"ENG","project":null,"due":null,"teams":{"ENG":[]}}}),
+            json!({"team":"ENG","project":null,"due":null,"context":"Ship the preview."}).to_string(),
+        ).await;
+    }
+
+    async fn check_native_question_round_trip(native_question: Value, answer: String) {
         use centaur_session_core::user_input::UserInputAnswers;
         use tokio::io::AsyncBufReadExt;
         let Some(store) = test_store().await else {
@@ -10470,8 +10489,7 @@ mod adoption_tests {
             "id":request_id,"method":"item/tool/requestUserInput",
             "params":{"requestId":request_id,"threadId":"native-thread","turnId":"native-turn",
                 "requester_user_id":"model-must-not-set-owner",
-                "questions":[{"id":"project","header":"Project","question":"Which project?",
-                    "options":[{"label":"Project A","description":"Matches the work"}]}]}
+                "questions":[native_question]}
         });
         stdout
             .write_all(format!("{question}\n").as_bytes())
@@ -10486,8 +10504,12 @@ mod adoption_tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].execution_id, execution.execution_id);
         assert_eq!(pending[0].requester_user_id.as_deref(), Some("U-requester"));
+        assert_eq!(
+            serde_json::to_value(&pending[0].questions[0]).unwrap()["ticketForm"],
+            native_question["ticketForm"]
+        );
         let answers: UserInputAnswers =
-            serde_json::from_value(json!({"project":{"answers":["Project A"]}})).unwrap();
+            serde_json::from_value(json!({"project":{"answers":[answer]}})).unwrap();
         assert!(matches!(
             runtime
                 .answer_user_input(
@@ -10524,7 +10546,7 @@ mod adoption_tests {
             line["trace_metadata"]["execution_id"],
             execution.execution_id
         );
-        assert_eq!(line["answers"]["project"]["answers"][0], "Project A");
+        assert_eq!(line["answers"]["project"]["answers"][0], answer);
         stdout.write_all(format!("{}\n", json!({"method":"serverRequest/resolved","params":{"requestId":request_id,"reason":"answered"}})).as_bytes()).await.unwrap();
         wait_for_event(&store, &thread_key, "session.user_input.resolved").await;
         stdout

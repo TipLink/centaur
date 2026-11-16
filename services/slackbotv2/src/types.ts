@@ -108,6 +108,7 @@ export type SlackbotV2InterruptSessionResponse = {
 export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 export type SessionUserInputQuestion = {
+  ticketForm?: import('./ticket-form').TicketForm
   id: string
   header: string
   question: string
