@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "82e8153689fec428d2a42ad4522492905fd61fa1",
-  "result_tree": "2f6190b543377349ea152fdf69240647a453e106",
+  "result_tree": "a51c2f179c3183a6b03de1e8636315f8f039f086",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -71,6 +71,14 @@
     {
       "file": "0017-optional-additional-details.patch",
       "sha256": "6b82f36b4d84239a22924dc79eac5da403a2acc7c48ff1b223eb827f5d4f3f50"
+    },
+    {
+      "file": "0018-workflow-sandbox-lifecycle-and-db-secret.patch",
+      "sha256": "40fd7352359f5182efd5c9af09b1c94c99333e5a356584094ea7113cf85ce45a"
+    },
+    {
+      "file": "0019-repo-cache-shutdown-and-recovery.patch",
+      "sha256": "45e543060687ed9bce1801cf1bf0130bdc6d526452a97c657e0802b48ab2a11e"
     }
   ]
 }

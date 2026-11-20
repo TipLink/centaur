@@ -12,8 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, ResourceRequirements, SandboxBackend, SandboxError, SandboxHandle,
-    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
+    COMPONENT_LABEL, MountKind, ObservedSandbox, ResourceRequirements, SandboxBackend,
+    SandboxError, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
+    WORKFLOW_RUN_COMPONENT, WORKFLOW_RUN_ID_LABEL,
 };
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -30,7 +31,7 @@ use tokio::time::{Instant, sleep};
 pub use crd_migration::{CrdMigrationError, DeploymentRef, install_agent_sandbox_crds};
 pub use generated::agents_x_k8s_io as crd;
 pub use iron_proxy::IronProxyConfig;
-pub use k8s_openapi::api::core::v1::{SecurityContext, Toleration};
+pub use k8s_openapi::api::core::v1::{SecretKeySelector, SecurityContext, Toleration};
 pub use ssh::SshProxyConfig;
 pub use tools::{GitHubTokenRef, ToolSource, ToolsConfig};
 
@@ -108,6 +109,8 @@ pub struct AgentSandboxConfig {
     /// under node pressure. Empty leaves the cluster default untouched.
     pub priority_class_name: Option<String>,
     pub state_volume: Option<StateVolumeConfig>,
+    /// Set only on the workflow host backend. The kubelet resolves this key at pod start.
+    pub workflow_database_secret: Option<SecretKeySelector>,
     pub iron_proxy: Option<IronProxyConfig>,
     pub iron_control: IronControlSettings,
     /// When set, every sandbox gets a `tools-bootstrap` init container that
@@ -173,6 +176,7 @@ impl AgentSandboxConfig {
             service_account_name: None,
             priority_class_name: None,
             state_volume: None,
+            workflow_database_secret: None,
             iron_proxy: None,
             iron_control,
             tools: None,
@@ -355,7 +359,7 @@ impl AgentSandboxBackend {
         let pod = self.get_pod(id).await?;
         let status = sandbox_status_from_pod(sandbox_suspended(sandbox), pod.as_ref());
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
-            .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
+            .with_labels(observed_labels(sandbox, &self.config.container_name))
             .with_created_at(sandbox_creation_time(sandbox))
             .with_suspended_since(sandbox_paused_at(sandbox))
             .with_reason(pod.as_ref().and_then(pod_termination_reason))
@@ -1099,6 +1103,27 @@ fn sandbox_suspended(sandbox: &crd::Sandbox) -> bool {
     sandbox.spec.operating_mode == Some(crd::SandboxOperatingMode::Suspended)
 }
 
+fn observed_labels(sandbox: &crd::Sandbox, container_name: &str) -> BTreeMap<String, String> {
+    let mut labels = sandbox.metadata.labels.clone().unwrap_or_default();
+    // Pre-label workflow hosts already carry their exact attempt ID in the agent env.
+    if labels.get(COMPONENT_LABEL).map(String::as_str) == Some(WORKFLOW_RUN_COMPONENT)
+        && !labels.contains_key(WORKFLOW_RUN_ID_LABEL)
+        && let Some(id) = sandbox
+            .spec
+            .pod_template
+            .spec
+            .containers
+            .iter()
+            .find(|c| c.name == container_name)
+            .and_then(|c| c.env.as_ref())
+            .and_then(|env| env.iter().find(|e| e.name == "WORKFLOW_RUN_ID"))
+            .and_then(|e| e.value.as_ref())
+    {
+        labels.insert(WORKFLOW_RUN_ID_LABEL.to_owned(), id.clone());
+    }
+    labels
+}
+
 fn sandbox_status_from_pod(suspended: bool, pod: Option<&Pod>) -> SandboxStatus {
     if suspended {
         return SandboxStatus::Suspended;
@@ -1236,16 +1261,17 @@ fn build_agent_sandbox(
             upsert_env(&mut agent_env, &name, value);
         }
     }
-    insert_optional(
-        &mut container,
-        "env",
-        (!agent_env.is_empty()).then(|| {
-            agent_env
-                .iter()
-                .map(|(name, value)| json!({ "name": name, "value": value }))
-                .collect::<Vec<_>>()
-        }),
-    );
+    // The template, configured passthrough, and per-run fallback can all supply a
+    // literal DATABASE_URL. Apply the trusted backend selector at the final CR boundary.
+    let mut env: Vec<_> = agent_env
+        .into_iter()
+        .filter(|(name, _)| name != "DATABASE_URL" || config.workflow_database_secret.is_none())
+        .map(|(name, value)| json!({ "name": name, "value": value }))
+        .collect();
+    if let Some(secret) = &config.workflow_database_secret {
+        env.push(json!({ "name": "DATABASE_URL", "valueFrom": { "secretKeyRef": secret } }));
+    }
+    insert_optional(&mut container, "env", (!env.is_empty()).then_some(env));
     insert_optional(&mut container, "workingDir", spec.working_dir.clone());
     insert_optional(&mut container, "resources", resources_json(spec));
     insert_optional(
@@ -1764,6 +1790,59 @@ mod tests {
 
         assert!(exceeded);
         assert_eq!(retained, b"abc");
+    }
+
+    #[test]
+    fn workflow_cr_serializes_only_the_database_secret_selector() {
+        let spec = SandboxSpec::new("workflow-host")
+            .label(COMPONENT_LABEL, WORKFLOW_RUN_COMPONENT)
+            .env("DATABASE_URL", "first-test-literal")
+            .env("DATABASE_URL", "second-test-literal")
+            .env("WORKFLOW_NAME", "test");
+        let id = SandboxId::new("test-workflow");
+        let mut config = AgentSandboxConfig::new("test", test_iron_control_settings());
+        config.workflow_database_secret = Some(SecretKeySelector {
+            name: "workflow-env".into(),
+            key: "PREFIX_DATABASE_URL".into(),
+            optional: None,
+        });
+        let cr = serde_json::to_value(build_agent_sandbox(&id, &spec, &config).unwrap()).unwrap();
+        assert_eq!(
+            cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"],
+            json!([
+                {"name":"WORKFLOW_NAME","value":"test"},
+                {"name":"DATABASE_URL","valueFrom":{"secretKeyRef":{"name":"workflow-env","key":"PREFIX_DATABASE_URL"}}}
+            ])
+        );
+        assert!(!cr.to_string().contains("test-literal"));
+        config.workflow_database_secret = None;
+        let legacy = build_agent_sandbox(&id, &spec, &config).unwrap();
+        assert_eq!(
+            legacy.spec.pod_template.spec.containers[0]
+                .env
+                .as_ref()
+                .unwrap()[0]
+                .value
+                .as_deref(),
+            Some("first-test-literal")
+        );
+    }
+
+    #[test]
+    fn observes_attempt_id_from_pre_label_workflow_hosts_only() {
+        let spec = SandboxSpec::new("host")
+            .label(COMPONENT_LABEL, WORKFLOW_RUN_COMPONENT)
+            .env("WORKFLOW_RUN_ID", "original-attempt");
+        let config = AgentSandboxConfig::new("test", test_iron_control_settings());
+        let mut cr = build_agent_sandbox(&SandboxId::new("test"), &spec, &config).unwrap();
+        assert_eq!(
+            observed_labels(&cr, &config.container_name)[WORKFLOW_RUN_ID_LABEL],
+            "original-attempt"
+        );
+        assert!(!observed_labels(&cr, "other-container").contains_key(WORKFLOW_RUN_ID_LABEL));
+        let labels = cr.metadata.labels.as_mut().unwrap();
+        labels.insert(COMPONENT_LABEL.into(), "session-sandbox".into());
+        assert!(!observed_labels(&cr, &config.container_name).contains_key(WORKFLOW_RUN_ID_LABEL));
     }
 
     #[test]

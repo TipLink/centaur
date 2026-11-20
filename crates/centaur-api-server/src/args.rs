@@ -26,10 +26,12 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, DeploymentRef, GitHubTokenRef, IronControlSettings,
-    IronProxyConfig, OtlpEgressTarget, SecurityContext, SshProxyConfig, StateVolumeConfig,
-    Toleration, ToolSource, ToolsConfig,
+    IronProxyConfig, OtlpEgressTarget, SecretKeySelector, SecurityContext, SshProxyConfig,
+    StateVolumeConfig, Toleration, ToolSource, ToolsConfig,
 };
-use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
+use centaur_sandbox_core::{
+    COMPONENT_LABEL, Mount, MountKind, ResourceRequirements, SandboxSpec, WORKFLOW_RUN_COMPONENT,
+};
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::{HarnessType, SandboxRepoCacheAccess};
 use centaur_session_runtime::{
@@ -1042,6 +1044,17 @@ struct SandboxArgs {
     workflow_host_image: Option<String>,
     #[arg(long = "workflow-host-command", env = "WORKFLOW_HOST_COMMAND")]
     workflow_host_command: Option<String>,
+    /// Override DATABASE_URL for workflow hosts.
+    #[arg(long, env = "WORKFLOW_HOST_DATABASE_URL", hide_env_values = true)]
+    workflow_host_database_url: Option<String>,
+    /// Source workflow pod DATABASE_URL from this key in KUBERNETES_SECRET_ENV_NAME.
+    #[arg(
+        long,
+        env = "WORKFLOW_HOST_DATABASE_SECRET_KEY",
+        value_parser = parse_workflow_host_database_secret_key,
+        conflicts_with = "workflow_host_database_url"
+    )]
+    workflow_host_database_secret_key: Option<String>,
     /// Workflow-host container resources as a JSON Kubernetes
     /// `ResourceRequirements` object.
     #[arg(long = "workflow-host-resources", env = "WORKFLOW_HOST_RESOURCES")]
@@ -1156,11 +1169,30 @@ impl SandboxArgs {
         let runtime = SandboxRuntime::backend(
             Arc::new(AgentSandboxBackend::new(
                 self.kube_client().await?,
-                AgentSandboxConfig::try_from(self)?,
+                self.workflow_host_sandbox_config()?,
             )),
             spec.clone(),
         );
         Ok(Some(WorkflowHostSandboxRuntime::new(runtime, spec)))
+    }
+
+    fn workflow_host_sandbox_config(&self) -> Result<AgentSandboxConfig, ServerError> {
+        let mut config = AgentSandboxConfig::try_from(self)?;
+        // A workflow attempt persists its checkpoints in Postgres and never resumes this host.
+        config.state_volume = None;
+        if let Some(key) = self.workflow_host_database_secret_key.as_deref() {
+            let name = non_empty(self.iron_proxy.secret_env_name.as_deref()).ok_or_else(|| {
+                ServerError::UnsupportedConfig(
+                    "WORKFLOW_HOST_DATABASE_SECRET_KEY requires KUBERNETES_SECRET_ENV_NAME".into(),
+                )
+            })?;
+            config.workflow_database_secret = Some(SecretKeySelector {
+                name: name.to_owned(),
+                key: key.to_owned(),
+                optional: None,
+            });
+        }
+        Ok(config)
     }
 
     fn workflow_host_spec(
@@ -1178,7 +1210,7 @@ impl SandboxArgs {
             format!("exec {interpreter} {WORKFLOW_HOST_PATH}")
         });
         let mut spec = SandboxSpec::new(image)
-            .label("centaur.ai/component", "workflow-run")
+            .label(COMPONENT_LABEL, WORKFLOW_RUN_COMPONENT)
             .env("CENTAUR_WORKLOAD", "workflow-host");
         if let Some(resources) = resource_requirements(
             self.workflow_host_resources_json.as_deref(),
@@ -1192,8 +1224,11 @@ impl SandboxArgs {
             command,
         ]);
         spec = spec.env("WORKFLOW_DIRS", self.agent_k8s_workflow_dirs());
-        if let Ok(value) =
-            env::var("WORKFLOW_HOST_DATABASE_URL").or_else(|_| env::var("DATABASE_URL"))
+        if self.workflow_host_database_secret_key.is_none()
+            && let Some(value) = self
+                .workflow_host_database_url
+                .clone()
+                .or_else(|| env::var("DATABASE_URL").ok())
         {
             spec = spec.env("DATABASE_URL", value);
         }
@@ -2626,6 +2661,23 @@ fn upsert_spec_env(spec: &mut SandboxSpec, name: String, value: String) {
     }
 }
 
+fn parse_workflow_host_database_secret_key(key: &str) -> Result<String, &'static str> {
+    if key == "." || key.starts_with("..") {
+        return Err("WORKFLOW_HOST_DATABASE_SECRET_KEY cannot be '.' or start with '..'");
+    }
+    if key.is_empty()
+        || key.len() > 253
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(
+            "WORKFLOW_HOST_DATABASE_SECRET_KEY must be 1 to 253 ASCII letters, digits, dots, hyphens or underscores",
+        );
+    }
+    Ok(key.to_owned())
+}
+
 fn parse_label_selector_arg(value: &str) -> Result<BTreeMap<String, String>, String> {
     let mut labels = BTreeMap::new();
     for item in value
@@ -3032,6 +3084,105 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn workflow_host_database_secret_key_requires_valid_kubernetes_key() {
+        let parse = |key: &str| {
+            Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://localhost/centaur",
+                "--workflow-host-database-secret-key",
+                key,
+            ])
+        };
+        for key in [
+            "",
+            ".",
+            "..",
+            "..data",
+            " DB_URL",
+            "DB_URL ",
+            "db/url",
+            "db\nurl",
+            "é",
+            &"k".repeat(254),
+        ] {
+            assert_eq!(
+                parse(key).unwrap_err().kind(),
+                clap::error::ErrorKind::ValueValidation
+            );
+        }
+        for key in ["a", ".Db_0-x", &"k".repeat(253)] {
+            assert_eq!(
+                parse(key)
+                    .unwrap()
+                    .sandbox
+                    .workflow_host_database_secret_key
+                    .as_deref(),
+                Some(key)
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_host_database_sources_are_mutually_exclusive() {
+        let error = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://localhost/centaur",
+            "--workflow-host-database-url",
+            "postgres://localhost/workflow",
+            "--workflow-host-database-secret-key",
+            "DB_URL",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[tokio::test]
+    async fn workflow_host_backend_is_stateless_and_uses_its_own_database_selector() {
+        let mut args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://localhost/centaur",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-proxy-sync-url",
+            "http://proxy-sync.local",
+            "--iron-control-api-key",
+            "test",
+            "--iron-control-database-url",
+            "postgres://localhost/console",
+            "--session-sandbox-state-volume-enabled",
+            "true",
+            "--kubernetes-secret-env-name",
+            "workflow-env",
+            "--workflow-host-database-secret-key",
+            "PREFIX_DATABASE_URL",
+        ])
+        .unwrap()
+        .sandbox;
+        let workflow = args.workflow_host_sandbox_config().unwrap();
+        assert!(workflow.state_volume.is_none());
+        let selector = workflow.workflow_database_secret.unwrap();
+        assert_eq!(selector.name, "workflow-env");
+        assert_eq!(selector.key, "PREFIX_DATABASE_URL");
+        let session = AgentSandboxConfig::try_from(&args).unwrap();
+        assert!(session.state_volume.is_some());
+        assert!(session.workflow_database_secret.is_none());
+
+        args.iron_proxy.secret_env_name = None;
+        assert!(matches!(args.workflow_host_sandbox_config(),
+            Err(ServerError::UnsupportedConfig(message)) if message.contains("KUBERNETES_SECRET_ENV_NAME")));
+        args.workflow_host_database_secret_key = None;
+        assert!(
+            args.workflow_host_sandbox_config()
+                .unwrap()
+                .workflow_database_secret
+                .is_none()
+        );
     }
 
     #[test]
