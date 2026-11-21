@@ -1,13 +1,13 @@
 use std::{collections::BTreeSet, time::Duration};
 
-use centaur_sandbox_core::{ObservedSandbox, SandboxError, SandboxId, SandboxStatus};
+use centaur_sandbox_core::{
+    COMPONENT_LABEL, ObservedSandbox, SandboxError, SandboxId, SandboxStatus,
+    WORKFLOW_RUN_COMPONENT,
+};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 
 use crate::{RuntimeContext, SessionRuntimeError, record_idle_pause};
-
-const COMPONENT_LABEL: &str = "centaur.ai/component";
-const WORKFLOW_RUN_COMPONENT: &str = "workflow-run";
 
 #[derive(Clone, Copy, Debug)]
 pub struct SessionSandboxCleanupConfig {

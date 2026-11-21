@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     str::FromStr,
+    sync::LazyLock,
     time::{Duration, SystemTime},
 };
 
@@ -31,6 +32,27 @@ pub use migrations::{TextSearchBackend, migrate, migration_list};
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
+
+/// Absurd queues whose running attempts can own a workflow sandbox.
+pub const WORKFLOW_HOST_CLAIM_QUEUES: [&str; 4] = [
+    "centaur_workflows",
+    "centaur_workflows_slack_live",
+    "centaur_workflows_etl",
+    "centaur_workflows_etl_backfill",
+];
+
+static WORKFLOW_RUN_LIVE_CLAIM_SQL: LazyLock<String> = LazyLock::new(|| {
+    let attempts = WORKFLOW_HOST_CLAIM_QUEUES
+        .map(|queue| format!("select run_id, state, claim_expires_at from absurd.r_{queue}"))
+        .join(" union all ");
+    format!(
+        "select exists (
+        select 1 from ({attempts}) attempts
+        where run_id = $1::text::uuid and state = 'running'
+            and claim_expires_at > absurd.current_time()
+    )"
+    )
+});
 
 #[derive(Clone, Debug)]
 pub struct CreateExecutionResult {
@@ -694,6 +716,18 @@ impl PgSessionStore {
         self.set_session_status(&row.thread_key, SessionStatus::Idle)
             .await?;
         row.try_into().map(Some)
+    }
+
+    /// A workflow host can legitimately run for hours while its worker renews its
+    /// Absurd claim. Check the exact attempt across the four workflow host queues.
+    pub async fn workflow_run_has_live_claim(
+        &self,
+        run_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        Ok(sqlx::query_scalar(&WORKFLOW_RUN_LIVE_CLAIM_SQL)
+            .bind(run_id)
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn sandbox_reap_state(

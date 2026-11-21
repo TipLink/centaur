@@ -48,6 +48,12 @@ pub const WORKFLOW_SLACK_LIVE_QUEUE: &str = "centaur_workflows_slack_live";
 pub const WORKFLOW_ETL_QUEUE: &str = "centaur_workflows_etl";
 pub const WORKFLOW_ETL_BACKFILL_QUEUE: &str = "centaur_workflows_etl_backfill";
 pub const WORKFLOW_SCHEDULE_QUEUE: &str = "centaur_workflow_schedules";
+const WORKFLOW_HOST_QUEUES: [&str; 4] = [
+    WORKFLOW_QUEUE,
+    WORKFLOW_SLACK_LIVE_QUEUE,
+    WORKFLOW_ETL_QUEUE,
+    WORKFLOW_ETL_BACKFILL_QUEUE,
+];
 pub const WORKFLOW_TASK: &str = "centaur.workflow";
 pub const WORKFLOW_SCHEDULE_TASK: &str = "centaur.workflow.schedule_tick";
 const PYTHON_HOST_ENV: &str = "PYTHON_WORKFLOW_HOST_PATH";
@@ -1073,12 +1079,7 @@ impl WorkflowRuntime {
     }
 
     pub async fn get_run(&self, run_id: &str) -> Result<WorkflowRun, WorkflowRuntimeError> {
-        for queue_name in [
-            WORKFLOW_QUEUE,
-            WORKFLOW_SLACK_LIVE_QUEUE,
-            WORKFLOW_ETL_QUEUE,
-            WORKFLOW_ETL_BACKFILL_QUEUE,
-        ] {
+        for queue_name in WORKFLOW_HOST_QUEUES {
             if let Some(run) = self.get_run_for_queue(queue_name, run_id).await? {
                 return Ok(run);
             }
@@ -3298,6 +3299,7 @@ async fn run_python_workflow_host_in_sandbox(
                 },
             )
             .env("WORKFLOW_RUN_ID", ctx.run_id())
+            .label(centaur_sandbox_core::WORKFLOW_RUN_ID_LABEL, ctx.run_id())
             .env("WORKFLOW_TASK_ID", ctx.task_id())
             .env("WORKFLOW_NAME", input.workflow_name.clone());
         if env::var_os("WORKFLOW_DIRS").is_none() && !sandbox_spec_has_env(&spec, "WORKFLOW_DIRS") {
@@ -4934,6 +4936,15 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn live_claim_queues_match_workflow_host_queues() {
+        assert_eq!(
+            BTreeSet::from(centaur_session_sqlx::WORKFLOW_HOST_CLAIM_QUEUES),
+            BTreeSet::from(WORKFLOW_HOST_QUEUES),
+        );
+        assert!(!WORKFLOW_HOST_QUEUES.contains(&WORKFLOW_SCHEDULE_QUEUE));
+    }
 
     async fn assert_structured_host_error_is_bounded(message_type: &str) {
         let stderr_task = tokio::spawn(async {
