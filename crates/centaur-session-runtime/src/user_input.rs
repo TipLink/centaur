@@ -185,7 +185,7 @@ pub(super) async fn persist_user_input_output(
             let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
                 return Ok(());
             };
-            if Uuid::parse_str(request_id).is_err()
+            if uuid::Uuid::parse_str(request_id).is_err()
                 || value.get("id").and_then(Value::as_str) != Some(request_id)
             {
                 return Ok(());

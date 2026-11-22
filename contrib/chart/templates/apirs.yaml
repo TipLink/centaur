@@ -1,5 +1,6 @@
 {{- if .Values.apiRs.enabled }}
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
+{{- $companyContext := include "centaur.companyContextValues" . | fromYaml -}}
 {{- $mcpPublicUrl := default .Values.slackbotv2.mcpPublicUrl .Values.apiRs.mcpPublicUrl -}}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
 {{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
@@ -17,6 +18,7 @@
 {{- $skillDirs := list -}}
 {{- $publicSkillDirs := list -}}
 {{- $overlayRepoDirs := list -}}
+{{- $codemodeSandboxConnectorDirs := list -}}
 {{- range $source := $overlaySources -}}
 {{- $repo := get $source "repo" | default "" -}}
 {{- $visibility := get $source "visibility" | default "private" -}}
@@ -40,6 +42,11 @@
 {{- if eq $visibility "public" -}}
 {{- $publicSkillDirs = append $publicSkillDirs $skillDir -}}
 {{- end -}}
+{{- end -}}
+{{- /* Code Mode connector roots: overlay copies shadow the image's baked
+connectors, so later sources come later in the list. */ -}}
+{{- with (get $source "connectorsSubdir") -}}
+{{- $codemodeSandboxConnectorDirs = append $codemodeSandboxConnectorDirs (printf "/home/agent/github/%s/%s" $repo .) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -72,12 +79,12 @@
 {{- $apiRsMetricsAnnotations = mergeOverwrite $apiRsMetricsAnnotations (.Values.apiRs.metrics.annotations | default dict) -}}
 {{- end -}}
 {{- $apiRsEtl := .Values.apiRs.etl | default dict -}}
-{{- $companyContextV1Enabled := .Values.companyContextV1.enabled -}}
+{{- $legacyCompanyContextEnabled := eq (include "centaur.legacyCompanyContextEnabled" .) "true" -}}
 {{- $companyContextEmbeddingsEnabled := dig "companyContextEmbeddings" "enabled" false $apiRsEtl -}}
 {{- $companyContextEmbeddingsModel := dig "companyContextEmbeddings" "model" "text-embedding-3-small" $apiRsEtl -}}
 {{- $companyContextEmbeddingsDimensions := dig "companyContextEmbeddings" "dimensions" 1536 $apiRsEtl -}}
 {{- $apiRsEtlEnv := list
-  (dict "name" "SLACK_ETL_ENABLED" "value" (and $companyContextV1Enabled (dig "slack" "enabled" false $apiRsEtl)))
+  (dict "name" "SLACK_ETL_ENABLED" "value" (and $legacyCompanyContextEnabled (dig "slack" "enabled" false $apiRsEtl)))
   (dict "name" "SLACK_SYNC_INTERVAL_SECONDS" "value" (dig "slack" "syncIntervalSeconds" 3600 $apiRsEtl))
   (dict "name" "SLACK_SYNC_BACKFILL_LOOKBACK_DAYS" "value" (dig "slack" "syncBackfillLookbackDays" 30 $apiRsEtl))
   (dict "name" "SLACK_SYNC_THREAD_LOOKBACK_DAYS" "value" (dig "slack" "syncThreadLookbackDays" 3 $apiRsEtl))
@@ -89,7 +96,7 @@
   (dict "name" "SLACK_BACKFILL_INTERVAL_SECONDS" "value" (dig "slack" "backfill" "intervalSeconds" 600 $apiRsEtl))
   (dict "name" "SLACK_BACKFILL_CHANNEL_BATCH_LIMIT" "value" (dig "slack" "backfill" "channelBatchLimit" 50 $apiRsEtl))
   (dict "name" "SLACK_BACKFILL_CHANNEL_PAGES_PER_JOB" "value" (dig "slack" "backfill" "channelPagesPerJob" 5 $apiRsEtl))
-  (dict "name" "SLACK_RETENTION_ENABLED" "value" (and $companyContextV1Enabled (dig "slack" "retention" "enabled" true $apiRsEtl)))
+  (dict "name" "SLACK_RETENTION_ENABLED" "value" (and $legacyCompanyContextEnabled (dig "slack" "retention" "enabled" true $apiRsEtl)))
   (dict "name" "SLACK_RETENTION_INTERVAL_MINUTES" "value" (dig "slack" "retention" "intervalMinutes" 60 $apiRsEtl))
   (dict "name" "SLACK_ETL_RETENTION_DAYS" "value" (dig "slack" "retention" "etlDays" 0 $apiRsEtl))
   (dict "name" "SLACK_DM_RETENTION_DAYS" "value" (dig "slack" "retention" "dmDays" 0 $apiRsEtl))
@@ -110,9 +117,9 @@
   (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_MODEL" "value" $companyContextEmbeddingsModel)
   (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS" "value" $companyContextEmbeddingsDimensions)
 -}}
-{{- if .Values.experimentalCompanyContext.enabled -}}
+{{- if $companyContext.enabled -}}
 {{- /* Workflows that write custom documents (e.g. overlay ingest workflows) need the company-context API URL. */ -}}
-{{- $companyContextApiUrl := get .Values.sandbox.extraEnv "COMPANY_CONTEXT_API_URL" | default (printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) .Values.experimentalCompanyContext.port) -}}
+{{- $companyContextApiUrl := get .Values.sandbox.extraEnv "COMPANY_CONTEXT_API_URL" | default (printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) $companyContext.port) -}}
 {{- $apiRsEtlEnv = append $apiRsEtlEnv (dict "name" "COMPANY_CONTEXT_API_URL" "value" $companyContextApiUrl) -}}
 {{- end -}}
 {{- $apiRsEtlPassthroughNames := list -}}
@@ -279,9 +286,9 @@ spec:
 {{- end }}
             - name: CENTAUR_API_CLIENTS_ENABLED
               value: {{ .Values.apiClients.enabled | quote }}
-{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_MCP_V2_ENABLED") }}
-            - name: CENTAUR_MCP_V2_ENABLED
-              value: {{ .Values.apiRs.mcpV2Enabled | quote }}
+{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_MCP_ENABLED") }}
+            - name: CENTAUR_MCP_ENABLED
+              value: {{ .Values.apiRs.mcpEnabled | quote }}
 {{- end }}
             - name: IRON_CONTROL_SYNC_INFRA_SECRETS
               value: {{ .Values.apiRs.syncInfraSecrets | quote }}
@@ -396,6 +403,10 @@ spec:
               value: {{ printf "%s:%s" .Values.sandbox.image.repository .Values.sandbox.image.tag | quote }}
             - name: SESSION_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.sandbox.image.pullPolicy | quote }}
+{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_CODEMODE_IMAGE") }}
+            - name: CENTAUR_CODEMODE_IMAGE
+              value: {{ printf "%s:%s" .Values.codemode.image.repository .Values.codemode.image.tag | quote }}
+{{- end }}
 {{- if .Values.sandbox.stateVolume.enabled }}
             - name: SESSION_SANDBOX_STATE_VOLUME_ENABLED
               value: "true"
@@ -524,10 +535,10 @@ spec:
               value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=api-rs" (include "centaur.name" .) .Release.Name | quote }}
             - name: KUBERNETES_IRON_PROXY_SYNC_POD_LABEL_SELECTOR
               value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=proxy-sync" (include "centaur.name" .) .Release.Name | quote }}
-{{- if .Values.experimentalCompanyContext.enabled }}
+{{- if $companyContext.enabled }}
             # Sandboxes call the company-context query API through their proxy.
             - name: KUBERNETES_IRON_PROXY_COMPANY_CONTEXT_URL
-              value: {{ printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) .Values.experimentalCompanyContext.port | quote }}
+              value: {{ printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) $companyContext.port | quote }}
             - name: KUBERNETES_IRON_PROXY_COMPANY_CONTEXT_POD_LABEL_SELECTOR
               value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=company-context" (include "centaur.name" .) .Release.Name | quote }}
 {{- end }}
@@ -573,6 +584,15 @@ spec:
 {{- if and .Values.repoCache.enabled (gt (len $overlayRepoDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_OVERLAY_REPO_DIRS" "value" (join ":" $overlayRepoDirs)) }}
 {{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_CODEMODE_CONNECTORS") }}
+{{- /* Code Mode connector roots: the image's baked connectors, then overlay
+copies in source order (later roots shadow earlier ones). */}}
+{{- $codemodeSandboxConnectorRoots := list "/opt/centaur/connectors" -}}
+{{- if and .Values.repoCache.enabled (gt (len $codemodeSandboxConnectorDirs) 0) -}}
+{{- $codemodeSandboxConnectorRoots = concat $codemodeSandboxConnectorRoots $codemodeSandboxConnectorDirs -}}
+{{- end }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_CODEMODE_CONNECTORS" "value" (join ":" $codemodeSandboxConnectorRoots)) }}
+{{- end }}
 {{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_ENABLED") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_ENABLED" "value" ($companyContextEmbeddingsEnabled | toString)) }}
 {{- end }}
@@ -582,9 +602,9 @@ spec:
 {{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS" "value" ($companyContextEmbeddingsDimensions | toString)) }}
 {{- end }}
-{{- if and .Values.experimentalCompanyContext.enabled (not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_API_URL")) }}
+{{- if and $companyContext.enabled (not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_API_URL")) }}
 {{- /* The company_context tool's v2 commands call this query API through the proxy. */}}
-{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_API_URL" "value" (printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) .Values.experimentalCompanyContext.port)) }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_API_URL" "value" (printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) $companyContext.port)) }}
 {{- end }}
 {{- if .Values.codex.customProviders }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CODEX_CUSTOM_PROVIDERS" "value" (.Values.codex.customProviders | toJson)) }}
@@ -620,7 +640,8 @@ spec:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
             # Principals and their effective config are read from the console
-            # database directly, in read-only sessions.
+            # database directly, in read-only sessions. The scheduled-task
+            # scheduler also claims and updates scheduled_tasks rows there.
             - name: IRON_CONTROL_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -682,7 +703,11 @@ spec:
 {{- range $name, $value := .Values.apiRs.extraEnv }}
 {{- if ne $name "SESSION_SANDBOX_PASSTHROUGH_ENV" }}
             - name: {{ $name }}
+{{- if kindIs "map" $value }}
+{{ toYaml $value | nindent 14 }}
+{{- else }}
               value: {{ $value | quote }}
+{{- end }}
 {{- end }}
 {{- end }}
           envFrom:

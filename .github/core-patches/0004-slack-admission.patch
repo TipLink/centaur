@@ -1,0 +1,420 @@
+diff --git a/services/slackbotv2/CHANNEL_USER_POLICY.md b/services/slackbotv2/CHANNEL_USER_POLICY.md
+new file mode 100644
+index 00000000..393dbede
+--- /dev/null
++++ b/services/slackbotv2/CHANNEL_USER_POLICY.md
+@@ -0,0 +1,43 @@
++# Channel user admission
++
++Set `SLACKBOTV2_CHANNEL_USER_POLICY` to a JSON object keyed by protected Slack
++channel ID. Each entry has `team_id` and a nonempty `allowed_user_ids` list:
++
++```json
++{"CEXAMPLE":{"team_id":"TEXAMPLE","allowed_user_ids":["UEXAMPLE"]}}
++```
++
++Malformed configuration fails startup. Unlisted channels keep normal admission.
++In protected channels, only listed humans can mention, follow up, steer, stop,
++or invoke channel-bound controls. Bot messages and message edits cannot trigger
++execution there. Rejected events receive an HTTP acknowledgement to avoid Slack
++retries, but never reach session creation, append, execution or late-file repair.
++The SDK still verifies Slack signatures for accepted requests. The message
++callback also checks the normalized actor before handoff.
++
++This policy controls Slack ingress, not direct API calls, Console access or
++provider workflows. Those need their own authorization; a signed provider
++webhook may deliberately start an automated session without granting it AWS
++access. Any separate command/interaction receiver must enforce the same policy.
++
++Sandbox reuse is unchanged. Before granting a sensitive capability, retire or
++exclude sessions created before this boundary was enabled: changing admission
++does not remove earlier processes or files. Channel membership and session
++history are not authorization. Thread context can still contain untrusted
++content; this gate does not prevent prompt injection during an approved turn.
++
++## Fixed thread ownership
++
++Set `SLACKBOTV2_THREAD_ADMISSION_URL` to the deployment's trusted admission
++service. For channels in the user policy, Slackbot forwards the original signed
++message bytes before any SDK callback, late-file repair, append, stop or steering.
++Only an explicit `{ "allowed": true }` admits a message. Timeouts, errors and
++malformed replies fail closed; other channels do not call this service.
++Protected-channel buttons are disabled while this policy is enabled.
++
++The service must verify Slack's signature itself and atomically reserve a fixed
++thread owner before the first session starts. It must refuse ownership changes
++and pre-existing unowned sessions. Provider workflows must reserve the same
++owner before starting their initial execution. The gateway must authorize that
++fixed owner from the first execution onward, including provider startup.
++The service URL is trusted deployment configuration, never supplied by Slack.
+diff --git a/services/slackbotv2/src/channel-user-policy.ts b/services/slackbotv2/src/channel-user-policy.ts
+new file mode 100644
+index 00000000..41e249d0
+--- /dev/null
++++ b/services/slackbotv2/src/channel-user-policy.ts
+@@ -0,0 +1,62 @@
++/** Trusted ingress policy, independent of model instructions or sandbox state. */
++export type ChannelUserPolicy = Readonly<Record<string, {
++  team_id: string
++  allowed_user_ids: readonly string[]
++}>>
++
++export function parseChannelUserPolicy(raw: string | undefined): ChannelUserPolicy {
++  if (raw === undefined) return {}
++  let value: unknown
++  try { value = JSON.parse(raw) } catch { throw new Error('Invalid SLACKBOTV2_CHANNEL_USER_POLICY JSON') }
++  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid channel user policy')
++  for (const [channel, rule] of Object.entries(value)) {
++    if (!/^[CG][A-Z0-9]+$/.test(channel) || !rule || typeof rule !== 'object' || Array.isArray(rule)
++      || Object.keys(rule).sort().join(',') !== 'allowed_user_ids,team_id'
++      || typeof rule.team_id !== 'string' || !/^T[A-Z0-9]+$/.test(rule.team_id)
++      || !Array.isArray(rule.allowed_user_ids) || rule.allowed_user_ids.length === 0
++      || rule.allowed_user_ids.some((id: unknown) => typeof id !== 'string' || !/^[UW][A-Z0-9]+$/.test(id))
++      || new Set(rule.allowed_user_ids).size !== rule.allowed_user_ids.length) {
++      throw new Error('Invalid channel user policy rule')
++    }
++  }
++  return value as ChannelUserPolicy
++}
++
++export function channelUserAllowed(policy: ChannelUserPolicy | undefined,
++  channel: unknown, team: unknown, user: unknown): boolean {
++  if (typeof channel !== 'string' || !policy || !Object.hasOwn(policy, channel)) return true
++  const rule = policy[channel]!
++  return team === rule.team_id && typeof user === 'string' && rule.allowed_user_ids.includes(user)
++}
++
++function object(value: unknown): Record<string, unknown> {
++  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
++}
++
++/** Filter only; Slack's SDK must still verify the original request before accepting it. */
++export function channelWebhookAllowed(payload: Record<string, unknown>, policy: ChannelUserPolicy | undefined): boolean {
++  if (!policy || !Object.keys(policy).length) return true
++  const event = object(payload.event)
++  const channel = object(payload.channel)
++  const container = object(payload.container)
++  const team = object(payload.team)
++  const user = object(payload.user)
++  const message = object(event.message)
++  // Check every advertised destination, so conflicting channel fields cannot
++  // make the filter inspect one channel while the SDK acts on another.
++  const channels = [event.channel, event.channel_id, payload.channel_id, channel.id, container.channel_id]
++  const actor = payload.type === 'event_callback' ? event.user : (user.id ?? payload.user_id)
++  const teamId = payload.team_id ?? team.id
++  for (const id of channels) {
++    if (!channelUserAllowed(policy, id, teamId, actor)) return false
++    // Do not use the original message author to authorize someone else's edit.
++    // Edited/deleted events cannot start or repair protected-channel executions.
++    if (typeof id === 'string' && Object.hasOwn(policy, id)
++      && (event.subtype === 'message_changed' || event.subtype === 'message_deleted'
++        || event.bot_id || message.bot_id)) return false
++  }
++  // Native workflow buttons always have a channel. A missing destination must
++  // not bypass the channel gate and then resolve to a protected workflow.
++  if (payload.type === 'block_actions' && !channels.some(id => typeof id === 'string' && /^[CGD]/.test(id))) return false
++  return true
++}
+diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
+index e7c1b06b..a97ee338 100644
+--- a/services/slackbotv2/src/index.ts
++++ b/services/slackbotv2/src/index.ts
+@@ -1,3 +1,4 @@
++import { admitSlackThread } from './thread-admission'
+ import { AsyncLocalStorage } from 'node:async_hooks'
+ import { Buffer } from 'node:buffer'
+ import { randomUUID } from 'node:crypto'
+@@ -718,6 +719,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+         outcome = 'ignored'
+         return new globalThis.Response('ok', { status: 200 })
+       }
++      if (!(await admitSlackThread(c.req.raw, rawBody, options))) {
++        outcome = 'ignored'
++        return new globalThis.Response('ok', { status: 200 })
++      }
+       const interaction = parseSlackWebhookPayload(rawBody)
+       const workflowAction = interaction?.type === 'block_actions'
+         && Array.isArray(interaction.actions)
+diff --git a/services/slackbotv2/src/server.ts b/services/slackbotv2/src/server.ts
+index a0912ce1..45b9ddcd 100644
+--- a/services/slackbotv2/src/server.ts
++++ b/services/slackbotv2/src/server.ts
+@@ -1,5 +1,6 @@
+ import { createSlackbotV2, type SlackbotV2Options } from './index'
+ import { parseChannelDefaults } from './channel-defaults'
++import { parseChannelUserPolicy } from './channel-user-policy'
+ import { isHarnessEnabled, parseEnabledHarnesses } from './overrides'
+ import { resolveSlackHomeTeamId } from './session-api'
+ import { resolveSlackBotUserId } from './slack-user'
+@@ -54,6 +55,8 @@ const consoleLogger = {
+ }
+ 
+ const options: SlackbotV2Options = {
++  threadAdmissionUrl: optionalEnv('SLACKBOTV2_THREAD_ADMISSION_URL'),
++  channelUserPolicy: parseChannelUserPolicy(process.env.SLACKBOTV2_CHANNEL_USER_POLICY),
+   apiUrl,
+   agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),
+   apiKey: optionalEnv('SLACKBOT_API_KEY'),
+diff --git a/services/slackbotv2/src/slack-events.ts b/services/slackbotv2/src/slack-events.ts
+index c824e695..629d891a 100644
+--- a/services/slackbotv2/src/slack-events.ts
++++ b/services/slackbotv2/src/slack-events.ts
+@@ -2,6 +2,7 @@ import type { Logger, Message } from 'chat'
+ import { fetchSlackExternalTeamIds, withSlackApiTimeout } from './session-api'
+ import type { JsonValue, SlackbotV2Options } from './types'
+ import { errorMessage, isJsonObject, nowMs, stringValue } from './utils'
++import { channelWebhookAllowed, channelUserAllowed } from './channel-user-policy'
+ 
+ type RawSlackBotProfile = {
+   app_id?: JsonValue
+@@ -80,6 +81,10 @@ export async function isAllowedSlackWebhookBody(
+ ): Promise<boolean> {
+   const payload = parseSlackWebhookPayload(rawBody)
+   if (!payload) return true
++  if (!channelWebhookAllowed(payload, options.channelUserPolicy)) {
++    logger.warn('slackbotv2_channel_user_denied', { type: payload.type })
++    return false
++  }
+   if (isRawSlackInteraction(payload) && payload.type === 'block_actions') {
+     return isAllowedSlackInteraction(payload, options, logger)
+   }
+@@ -103,7 +108,9 @@ export function parseSlackWebhookPayload(rawBody: string): Record<string, unknow
+   const parsed = parseJsonObject(rawBody)
+   if (parsed) return parsed
+   const formPayload = new URLSearchParams(rawBody).get('payload')
+-  return formPayload ? parseJsonObject(formPayload) : null
++  if (formPayload) return parseJsonObject(formPayload)
++  const form = new URLSearchParams(rawBody)
++  return form.has('command') ? Object.fromEntries(form) : null
+ }
+ 
+ function parseJsonObject(value: string): Record<string, unknown> | null {
+@@ -145,6 +152,13 @@ export async function isAllowedSlackMessage(
+   options: SlackbotV2Options,
+   logger: Logger
+ ): Promise<boolean> {
++  const channel = message.threadId.match(/(?:^|:)([CGD][A-Z0-9]+)(?::|$)/)?.[1]
++  const messageRaw = isJsonObject(message.raw) ? message.raw : {}
++  if (!channelUserAllowed(options.channelUserPolicy, channel,
++    messageRaw.team_id ?? messageRaw.team ?? options.slackHomeTeamId, message.author.userId)) {
++    logger.warn('slackbotv2_channel_user_denied', { channel_id: channel, user_id: message.author.userId })
++    return false
++  }
+   const raw = isRawSlackEvent(message.raw) ? message.raw : undefined
+   const externalTeamId = raw ? externalSlackTeamId(raw) : undefined
+   if (externalTeamId && !(await isAllowedExternalTeamForMessage(externalTeamId, options, logger))) {
+diff --git a/services/slackbotv2/src/thread-admission.ts b/services/slackbotv2/src/thread-admission.ts
+new file mode 100644
+index 00000000..e158707e
+--- /dev/null
++++ b/services/slackbotv2/src/thread-admission.ts
+@@ -0,0 +1,31 @@
++import type { SlackbotV2Options } from './types'
++import { parseSlackWebhookPayload } from './slack-events'
++
++/** Forward signed bytes to a trusted ownership service before any SDK effects. */
++export async function admitSlackThread(request: Request, body: string, options: SlackbotV2Options): Promise<boolean> {
++  if (!options.threadAdmissionUrl) return true
++  const payload = parseSlackWebhookPayload(body)
++  const event = payload?.event as Record<string, unknown> | undefined
++  const channel = payload?.channel as Record<string, unknown> | undefined
++  const container = payload?.container as Record<string, unknown> | undefined
++  const channels = [event?.channel, event?.channel_id, payload?.channel_id, channel?.id, container?.channel_id]
++  if (!channels.some(id => typeof id === 'string' && Object.hasOwn(options.channelUserPolicy ?? {}, id))) return true
++  // Channel-level controls/buttons cannot establish or switch a thread owner.
++  if (payload?.type !== 'event_callback') return false
++  const response = await (options.fetch ?? fetch)(options.threadAdmissionUrl, {
++    method: 'POST', redirect: 'error', signal: AbortSignal.timeout(2000),
++    headers: {
++      'content-type': request.headers.get('content-type') ?? 'application/json',
++      'x-slack-signature': request.headers.get('x-slack-signature') ?? '',
++      'x-slack-request-timestamp': request.headers.get('x-slack-request-timestamp') ?? '',
++      // Preserve the explicit Socket Mode rejection at the trusted service.
++      ...(request.headers.has('x-slack-socket-token') ? { 'x-slack-socket-token': 'reject' } : {})
++    }, body
++  })
++  if (!response.ok) throw new Error('Thread ownership unavailable')
++  const result: unknown = await response.json()
++  if (!result || typeof result !== 'object' || !('allowed' in result) || typeof result.allowed !== 'boolean') {
++    throw new Error('Invalid thread ownership response')
++  }
++  return result.allowed
++}
+diff --git a/services/slackbotv2/src/types.ts b/services/slackbotv2/src/types.ts
+index 7018b989..a45d76e5 100644
+--- a/services/slackbotv2/src/types.ts
++++ b/services/slackbotv2/src/types.ts
+@@ -5,6 +5,7 @@ import type { Attachment, Chat, Logger, SerializedMessage, StateAdapter } from '
+ import type { Hono } from 'hono'
+ import type { ChannelDefaults } from './channel-defaults'
+ import type { ProactivityRule, ProactivityRules } from './proactivity-rules'
++import type { ChannelUserPolicy } from './channel-user-policy'
+ import type { HarnessOverrides } from './overrides'
+ import type { SlackDisplayTextSource } from './slack-display-text'
+ 
+@@ -135,6 +136,9 @@ export type SlackbotV2BlockActionPayload = {
+ }
+ 
+ export type SlackbotV2Options = {
++  /** Approved human callers per protected channel; omitted channels retain normal admission. */
++  threadAdmissionUrl?: string
++  channelUserPolicy?: ChannelUserPolicy
+   allowedExternalTeamIds?: readonly string[]
+   apiKey?: string
+   apiUrl: string
+diff --git a/services/slackbotv2/test/channel-user-policy.test.ts b/services/slackbotv2/test/channel-user-policy.test.ts
+new file mode 100644
+index 00000000..aabf60d0
+--- /dev/null
++++ b/services/slackbotv2/test/channel-user-policy.test.ts
+@@ -0,0 +1,55 @@
++import { describe, expect, it } from 'bun:test'
++import { channelWebhookAllowed, parseChannelUserPolicy } from '../src/channel-user-policy'
++import { isAllowedSlackWebhookBody, isAllowedSlackMessage } from '../src/slack-events'
++import type { Logger, Message } from 'chat'
++
++const policy = parseChannelUserPolicy(JSON.stringify({ CPROTECTED: { team_id: 'THOME', allowed_user_ids: ['UAPPROVED'] } }))
++const logger: Logger = { debug() {}, info() {}, warn() {}, error() {}, child: () => logger }
++const options = { apiUrl: 'http://localhost', botToken: 'test', signingSecret: 'test', channelUserPolicy: policy }
++const event = (user: string | undefined, channel = 'CPROTECTED', type = 'app_mention') => ({
++  type: 'event_callback', team_id: 'THOME', event: { type, user, channel }
++})
++
++describe('channel user admission', () => {
++  it('requires a nonempty valid allowlist and fails startup on malformed policy', () => {
++    expect(parseChannelUserPolicy(undefined)).toEqual({})
++    for (const raw of ['', '[]', 'null', '{', '{"CPROTECTED":{"team_id":"THOME","allowed_user_ids":[]}}',
++      '{"CPROTECTED":{"team_id":"THOME","allowed_user_ids":["*"]}}',
++      '{"CPROTECTED":{"team_id":"THOME","allowed_user_ids":["UONE","UONE"]}}']) {
++      expect(() => parseChannelUserPolicy(raw)).toThrow()
++    }
++  })
++  it('allows approved humans, denies others and leaves other channels unchanged', () => {
++    expect(channelWebhookAllowed(event('UAPPROVED'), policy)).toBe(true)
++    expect(channelWebhookAllowed(event('UOTHER'), policy)).toBe(false)
++    expect(channelWebhookAllowed(event(undefined), policy)).toBe(false)
++    expect(channelWebhookAllowed(event('UOTHER', 'COTHER'), policy)).toBe(true)
++    expect(channelWebhookAllowed({ ...event('UAPPROVED'), team_id: 'TOTHER' }, policy)).toBe(false)
++  })
++  it('blocks follow-ups, rich message mentions, file events and edits before SDK dispatch', async () => {
++    for (const type of ['message', 'app_mention', 'file_shared']) {
++      expect(await isAllowedSlackWebhookBody(JSON.stringify(event('UOTHER', 'CPROTECTED', type)), options, logger)).toBe(false)
++    }
++    const edited = event('UAPPROVED', 'CPROTECTED', 'message')
++    expect(channelWebhookAllowed({ ...edited, event: { ...edited.event, subtype: 'message_changed', message: { user: 'UAPPROVED' } } }, policy)).toBe(false)
++  })
++  it('does not grant Slack bots an exception for the separate provider webhook', () => {
++    const bot = event('UAPPROVED')
++    expect(channelWebhookAllowed({ ...bot, event: { ...bot.event, bot_id: 'BBOT' } }, policy)).toBe(false)
++  })
++  it('checks workflow buttons, conflicting destinations and slash commands', async () => {
++    const action = { type: 'block_actions', team: { id: 'THOME' }, user: { id: 'UOTHER' }, channel: { id: 'CPROTECTED' } }
++    expect(channelWebhookAllowed(action, policy)).toBe(false)
++    expect(channelWebhookAllowed({ ...action, user: { id: 'UAPPROVED' } }, policy)).toBe(true)
++    expect(channelWebhookAllowed({ ...action, channel: { id: 'COTHER' }, container: { channel_id: 'CPROTECTED' } }, policy)).toBe(false)
++    expect(channelWebhookAllowed({ ...action, channel: undefined }, policy)).toBe(false)
++    const form = new URLSearchParams({ command: '/stop', team_id: 'THOME', channel_id: 'CPROTECTED', user_id: 'UOTHER' })
++    expect(await isAllowedSlackWebhookBody(form.toString(), options, logger)).toBe(false)
++  })
++  it('rechecks the normalized actor before message handoff', async () => {
++    const message = { threadId: 'slack:CPROTECTED:1700000000.000001', author: { userId: 'UOTHER', isBot: false }, raw: { team: 'THOME' } } as Message
++    expect(await isAllowedSlackMessage(message, options, logger)).toBe(false)
++    message.author.userId = 'UAPPROVED'
++    expect(await isAllowedSlackMessage(message, options, logger)).toBe(true)
++  })
++})
+diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+index fcb0be5e..b819fcea 100644
+--- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
++++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+@@ -141,6 +141,53 @@ afterAll(async () => {
+ })
+ 
+ describe('slackbotv2', () => {
++  it('fixed ownership denies an approved user before append, stop and execution', async () => {
++    let allowed = true
++    let ownerChecks = 0
++    bot = createTestBot({
++      channelUserPolicy: { [CHANNEL_ID]: { team_id: TEAM_ID, allowed_user_ids: [USER_ID] } },
++      threadAdmissionUrl: 'http://ownership.test/slack/thread-admission',
++      fetch: async (input, init) => {
++        if (String(input) === 'http://ownership.test/slack/thread-admission') {
++          ownerChecks++
++          expect(new Headers(init?.headers).get('x-slack-signature')).toStartWith('v0=')
++          return Response.json({ allowed })
++        }
++        return fetch(input, init)
++      }
++    })
++    const initial = await sendMessage(`<@${BOT_USER_ID}> start`)
++    await initial.finished()
++    expect(codexApi.executes).toHaveLength(1)
++    const counts = [codexApi.creates.length, codexApi.appends.length, codexApi.executes.length]
++    allowed = false
++    for (const text of ['check again', 'stop', 'start a background script']) {
++      const denied = await sendMessage(`<@${BOT_USER_ID}> ${text}`, { threadTs: initial.ts })
++      await denied.finished()
++      expect(denied.response.status).toBe(200)
++      expect([codexApi.creates.length, codexApi.appends.length, codexApi.executes.length]).toEqual(counts)
++    }
++    expect(ownerChecks).toBeGreaterThanOrEqual(4)
++  })
++
++  it('rejects unapproved channel starts and follow-ups before session mutation', async () => {
++    bot = createTestBot({ channelUserPolicy: { [CHANNEL_ID]: { team_id: TEAM_ID, allowed_user_ids: [USER_ID] } } })
++    const denied = await sendMessage(`<@${BOT_USER_ID}> start a background watcher`, { client: slackB })
++    await denied.finished()
++    expect(denied.response.status).toBe(200)
++    expect(codexApi.executes).toHaveLength(0)
++    expect(codexApi.creates).toHaveLength(0)
++    expect(codexApi.appends).toHaveLength(0)
++    const allowed = await sendMessage(`<@${BOT_USER_ID}> approved request`)
++    await allowed.finished()
++    expect(codexApi.executes).toHaveLength(1)
++    const mutationCounts = [codexApi.creates.length, codexApi.appends.length]
++    const followup = await sendMessage(`<@${BOT_USER_ID}> stop and run this instead`, { client: slackB, threadTs: allowed.ts })
++    await followup.finished()
++    expect(codexApi.executes).toHaveLength(1)
++    expect([codexApi.creates.length, codexApi.appends.length]).toEqual(mutationCounts)
++  })
++
+   // Legacy (non-agent-view) DMs run end to end in e2e/tests/context.test.ts.
+   it('routes agent-view DM roots and replies to their own sessions', async () => {
+     bot = createTestBot({ agentViewEnabled: true })
+diff --git a/services/slackbotv2/test/thread-admission.test.ts b/services/slackbotv2/test/thread-admission.test.ts
+new file mode 100644
+index 00000000..f21e0c0b
+--- /dev/null
++++ b/services/slackbotv2/test/thread-admission.test.ts
+@@ -0,0 +1,31 @@
++import { expect, test } from 'bun:test'
++import { admitSlackThread } from '../src/thread-admission'
++import type { SlackbotV2Options } from '../src/types'
++
++const body = JSON.stringify({ type: 'event_callback', team_id: 'THOME', event: {
++  channel: 'CPROTECTED', type: 'app_mention', user: 'UOWNER', ts: '1792186000.000001'
++} })
++const request = new Request('http://fixture', { headers: { 'x-slack-signature': 'v0=fixture', 'x-slack-request-timestamp': '1792186000' } })
++const options: SlackbotV2Options = { apiUrl: 'http://api', botToken: 'fixture', signingSecret: 'fixture',
++  channelUserPolicy: { CPROTECTED: { team_id: 'THOME', allowed_user_ids: ['UOWNER'] } },
++  threadAdmissionUrl: 'http://ownership/slack/thread-admission' }
++
++test('passes original signature and body to owner gate; respects deny without a fallback', async () => {
++  for (const allowed of [true, false]) {
++    const fetchFn = (async (url: RequestInfo | URL, init?: RequestInit) => {
++      expect(String(url)).toBe(String(options.threadAdmissionUrl))
++      expect(init?.body).toBe(body)
++      expect(new Headers(init?.headers).get('x-slack-signature')).toBe('v0=fixture')
++      return Response.json({ allowed })
++    }) as unknown as NonNullable<SlackbotV2Options["fetch"]>
++    expect(await admitSlackThread(request, body, { ...options, fetch: fetchFn })).toBe(allowed)
++  }
++})
++test('errors and malformed responses fail closed; unrelated channels stay independent', async () => {
++  for (const response of [new Response('unavailable', { status: 503 }), Response.json({}), Response.json({ allowed: 'true' })]) {
++    const fetchFn = (async () => response) as unknown as NonNullable<SlackbotV2Options["fetch"]>
++    expect(admitSlackThread(request, body, { ...options, fetch: fetchFn })).rejects.toThrow()
++  }
++  expect(await admitSlackThread(request, body.replace('CPROTECTED', 'COTHER'), { ...options,
++    fetch: (async () => { throw new Error('must not call') }) as unknown as NonNullable<SlackbotV2Options["fetch"]> })).toBe(true)
++})

@@ -100,6 +100,13 @@ impl Args {
         self.sandbox.runtime().await
     }
 
+    /// The image Code Mode sandboxes run. Missing or blank falls back to
+    /// `centaur-codemode:latest`, like the session sandbox image.
+    pub(crate) fn codemode_image(&self) -> String {
+        clean_optional_value(self.sandbox.codemode_image.as_deref())
+            .unwrap_or_else(|| DEFAULT_CODEMODE_IMAGE.to_owned())
+    }
+
     pub(crate) async fn iron_control_runtime(&self) -> Result<IronControlRuntime, ServerError> {
         self.sandbox.iron_control_runtime().await
     }
@@ -561,7 +568,8 @@ struct IronControlArgs {
     #[arg(long = "iron-control-api-key", env = "IRON_CONTROL_API_KEY")]
     api_key: Option<String>,
     /// Console's database. Principals and their effective config are read from
-    /// it directly instead of through the Console API.
+    /// it directly instead of through the Console API, and Console's scheduled
+    /// tasks are run from it.
     #[arg(
         long = "iron-control-database-url",
         env = "IRON_CONTROL_DATABASE_URL",
@@ -646,8 +654,9 @@ impl IronControlArgs {
 /// sooner than sqlx's 30 second default.
 const CONSOLE_DB_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Connection options for Console's database. Sessions are read-only:
-/// Console owns every write to its schema.
+/// Connection options for Console's database. Sessions are read-only by
+/// default: Console owns its schema, and the scheduled-task scheduler writes
+/// its rows only in explicitly read-write transactions.
 fn console_db_options(
     url: &str,
     database_name: Option<&str>,
@@ -805,6 +814,10 @@ struct SandboxArgs {
         env = "SESSION_SANDBOX_IMAGE"
     )]
     agent_image: Option<String>,
+    /// Full image reference for MCP Code Mode sandboxes. Defaults to
+    /// `centaur-codemode:latest`.
+    #[arg(long = "codemode-image", env = "CENTAUR_CODEMODE_IMAGE")]
+    codemode_image: Option<String>,
     #[arg(
         long = "session-sandbox-image-pull-policy",
         alias = "kubernetes-agent-image-pull-policy",
@@ -1148,14 +1161,10 @@ impl SandboxArgs {
                 "drained sandboxes with stale pod identity or agent security contexts before enabling reuse"
             );
         }
-        let artifact_backend = backend.clone();
-        Ok(
-            SandboxRuntime::backend_with_workload(backend, self.container_workload_mode()?)
-                .with_artifact_reader(move |id, path, max_bytes| {
-                    let backend = artifact_backend.clone();
-                    async move { backend.read_artifact(&id, &path, max_bytes).await }
-                }),
-        )
+        Ok(SandboxRuntime::backend_with_workload(
+            backend,
+            self.container_workload_mode()?,
+        ))
     }
 
     async fn workflow_host_sandbox_runtime(
@@ -2581,6 +2590,7 @@ impl IronProxyHarnessArgs {
 }
 
 const DEFAULT_SANDBOX_IMAGE: &str = "centaur-agent:latest";
+const DEFAULT_CODEMODE_IMAGE: &str = "centaur-codemode:latest";
 /// Where the sandbox image installs the Python workflow host.
 const WORKFLOW_HOST_PATH: &str = "/usr/local/bin/workflow-host";
 
@@ -3011,6 +3021,26 @@ mod tests {
 
         let config = args.activity_summary_config().unwrap();
         assert_eq!(config.api_key, "sk-mounted");
+    }
+
+    #[test]
+    fn codemode_image_defaults_when_missing_or_blank() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ];
+        for (flags, expected) in [
+            (vec![], "centaur-codemode:latest"),
+            (vec!["--codemode-image", "   "], "centaur-codemode:latest"),
+            (
+                vec!["--codemode-image", "registry.local/centaur-codemode:tag"],
+                "registry.local/centaur-codemode:tag",
+            ),
+        ] {
+            let args = Args::try_parse_from(base.into_iter().chain(flags)).unwrap();
+            assert_eq!(args.codemode_image(), expected);
+        }
     }
 
     #[tokio::test]
@@ -3633,6 +3663,7 @@ mod tests {
                 {"name":"OTEL_SERVICE_NAME","value":"codex"},
                 {"name":"CODEX_AUTH_MODE","value":"chatgpt"},
                 {"name":" TOOL_ALLOWLIST ","value":123},
+                {"name":"CENTAUR_CODEMODE_ALLOWLIST","value":""},
                 {"name":"NULL_VALUE"},
                 {"name":"  ","value":"skipped"},
                 {"name":"BAD=NAME","value":"skipped"}
@@ -3656,6 +3687,7 @@ mod tests {
         assert_eq!(value("CODEX_AUTH_MODE"), Some("chatgpt"));
         // Names are trimmed and non-string values use their JSON representation.
         assert_eq!(value("TOOL_ALLOWLIST"), Some("123"));
+        assert_eq!(value("CENTAUR_CODEMODE_ALLOWLIST"), Some(""));
         // Null values become empty strings; invalid names are dropped.
         assert_eq!(value("NULL_VALUE"), Some(""));
         assert!(!env.iter().any(|(name, _)| name == "BAD=NAME"));

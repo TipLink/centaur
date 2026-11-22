@@ -34,6 +34,14 @@ class SlackDeliveryPolicy
     slack_identity&.second
   end
 
+  # The scheduler copies identity onto a Console principal when a task is saved.
+  # A destructive action also needs a current sign-in or OAuth link.
+  def linked_identity_matches?(user_id, team_id)
+    expected = [ user_id, team_id ]
+    linked = user_identity_candidates + credential_identity_candidates
+    linked.include?(expected) && unique_identity(linked + principal_identity_candidates) == expected
+  end
+
   private
 
   attr_reader :user
@@ -42,9 +50,13 @@ class SlackDeliveryPolicy
     return @slack_identity if defined?(@slack_identity)
 
     identities = user_identity_candidates + principal_identity_candidates + credential_identity_candidates
-    @slack_identity = identities.filter_map { |identity| valid_identity(identity) }.uniq.sole
+    @slack_identity = unique_identity(identities)
+  end
+
+  def unique_identity(identities)
+    identities.filter_map { |identity| valid_identity(identity) }.uniq.sole
   rescue Enumerable::SoleItemExpectedError
-    @slack_identity = nil
+    nil
   end
 
   def user_identity_candidates
@@ -58,7 +70,8 @@ class SlackDeliveryPolicy
   def credential_identity_candidates
     BrokerCredential.includes(:oauth_app)
                     .joins(:oauth_app)
-                    .where(created_by: user, oauth_apps: { provider: Oauth::Providers::Slack::KEY })
+                    .where(dead: false, created_by: user, oauth_apps: { provider: Oauth::Providers::Slack::KEY })
+                    .where("dead_reason IS DISTINCT FROM ?", Oauth::Disconnect::DEAD_REASON)
                     .map do |credential|
       team_id = credential.labels.to_h["slack_team_id"].presence ||
                 credential.oauth_app.labels.to_h["slack_team_id"].presence

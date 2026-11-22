@@ -52,7 +52,7 @@ use crate::{
     },
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
     auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability},
-    mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
+    mcp::{mcp_enabled, mcp_get, mcp_post, mcp_protected_resource_metadata},
     slack_external_teams::{get_slack_external_team_ids, replace_slack_external_team_ids},
     slack_proxy::slack_proxy_router,
     types::{
@@ -296,6 +296,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         )
         .route("/api/workflows/events", post(emit_workflow_event))
         .route(
+            "/api/scheduled-tasks/{task_id}/runs",
+            post(crate::scheduled_tasks::run_scheduled_task),
+        )
+        .route(
             "/api/workflows/actions/invoke",
             post(invoke_workflow_button),
         )
@@ -332,21 +336,24 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             authorize_api_request,
         ));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .route("/mcp", post(mcp_post).get(mcp_get))
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(mcp_protected_resource_metadata),
-        )
-        .route(
-            "/.well-known/oauth-protected-resource/mcp",
-            get(mcp_protected_resource_metadata),
-        )
         .route("/api/webhooks/{slug}", any(invoke_workflow_webhook))
         .merge(protected);
+    if mcp_enabled() {
+        app = app
+            .route("/mcp", post(mcp_post).get(mcp_get))
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(mcp_protected_resource_metadata),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get(mcp_protected_resource_metadata),
+            );
+    }
     let app = if state.auth().api_clients_enabled() {
         app.route("/oauth/token", post(issue_api_client_token))
     } else {
@@ -622,7 +629,8 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         | (&Method::GET, "/api/workflows/runs")
         | (&Method::GET, "/api/workflows/runs/{run_id}") => capability(Capability::WorkflowsRead),
         (&Method::POST, "/api/workflows/runs")
-        | (&Method::POST, "/api/workflows/runs/{run_id}/cancel") => {
+        | (&Method::POST, "/api/workflows/runs/{run_id}/cancel")
+        | (&Method::POST, "/api/scheduled-tasks/{task_id}/runs") => {
             capability(Capability::WorkflowsWrite)
         }
         (&Method::POST, "/api/workflows/events") => capability(Capability::WorkflowsEvents),
@@ -861,13 +869,14 @@ async fn append_messages(
     Json(request): Json<AppendMessagesRequest>,
 ) -> Result<Json<AppendMessagesResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let message_ids = state
+    let outcome = state
         .runtime()?
-        .append_messages(&thread_key, &request.messages)
+        .append_messages_with_steering(&thread_key, &request.messages)
         .await?;
     Ok(Json(AppendMessagesResponse {
         ok: true,
-        message_ids,
+        message_ids: outcome.message_ids,
+        steering: outcome.steering,
     }))
 }
 
@@ -1152,7 +1161,10 @@ fn principal_subject_owns_session(subject: Option<&str>, session_principal: Opti
 /// A workflow that declares `WORKFLOW_STARTERS` may only be started through
 /// the API by those caller classes; undeclared workflows accept any caller
 /// with workflow write access.
-fn caller_may_start_workflow(starters: Option<&BTreeSet<String>>, caller: CallerClass) -> bool {
+pub(crate) fn caller_may_start_workflow(
+    starters: Option<&BTreeSet<String>>,
+    caller: CallerClass,
+) -> bool {
     starters.is_none_or(|starters| starters.contains(caller.as_str()))
 }
 

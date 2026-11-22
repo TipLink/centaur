@@ -1,6 +1,7 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- $ingressSourceNamespaces := default .Values.networkPolicy.ingressControllerNamespaces .Values.networkPolicy.ingressSourceNamespaces }}
 {{- $console := include "centaur.consoleValues" . | fromYaml }}
+{{- $companyContext := include "centaur.companyContextValues" . | fromYaml }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -97,7 +98,7 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "token-broker") | nindent 14 }}
 {{- end }}
-{{- if .Values.experimentalCompanyContext.enabled }}
+{{- if $companyContext.enabled }}
         - podSelector:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "company-context") | nindent 14 }}
@@ -339,6 +340,16 @@ spec:
       ports:
         - protocol: TCP
           port: {{ $console.service.httpPort }}
+    # Code Mode sandboxes (centaur.ai/workload=codemode, created by api-rs) serve
+    # the connector HTTP API on a fixed port. api-rs calls them directly: their
+    # outbound traffic goes through their own paired iron-proxy, not this one.
+    - to:
+        - podSelector:
+            matchLabels:
+              centaur.ai/workload: codemode
+      ports:
+        - protocol: TCP
+          port: 8790
     - ports:
         - protocol: TCP
           port: 443
@@ -349,7 +360,31 @@ spec:
         - protocol: TCP
           port: {{ .Values.networkPolicy.apiServerPort }}
 ---
-{{- end }}
+# Code Mode sandboxes accept requests from api-rs only, on the connector HTTP
+# port. Their connector calls egress through the paired iron-proxy pods, which
+# api-rs covers with the per-sandbox policies it renders. This policy is the
+# trust boundary: the sandbox API itself is unauthenticated.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-codemode
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/workload: codemode
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8790
+---{{- end }}
 {{- if .Values.slackbotv2.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

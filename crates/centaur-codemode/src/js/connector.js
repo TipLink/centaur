@@ -41,10 +41,22 @@
   const fetch = async (url, init = {}) => {
     const method = String(init.method ?? "GET").toUpperCase();
     const body = requestBody(init.body);
-    const raw = body === undefined
-      ? await host.fetch(String(url), method, requestHeaders(init), requestTimeout(init))
-      : await host.fetch(String(url), method, requestHeaders(init), requestTimeout(init), body);
+    const raw = await host.fetch(
+      String(url), method, requestHeaders(init), requestTimeout(init), init.redirect, body,
+    );
     return new Response(raw.status, JSON.parse(raw.headers), raw.body);
+  };
+
+  // A text WebSocket bound to this call. The host owns the socket; this is a
+  // handle it closes when the call ends.
+  const wait = (timeout_ms) => Math.max(0, Number(timeout_ms ?? 0) || 0);
+  const websocket = async (url, init = {}) => {
+    const id = await host.wsConnect(String(url), wait(init.timeout_ms));
+    return Object.freeze({
+      send: (text) => host.wsSend(id, String(text)),
+      recv: async (timeout_ms) => (await host.wsRecv(id, wait(timeout_ms))) ?? null,
+      close: () => host.wsClose(id),
+    });
   };
 
   // The files capability; `null` unless the runner was started with --files-dir.
@@ -56,9 +68,9 @@
     download: async (url, path, init = {}) => {
       const method = String(init.method ?? "GET").toUpperCase();
       const body = requestBody(init.body);
-      const raw = body === undefined
-        ? await host.filesDownload(String(url), String(path), method, requestHeaders(init), requestTimeout(init))
-        : await host.filesDownload(String(url), String(path), method, requestHeaders(init), requestTimeout(init), body);
+      const raw = await host.filesDownload(
+        String(url), String(path), method, requestHeaders(init), requestTimeout(init), init.redirect, body,
+      );
       const ok = raw.status >= 200 && raw.status < 300;
       return Object.freeze({ ...raw, ok, headers: JSON.parse(raw.headers) });
     },
@@ -72,6 +84,7 @@
 
   return Object.freeze({
     fetch,
+    websocket,
     env,
     context,
     sleep,

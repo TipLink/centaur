@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command as ProcessCommand};
-use std::sync::mpsc::Receiver;
+use std::sync::{Arc, atomic::AtomicUsize, mpsc::Receiver};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -38,6 +38,8 @@ pub struct ThreadState {
     pub supports_user_input: bool,
     /// Whether the calling ingress can render Claude's optional next prompt.
     pub supports_prompt_suggestions: bool,
+    /// Number of blocks turns waiting behind the active turn. Suppresses stale suggestions.
+    pub queued_turns: Arc<AtomicUsize>,
 }
 
 pub struct HarnessChild {
@@ -94,7 +96,20 @@ pub trait HarnessServer {
         Ok(())
     }
     fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>>;
-    fn stdin_for_steer(&self, input: &[UserInput]) -> Result<Vec<u8>> {
+    /// Whether a steer is written to the running harness as it arrives
+    /// (`stdin_for_steer`), for the harness to fold into its work and answer
+    /// within its native turn. Otherwise the steer waits for the native turn
+    /// to end and is sent as the next one, which continues the same turn.
+    fn steers_mid_turn(&self) -> bool {
+        false
+    }
+    /// Stdin that steers the running native turn. The normalizer lets the
+    /// harness track a steer it must see answered before the turn may end.
+    fn stdin_for_steer(
+        &self,
+        _normalizer: &mut Self::EventNormalizer,
+        input: &[UserInput],
+    ) -> Result<Vec<u8>> {
         self.stdin_for_turn(input)
     }
     /// Normalizes a requested reasoning effort to a level this harness applies
@@ -188,6 +203,7 @@ pub trait HarnessServer {
             thread_started_sent: false,
             supports_user_input: false,
             supports_prompt_suggestions: false,
+            queued_turns: Default::default(),
         }
     }
 }

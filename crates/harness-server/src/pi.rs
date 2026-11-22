@@ -32,6 +32,7 @@ const DEFAULT_THINKING_LEVEL: &str = "medium";
 const MODELS: &[(&str, &str)] = &[
     ("anthropic", "claude-fable-5"),
     ("anthropic", "claude-fable-5-1"),
+    ("anthropic", "claude-fable-5-2"),
     ("anthropic", "claude-haiku-4-5"),
     ("anthropic", "claude-haiku-5-5"),
     ("anthropic", "claude-opus-4-7"),
@@ -332,7 +333,17 @@ impl HarnessServer for PiHarness {
         command_line(json!({"type": "prompt", "message": message_text(input)}))
     }
 
-    fn stdin_for_steer(&self, input: &[UserInput]) -> Result<Vec<u8>> {
+    /// The steer is queued natively and answered before `agent_settled`,
+    /// which ends the turn.
+    fn steers_mid_turn(&self) -> bool {
+        true
+    }
+
+    fn stdin_for_steer(
+        &self,
+        _normalizer: &mut Self::EventNormalizer,
+        input: &[UserInput],
+    ) -> Result<Vec<u8>> {
         command_line(json!({"type": "steer", "message": message_text(input)}))
     }
 
@@ -376,6 +387,7 @@ mod tests {
         for model in [
             "anthropic/claude-sonnet-5",
             "anthropic/claude-fable-5-1",
+            "anthropic/claude-fable-5-2",
             "anthropic/claude-sonnet-5-5",
             "claude-haiku-5-5",
             "claude-sonnet-5",

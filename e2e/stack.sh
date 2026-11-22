@@ -58,7 +58,7 @@ case "$AUTH_MODE" in
   api_key | access_token) ;;
   *) echo "CENTAUR_E2E_AUTH_MODE must be api_key or access_token, not $AUTH_MODE" >&2; exit 2 ;;
 esac
-IMAGES=(api-rs:apiRs proxy-sync:proxySync token-broker:tokenBroker iron-proxy:ironProxy slackbotv2:slackbotv2 agent:sandbox console:console)
+IMAGES=(api-rs:apiRs proxy-sync:proxySync codemode:codemode token-broker:tokenBroker iron-proxy:ironProxy slackbotv2:slackbotv2 agent:sandbox console:console)
 
 export KUBECONFIG
 KUBECONFIG="$(mktemp)"
@@ -76,7 +76,8 @@ apply_stdin() {
 up() {
   if kind get clusters | grep -qx "$CLUSTER"; then
     use_cluster
-    if ! docker port "${CLUSTER}-control-plane" | grep -q '^30082/tcp'; then
+    if ! docker port "${CLUSTER}-control-plane" | grep -q '^30082/tcp' \
+      || [[ "$(kubectl get node "${CLUSTER}-control-plane" -o jsonpath='{.status.capacity.pods}')" -lt 250 ]]; then
       echo "cluster $CLUSTER predates e2e/infra/kind.yaml; run e2e/stack.sh down first" >&2
       exit 1
     fi
@@ -242,7 +243,8 @@ deploy_model_server() {
 # cluster: the gateway authorizes the public half, and tests grant the private
 # half to the principals that may use it.
 deploy_ssh_gateway() {
-  docker build -q -t centaur-e2e-ssh-gateway:latest e2e/infra/ssh-gateway > /dev/null
+  docker build -q ${CENTAUR_BUILD_HTTP_PROXY:+--build-arg "http_proxy=$CENTAUR_BUILD_HTTP_PROXY"} \
+    -t centaur-e2e-ssh-gateway:latest e2e/infra/ssh-gateway > /dev/null
   kind load docker-image --name "$CLUSTER" centaur-e2e-ssh-gateway:latest
   issue_cert ssh-gateway workspace.ssh-gateway.test
 

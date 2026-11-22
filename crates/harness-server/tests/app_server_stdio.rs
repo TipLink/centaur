@@ -1,6 +1,7 @@
+mod support;
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -9,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+use support::write_executable;
 
 const LONG_PROMPT: &str = "Write exactly 24 lines. Each line must be 'LONG_STREAM_DELTA_LINE_N: abcdefghijklmnopqrstuvwxyz 0123456789' where N is 01 through 24. Do not use markdown, bullets, tools, or extra text.";
 
@@ -145,8 +148,7 @@ for line in sys.stdin:
 fn question_bridge(harness: Harness) -> (BridgeProcess, PathBuf, PathBuf) {
     let script = temp_path("native-question-cli.py");
     let log = temp_path("native-question-responses.jsonl");
-    std::fs::write(&script, QUESTION_CLI).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&script, QUESTION_CLI);
     let process = BridgeProcess::spawn_harness_blocks_envs(
         harness,
         Some(format!("python3 {}", script.display())),
@@ -696,12 +698,7 @@ fn fake_codex_blocks_mode_uses_openrouter_provider_when_model_is_configured() {
     let fake_codex = temp_path("fake-openrouter-codex.sh");
     let fake_codex_log = temp_path("fake-openrouter-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
         Harness::Codex,
@@ -758,12 +755,7 @@ fn fake_codex_blocks_mode_uses_openrouter_provider_for_explicit_model_slug() {
     let fake_codex = temp_path("fake-openrouter-flag-codex.sh");
     let fake_codex_log = temp_path("fake-openrouter-flag-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -823,12 +815,7 @@ fn fake_codex_blocks_mode_resumes_thread_on_the_configured_model() {
     let fake_codex = temp_path("fake-resume-model-codex.sh");
     let fake_codex_log = temp_path("fake-resume-model-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
         Harness::Codex,
@@ -882,12 +869,7 @@ fn fake_codex_blocks_mode_uses_bedrock_provider_when_selected() {
     let fake_codex = temp_path("fake-bedrock-codex.sh");
     let fake_codex_log = temp_path("fake-bedrock-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -1263,7 +1245,7 @@ fn blocks_mode_runs_session_prompt_hooks_once_before_the_harness_starts() {
     let prompt = temp_path("session-prompt.md");
     let runs = temp_path("session-prompt-runs.log");
     let composer = temp_path("fake-compose-system-prompt.sh");
-    std::fs::write(
+    write_executable(
         &composer,
         format!(
             concat!(
@@ -1275,13 +1257,7 @@ fn blocks_mode_runs_session_prompt_hooks_once_before_the_harness_starts() {
             runs = shell_quote(&runs),
             prompt = shell_quote(&prompt),
         ),
-    )
-    .expect("write fake composer");
-    let mut permissions = std::fs::metadata(&composer)
-        .expect("composer metadata")
-        .permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&composer, permissions).expect("chmod fake composer");
+    );
     let fake_claude = format!(
         concat!(
             "text=$(cat {prompt}); ",
@@ -1331,7 +1307,7 @@ fn blocks_mode_recomposes_the_prompt_without_hook_output() {
     std::fs::write(&prompt, "boot").expect("write boot prompt");
     let runs = temp_path("session-prompt-no-hook-runs.log");
     let composer = temp_path("fake-compose-system-prompt-no-hook.sh");
-    std::fs::write(
+    write_executable(
         &composer,
         format!(
             concat!(
@@ -1342,13 +1318,7 @@ fn blocks_mode_recomposes_the_prompt_without_hook_output() {
             runs = shell_quote(&runs),
             prompt = shell_quote(&prompt),
         ),
-    )
-    .expect("write fake composer");
-    let mut permissions = std::fs::metadata(&composer)
-        .expect("composer metadata")
-        .permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&composer, permissions).expect("chmod fake composer");
+    );
     let fake_claude = format!(
         concat!(
             "text=$(cat {prompt}); ",
@@ -1516,12 +1486,7 @@ fn fake_codex_blocks_mode_spawns_app_server_and_translates_user_blocks() {
     let fake_codex = temp_path("fake-codex.sh");
     let fake_codex_log = temp_path("fake-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -1581,12 +1546,7 @@ fn fake_codex_blocks_mode_queues_active_turns_in_order() {
     let fake_codex = temp_path("fake-queued-codex.sh");
     let fake_codex_log = temp_path("fake-queued-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
         Harness::Codex,
@@ -1649,12 +1609,7 @@ fn fake_codex_blocks_mode_interrupts_active_turn() {
     let fake_codex = temp_path("fake-interruptible-codex.sh");
     let fake_codex_log = temp_path("fake-interruptible-codex-requests.jsonl");
     let script = fake_codex_interruptible_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -1716,12 +1671,7 @@ fn fake_codex_blocks_mode_steers_active_turn() {
     let fake_codex = temp_path("fake-steerable-codex.sh");
     let fake_codex_log = temp_path("fake-steerable-codex-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
         Harness::Codex,
@@ -1780,17 +1730,275 @@ fn fake_codex_blocks_mode_steers_active_turn() {
     let _ = std::fs::remove_file(fake_codex_log);
 }
 
+/// A fake Claude Code that logs its stdin, answers the first prompt, and
+/// handles the steer it receives as `steer_body` (shell) describes.
+fn fake_claude_steer_script(log: &std::path::Path, steer_body: &str) -> String {
+    format!(
+        concat!(
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}}'; ",
+            "IFS= read -r prompt; printf '%s\\n' \"$prompt\" >> '{log}'; ",
+            "printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"content\":[]}}}}}}'; ",
+            "IFS= read -r steer; printf '%s\\n' \"$steer\" >> '{log}'; ",
+            "uuid=$(printf '%s' \"$steer\" | sed -n 's/.*\"uuid\":\"\\([^\"]*\\)\".*/\\1/p'); ",
+            "replay=\"{{\\\"type\\\":\\\"user\\\",\\\"isReplay\\\":true,\\\"uuid\\\":\\\"$uuid\\\",\\\"message\\\":{{\\\"role\\\":\\\"user\\\",\\\"content\\\":[{{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"steer\\\"}}]}}}}\"; ",
+            "{steer_body} ",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; done"
+        ),
+        log = log.display(),
+        steer_body = steer_body,
+    )
+}
+
+fn logged_lines(log: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(log)
+        .expect("read fake stdin log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("fake stdin JSON"))
+        .collect()
+}
+
+#[test]
+fn fake_claude_blocks_mode_folds_a_steer_into_the_active_turn() {
+    // Claude Code takes the steer in at its next tool result and echoes it,
+    // then ends the turn with one `result` answering both.
+    let log = temp_path("fake-claude-fold-stdin.jsonl");
+    let fake_claude = fake_claude_steer_script(
+        &log,
+        concat!(
+            "printf '%s\\n' \"$replay\" ",
+            "'{\"type\":\"assistant\",\"is_partial\":false,\"message\":{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"did both\"}]}}' ",
+            "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"did both\"}';"
+        ),
+    );
+    let mut bridge =
+        BridgeProcess::spawn_harness_blocks(Harness::ClaudeCode, Some(fake_claude), None);
+    let turn = bridge.run_blocks_steered_turn("start", "also this", Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "did both");
+    assert_eq!(turn.turn_completed_count, 1);
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![None, Some("steer-message-1".to_string())]
+    );
+    let lines = logged_lines(&log);
+    assert_eq!(lines.len(), 2, "stdin={lines:?}");
+    assert_eq!(lines[1]["message"]["content"][0]["text"], "also this");
+    assert!(
+        lines[1]["uuid"]
+            .as_str()
+            .is_some_and(|uuid| !uuid.is_empty())
+    );
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_claude_blocks_mode_keeps_a_follow_up_steer_answer_in_the_turn() {
+    // No tool result is left to carry the steer, so Claude Code ends its turn
+    // and answers the steer in a follow-up turn of its own; both belong to
+    // the one Centaur turn (and so to the api-rs execution).
+    let log = temp_path("fake-claude-follow-up-stdin.jsonl");
+    let fake_claude = fake_claude_steer_script(
+        &log,
+        concat!(
+            "printf '%s\\n' ",
+            "'{\"type\":\"assistant\",\"is_partial\":false,\"message\":{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"first part\"}]}}' ",
+            "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"first part\"}' ",
+            "'{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}' ",
+            "\"$replay\" ",
+            "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"content\":[]}}}' ",
+            "'{\"type\":\"assistant\",\"is_partial\":false,\"message\":{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"steered\"}]}}' ",
+            "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"steered\"}';"
+        ),
+    );
+    let mut bridge =
+        BridgeProcess::spawn_harness_blocks(Harness::ClaudeCode, Some(fake_claude), None);
+    let turn = bridge.run_blocks_steered_turn("start", "also this", Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.turn_completed_count, 1);
+    assert!(turn.text_from_deltas.contains("first part"), "{turn:?}");
+    assert!(turn.text_from_deltas.ends_with("steered"), "{turn:?}");
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![None, Some("steer-message-1".to_string())]
+    );
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_claude_blocks_mode_resets_turn_state_when_a_held_steer_respawns_the_process() {
+    // The errored turn leaves a native steer unanswered, so the process is
+    // replaced. The held steer's answer must not be swallowed by that dead
+    // process's outstanding-steer state.
+    let log = temp_path("fake-claude-held-steer-respawn-stdin.jsonl");
+    let fake_claude = format!(
+        concat!(
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}}'; ",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; ",
+            "case \"$line\" in ",
+            "*'\"text\":\"steer one\"'*) ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"first part\"}}]}}}}'; ",
+            "sleep 0.5; ",
+            "printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"boom\"}}';; ",
+            "*'\"text\":\"steer two\"'*) ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered\"}}]}}}}'; ",
+            "printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"steered\"}}';; ",
+            "esac; done"
+        ),
+        log = log.display(),
+    );
+    let mut bridge =
+        BridgeProcess::spawn_harness_blocks(Harness::ClaudeCode, Some(fake_claude), None);
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {"source": "slackbotv2", "action": "execute"},
+        "message": {"role": "user", "content": [{"type": "text", "text": "start"}]},
+    }));
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {"source": "session.append_messages", "action": "steer_active_execution"},
+        "client_user_message_id": "steer-message-1",
+        "message": {"role": "user", "content": [{"type": "text", "text": "steer one"}]},
+    }));
+    // The first steer is native; this one arrives after Claude Code's final
+    // assistant message and is held for the next native turn.
+    std::thread::sleep(Duration::from_millis(250));
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {"source": "session.append_messages", "action": "steer_active_execution"},
+        "client_user_message_id": "steer-message-2",
+        "message": {"role": "user", "content": [{"type": "text", "text": "steer two"}]},
+    }));
+    let turn = bridge.read_blocks_turn(Instant::now() + Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_eq!(turn.terminal_status.as_deref(), Some("failed"));
+    assert_eq!(turn.terminal_error.as_deref(), Some("boom"), "{turn:?}");
+    assert_eq!(turn.turn_completed_count, 1);
+    assert_eq!(turn.text_from_deltas, "first partsteered");
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![
+            None,
+            Some("steer-message-1".to_string()),
+            Some("steer-message-2".to_string())
+        ]
+    );
+    let lines = logged_lines(&log);
+    assert_eq!(lines.len(), 3, "stdin={lines:?}");
+    assert_eq!(lines[1]["message"]["content"][0]["text"], "steer one");
+    assert_eq!(lines[2]["message"]["content"][0]["text"], "steer two");
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_amp_blocks_mode_continues_the_turn_with_a_held_steer() {
+    // Amp's turn ends at its terminal stop, so a steer waits for it and is
+    // sent as Amp's next native turn, which this turn continues into.
+    let log = temp_path("fake-amp-held-steer-stdin.jsonl");
+    let fake_amp = format!(
+        concat!(
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"T-amp-session\"}}'; ",
+            "IFS= read -r prompt; printf '%s\\n' \"$prompt\" >> '{log}'; ",
+            "sleep 1; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"first part\"}}]}}}}'; ",
+            "IFS= read -r steer; printf '%s\\n' \"$steer\" >> '{log}'; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered\"}}]}}}}'; ",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; done"
+        ),
+        log = log.display(),
+    );
+    let mut bridge = BridgeProcess::spawn_harness_blocks(Harness::Amp, Some(fake_amp), None);
+    let turn = bridge.run_blocks_steered_turn("start", "also this", Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.turn_completed_count, 1);
+    assert_eq!(turn.text_from_deltas, "first partsteered");
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![None, Some("steer-message-1".to_string())]
+    );
+    let lines = logged_lines(&log);
+    assert_eq!(lines.len(), 2, "stdin={lines:?}");
+    assert!(
+        lines[1].get("steer").is_none(),
+        "held steer is a plain turn"
+    );
+    assert_eq!(lines[1]["message"]["content"][0]["text"], "also this");
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_amp_blocks_mode_runs_multiple_held_steers_one_native_turn_at_a_time() {
+    // A second held steer must wait for the first one's native turn instead of
+    // being written to an Amp process that already answered the first.
+    let log = temp_path("fake-amp-held-steers-stdin.jsonl");
+    let fake_amp = format!(
+        concat!(
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"T-amp-session\"}}'; ",
+            "IFS= read -r prompt; printf '%s\\n' \"$prompt\" >> '{log}'; ",
+            "sleep 1; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"first part\"}}]}}}}'; ",
+            "IFS= read -r steer; printf '%s\\n' \"$steer\" >> '{log}'; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered one\"}}]}}}}'; ",
+            "IFS= read -r steer; printf '%s\\n' \"$steer\" >> '{log}'; ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_3\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered two\"}}]}}}}'; ",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; done"
+        ),
+        log = log.display(),
+    );
+    let mut bridge = BridgeProcess::spawn_harness_blocks(Harness::Amp, Some(fake_amp), None);
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {"source": "slackbotv2", "action": "execute"},
+        "message": {"role": "user", "content": [{"type": "text", "text": "start"}]},
+    }));
+    for (index, steer) in ["also this", "and this"].into_iter().enumerate() {
+        bridge.send(json!({
+            "type": "user",
+            "thread_key": "slack:C123:123.456",
+            "trace_metadata": {"source": "session.append_messages", "action": "steer_active_execution"},
+            "client_user_message_id": format!("steer-message-{}", index + 1),
+            "message": {"role": "user", "content": [{"type": "text", "text": steer}]},
+        }));
+    }
+    let turn = bridge.read_blocks_turn(Instant::now() + Duration::from_secs(10));
+    bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.turn_completed_count, 1);
+    assert_eq!(turn.text_from_deltas, "first partsteered onesteered two");
+    assert_eq!(
+        turn.user_message_client_ids,
+        vec![
+            None,
+            Some("steer-message-1".to_string()),
+            Some("steer-message-2".to_string())
+        ]
+    );
+    let lines = logged_lines(&log);
+    assert_eq!(lines.len(), 3, "stdin={lines:?}");
+    for (line, steer) in lines[1..].iter().zip(["also this", "and this"]) {
+        assert!(line.get("steer").is_none(), "held steer is a plain turn");
+        assert_eq!(line["message"]["content"][0]["text"], steer);
+    }
+    let _ = std::fs::remove_file(log);
+}
+
 #[test]
 fn fake_codex_blocks_mode_forwards_traceparent_to_app_server_requests() {
     let fake_codex = temp_path("fake-codex-trace.sh");
     let fake_codex_log = temp_path("fake-codex-trace-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
     let mut bridge = BridgeProcess::spawn_harness_blocks(
@@ -1844,12 +2052,7 @@ fn fake_codex_blocks_mode_forwards_reasoning_as_turn_start_effort() {
     let fake_codex = temp_path("fake-codex-effort.sh");
     let fake_codex_log = temp_path("fake-codex-effort-requests.jsonl");
     let script = fake_codex_app_server_script(&fake_codex_log);
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex)
-        .expect("fake codex metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+    write_executable(&fake_codex, script);
 
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
@@ -2252,6 +2455,9 @@ struct TurnCapture {
     delta_text_by_item: HashMap<String, String>,
     terminal_status: Option<String>,
     terminal_error: Option<String>,
+    /// `clientId` of each completed userMessage item, in order.
+    user_message_client_ids: Vec<Option<String>>,
+    turn_completed_count: usize,
 }
 
 fn run_bridge_turn(config: BridgeTurnConfig) -> BridgeRun {
@@ -3030,6 +3236,13 @@ impl TurnCapture {
                     .get("params")
                     .and_then(|params| params.get("item"))
                     .expect("completed item");
+                if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+                    self.user_message_client_ids.push(
+                        item.get("clientId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    );
+                }
                 if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
                     let item_id = item
                         .get("id")
@@ -3044,6 +3257,7 @@ impl TurnCapture {
                 }
             }
             "turn/completed" => {
+                self.turn_completed_count += 1;
                 self.terminal_status = value
                     .pointer("/params/turn/status")
                     .and_then(Value::as_str)
@@ -3475,10 +3689,7 @@ fn fake_codex_handles_resolved_and_unresolved_citations_in_both_modes() {
                 &format!("\"items\":[{sources},{{\"type\":\"agentMessage\""),
             );
         }
-        std::fs::write(&fake_codex, script).expect("write fake codex script");
-        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+        write_executable(&fake_codex, script);
         let extra_env = Some(("CODEX_BIN", fake_codex.to_str().unwrap()));
         let mut bridge = if blocks {
             BridgeProcess::spawn_harness_blocks(Harness::Codex, None, extra_env)
@@ -3542,8 +3753,7 @@ fn spawn_fake_codex_recovery(name: &str) -> (BridgeProcess, PathBuf, PathBuf) {
             "      fi\n      ;;",
             "      fi\n      case \"$line\" in *'exit after turn'*) exit 0;; esac\n      ;;",
         );
-    std::fs::write(&fake_codex, script).unwrap();
-    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&fake_codex, script);
     let bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
         None,
@@ -3583,7 +3793,7 @@ fn track_fake_codex_thread_providers(fake_codex: &Path) {
         script.contains("tid=\"$tid.$provider\""),
         "fake app-server fork patch did not apply"
     );
-    std::fs::write(fake_codex, script).unwrap();
+    write_executable(fake_codex, script);
 }
 
 fn read_requests(log: &Path) -> Vec<Value> {
@@ -4011,10 +4221,7 @@ fn fake_codex_blocks_mode_filters_child_and_stale_notifications_across_queued_tu
             "      fi\n      ;;",
             &format!("      fi\n{replay}\n      ;;"),
         );
-    std::fs::write(&fake_codex, script).expect("write fake codex script");
-    let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_codex, permissions).unwrap();
+    write_executable(&fake_codex, script);
     let mut bridge = BridgeProcess::spawn_harness_blocks(
         Harness::Codex,
         None,

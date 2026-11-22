@@ -25,11 +25,11 @@ The service owns these Postgres schemas:
 - `company_context_system`: private cursors, staging (including Slack messages and users, and custom documents), and processing state.
 - `company_context_data`: retrieval-facing Drive documents, Calendar events, Granola notes, Slack channel and file documents, custom document chunks, access observations (including Slack identities, channel memberships, and the conversations each Slack file is shared in), and embeddings. The query endpoints read only this schema, as the `centaur_company_context_v2_query` role, which can only select from it; the service switches to that role for each query transaction, so its login role must be able to grant itself membership (`CREATEROLE` or superuser).
 
-Documents are exposed to retrieval only through the query endpoints; no other database role can read them. The Helm deployment is gated by `experimentalCompanyContext.enabled` until it is ready for production.
+Documents are exposed to retrieval only through the query endpoints; no other database role can read them. The Helm deployment is gated by `companyContext.enabled` (formerly `experimentalCompanyContext.enabled`, still accepted as an alias), which defaults to `false`. See `docs/pages/operate/company-context.mdx`.
 
 ## Required infrastructure
 
-- Postgres with the existing Absurd schema and the `vector` and `pg_search` extensions available.
+- Postgres with the existing Absurd schema and the `vector` extension available. The `pg_search` extension is needed only for the `paradedb` text-search backend.
 - `pdftotext` from Poppler (for PDF sources).
 - `pandoc` 3.8.3 or later (for Office, OpenDocument, RTF, and EPUB Slack files).
 - A Rails Console database containing live per-user Google and Granola OAuth broker credentials.
@@ -74,6 +74,22 @@ walk runs as one Absurd task per batch of folders: each batch lists its
 folders' children in a single Drive search and spawns batches for the
 subfolders. The Helm deployment reads
 `OPENAI_API_KEY` directly from the shared Kubernetes Secret.
+
+Keyword search backend:
+
+- `DATABASE_TEXT_SEARCH` (default `paradedb`): `paradedb` uses ParadeDB BM25
+  indexes and requires `pg_search`; `postgres` uses PostgreSQL's built-in
+  full-text search and runs on any server with `vector`, including RDS and
+  Cloud SQL. Each backend has its own migration tree, `migrations/paradedb` and
+  `migrations/postgres` under `crates/centaur-company-context`. A database keeps
+  the backend it was first migrated with, and the service refuses to start
+  with the other one. The Helm chart passes the backend it gives api-rs.
+
+  The backends match terms slightly differently. `postgres` uses the `english`
+  text-search configuration, so it matches stemmed forms ("launches" finds
+  "launch") and ignores stopwords; a query of only stopwords matches nothing.
+  Its `keyword` mode requires every term in the title and body together, while
+  `paradedb` requires them all in the title or all in the body.
 
 Indexer switches (default `true`):
 
@@ -255,7 +271,7 @@ results follow, the response's `next_cursor` is passed as `cursor`, with the
 same query, mode, and filters, to fetch the next page; the cursor is valid only
 in `keyword` mode.
 
-A `hybrid` search is not paged, so narrow its filters instead. Keyword (BM25) and embedding similarity ranks, each taken across every
+A `hybrid` search is not paged, so narrow its filters instead. Keyword (BM25 on `paradedb`, `ts_rank` on `postgres`) and embedding similarity ranks, each taken across every
 searched type, are combined with reciprocal rank fusion. A keyword match is
 ranked by its similarity too, and a document farther from the query than
 `COMPANY_CONTEXT_EMBEDDINGS_MAX_QUERY_DISTANCE` gets no similarity rank. If the

@@ -1,84 +1,60 @@
 {
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
-  "upstream_revision": "82e8153689fec428d2a42ad4522492905fd61fa1",
-  "result_tree": "a51c2f179c3183a6b03de1e8636315f8f039f086",
+  "upstream_revision": "70467ca5d310f23ffb9fa8a5bb890bce7178aaab",
+  "result_tree": "d9ab8f885e04558cc975cb3ffbe8cff629fff0af",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
-      "sha256": "866f43ac48b3288a1108345cb39ec2f51933a32340c6b86da2532fb530a845cc"
+      "sha256": "0541592d73cc570b71ddf51b411d34eedac51fed92aa8bfd4dc640ab1cb70cd2"
     },
     {
-      "file": "0002-approval-slack-ux.patch",
-      "sha256": "c59522071429c0476964f695cefe5d411d4967a8d1c3f16e370e75466b4e92be"
+      "file": "0002-proxy-ack-diagnostics.patch",
+      "sha256": "90c3e55c7c2b874e77398b74bf6b146f98a6ae7ca0a70a01c10747604075eccd"
     },
     {
-      "file": "0003-proxy-ack-diagnostics.patch",
-      "sha256": "d58ee41253deb3b69564418267aacc35c55841ab0d8a720f16c33f6aa0020307"
-    },
-    {
-      "file": "0004-skills-requester-authoring.patch",
+      "file": "0003-skills-requester-authoring.patch",
       "sha256": "b3478c4fdda3b2af7547c4c82d5d0a889a1afe4a18b2ca77b7966073abfdd3c4"
     },
     {
-      "file": "0005-renumber-upstream-migrations.patch",
-      "sha256": "7429159354961263d101d63d19d20f8e344722889e5370d1cc9f6723ffb52434"
+      "file": "0004-slack-admission.patch",
+      "sha256": "a3a6328b9ceedb92c8b7c41f12aced6bd45d76992f9887bc84d643525392f0c9"
     },
     {
-      "file": "0006-slack-channel-user-admission.patch",
-      "sha256": "ec1e35cda135d39c857f14f98739482e72db3c83385364d3337ac32062fdda03"
+      "file": "0005-native-user-questions.patch",
+      "sha256": "a0563533717212b63c8b372cac0748be4ac26cbefaaebeb750c81c42f4284272"
     },
     {
-      "file": "0007-fixed-thread-admission.patch",
-      "sha256": "b6441f709ae18684fe42083623e1ab71b3d7a62127c2d4e3d1f50ef519514941"
+      "file": "0006-claude-prompt-suggestions.patch",
+      "sha256": "e3ef09a874d66ba76e3688c91c0fd02775903c838dddef5d85520a59b766240a"
     },
     {
-      "file": "0008-native-user-questions.patch",
-      "sha256": "925b76df6b39f79249372ec70fe98c949ab52f50b2d922508b4001be1941f0e1"
+      "file": "0007-native-interaction-followups.patch",
+      "sha256": "54ac389fb0103b7b27191e0e2c1813fa8a8bb91c9806e3bec532a9ed07334c91"
     },
     {
-      "file": "0009-claude-prompt-suggestions.patch",
-      "sha256": "3b492a306bca782f0ec8f95a678ef219af2e7d329096517e240574a266c9dc99"
+      "file": "0008-cancel-scheduled-tasks-from-slack.patch",
+      "sha256": "c55fa9da7e1834011f4093409a3f5ea266a861e3000e7b212a74ee67b46e4711"
     },
     {
-      "file": "0010-claude-monitor-follow-up.patch",
-      "sha256": "5185f5d90c8974ce623215c58be8c34fd7a2d9d77c8072e4386507082e7e14b0"
+      "file": "0009-slack-thread-author-names.patch",
+      "sha256": "ae677974c65f993cfc859b695feb28507d63d5454ebd0d8c923898fbc0ee924a"
     },
     {
-      "file": "0011-native-interaction-followups.patch",
-      "sha256": "ff23a96ee74b7862d815caf8bb08ae7290a4047fa09c676246167936c33b4632"
+      "file": "0010-workflow-sandbox-lifecycle-and-db-secret.patch",
+      "sha256": "9b1110db1ca6bb027b94306543fdf92d3c33c1f03853289bc15b11e973d3863f"
     },
     {
-      "file": "0012-cancel-scheduled-tasks-from-slack.patch",
-      "sha256": "2d3583c156e59b25c99dc51846e0655cfd2c6e44066f8771e1bef0e14a824452"
+      "file": "0011-repo-cache-shutdown-and-recovery.patch",
+      "sha256": "1d26ea8934e9d023e3fd628815bb1237d51a03476647e545089cc1721d81772e"
     },
     {
-      "file": "0013-slack-thread-author-names.patch",
-      "sha256": "0cef1eb3896aebe2dcfcdeceea9975d3e2d765200be1c5a1d86de84ccaab34ad"
+      "file": "0012-decouple-code-mode-connector-policy.patch",
+      "sha256": "33759bde2d07379725e62fbd8eefe56e4fa630f860f62818786ff5e77ff9d65d"
     },
     {
-      "file": "0014-claude-fable-5-2.patch",
-      "sha256": "a00516a057da69787495e285c2e4217c6af0dbc2d79a97f1e9b175cff15f0030"
-    },
-    {
-      "file": "0015-question-card-single-form.patch",
-      "sha256": "ef45318c8ab152c62e298ac84db6b54bf049316806cdcccaf8ca96a2b475624b"
-    },
-    {
-      "file": "0016-preserve-question-details.patch",
-      "sha256": "9cca51d5245d965b92f34aa60ae7317eefff0be5c40dc51af2bd7e7d9e617918"
-    },
-    {
-      "file": "0017-optional-additional-details.patch",
-      "sha256": "6b82f36b4d84239a22924dc79eac5da403a2acc7c48ff1b223eb827f5d4f3f50"
-    },
-    {
-      "file": "0018-workflow-sandbox-lifecycle-and-db-secret.patch",
-      "sha256": "40fd7352359f5182efd5c9af09b1c94c99333e5a356584094ea7113cf85ce45a"
-    },
-    {
-      "file": "0019-repo-cache-shutdown-and-recovery.patch",
-      "sha256": "45e543060687ed9bce1801cf1bf0130bdc6d526452a97c657e0802b48ab2a11e"
+      "file": "0013-add-per-request-redirect-policy-to-code-mode-fetch.patch",
+      "sha256": "a7bda276a35ef6dc82a94167156c42701806a022b7940cccb22a1af29ba492d2"
     }
   ]
 }

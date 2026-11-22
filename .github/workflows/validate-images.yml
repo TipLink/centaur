@@ -133,7 +133,7 @@ jobs:
         if: matrix.service == 'agent'
         env:
           AGENT_IMAGE: ${{ matrix.image }}:validate-${{ env.PLATFORM_SLUG }}
-        run: bash scripts/probe-agent-harness-image.sh "$AGENT_IMAGE"
+        run: bash .github/scripts/probe-agent-harness-image.sh "$AGENT_IMAGE"
 
       - name: Record validated BuildKit inputs
         if: github.event_name == 'push'

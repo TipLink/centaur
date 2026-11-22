@@ -118,6 +118,23 @@ module Api
         assert_response :forbidden
       end
 
+      test "a disconnected Slack credential cannot authorize cancellation" do
+        @author.user_identities.destroy_all
+        app = oauth_apps(:acme_slack)
+        credential = BrokerCredential.create!(created_by: @author, oauth_app: app,
+          provider_subject: "U0123456789", labels: { "slack_team_id" => "T0123456789" },
+          token_endpoint: app.provider_strategy.token_endpoint)
+        assert SlackDeliveryPolicy.new(@author).linked_identity_matches?("U0123456789", "T0123456789")
+
+        Oauth::Disconnect.new.call(credential)
+        assert_predicate credential.reload, :dead?
+        assert_equal Oauth::Disconnect::DEAD_REASON, credential.dead_reason
+        assert_no_changes -> { @task.reload.attributes } do
+          cancel_task
+        end
+        assert_response :forbidden
+      end
+
       test "ambiguous Slack ownership cannot cancel" do
         @author.user_identities.create!(provider: "slack", subject: "U2222222222", team_id: "T0123456789")
 

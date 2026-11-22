@@ -11,9 +11,10 @@ import sys
 from urllib.parse import parse_qs, urlsplit
 
 PLATFORMS = ("linux/amd64", "linux/arm64")
-SERVICES = ("api-rs", "company-context", "proxy-sync", "token-broker", "slackbotv2",
+SERVICES = ("api-rs", "company-context", "proxy-sync", "codemode", "token-broker", "slackbotv2",
             "linearbot", "discordbot", "githubbot", "teamsbot", "agent", "iron-proxy", "console")
 REGISTRY_NAMESPACE = "ghcr.io/tiplink/centaur"
+AGENT_PROBE = ".github/scripts/probe-agent-harness-image.sh"
 SHA = r"[0-9a-f]{40}"
 DIGEST = r"sha256:[0-9a-f]{64}"
 
@@ -56,7 +57,7 @@ def changed_paths(origin, current):
     # The source validator proves that the checkout outside publisher orchestration
     # matches the prepared runtime. Patch packaging itself is absent from that context.
     paths = {p for p in paths if not p.startswith(".github/core-patches/")}
-    require(not any(p.startswith(".github/") for p in paths), "publisher inputs changed")
+    require(not any(p.startswith(".github/") for p in paths - {AGENT_PROBE}), "publisher inputs changed")
     # BuildKit follows source symlinks. A change to their targets can live outside
     # followpaths. Treat these and submodules conservatively on either side.
     for rev in (origin, current):
@@ -70,7 +71,7 @@ def material_reference(material):
     require(p.scheme == "pkg" and p.path.startswith("docker/") and not p.fragment, "unknown build material")
     image, tag = p.path.removeprefix("docker/").rsplit("@", 1)
     require(re.fullmatch(r"[a-z0-9._/-]+", image) and re.fullmatch(r"[A-Za-z0-9._-]+", tag), "unknown image name")
-    q = parse_qs(p.query, strict_parsing=True)
+    q = parse_qs(p.query, strict_parsing=True) if p.query else {}
     require(set(q) <= {"platform", "digest"} and all(len(v) == 1 for v in q.values()), "unknown image qualifier")
     digest = "sha256:" + material["digest"]["sha256"]
     require(re.fullmatch(DIGEST, digest), "unknown material digest")
