@@ -1,6 +1,8 @@
 """Exercise the release admission script without credentials or GitHub writes."""
 import json
 import os
+import importlib
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -61,6 +63,21 @@ class AdmissionTest(unittest.TestCase):
             with self.subTest(branch=branch):
                 result = self.run_gate(base=branch)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_codemode_publication_contract(self):
+        planner = importlib.import_module("plan-reviewed-images")
+        plan = planner.plan("", SHA)
+        builds = [row for row in plan["build"]["include"] if row["service"] == "codemode"]
+        self.assertCountEqual(builds, [
+            dict(service="codemode", image="centaur-codemode", context=".", target="",
+                 dockerfile="services/codemode/Dockerfile", platform=platform)
+            for platform in ("linux/amd64", "linux/arm64")])
+
+        workflow = (SCRIPT.parents[1] / "workflows/publish-images.yml").read_text()
+        images = ["centaur-" + service for service in planner.SERVICES]
+        self.assertCountEqual(re.findall(r"^ +(?:- image: )(centaur-[\w-]+)$", workflow, re.M), images)
+        self.assertCountEqual(re.findall(r"^ +(centaur-[\w-]+)(?: \\|; do)$", workflow, re.M), images)
+        self.assertIn("          codemode\tcentaur-codemode\n", workflow)
 
     def test_missing_patch_reproduction_check_fails(self):
         self.assertNotEqual(self.run_gate(patch_check=False).returncode, 0)

@@ -250,10 +250,11 @@ overlay:
 # toolServer.extraSources are mapped into this shape for compatibility.
 #
 # Subdirs default to the conventional layout — toolsSubdir: tools,
-# workflowsSubdir: workflows, skillsSubdir: .agents/skills — so most sources
-# only need `repo`; set `ref` to a branch, tag, or commit when you do not want
-# the repo's default branch. Directories missing from a repo are skipped at
-# runtime. Set a subdir to "" to explicitly disable that surface for a source.
+# workflowsSubdir: workflows, skillsSubdir: .agents/skills,
+# connectorsSubdir: connectors — so most sources only need `repo`; set `ref` to
+# a branch, tag, or commit when you do not want the repo's default branch.
+# Directories missing from a repo are skipped at runtime. Set a subdir to ""
+# to explicitly disable that surface for a source.
 # Repo visibility defaults to private; set visibility: public only for repos
 # safe to expose to principals with sandbox_repo_cache=public.
 overlays:
@@ -269,6 +270,7 @@ overlays:
   #   visibility: private
   #   toolsSubdir: ""
   #   skillsSubdir: ""
+  #   connectorsSubdir: ""
 
 codex:
   # Operator-defined OpenAI-compatible Responses providers. Each provider is
@@ -298,6 +300,15 @@ codex:
   #           defaultReasoning: high
   #           reasoningAliases: {max: high}
   customProviders: {}
+
+# Code Mode runtime image. api-rs builds one sandbox per principal from this
+# slim image when `apiRs.mcpEnabled` is true. Pull policy and pull secrets
+# reuse `sandbox.image.pullPolicy` and `global.imagePullSecrets`. Rendered as
+# CENTAUR_CODEMODE_IMAGE.
+codemode:
+  image:
+    repository: centaur-codemode
+    tag: latest
 
 sandbox:
   image:
@@ -515,13 +526,20 @@ tokenBroker:
     annotations: {}
   resources: {}
 
-# v1 company-context ingestion: the api-rs Slack workflows (slack_sync,
+# Legacy (v1) company-context ingestion: the api-rs Slack workflows (slack_sync,
 # slack_backfill, slack_retention) and the Console Slack DM, Google Docs, and
-# Granola sync jobs. Set false to stop all of them, for example to roll out
-# experimentalCompanyContext in isolation. Already-synced data is kept, and
-# Slack retention does not run while this is false.
-companyContextV1:
-  enabled: true
+# Granola sync jobs. Deprecated and off by default; it will be removed in a
+# future release. New deployments should use companyContext instead. Setting
+# true runs the Console Slack DM and Granola sync for connected users and allows
+# the Slack ETL (apiRs.etl.slack.enabled) and Google Docs sync
+# (console.googleDocsSync.enabled) to run. While false, already-synced data is kept and Slack retention does not
+# run. See docs/pages/operate/company-context.mdx.
+#
+# Backwards compatibility: this block used to be named `companyContextV1`. That
+# key is still honored as a deprecated alias and wins when set (see the
+# `centaur.legacyCompanyContextEnabled` helper).
+legacyCompanyContext:
+  enabled: false
 
 # API clients: machine callers, such as eval runners, that exchange a client
 # secret for a session API token at api-rs /oauth/token. Off hides them in the
@@ -531,9 +549,16 @@ apiClients:
 
 # Standalone company-context ingestion service. It indexes Google Docs and PDFs
 # from Google Drive, Google Calendar events, and Granola meeting notes into its
-# private system and data schemas. Disabled while the corpus is validated
-# alongside the legacy Python workflows.
-experimentalCompanyContext:
+# private system and data schemas. Off by default. Enabling it requires
+# OPENAI_API_KEY, SLACK_BOT_TOKEN, and CENTAUR_JWT_SIGNING_SECRET in the shared
+# Secret; the pod does not start without them. Review the indexers and
+# syncLimits below before enabling. See docs/pages/operate/company-context.mdx.
+#
+# Backwards compatibility: this block used to be named
+# `experimentalCompanyContext`. That key is still honored as a deprecated alias:
+# anything set under it is merged on top of these `companyContext` values (see
+# the `centaur.companyContextValues` helper), and wins for keys set under both.
+companyContext:
   enabled: false
   replicaCount: 1
   nodeSelector: {}
@@ -655,8 +680,15 @@ apiRs:
   # incompatible with preapproved mode. Internal workflow/MCP sessions use
   # separate principal-provisioning paths.
   sessionPrincipalAdmission: automatic
-  # Expose the experimental centaur MCP dispatcher (currently action=list).
-  mcpV2Enabled: false
+  # Serve /mcp through Code Mode: a centaur-codemode sandbox per principal,
+  # with api-rs forwarding catalog search/load and centaur_execute over HTTP.
+  # A principal normally has one sandbox; with several api-rs replicas (or
+  # during a rolling deploy) it may briefly have more, which is harmless.
+  # Readiness is the sandbox pod's own readiness probe; api-rs neither polls the
+  # sandbox nor waits for one shared instance. false turns off /mcp and its
+  # OAuth protected-resource metadata, and api-rs starts no Code Mode sandboxes.
+  # Rendered as CENTAUR_MCP_ENABLED.
+  mcpEnabled: true
   sandboxReadyTimeoutSecs: 90
   # Warm pool of default-harness sandboxes with full repo-cache access.
   # Ignored when sandboxWarmPools is set.
@@ -822,6 +854,14 @@ apiRs:
     periodSeconds: 10
     timeoutSeconds: 5
   terminationGracePeriodSeconds: 35
+  # Extra environment variables: strings or Kubernetes valueFrom objects.
+  # extraEnv:
+  #   LOG_LEVEL: "info"
+  #   EXAMPLE_TOKEN:
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: example-secret
+  #         key: example-key
   extraEnv: {}
   resources: {}
   # PriorityClass for the api-rs control plane pod itself. Pair with
@@ -832,6 +872,10 @@ apiRs:
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
 # (:8080) and streams responses back. Listens on :3001.
 slackbotv2:
+  # Optional public PEM CA bundle trusted in addition to the runtime's default
+  # roots (for example, a database CA). Stored in a ConfigMap, never private keys.
+  # A change updates the pod checksum so the runtime reloads its trust at startup.
+  extraCaCertificates: ""
   enabled: true
   replicaCount: 1
   image:
@@ -976,6 +1020,10 @@ slackbotv2:
 # Disabled by default: requires the LINEAR_ACCESS_TOKEN / LINEARBOT_WEBHOOK_SECRET
 # secrets from the Linear OAuth app install (see contrib/scripts/bootstrap-k8s-secrets.sh).
 linearbot:
+  # Optional public PEM CA bundle trusted in addition to the runtime's default
+  # roots (for example, a database CA). Stored in a ConfigMap, never private keys.
+  # A change updates the pod checksum so the runtime reloads its trust at startup.
+  extraCaCertificates: ""
   enabled: false
   replicaCount: 1
   image:
@@ -1002,6 +1050,10 @@ linearbot:
 # (see contrib/scripts/bootstrap-k8s-secrets.sh). userName must be the bot
 # account's GitHub login so @-mention and review-request matching work.
 githubbot:
+  # Optional public PEM CA bundle trusted in addition to the runtime's default
+  # roots (for example, a database CA). Stored in a ConfigMap, never private keys.
+  # A change updates the pod checksum so the runtime reloads its trust at startup.
+  extraCaCertificates: ""
   enabled: false
   replicaCount: 1
   image:
@@ -1050,6 +1102,9 @@ discordbot:
   userName: centaur
   # Comma/space-separated Discord guild IDs. The bot is INERT (ignores all messages) until set.
   guildAllowlist: ""
+  # Comma/space-separated Discord channel IDs the bot answers in; threads count as their
+  # parent channel. Empty means every channel in an allowlisted guild.
+  channelAllowlist: ""
   # Comma/space-separated role IDs whose mentions also trigger the bot.
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.
@@ -1141,7 +1196,8 @@ externalDatabase:
   # namespace.
   namespace: ""
   port: 5432
-  # Keyword search backend for company context. "postgres" (used when empty)
+  # Keyword search backend for company context, in api-rs and the
+  # company-context service. "postgres" (used when empty)
   # uses built-in full-text search and works on RDS and Cloud SQL; "paradedb"
   # uses BM25 and requires the pg_search extension. Must be empty while
   # postgres.enabled=true: the bundled Postgres always uses "paradedb". A

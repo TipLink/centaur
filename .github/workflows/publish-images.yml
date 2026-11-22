@@ -102,6 +102,7 @@ jobs:
             centaur-api-rs \
             centaur-company-context \
             centaur-proxy-sync \
+            centaur-codemode \
             centaur-token-broker \
             centaur-slackbotv2 \
             centaur-linearbot \
@@ -195,7 +196,7 @@ jobs:
           # per-arch release builds are pushed by digest only.
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
           no-cache: ${{ inputs.full_rebuild || false }}
-          provenance: true
+          provenance: mode=max
           # BuildKit 0.32.2 rejects attestations larger than 40 MiB. The agent
           # image's package-owned file inventory exceeds that limit on both
           # architectures; retain SBOMs for every other image and provenance
@@ -265,6 +266,7 @@ jobs:
           - image: centaur-api-rs
           - image: centaur-company-context
           - image: centaur-proxy-sync
+          - image: centaur-codemode
           - image: centaur-token-broker
           - image: centaur-slackbotv2
           - image: centaur-linearbot
@@ -437,6 +439,7 @@ jobs:
           done <<'COMPONENTS'
           api-rs	centaur-api-rs
           proxy-sync	centaur-proxy-sync
+          codemode	centaur-codemode
           token-broker	centaur-token-broker
           slackbotv2	centaur-slackbotv2
           sandbox	centaur-agent

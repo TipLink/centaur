@@ -259,6 +259,8 @@ export async function submit_extract(
  * never enters the realm); `filename` drives Reducto's type detection (default:
  * the path's last segment), `content_type` defaults to application/octet-stream.
  * Returns the `file_id` for `submit_parse`/`submit_extract`.
+ *
+ * @requires files
  */
 export async function upload(
   args: { path: string; filename?: string; content_type?: string },
@@ -387,6 +389,8 @@ export async function extract_metadata(
  * (reported as an error), Drive folders cannot be listed without OAuth, and
  * Google-native files only export this way; authenticated `gog` downloads are
  * not available here.
+ *
+ * @requires files
  */
 export async function google_export(
   args: { url: string; title?: string; export_format?: string; path?: string },
@@ -456,7 +460,7 @@ function sha256Hex(input: string): string {
     padded[padded.length - 4 + index] = (bitLength >>> (24 - index * 8)) & 0xff;
   }
   const state = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-  const words = new Array<number>(64).fill(0);
+  const words = Array.from<number>({ length: 64 }).fill(0);
   for (let offset = 0; offset < padded.length; offset += 64) {
     for (let index = 0; index < 16; index += 1) {
       const at = offset + index * 4;

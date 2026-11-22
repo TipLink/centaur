@@ -12,7 +12,7 @@ spec = importlib.util.spec_from_file_location("planner", Path(__file__).with_nam
 planner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(planner)
 planner.REGISTRY_NAMESPACE = "localhost:5000/e2e"
-services = ("slackbotv2", "agent")
+services = ("codemode", "agent")
 upstream = "a" * 40
 manifest = {"result_tree": "b" * 40, "upstream_revision": upstream}
 series_path = Path(".github/core-patches/series.json")
@@ -68,20 +68,22 @@ def test(work):
         (folder / "payload").write_text(service)
         (folder / "Dockerfile").write_text(
             "# syntax=docker/dockerfile:1.7\nFROM busybox:1.37\nCOPY shared /shared\n"
-            f"COPY {folder}/payload /payload\n")
+            f"COPY {folder}/payload /payload\nCOPY connectors/ /connectors/\n")
+    Path("connectors").mkdir()
+    Path("connectors/example.ts").write_text("export const value = 1")
     first = commit()
     expect_build("", first, services)
     for service in services:
         build(service, first)
-    (directory("slackbotv2") / "payload").write_text("updated slack")
+    (directory("codemode") / "payload").write_text("updated codemode")
     second = commit()
-    reuse = expect_build(first, second, ["slackbotv2"])
-    build("slackbotv2", second)
+    reuse = expect_build(first, second, ["codemode"])
+    build("codemode", second)
     digest = reuse["centaur-agent"]["digest"]
     command("docker", "buildx", "imagetools", "create", "-t", f"{image('agent')}:reviewed-{second}",
             f"{image('agent')}@{digest}")
     assert planner.manifest(f"{image('agent')}:reviewed-{second}")[0] == digest
-    for service, expected in (("agent", "agent"), ("slackbotv2", "updated slack")):
+    for service, expected in (("agent", "agent"), ("codemode", "updated codemode")):
         assert command("docker", "run", "--rm", f"{image(service)}:reviewed-{second}", "cat", "/payload") == expected
     Path("notes").write_text("outside both images")
     expect_build(second, commit(), [])
@@ -103,6 +105,9 @@ def test(work):
     expect_build(second, commit(), services)
     Path(".dockerignore").unlink()
     Path("shared").unlink()
+    expect_build(second, commit(), services)
+    command("git", "restore", "--source", second, "shared", str(recipe))
+    Path("connectors/example.ts").write_text("export const value = 2")
     expect_build(second, commit(), services)
     print("PASS: native runtime reads, identical reused index, isolated change, all-reuse and shared deletion")
 

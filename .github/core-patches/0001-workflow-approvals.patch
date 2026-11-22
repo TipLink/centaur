@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index bb57f362..1792e3fb 100644
+index 899938fc..04b144df 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -895,6 +895,7 @@ name = "centaur-workflows"
+@@ -916,6 +916,7 @@ name = "centaur-workflows"
  version = "0.1.0"
  dependencies = [
   "absurd-sdk",
@@ -10,7 +10,7 @@ index bb57f362..1792e3fb 100644
   "base64 0.23.1",
   "centaur-iron-control",
   "centaur-sandbox-core",
-@@ -906,6 +907,7 @@ dependencies = [
+@@ -927,6 +928,7 @@ dependencies = [
   "chrono-tz",
   "cron",
   "futures-util",
@@ -18,7 +18,7 @@ index bb57f362..1792e3fb 100644
   "hmac 0.13.0",
   "reqwest",
   "serde",
-@@ -5923,6 +5925,7 @@ dependencies = [
+@@ -5921,6 +5923,7 @@ dependencies = [
   "tokio-stream",
   "tracing",
   "url",
@@ -26,7 +26,7 @@ index bb57f362..1792e3fb 100644
   "webpki-roots 0.26.11",
  ]
  
-@@ -6005,6 +6008,7 @@ dependencies = [
+@@ -6003,6 +6006,7 @@ dependencies = [
   "thiserror 2.0.21",
   "time",
   "tracing",
@@ -34,7 +34,7 @@ index bb57f362..1792e3fb 100644
   "whoami",
  ]
  
-@@ -6044,6 +6048,7 @@ dependencies = [
+@@ -6042,6 +6046,7 @@ dependencies = [
   "thiserror 2.0.21",
   "time",
   "tracing",
@@ -42,7 +42,7 @@ index bb57f362..1792e3fb 100644
   "whoami",
  ]
  
-@@ -6071,6 +6076,7 @@ dependencies = [
+@@ -6069,6 +6074,7 @@ dependencies = [
   "time",
   "tracing",
   "url",
@@ -117,10 +117,10 @@ index 0c290ee4..53f8953c 100644
          Ok(())
      }
 diff --git a/crates/centaur-api-server/Cargo.toml b/crates/centaur-api-server/Cargo.toml
-index 0ee97d39..ab118040 100644
+index fdfe75c8..e216acec 100644
 --- a/crates/centaur-api-server/Cargo.toml
 +++ b/crates/centaur-api-server/Cargo.toml
-@@ -34,7 +34,7 @@ serde_yaml.workspace = true
+@@ -35,7 +35,7 @@ serde_yaml.workspace = true
  sha2.workspace = true
  standardwebhooks.workspace = true
  subtle.workspace = true
@@ -144,19 +144,72 @@ index d84135a6..3d272ae0 100644
              .map_err(|error| ApiError::Forbidden(error.into()))
      }
  
+diff --git a/crates/centaur-api-server/src/error.rs b/crates/centaur-api-server/src/error.rs
+index bac14eb7..9030d3c7 100644
+--- a/crates/centaur-api-server/src/error.rs
++++ b/crates/centaur-api-server/src/error.rs
+@@ -82,6 +82,9 @@ impl IntoResponse for ApiError {
+             )) => StatusCode::FORBIDDEN,
+             Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
+             Self::Workflow(WorkflowRuntimeError::Disabled(_)) => StatusCode::FORBIDDEN,
++            Self::Workflow(WorkflowRuntimeError::ApprovalDecisionRejected(_)) => {
++                StatusCode::FORBIDDEN
++            }
+             Self::Workflow(WorkflowRuntimeError::NotFound(_)) => StatusCode::NOT_FOUND,
+             Self::Workflow(WorkflowRuntimeError::Upstream(_)) => StatusCode::BAD_GATEWAY,
+             Self::Internal(_)
+@@ -106,6 +109,10 @@ impl IntoResponse for ApiError {
+             "ok": false,
+             "error": message,
+         });
++        if let Self::Workflow(WorkflowRuntimeError::ApprovalDecisionRejected(reason)) = &self {
++            body["code"] = json!("approval_decision_rejected");
++            body["reason"] = json!(reason);
++        }
+         // Structured conflict details let clients (e.g. the slackbot) recover by
+         // retrying with the session's existing harness instead of parsing the
+         // human-readable message.
+@@ -167,6 +174,27 @@ mod tests {
+     use axum::body::to_bytes;
+     use centaur_iron_control::{IronControlError, PrincipalDerivationError};
+ 
++    #[tokio::test]
++    async fn approval_rejections_have_a_safe_typed_reason() {
++        let response = ApiError::Workflow(WorkflowRuntimeError::ApprovalDecisionRejected(
++            centaur_workflows::approvals::DecisionRejection::SelfApprovalNotAllowed,
++        ))
++        .into_response();
++        assert_eq!(response.status(), StatusCode::FORBIDDEN);
++        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
++        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
++        assert_eq!(body["code"], "approval_decision_rejected");
++        assert_eq!(body["reason"], "self_approval_not_allowed");
++
++        let response = ApiError::Workflow(WorkflowRuntimeError::Disabled(
++            "approval unavailable".into(),
++        ))
++        .into_response();
++        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
++        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
++        assert!(body.get("reason").is_none());
++    }
++
+     #[test]
+     fn principal_derivation_errors_are_bad_requests() {
+         let response = ApiError::Runtime(SessionRuntimeError::IronControl(
 diff --git a/crates/centaur-api-server/src/lib.rs b/crates/centaur-api-server/src/lib.rs
-index 662ffd8b..8ff78a20 100644
+index 7a715453..c92d720b 100644
 --- a/crates/centaur-api-server/src/lib.rs
 +++ b/crates/centaur-api-server/src/lib.rs
-@@ -7,6 +7,7 @@ mod mcp;
- mod routes;
+@@ -8,6 +8,7 @@ mod routes;
+ mod scheduled_tasks;
  mod slack_external_teams;
  mod slack_proxy;
 +mod tool_approvals;
  mod tool_discovery;
  pub mod types;
  
-@@ -161,6 +162,42 @@ mod tests {
+@@ -164,6 +165,42 @@ mod tests {
          )
      }
  
@@ -199,7 +252,7 @@ index 662ffd8b..8ff78a20 100644
      #[tokio::test]
      async fn metrics_endpoint_renders_http_request_metrics() {
          let pool =
-@@ -549,6 +586,36 @@ mod tests {
+@@ -578,6 +615,36 @@ mod tests {
          }
      }
  
@@ -237,18 +290,9 @@ index 662ffd8b..8ff78a20 100644
      async fn principal_jwt_is_capability_scoped() {
          let principal = principal_token("prn_sandbox");
 diff --git a/crates/centaur-api-server/src/routes.rs b/crates/centaur-api-server/src/routes.rs
-index 11728342..9e3b4d91 100644
+index 15af34de..331b9e90 100644
 --- a/crates/centaur-api-server/src/routes.rs
 +++ b/crates/centaur-api-server/src/routes.rs
-@@ -168,7 +168,7 @@ impl AppState {
-             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
-     }
- 
--    fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
-+    pub(crate) fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
-         let initialized = self
-             .initialized()
-             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
 @@ -261,6 +261,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
              get(get_slack_external_team_ids).put(replace_slack_external_team_ids),
          )
@@ -257,7 +301,7 @@ index 11728342..9e3b4d91 100644
          .route("/api/workflows/schedules", get(list_workflow_schedules))
          .route(
              "/api/workflows/runs",
-@@ -424,6 +425,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
+@@ -431,6 +432,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
  
  #[derive(Clone, Copy)]
  enum RouteAccess {
@@ -265,7 +309,7 @@ index 11728342..9e3b4d91 100644
      Capability(Capability),
      PrincipalOnly,
      /// Session write access, held by an API client (confined to its own
-@@ -478,6 +480,7 @@ async fn authorize_api_request(
+@@ -485,6 +487,7 @@ async fn authorize_api_request(
      };
  
      let allowed = match access {
@@ -273,7 +317,7 @@ index 11728342..9e3b4d91 100644
          RouteAccess::Capability(capability) => caller.has_capability(capability),
          RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
          RouteAccess::ApiClientOrOperatorSessionWrite => {
-@@ -561,6 +564,10 @@ pub(crate) fn api_client_may_touch(
+@@ -568,6 +571,10 @@ pub(crate) fn api_client_may_touch(
  fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
      let capability = |capability| Some(RouteAccess::Capability(capability));
      match (method, route) {
@@ -284,7 +328,7 @@ index 11728342..9e3b4d91 100644
          (&Method::GET, "/api/session/{thread_key}")
          | (&Method::GET, "/api/session/{thread_key}/events") => {
              capability(Capability::SessionsRead)
-@@ -2592,14 +2599,24 @@ async fn ingest_google_docs_sync_batch(
+@@ -2604,14 +2611,24 @@ async fn ingest_google_docs_sync_batch(
  
  async fn invoke_workflow_button(
      State(state): State<AppState>,
@@ -364,11 +408,24 @@ index 00000000..78e2b9f0
 +        state.workflows()?.cancel_approval(id, identity).await?,
 +    ))
 +}
+diff --git a/crates/centaur-session-runtime/src/codemode.rs b/crates/centaur-session-runtime/src/codemode.rs
+index 499cab9e..fdcb88ab 100644
+--- a/crates/centaur-session-runtime/src/codemode.rs
++++ b/crates/centaur-session-runtime/src/codemode.rs
+@@ -254,6 +254,8 @@ impl SessionRuntime {
+                 "MCP Code Mode requires a principal".to_owned(),
+             ));
+         }
++        self.ensure_unreserved_principal_reference(principal_id)
++            .await?;
+         let thread_key = codemode_thread_key(principal_id)?;
+         let harness = self.default_harness();
+         let base =
 diff --git a/crates/centaur-session-runtime/src/lib.rs b/crates/centaur-session-runtime/src/lib.rs
-index 7aebe309..39e963ee 100644
+index d1871d7b..e05b13fc 100644
 --- a/crates/centaur-session-runtime/src/lib.rs
 +++ b/crates/centaur-session-runtime/src/lib.rs
-@@ -164,6 +164,7 @@ impl SessionPrincipalAdmission {
+@@ -160,6 +160,7 @@ impl SessionPrincipalAdmission {
  
  #[derive(Clone)]
  pub struct SessionRuntime {
@@ -376,7 +433,7 @@ index 7aebe309..39e963ee 100644
      store: PgSessionStore,
      sandbox_runtime: SandboxRuntime,
      sandbox_pipes: SessionPipeMap,
-@@ -834,6 +835,7 @@ impl SessionRuntime {
+@@ -696,6 +697,7 @@ impl SessionRuntime {
          Self {
              store,
              sandbox_runtime,
@@ -384,7 +441,7 @@ index 7aebe309..39e963ee 100644
              sandbox_pipes: Arc::new(DashMap::new()),
              sandbox_pipe_open_locks: Arc::new(DashMap::new()),
              dispatching_executions: Arc::new(DashSet::new()),
-@@ -861,6 +863,41 @@ impl SessionRuntime {
+@@ -723,6 +725,41 @@ impl SessionRuntime {
          self
      }
  
@@ -426,22 +483,7 @@ index 7aebe309..39e963ee 100644
      pub fn with_session_title_generator<F, Fut>(mut self, generator: F) -> Self
      where
          F: Fn(String) -> Fut + Send + Sync + 'static,
-@@ -950,6 +987,14 @@ impl SessionRuntime {
-         policy: ToolHostCallPolicy,
-     ) -> Result<ToolHostCallOutput, ToolHostCallError> {
-         let principal_id = input.principal_id.trim().to_owned();
-+        if !self.workflow_only_principals.is_empty() {
-+            let principal = self
-+                .iron_control
-+                .get_principal(&principal_id)
-+                .await
-+                .map_err(SessionRuntimeError::from)?;
-+            self.ensure_unreserved_record(&principal)?;
-+        }
-         let tool_name = input.tool_name.trim().to_owned();
-         let invocation = match input.invocation {
-             ToolHostInvocation::V1 { method, arguments } => ToolHostInvocation::V1 {
-@@ -1750,6 +1795,7 @@ impl SessionRuntime {
+@@ -1143,6 +1180,7 @@ impl SessionRuntime {
                  }
              };
              let desired_capabilities = sandbox_capabilities_from_principal(&registered_principal);
@@ -449,17 +491,17 @@ index 7aebe309..39e963ee 100644
              // A session's persona is fixed by the first successful create.
              // Use the stored persona before the requested one so later persona
              // flags cannot change or invalidate an existing thread. Its
-@@ -2363,6 +2409,9 @@ impl SessionRuntime {
+@@ -1757,6 +1795,9 @@ impl SessionRuntime {
+                 "starting session execution"
              );
              let session = self.store.get_session(thread_key).await?;
-             correlation_sandbox_id = session.sandbox_id.clone();
 +            if let Some(principal) = session.iron_control_principal.as_deref() {
 +                self.ensure_unreserved_principal_reference(principal).await?;
 +            }
              let harness_label = session.harness_type.to_string();
              validate_input_lines(&input_lines)?;
              let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
-@@ -3597,6 +3646,7 @@ impl SessionRuntime {
+@@ -2999,6 +3040,7 @@ impl SessionRuntime {
              return Ok(SessionSandboxCapabilities::default_enabled());
          };
          let principal = self.iron_control.get_principal(principal_id).await?;
@@ -467,7 +509,7 @@ index 7aebe309..39e963ee 100644
          Ok(sandbox_capabilities_from_principal(&principal))
      }
  
-@@ -4491,7 +4541,19 @@ impl SandboxRuntime {
+@@ -3905,7 +3947,19 @@ impl SandboxRuntime {
          spec: SandboxSpec,
      ) -> Result<(SandboxId, centaur_sandbox_core::SandboxIoParts), SessionRuntimeError> {
          let handle = self.manager.create_running(spec).await?;
@@ -488,16 +530,27 @@ index 7aebe309..39e963ee 100644
          Ok((handle.id, io))
      }
  
-@@ -10359,6 +10421,66 @@ mod adoption_tests {
-         reset_test_store(&store).await;
+@@ -9269,6 +9323,10 @@ mod adoption_tests {
+             ))
+         }
+ 
++        async fn workload_address(&self, _id: &SandboxId) -> SandboxResult<String> {
++            Ok("127.0.0.1".to_owned())
++        }
++
+         async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+             self.open_count.fetch_add(1, Ordering::SeqCst);
+             self.ios
+@@ -9582,6 +9640,73 @@ mod adoption_tests {
+         )
      }
  
 +    #[tokio::test]
-+    async fn approval_principals_cannot_escape_through_agent_or_tool_hosts() {
++    async fn approval_principals_cannot_escape_through_sessions_or_codemode() {
 +        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
 +        let store = PgSessionStore::new(pool);
 +        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
-+        let runtime = runtime_with(&store, backend.clone());
++        let runtime = runtime_with(&store, backend.clone()).with_codemode("test-image");
 +        let policy = runtime
 +            .resolve_tool_host_call_policy("prn_executor")
 +            .await
@@ -520,26 +573,10 @@ index 7aebe309..39e963ee 100644
 +            )
 +            .await;
 +        assert!(matches!(error, Err(SessionRuntimeError::BadRequest(_))));
-+        assert!(
-+            runtime
-+                .run_tool_host_call(
-+                    ToolHostCallInput {
-+                        principal_id: "prn_executor".into(),
-+                        console_user_email: None,
-+                        console_user_name: None,
-+                        token_id: None,
-+                        tool_name: "protected".into(),
-+                        invocation: ToolHostInvocation::V1 {
-+                            method: "start".into(),
-+                            arguments: json!({})
-+                        },
-+                        timeout: Duration::from_secs(1),
-+                    },
-+                    policy
-+                )
-+                .await
-+                .is_err()
-+        );
++        assert!(matches!(
++            runtime.codemode_endpoint(&policy).await,
++            Err(SessionRuntimeError::BadRequest(_))
++        ));
 +        // The test registrar gives every record the foreign ID "test".
 +        runtime.reserve_workflow_principal("test");
 +        assert!(
@@ -550,6 +587,29 @@ index 7aebe309..39e963ee 100644
 +        );
 +        assert_eq!(backend.open_count.load(Ordering::SeqCst), 0);
 +        assert!(backend.created_specs.lock().unwrap().is_empty());
++    }
++
++    #[tokio::test]
++    async fn reserving_a_principal_denies_its_cached_codemode_endpoint() {
++        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
++        let store = PgSessionStore::new(pool);
++        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
++        let runtime = runtime_with(&store, backend.clone()).with_codemode("test-image");
++        let policy = runtime
++            .resolve_tool_host_call_policy("prn_executor")
++            .await
++            .unwrap();
++
++        let endpoint = runtime.codemode_endpoint(&policy).await.unwrap();
++        assert_eq!(runtime.codemode_endpoint(&policy).await.unwrap(), endpoint);
++        assert_eq!(backend.created_specs.lock().unwrap().len(), 1);
++
++        runtime.reserve_workflow_principal("prn_executor");
++        assert!(matches!(
++            runtime.codemode_endpoint(&policy).await,
++            Err(SessionRuntimeError::BadRequest(reason)) if reason.contains("reserved")
++        ));
++        assert_eq!(backend.created_specs.lock().unwrap().len(), 1);
 +    }
 +
      fn runtime_with_personas(store: &PgSessionStore, backend: Arc<MockBackend>) -> SessionRuntime {
@@ -620,6 +680,30 @@ index 00000000..1857c468
 +    drop column revision;
 +drop index tool_approvals_one_executing_per_executor;
 +create unique index tool_approvals_workflow_task on tool_approvals(workflow_task_id);
+diff --git a/crates/centaur-session-sqlx/migrations/0057_drop_sessions_harness_type_supported.sql b/crates/centaur-session-sqlx/migrations/0059_drop_sessions_harness_type_supported.sql
+similarity index 100%
+rename from crates/centaur-session-sqlx/migrations/0057_drop_sessions_harness_type_supported.sql
+rename to crates/centaur-session-sqlx/migrations/0059_drop_sessions_harness_type_supported.sql
+diff --git a/crates/centaur-session-sqlx/migrations/0058_remove_centaur_user_email_override.sql b/crates/centaur-session-sqlx/migrations/0060_remove_centaur_user_email_override.sql
+similarity index 100%
+rename from crates/centaur-session-sqlx/migrations/0058_remove_centaur_user_email_override.sql
+rename to crates/centaur-session-sqlx/migrations/0060_remove_centaur_user_email_override.sql
+diff --git a/crates/centaur-session-sqlx/migrations/0059_drop_centaur_readonly_role.sql b/crates/centaur-session-sqlx/migrations/0061_drop_centaur_readonly_role.sql
+similarity index 100%
+rename from crates/centaur-session-sqlx/migrations/0059_drop_centaur_readonly_role.sql
+rename to crates/centaur-session-sqlx/migrations/0061_drop_centaur_readonly_role.sql
+diff --git a/crates/centaur-session-sqlx/migrations/0060_slack_external_team_allowlist.sql b/crates/centaur-session-sqlx/migrations/0062_slack_external_team_allowlist.sql
+similarity index 100%
+rename from crates/centaur-session-sqlx/migrations/0060_slack_external_team_allowlist.sql
+rename to crates/centaur-session-sqlx/migrations/0062_slack_external_team_allowlist.sql
+diff --git a/crates/centaur-session-sqlx/search-migrations/paradedb/0056_company_context_text_search.sql b/crates/centaur-session-sqlx/search-migrations/paradedb/0058_company_context_text_search.sql
+similarity index 100%
+rename from crates/centaur-session-sqlx/search-migrations/paradedb/0056_company_context_text_search.sql
+rename to crates/centaur-session-sqlx/search-migrations/paradedb/0058_company_context_text_search.sql
+diff --git a/crates/centaur-session-sqlx/search-migrations/postgres/0056_company_context_text_search.sql b/crates/centaur-session-sqlx/search-migrations/postgres/0058_company_context_text_search.sql
+similarity index 100%
+rename from crates/centaur-session-sqlx/search-migrations/postgres/0056_company_context_text_search.sql
+rename to crates/centaur-session-sqlx/search-migrations/postgres/0058_company_context_text_search.sql
 diff --git a/crates/centaur-workflows/Cargo.toml b/crates/centaur-workflows/Cargo.toml
 index d360e82a..d1e44c12 100644
 --- a/crates/centaur-workflows/Cargo.toml
@@ -712,10 +796,10 @@ index 00000000..3516ab5a
 +}
 diff --git a/crates/centaur-workflows/src/approvals.rs b/crates/centaur-workflows/src/approvals.rs
 new file mode 100644
-index 00000000..5dd59a72
+index 00000000..b110be1c
 --- /dev/null
 +++ b/crates/centaur-workflows/src/approvals.rs
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,353 @@
 +//! One-shot authorization; scheduling, Slack transport and execution use workflows.
 +use super::*;
 +use sha2::{Digest, Sha256};
@@ -731,6 +815,23 @@ index 00000000..5dd59a72
 +pub const DRIVER_WORKFLOW: &str = "centaur_approval_request";
 +pub const DECISION_WORKFLOW: &str = "centaur_approval_decision";
 +pub const EVENT_PREFIX: &str = "centaur.approval:";
++
++/// Safe feedback for an authenticated click on its original approval card.
++/// Untrusted/mismatched buttons still receive the generic unavailable error.
++#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++pub enum DecisionRejection {
++    NotApprover,
++    SelfApprovalNotAllowed,
++    PolicyChanged,
++    Expired,
++    AlreadyApproved,
++    AlreadyDeclined,
++    Cancelled,
++    Executing,
++    Succeeded,
++    Unknown,
++}
 +
 +pub fn is_reserved(name: &str) -> bool {
 +    name.starts_with("centaur_approval_")
@@ -866,6 +967,10 @@ index 00000000..5dd59a72
 +
 +pub(super) fn unavailable() -> WorkflowRuntimeError {
 +    WorkflowRuntimeError::Disabled("approval unavailable".into())
++}
++
++fn rejected(reason: DecisionRejection) -> WorkflowRuntimeError {
++    WorkflowRuntimeError::ApprovalDecisionRejected(reason)
 +}
 +
 +fn identifier(s: &str) -> bool {
@@ -1203,10 +1308,10 @@ index 00000000..443e0630
 +}
 diff --git a/crates/centaur-workflows/src/approvals/repository.rs b/crates/centaur-workflows/src/approvals/repository.rs
 new file mode 100644
-index 00000000..c51c7efc
+index 00000000..72376ef3
 --- /dev/null
 +++ b/crates/centaur-workflows/src/approvals/repository.rs
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,385 @@
 +use super::*;
 +use sqlx::Row;
 +
@@ -1400,10 +1505,19 @@ index 00000000..c51c7efc
 +        validate_decision(p, &row, &input, button.message.as_ref())?;
 +        let user = input["click"]["user_id"].as_str().ok_or_else(unavailable)?;
 +        let decision = input["click"]["action"].as_str().ok_or_else(unavailable)?;
-+        let changed = sqlx::query("update tool_approvals set status=$2,decided_by=$3,decided_at=now() where id=$1 and status='pending' and expires_at>now()")
++        let changed = sqlx::query("update tool_approvals set status=$2,decided_by=$3,decided_at=clock_timestamp() where id=$1 and status='pending' and expires_at>clock_timestamp()")
 +            .bind(id).bind(decision).bind(user).execute(&mut *tx).await?.rows_affected();
 +        if changed == 0 && !(row.status == decision && row.decided_by.as_deref() == Some(user)) {
-+            return Err(unavailable());
++            return Err(rejected(match row.status.as_str() {
++                "pending" | "expired" => DecisionRejection::Expired,
++                "approved" => DecisionRejection::AlreadyApproved,
++                "declined" => DecisionRejection::AlreadyDeclined,
++                "cancelled" => DecisionRejection::Cancelled,
++                "executing" => DecisionRejection::Executing,
++                "succeeded" => DecisionRejection::Succeeded,
++                "unknown" => DecisionRejection::Unknown,
++                _ => return Err(unavailable()),
++            }));
 +        }
 +        if changed > 0 {
 +            wake(&self.pool, &mut tx, id).await?;
@@ -1492,11 +1606,8 @@ index 00000000..c51c7efc
 +) -> Result<(), WorkflowRuntimeError> {
 +    let click = &input["click"];
 +    let user = click["user_id"].as_str().unwrap_or_default();
-+    if hash(p) != row.policy_hash
-+        || p.team_id != row.team_id
++    if p.team_id != row.team_id
 +        || click["team_id"] != row.team_id
-+        || !p.approver_user_ids.iter().any(|s| s == user)
-+        || (!p.allow_self_approval && row.requester_id == user)
 +        || !matches!(click["action"].as_str(), Some("approved" | "declined"))
 +        || click["id"] != row.id.to_string()
 +        || click["channel_id"] != row.channel_id
@@ -1510,6 +1621,17 @@ index 00000000..c51c7efc
 +        })
 +    {
 +        return Err(unavailable());
++    }
++    // Reveal actionable reasons only after the original card/message binding
++    // has passed. Non-approvers learn only that they cannot decide this action.
++    if !p.approver_user_ids.iter().any(|s| s == user) {
++        return Err(rejected(DecisionRejection::NotApprover));
++    }
++    if hash(p) != row.policy_hash {
++        return Err(rejected(DecisionRejection::PolicyChanged));
++    }
++    if !p.allow_self_approval && row.requester_id == user {
++        return Err(rejected(DecisionRejection::SelfApprovalNotAllowed));
 +    }
 +    Ok(())
 +}
@@ -1577,10 +1699,10 @@ index 00000000..c51c7efc
 +}
 diff --git a/crates/centaur-workflows/src/approvals/runner.rs b/crates/centaur-workflows/src/approvals/runner.rs
 new file mode 100644
-index 00000000..f1dc8caf
+index 00000000..a92bbba8
 --- /dev/null
 +++ b/crates/centaur-workflows/src/approvals/runner.rs
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,313 @@
 +use super::repository::Record;
 +use super::*;
 +
@@ -1623,16 +1745,37 @@ index 00000000..f1dc8caf
 +
 +pub(super) fn final_message(
 +    id: Uuid,
++    action: &str,
 +    status: &str,
 +    result: Option<&Value>,
 +    policy: Option<&ActionPolicy>,
 +) -> Value {
-+    let mut text = format!("Approval {id}: {status}.");
-+    if status == "unknown" {
-+        text.push_str(" Inspect the provider outcome before submitting another request.");
-+    }
-+    let mut blocks = vec![json!({"type":"section","text":{
-+        "type":"plain_text","emoji":false,"text":text}})];
++    let (label, detail) = match status {
++        "succeeded" => ("Completed", "The action completed successfully."),
++        "declined" => (
++            "Declined",
++            "The action did not run. Start a new request if you want to approve it.",
++        ),
++        "expired" => (
++            "Expired",
++            "The request expired before the action ran. Start a new request to try again.",
++        ),
++        "cancelled" => (
++            "Cancelled",
++            "The action did not run. Start a new request if it is still needed.",
++        ),
++        "unknown" => (
++            "Outcome uncertain",
++            "The action may have run. Inspect the provider outcome before submitting another request.",
++        ),
++        _ => ("Processing", "The request is still being processed."),
++    };
++    let title = format!("{label}: {action}");
++    let mut text = format!("{title}. {detail}");
++    let mut blocks = vec![
++        json!({"type":"header","text":{"type":"plain_text","emoji":false,"text":title}}),
++        json!({"type":"section","text":{"type":"plain_text","emoji":false,"text":detail}}),
++    ];
 +    if status == "succeeded"
 +        && let Some(policy) = policy.filter(|p| !p.public_result_fields.is_empty())
 +        && let Some(raw) = result.and_then(|value| value.get("output"))
@@ -1641,13 +1784,31 @@ index 00000000..f1dc8caf
 +        // Only the deliberately published projection is persisted here. Never
 +        // use the raw workflow result in a Slack message or fallback text.
 +        if let Ok(display) = display_json(&output) {
-+            blocks.push(json!({"type":"section","text":{
-+                "type":"plain_text","emoji":false,"text":display}}));
++            blocks.push(preformatted(&display));
 +            text.push('\n');
 +            text.push_str(&display);
 +        }
 +    }
++    if status == "succeeded" && result.is_some_and(|r| r["output_omitted"] == true) {
++        let detail = "The result could not be displayed. The action succeeded; do not rerun it just to recover the output.";
++        blocks.push(
++            json!({"type":"section","text":{"type":"plain_text","emoji":false,"text":detail}}),
++        );
++        text.push('\n');
++        text.push_str(detail);
++    }
++    blocks.push(
++        json!({"type":"context","elements":[{"type":"plain_text","emoji":false,
++        "text":format!("Request {id}")}]}),
++    );
 +    json!({"text":text,"blocks":blocks,"mrkdwn":false})
++}
++
++fn preformatted(text: &str) -> Value {
++    // Native preformatted text preserves indentation without interpreting
++    // markdown, mentions or embedded triple backticks from JSON strings.
++    json!({"type":"rich_text","elements":[{"type":"rich_text_preformatted","border":0,
++        "elements":[{"type":"text","text":text}]}]})
 +}
 +
 +pub(super) fn validate_executor(
@@ -1668,27 +1829,46 @@ index 00000000..f1dc8caf
 +    Ok(())
 +}
 +
-+fn card(row: &Record) -> Value {
++pub(super) fn card(row: &Record) -> Value {
++    let requester = if slack_id(&row.requester_id, 'U') || slack_id(&row.requester_id, 'W') {
++        format!("<@{}>", row.requester_id)
++    } else {
++        "Unknown requester".into()
++    };
 +    let mut blocks = vec![
++        json!({"type":"header","text":{"type":"plain_text","emoji":false,
++            "text":format!("Approval required: {}",row.action)}}),
++        json!({"type":"section","fields":[
++            {"type":"mrkdwn","verbatim":false,"text":format!("*Requested by*\n{requester}")},
++            {"type":"mrkdwn","verbatim":false,"text":format!("*Expires*\n<!date^{}^{{date_short_pretty}} at {{time}}|{} UTC>",
++                row.expires_at.timestamp(),row.expires_at.format("%Y-%m-%d %H:%M"))}
++        ]}),
 +        json!({"type":"section","text":{"type":"plain_text","emoji":false,
-+        "text":format!("Approve action {}? Requested by {}. Expires {}.\nPayload SHA-256: {}",
-+            row.action,row.requester_id,row.expires_at,row.payload_hash)}}),
++            "text":"Review the request below, then choose Approve or Decline."}}),
 +    ];
 +    for chunk in row.payload_json.as_bytes().chunks(2900) {
-+        blocks.push(
-+            json!({"type":"section","text":{"type":"plain_text","emoji":false,
-+            "text":std::str::from_utf8(chunk).expect("display is ASCII")}}),
-+        );
++        blocks.push(preformatted(
++            std::str::from_utf8(chunk).expect("display is ASCII"),
++        ));
 +    }
-+    let buttons = [("approved", "Accept"), ("declined", "Decline")].map(|(action, label)| {
++    let buttons = [
++        ("approved", "Approve", "primary"),
++        ("declined", "Decline", "danger"),
++    ]
++    .map(|(action, label, style)| {
 +        json!({"type":"button","text":{"type":"plain_text","text":label},
++            "style":style,
 +            "action_id":format!("centaur.workflow.action:{}:{action}",row.id),
 +            "value":json!({"workflow_name":DECISION_WORKFLOW,
 +                "input":{"approval_id":row.id,"payload_hash":row.payload_hash}}).to_string()})
 +    });
 +    blocks.push(json!({"type":"actions","elements":buttons}));
++    blocks.push(
++        json!({"type":"context","elements":[{"type":"plain_text","emoji":false,
++        "text":format!("Request {} · Payload SHA-256: {}",row.id,row.payload_hash)}]}),
++    );
 +    json!({"channel":row.channel_id,"thread_ts":row.thread_ts,"client_msg_id":row.id.to_string(),
-+        "text":format!("Approval requested: {}",row.action),"blocks":blocks,"unfurl_links":false,"unfurl_media":false})
++        "text":format!("Approval requested: {}",row.action),"blocks":blocks,"mrkdwn":false,"unfurl_links":false,"unfurl_media":false})
 +}
 +
 +pub(crate) async fn run(
@@ -1814,6 +1994,7 @@ index 00000000..f1dc8caf
 +    if let Some(ts) = &row.message_ts {
 +        let mut message = final_message(
 +            row.id,
++            &row.action,
 +            &row.status,
 +            row.result.as_ref(),
 +            p.filter(|policy| hash(policy) == row.policy_hash),
@@ -1837,10 +2018,10 @@ index 00000000..f1dc8caf
 +}
 diff --git a/crates/centaur-workflows/src/approvals/tests.rs b/crates/centaur-workflows/src/approvals/tests.rs
 new file mode 100644
-index 00000000..a59b7ac1
+index 00000000..2a8e7d0c
 --- /dev/null
 +++ b/crates/centaur-workflows/src/approvals/tests.rs
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,374 @@
 +use super::*;
 +mod execution;
 +mod postgres;
@@ -2011,10 +2192,23 @@ index 00000000..a59b7ac1
 +        result,
 +        json!({"outcome":"succeeded","output":{"message":"Hello world!"}})
 +    );
-+    let message = runner::final_message(Uuid::nil(), status, Some(&result), Some(&p));
++    let message =
++        runner::final_message(Uuid::nil(), "hello-world", status, Some(&result), Some(&p));
 +    assert!(message["text"].as_str().unwrap().contains("Hello world!"));
 +    assert_eq!(message["mrkdwn"], false);
-+    assert_eq!(message["blocks"][1]["text"]["type"], "plain_text");
++    assert_eq!(
++        message["blocks"][2]["elements"][0]["type"],
++        "rich_text_preformatted"
++    );
++    assert_eq!(
++        serde_json::from_str::<Value>(
++            message["blocks"][2]["elements"][0]["elements"][0]["text"]
++                .as_str()
++                .unwrap()
++        )
++        .unwrap(),
++        json!({"message":"Hello world!"})
++    );
 +    assert!(!message.to_string().contains("do-not-publish"));
 +    for status in [
 +        "pending",
@@ -2024,12 +2218,18 @@ index 00000000..a59b7ac1
 +        "cancelled",
 +        "unknown",
 +    ] {
-+        let message = runner::final_message(Uuid::nil(), status, Some(&result), Some(&p));
++        let message =
++            runner::final_message(Uuid::nil(), "hello-world", status, Some(&result), Some(&p));
 +        assert!(!message.to_string().contains("Hello world!"));
 +    }
 +    for policy in [None, Some(policy())] {
-+        let message =
-+            runner::final_message(Uuid::nil(), "succeeded", Some(&result), policy.as_ref());
++        let message = runner::final_message(
++            Uuid::nil(),
++            "hello-world",
++            "succeeded",
++            Some(&result),
++            policy.as_ref(),
++        );
 +        assert!(!message.to_string().contains("Hello world!"));
 +    }
 +}
@@ -2060,16 +2260,33 @@ index 00000000..a59b7ac1
 +}
 +
 +#[test]
-+fn public_output_is_plaintext_and_escaped_in_slack_fallback() {
++fn public_output_cannot_escape_preformatted_text_or_notify_slack_users() {
 +    let mut p = policy();
 +    p.public_result_fields = vec!["message".into()];
-+    let (_, result) = runner::executor_outcome(&p, Ok(json!({"message":"<@U1> & \u{202e}"})));
-+    let message = runner::final_message(Uuid::nil(), "succeeded", Some(&result), Some(&p));
++    let (_, result) = runner::executor_outcome(&p, Ok(json!({"message":"``` <@U1> & \u{202e}"})));
++    let message = runner::final_message(
++        Uuid::nil(),
++        "hello-world",
++        "succeeded",
++        Some(&result),
++        Some(&p),
++    );
 +    let text = message["text"].as_str().unwrap();
 +    assert!(text.is_ascii());
 +    assert!(!text.contains("<@"));
 +    assert!(text.contains("\\u202e"));
-+    assert_eq!(message["blocks"][1]["text"]["emoji"], false);
++    assert_eq!(
++        message["blocks"][2]["elements"][0]["elements"]
++            .as_array()
++            .unwrap()
++            .len(),
++        1
++    );
++    assert_eq!(
++        message["blocks"][2]["elements"][0]["elements"][0]["type"],
++        "text"
++    );
++    assert!(!message.to_string().contains("\"type\":\"user\""));
 +}
 +
 +#[test]
@@ -2106,6 +2323,78 @@ index 00000000..a59b7ac1
 +    let mut forged = generated;
 +    forged[0]["text"]["text"] = json!("other payload");
 +    assert_ne!(visible_blocks(&expected), visible_blocks(&forged));
++}
++
++#[test]
++fn approval_card_formats_the_complete_payload_without_markdown_interpretation() {
++    let mut p = policy();
++    p.public_result_fields = vec!["message".into()];
++    let arguments =
++        json!({"text":format!("``` <@U1> {}", "x".repeat(8000)), "number":9007199254740993_u64});
++    let (payload, payload_json) = payload(&p, arguments).unwrap();
++    let mut row = repository::Record {
++        id: Uuid::nil(),
++        action: "hello-world".into(),
++        policy_hash: hash(&p),
++        payload_hash: hash(&payload),
++        payload,
++        payload_json,
++        team_id: "T1".into(),
++        channel_id: "C1".into(),
++        thread_ts: "1.000".into(),
++        requester_id: "U1".into(),
++        status: "pending".into(),
++        result: None,
++        message_ts: None,
++        message_blocks: None,
++        workflow_task_id: None,
++        workflow_run_id: None,
++        decided_by: None,
++        expires_at: Utc::now(),
++    };
++    let message = runner::card(&row);
++    let blocks = message["blocks"].as_array().unwrap();
++    assert_eq!(blocks[0]["text"]["text"], "Approval required: hello-world");
++    assert!(
++        blocks[1]["fields"][0]["text"]
++            .as_str()
++            .unwrap()
++            .contains("<@U1>")
++    );
++    assert!(
++        blocks[1]["fields"][1]["text"]
++            .as_str()
++            .unwrap()
++            .contains("<!date^")
++    );
++    let mut display = String::new();
++    for block in blocks.iter().filter(|b| b["type"] == "rich_text") {
++        let pre = &block["elements"][0];
++        assert_eq!(pre["type"], "rich_text_preformatted");
++        assert_eq!(pre["elements"].as_array().unwrap().len(), 1);
++        assert_eq!(pre["elements"][0]["type"], "text");
++        let chunk = pre["elements"][0]["text"].as_str().unwrap();
++        assert!(chunk.len() <= 2900);
++        display.push_str(chunk);
++    }
++    assert_eq!(display, row.payload_json);
++    assert_eq!(
++        serde_json::from_str::<Value>(&display).unwrap(),
++        row.payload
++    );
++    assert!(!display.contains("<@"));
++    let buttons = blocks.iter().find(|b| b["type"] == "actions").unwrap();
++    assert_eq!(buttons["elements"][0]["text"]["text"], "Approve");
++    assert_eq!(buttons["elements"][0]["style"], "primary");
++    assert_eq!(buttons["elements"][1]["style"], "danger");
++    row.requester_id = "U1> <!channel".into();
++    let invalid_requester = runner::card(&row);
++    assert_eq!(
++        invalid_requester["blocks"][1]["fields"][0]["text"],
++        "*Requested by*\nUnknown requester"
++    );
++    assert!(!invalid_requester.to_string().contains("<!channel"));
++    assert_eq!(invalid_requester["mrkdwn"], false);
 +}
 diff --git a/crates/centaur-workflows/src/approvals/tests/execution.rs b/crates/centaur-workflows/src/approvals/tests/execution.rs
 new file mode 100644
@@ -2267,10 +2556,10 @@ index 00000000..a093b430
 +}
 diff --git a/crates/centaur-workflows/src/approvals/tests/postgres.rs b/crates/centaur-workflows/src/approvals/tests/postgres.rs
 new file mode 100644
-index 00000000..ef71af0a
+index 00000000..6e931e21
 --- /dev/null
 +++ b/crates/centaur-workflows/src/approvals/tests/postgres.rs
-@@ -0,0 +1,430 @@
+@@ -0,0 +1,606 @@
 +use super::*;
 +
 +#[tokio::test]
@@ -2391,7 +2680,7 @@ index 00000000..ef71af0a
 +    sqlx::query("insert into session_executions(execution_id,thread_key,status,metadata) values('exe_test','slack:C1:1.000','running',$1)")
 +        .bind(json!({"source":"slackbotv2","platform":"slack","slack_team_id":"T1","slack_home_team_id":"T1","slack_channel_id":"C1","slack_user_id":"U2"})).execute(&pool).await.unwrap();
 +    let mut p = policy();
-+    p.approver_user_ids.push("U3".into());
++    p.approver_user_ids.extend(["U2".into(), "U3".into()]);
 +    p.public_result_fields = vec!["message".into()];
 +    let repo = Repository {
 +        pool: pool.clone(),
@@ -2469,17 +2758,49 @@ index 00000000..ef71af0a
 +        },
 +        message: Some(json!({"blocks":blocks})),
 +    };
-+    for user in ["U2", "UUNKNOWN"] {
-+        assert!(repo.decide(button(user, "approved")).await.is_err());
++    for (user, reason) in [
++        ("U2", DecisionRejection::SelfApprovalNotAllowed),
++        ("UUNKNOWN", DecisionRejection::NotApprover),
++    ] {
++        for decision in ["approved", "declined"] {
++            assert!(matches!(repo.decide(button(user, decision)).await,
++                Err(WorkflowRuntimeError::ApprovalDecisionRejected(actual)) if actual == reason));
++            assert_eq!(
++                repo.read(id, identity()).await.unwrap()["status"],
++                "pending"
++            );
++        }
 +    }
 +    for field in ["id", "channel_id", "message_ts", "team_id"] {
 +        let mut forged = button("U1", "approved");
 +        forged.request.input["click"][field] = json!("OTHER");
-+        assert!(repo.decide(forged).await.is_err());
++        assert!(matches!(
++            repo.decide(forged).await,
++            Err(WorkflowRuntimeError::Disabled(_))
++        ));
 +    }
++    let mut changed_policy = p.clone();
++    changed_policy.implementation_revision = "new-reviewed-commit".into();
++    let changed_repo = Repository {
++        pool: pool.clone(),
++        policies: Arc::new(BTreeMap::from([("action".into(), changed_policy)])),
++    };
++    assert!(matches!(
++        changed_repo.decide(button("U1", "approved")).await,
++        Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++            DecisionRejection::PolicyChanged
++        ))
++    ));
++    assert_eq!(
++        repo.read(id, identity()).await.unwrap()["status"],
++        "pending"
++    );
 +    let mut forged = button("U1", "approved");
 +    forged.message.as_mut().unwrap()["blocks"][0]["text"]["text"] = json!("changed");
-+    assert!(repo.decide(forged).await.is_err());
++    assert!(matches!(
++        repo.decide(forged).await,
++        Err(WorkflowRuntimeError::Disabled(_))
++    ));
 +    // Requests survive the agent turn ending.
 +    sqlx::query("update session_executions set status='completed' where execution_id='exe_test'")
 +        .execute(&pool)
@@ -2505,6 +2826,12 @@ index 00000000..ef71af0a
 +        1
 +    );
 +    repo.recover(id).await.unwrap();
++    assert!(matches!(
++        repo.decide(button("U1", "approved")).await,
++        Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++            DecisionRejection::Unknown
++        ))
++    ));
 +    assert_eq!(
 +        repo.read(id, identity()).await.unwrap()["status"],
 +        "unknown"
@@ -2542,6 +2869,7 @@ index 00000000..ef71af0a
 +    assert_eq!(loaded.result.as_ref(), Some(&completed["result"]));
 +    let message = runner::final_message(
 +        id,
++        &loaded.action,
 +        &loaded.status,
 +        loaded.result.as_ref(),
 +        Some(&public_policy),
@@ -2575,7 +2903,13 @@ index 00000000..ef71af0a
 +            .await
 +            .unwrap();
 +        assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
-+        assert!(repo.decide(button("U1", "approved")).await.is_err());
++        let reason = if expired {
++            DecisionRejection::Expired
++        } else {
++            DecisionRejection::Cancelled
++        };
++        assert!(matches!(repo.decide(button("U1", "approved")).await,
++            Err(WorkflowRuntimeError::ApprovalDecisionRejected(actual)) if actual == reason));
 +    }
 +    // Repair uses durable native terminal state, including when the worker
 +    // never ran again. Known results are preserved and no authority is restored.
@@ -2694,6 +3028,137 @@ index 00000000..ef71af0a
 +    assert_eq!(repo.read(id, identity()).await.unwrap()["status"], expected);
 +    assert!(repo.decide(button("U1", "approved")).await.is_err());
 +    assert!(repo.claim(id, &p).await.unwrap().is_none());
++
++    // Opting in to self-approval still checks the approver allowlist, binds the
++    // complete signed/preformatted card, and never allows a second decision.
++    sqlx::query("update session_executions set status='running' where execution_id='exe_test'")
++        .execute(&pool)
++        .await
++        .unwrap();
++    let mut self_policy = p.clone();
++    self_policy.allow_self_approval = true;
++    let self_repo = Repository {
++        pool: pool.clone(),
++        policies: Arc::new(BTreeMap::from([("action".into(), self_policy.clone())])),
++    };
++    for decision in ["approved", "declined"] {
++        let admitted = self_repo
++            .request(req(Uuid::new_v4(), json!({})), &client)
++            .await
++            .unwrap();
++        let self_id: Uuid = serde_json::from_value(admitted["id"].clone()).unwrap();
++        let self_row: repository::Record =
++            sqlx::query_as("select * from tool_approvals where id=$1")
++                .bind(self_id)
++                .fetch_one(&pool)
++                .await
++                .unwrap();
++        let mut message = runner::card(&self_row);
++        slack_buttons::sign_message(&mut message, b"test-secret").unwrap();
++        sqlx::query("update tool_approvals set message_ts='3.000',message_blocks=$2 where id=$1")
++            .bind(self_id)
++            .bind(&message["blocks"])
++            .execute(&pool)
++            .await
++            .unwrap();
++        let click = |user: &str, action: &str| {
++            let buttons = message["blocks"]
++                .as_array()
++                .unwrap()
++                .iter()
++                .find(|b| b["type"] == "actions")
++                .unwrap();
++            let button = &buttons["elements"][usize::from(action == "declined")];
++            let mut echoed = message.clone();
++            // Slack adds generated block IDs; visible contents remain bound.
++            for (index, block) in echoed["blocks"]
++                .as_array_mut()
++                .unwrap()
++                .iter_mut()
++                .enumerate()
++            {
++                block["block_id"] = json!(format!("slack-{index}"));
++            }
++            slack_buttons::verify_button(slack_buttons::Invocation {
++                button: button["value"].as_str().unwrap().into(),
++                click: json!({"id":self_id,"action":action,"channel_id":"C1","message_ts":"3.000",
++                    "team_id":"T1","user_id":user,"action_ts":"4.000"}),
++                idempotency_key: "self-approval-click".into(),
++                message: Some(echoed),
++            }, b"test-secret").unwrap()
++        };
++        assert!(matches!(
++            self_repo.decide(click("UUNKNOWN", decision)).await,
++            Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++                DecisionRejection::NotApprover
++            ))
++        ));
++        let accepted = self_repo.decide(click("U2", decision)).await.unwrap();
++        assert!(accepted.created);
++        assert_eq!(accepted.status, decision);
++        assert!(
++            !self_repo
++                .decide(click("U2", decision))
++                .await
++                .unwrap()
++                .created
++        );
++        let opposite = if decision == "approved" {
++            "declined"
++        } else {
++            "approved"
++        };
++        let expected = if decision == "approved" {
++            DecisionRejection::AlreadyApproved
++        } else {
++            DecisionRejection::AlreadyDeclined
++        };
++        assert!(matches!(self_repo.decide(click("U2", opposite)).await,
++            Err(WorkflowRuntimeError::ApprovalDecisionRejected(reason)) if reason == expected));
++        let saved = self_repo.read(self_id, identity()).await.unwrap();
++        assert_eq!(saved["status"], decision);
++        assert_eq!(saved["decided_by"], "U2");
++        if decision == "approved" {
++            assert!(
++                self_repo
++                    .claim(self_id, &self_policy)
++                    .await
++                    .unwrap()
++                    .is_some()
++            );
++            assert!(
++                self_repo
++                    .claim(self_id, &self_policy)
++                    .await
++                    .unwrap()
++                    .is_none()
++            );
++            assert!(matches!(
++                self_repo.decide(click("U2", "approved")).await,
++                Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++                    DecisionRejection::Executing
++                ))
++            ));
++            self_repo
++                .finish(self_id, &self_policy, hello())
++                .await
++                .unwrap();
++            assert!(matches!(
++                self_repo.decide(click("U2", "approved")).await,
++                Err(WorkflowRuntimeError::ApprovalDecisionRejected(
++                    DecisionRejection::Succeeded
++                ))
++            ));
++        } else {
++            assert!(
++                self_repo
++                    .claim(self_id, &self_policy)
++                    .await
++                    .unwrap()
++                    .is_none()
++            );
++        }
++    }
 +    pool.close().await;
 +    sqlx::query(&format!("drop schema {schema} cascade"))
 +        .execute(&admin)
@@ -2702,7 +3167,7 @@ index 00000000..ef71af0a
 +    admin.close().await;
 +}
 diff --git a/crates/centaur-workflows/src/lib.rs b/crates/centaur-workflows/src/lib.rs
-index 8c807fdf..b5383a8a 100644
+index 8c807fdf..7401af26 100644
 --- a/crates/centaur-workflows/src/lib.rs
 +++ b/crates/centaur-workflows/src/lib.rs
 @@ -38,6 +38,8 @@ use tokio::{
@@ -3218,7 +3683,18 @@ index 8c807fdf..b5383a8a 100644
      WorkflowEnablement::from_env()?.ensure_enabled(workflow_name)?;
      let child_input = message.get("input").cloned().unwrap_or_else(|| json!({}));
      if !child_input.is_object() {
-@@ -5463,6 +5650,7 @@ mod tests {
+@@ -4666,6 +4853,10 @@ pub enum WorkflowRuntimeError {
+     /// HTTP 403.
+     #[error("{0}")]
+     Disabled(String),
++    /// An authenticated approval click was rejected. Maps to HTTP 403 with a
++    /// stable reason; no payload or executor error is exposed to the client.
++    #[error("approval decision rejected: {0:?}")]
++    ApprovalDecisionRejected(approvals::DecisionRejection),
+     #[error("workflow run not found: {0}")]
+     NotFound(String),
+     /// Server-side failure (workflow host spawn/protocol, internal dispatch).
+@@ -5463,6 +5654,7 @@ mod tests {
      #[test]
      fn required_workflow_principal_fails_closed_when_unregistered() {
          let assignments = WorkflowPrincipalAssignments {
@@ -3263,12 +3739,25 @@ index b172a2c1..b146dc00 100644
  fn button_mac(secret: &[u8]) -> Hmac<Sha256> {
      let mut derive = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
      derive.update(b"centaur:workflow-buttons:v1");
+diff --git a/e2e/tests/workflows.test.ts b/e2e/tests/workflows.test.ts
+index c53e2818..8a2b4069 100644
+--- a/e2e/tests/workflows.test.ts
++++ b/e2e/tests/workflows.test.ts
+@@ -285,7 +285,7 @@ test('a workflow button click starts its target once, for the person who clicked
+   // clicker is told so.
+   expect((await slack.click(CHANNEL, posted.ts, approve, { value: 'v1.forged.signature' })).status).toBe(200)
+   await eventually('the refusal to reach the clicker', 30_000, async () =>
+-    (await slack.ephemeral(USER)).some(ephemeral => ephemeral.text === 'This request is no longer available.')
++    (await slack.ephemeral(USER)).some(ephemeral => ephemeral.text.startsWith('This button could not be verified'))
+       ? true
+       : undefined
+   )
 diff --git a/services/api-rs/rfcs/0006-tool-approvals.md b/services/api-rs/rfcs/0006-tool-approvals.md
 new file mode 100644
-index 00000000..e668305c
+index 00000000..5f8d3c3e
 --- /dev/null
 +++ b/services/api-rs/rfcs/0006-tool-approvals.md
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,258 @@
 +# RFC 0006: Workflow-native approvals
 +
 +Status: Implemented, opt-in; credentialed end-to-end proof required before activation.
@@ -3294,7 +3783,7 @@ index 00000000..e668305c
 +2. Core validates the action policy and registered executor. It freezes the full
 +   JSON arguments, policy hash and payload hash. Request insertion and enqueue
 +   of the native approval driver commit in one PostgreSQL transaction.
-+3. The driver posts plaintext payload sections and signed native
++3. The driver posts indented JSON in native preformatted blocks and signed native
 +   `centaur.workflow.action:` buttons. It stores the original message timestamp
 +   and complete signed card, then suspends on a durable event.
 +4. Existing Slack ingress verifies Slack's webhook signature. The native
@@ -3302,8 +3791,10 @@ index 00000000..e668305c
 +   additionally require the Slack ingress service identity; ordinary workflow
 +   input and its `click.user_id` field are never authority.
 +5. Core checks current policy hash, team, channel, original message/card, payload
-+   hash, expiry, allowlisted actor and self-approval policy. One locked transition
-+   chooses the decision; the update and native wake event are atomic.
++   hash, expiry, allowlisted actor and self-approval policy. Authenticated original-card clicks receive a typed rejection reason for
++   unauthorized actors, self-approval restrictions, changed policy, expiry or an
++   existing decision. Untrusted/mismatched cards remain generically unavailable.
++   One locked transition chooses the decision; the update and native wake event are atomic.
 +6. Immediately before execution, core verifies enablement, approval-only marker
 +   and exact registered principal. One compare-and-set commits
 +   `approved -> executing`. The existing workflow host runs the pinned executor
@@ -3403,7 +3894,7 @@ index 00000000..e668305c
 +and must not be repeated merely to recover output.
 +
 +Selected fields are persisted as `result.output`, returned to the requesting
-+bot by the CLI/status API, and displayed as plaintext in the final Slack card.
++bot by the CLI/status API, and displayed as indented, preformatted JSON in the final Slack card.
 +All unselected fields and all executor errors remain private. This is an
 +explicit publication policy, **not a secret scanner**: only select fields that
 +reviewed executor code guarantees are non-secret. The field list is displayed
@@ -3452,7 +3943,9 @@ index 00000000..e668305c
 +
 +Slack post/checkpoint failure can leave a duplicate card. Only the recorded
 +original message/card can authorize the request. Final-message delivery retries
-+do not invoke the executor again.
++do not invoke the executor again. The clicker receives private feedback only
++after the decision commits. Duplicate decisions do not execute again; a declined
++request cannot later be approved. Use a fresh request for each decision test.
 +
 +Approval status includes `workflow_task_id` and `workflow_run_id` for the native
 +workflow history. Cancelling that native run also reconciles its approval:
@@ -3500,7 +3993,7 @@ index 00000000..e668305c
 +
 +The complete argument object, workflow, executor principal and implementation
 +revision must fit in 12,000 displayed JSON bytes; oversized payloads are rejected,
-+never truncated. Plaintext sections preserve large integers and use JSON escapes
++never truncated. Preformatted text blocks preserve large integers and use JSON escapes
 +for Unicode and Slack delimiters. Everyone in the thread can read the arguments.
 +Never include secrets. Do not approve deferred mutable URLs/files/draft IDs;
 +snapshot their contents first. The approval covers the reviewed executor's
@@ -3594,11 +4087,11 @@ index 00000000..533caf9b
 +  end
 +end
 diff --git a/services/console/app/services/centaur_api_client.rb b/services/console/app/services/centaur_api_client.rb
-index 16f28e19..7d9a0ec0 100644
+index a908eb5a..ee3416a8 100644
 --- a/services/console/app/services/centaur_api_client.rb
 +++ b/services/console/app/services/centaur_api_client.rb
-@@ -109,6 +109,22 @@ class CentaurApiClient
-     post("/api/workflows/runs", payload)
+@@ -117,6 +117,22 @@ class CentaurApiClient
+     post("/api/scheduled-tasks/#{escape_path(task_oid)}/runs", payload)
    end
  
 +  def tool_approval_context(identity)
@@ -3686,6 +4179,186 @@ index 00000000..f5c2a4ad
 +    end
 +  end
 +end
+diff --git a/services/slackbotv2/src/index.ts b/services/slackbotv2/src/index.ts
+index 4c998cc6..e7c1b06b 100644
+--- a/services/slackbotv2/src/index.ts
++++ b/services/slackbotv2/src/index.ts
+@@ -74,6 +74,7 @@ import {
+   sessionStreamError,
+   slackApiTimeoutMs,
+   WORKFLOW_ACTION_PREFIX,
++  workflowActionFeedback,
+   withSlackApiTimeout
+ } from './session-api'
+ import {
+@@ -442,17 +443,17 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
+     }
+     try {
+       const result = await dispatchSlackBlockAction(options, payload)
+-      // The workflow owns the message and its final button state. Successful
+-      // handoff (including redelivery) only needs Slack's native acknowledgment;
+-      // a separate success message adds noise before the actual result arrives.
+-      if (result?.outcome === 'unavailable' && payload.channel_id) {
++      // Decisions have committed before feedback. The workflow still owns the
++      // shared card and execution result; feedback is private to the clicker.
++      const feedback = workflowActionFeedback(result)
++      if (feedback && payload.channel_id) {
+         backgroundWaitUntil(
+           withSlackApiTimeout(options, 'post workflow action feedback', () =>
+             callSlackApi('chat.postEphemeral', {
+               channel: payload.channel_id,
+               user: payload.user_id,
+               ...(payload.thread_ts ? { thread_ts: payload.thread_ts } : {}),
+-              text: 'This request is no longer available.'
++              text: feedback
+             }, {
+               apiUrl: options.slackApiUrl,
+               fetch: options.fetch as typeof globalThis.fetch | undefined,
+diff --git a/services/slackbotv2/src/session-api.ts b/services/slackbotv2/src/session-api.ts
+index 5677b43f..d1b58233 100644
+--- a/services/slackbotv2/src/session-api.ts
++++ b/services/slackbotv2/src/session-api.ts
+@@ -597,6 +597,41 @@ export const SESSION_STEERING_FAILED_EVENT = 'session.steering_failed'
+ /** Emitted by api-rs while a long execution is still running. */
+ export const SESSION_PROGRESS_UPDATE_EVENT = 'session.progress_update'
+ 
++const approvalDecisionMessages: Record<string, string> = {
++  not_approver: 'You are not an approver for this action. Ask a designated approver to review it.',
++  self_approval_not_allowed: 'You requested this action, and self-approval is disabled. Ask another designated approver to decide, or have someone else submit a new request.',
++  policy_changed: 'The approval settings changed after this request was created. Start a new request using the current settings.',
++  expired: 'This approval request expired. The action did not run. Start a new request to try again.',
++  already_approved: 'This request has already been approved. No additional execution was started.',
++  already_declined: 'This request was already declined, so the action did not run. Start a new request if you want to approve it.',
++  cancelled: 'This request was cancelled. The action did not run. Start a new request if it is still needed.',
++  executing: 'This action is already running. Its result will appear in this thread; do not submit it again.',
++  succeeded: 'This action has already completed. Check its result in this thread. It will not run again from this request.',
++  unknown: 'The action may have run, but its outcome could not be confirmed. Inspect the provider outcome before submitting another request.'
++}
++
++export function workflowActionFeedback(result: JsonObject | undefined): string | undefined {
++  if (result?.outcome === 'unavailable') {
++    // Never display arbitrary API error text or unknown reason codes in Slack.
++    if (typeof result.reason === 'string' && Object.hasOwn(approvalDecisionMessages, result.reason)) {
++      return approvalDecisionMessages[result.reason]
++    }
++    return 'This button could not be verified for the original request. Open the original approval card or check the request status.'
++  }
++  if (result?.outcome === 'accepted' || result?.outcome === 'duplicate') {
++    if (result.status === 'approved') {
++      return result.outcome === 'duplicate'
++        ? 'Your approval is already recorded. No additional execution was started.'
++        : 'Approved. The result will appear in this thread.'
++    }
++    if (result.status === 'declined') {
++      return result.outcome === 'duplicate'
++        ? 'You already declined this request. Start a new request if you want to approve it.'
++        : 'Declined. The action will not run. Start a new request if you want to approve it.'
++    }
++  }
++}
++
+ export async function dispatchSlackBlockAction(
+   options: SlackbotV2Options,
+   payload: SlackbotV2BlockActionPayload
+@@ -647,8 +682,13 @@ export async function dispatchSlackBlockAction(
+     action
+   )
+   if (workflowAction && response.status === 403) {
+-    await response.body?.cancel()
+-    return { outcome: 'unavailable' }
++    const rejection: unknown = await response.json().catch(() => undefined)
++    const reason = isJsonObject(rejection)
++      && rejection.code === 'approval_decision_rejected'
++      && typeof rejection.reason === 'string'
++      && Object.hasOwn(approvalDecisionMessages, rejection.reason)
++      ? rejection.reason : undefined
++    return { outcome: 'unavailable', ...(reason ? { reason } : {}) }
+   }
+   await ensureApiOk(response, action)
+   if (workflowAction) {
+diff --git a/services/slackbotv2/test/chat-sdk-emulate.test.ts b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+index a92da531..fcb0be5e 100644
+--- a/services/slackbotv2/test/chat-sdk-emulate.test.ts
++++ b/services/slackbotv2/test/chat-sdk-emulate.test.ts
+@@ -577,6 +577,8 @@ describe('slackbotv2', () => {
+         ts: '1700000003.000200', text: 'Approve this release?',
+         blocks: [
+           { type: 'section', text: { type: 'mrkdwn', text: 'Approve this release?' } },
++          { type: 'rich_text', block_id: 'slack-generated', elements: [{ type: 'rich_text_preformatted',
++            elements: [{ type: 'text', text: '{\n  "message": "``` <@U1>"\n}' }] }] },
+           { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Approve' },
+             action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+             value: 'v1.opaque-signed-payload.signature' }] }
+@@ -622,6 +624,69 @@ describe('slackbotv2', () => {
+     expect(codexApi.workflowEvents).toHaveLength(0)
+   })
+ 
++  const approvalFeedbackCases = [
++    { name: 'untrusted button', status: 403, body: { error: 'invalid or untrusted workflow button' }, expected: 'could not be verified' },
++    ...[
++      ['not_approver', 'You are not an approver'],
++      ['self_approval_not_allowed', 'self-approval is disabled'],
++      ['policy_changed', 'approval settings changed'],
++      ['expired', 'request expired'],
++      ['already_approved', 'already been approved'],
++      ['already_declined', 'already declined'],
++      ['cancelled', 'request was cancelled'],
++      ['executing', 'already running'],
++      ['succeeded', 'already completed'],
++      ['unknown', 'may have run'],
++      ['constructor', 'could not be verified'],
++      ['unrecognized', 'could not be verified']
++    ].map(([reason, expected]) => ({ name: reason, status: 403,
++      body: { code: 'approval_decision_rejected', reason, error: 'do-not-publish <@USECRET>' }, expected })),
++    ...[
++      ['approved', true, 'Approved.'],
++      ['declined', true, 'Declined.'],
++      ['approved', false, 'approval is already recorded'],
++      ['declined', false, 'already declined']
++    ].map(([status, created, expected]) => ({ name: `${status} created=${created}`, status: 200,
++      body: { ok: true, run_id: 'run-approval', task_id: 'task-approval', status, created }, expected }))
++  ]
++  for (const feedbackCase of approvalFeedbackCases) it(`acknowledges ${feedbackCase.name} with private feedback and no retry`, async () => {
++    let starts = 0
++    const feedback: unknown[] = []
++    bot = createTestBot({
++      fetch: async (input, init) => {
++        if (String(input).endsWith('/api/workflows/actions/invoke')) {
++          starts += 1
++          expect(JSON.parse(String(init?.body)).button).toBe('unsigned')
++          return Response.json(feedbackCase.body, { status: feedbackCase.status })
++        }
++        if (String(input).endsWith('/chat.postEphemeral')) {
++          feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
++          return Response.json({ ok: true })
++        }
++        return globalThis.fetch(input, init)
++      }
++    })
++    const payload = {
++      type: 'block_actions', team: { id: TEAM_ID },
++      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
++      channel: { id: CHANNEL_ID }, message: { ts: '1700000003.000200', thread_ts: '1700000003.000100' },
++      actions: [{ type: 'button', action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
++        action_ts: '1700000004.000200', value: 'unsigned' }]
++    }
++    const waits: Promise<unknown>[] = []
++    const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
++    expect(response.status).toBe(200)
++    await Promise.all(waits)
++    expect(starts).toBe(1)
++    expect(feedback).toEqual([{
++      channel: CHANNEL_ID, user: USER_ID, thread_ts: '1700000003.000100',
++      text: expect.stringContaining(String(feedbackCase.expected))
++    }])
++    expect(JSON.stringify(feedback)).not.toContain('do-not-publish')
++    expect(JSON.stringify(feedback)).not.toContain('USECRET')
++    expect(codexApi.workflowEvents).toHaveLength(0)
++  })
++
+   it('applies the external-org allowlist to Slack block actions', async () => {
+     const interaction = signedSlackInteraction({
+       type: 'block_actions',
 diff --git a/services/workflow-python/tests/test_workflow_host.py b/services/workflow-python/tests/test_workflow_host.py
 index a6c52cd3..7124b5bb 100644
 --- a/services/workflow-python/tests/test_workflow_host.py
@@ -3761,7 +4434,7 @@ index 16ff8a45..8cb8ec5d 100644
              for workflow in workflows.values()
          ],
 diff --git a/tools/README.md b/tools/README.md
-index f8199a9e..767a4385 100644
+index 0753ed4a..83a9795b 100644
 --- a/tools/README.md
 +++ b/tools/README.md
 @@ -61,8 +61,11 @@ my-tool --help

@@ -15,11 +15,17 @@ class ValidationTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.directory = Path(temp.name)
-        self.services = ("agent", "slackbotv2", "linearbot")
+        self.services = ("agent", "codemode", "slackbotv2", "linearbot")
         self.all = {("agent", "linux/amd64"), ("agent", "linux/arm64"),
-                    ("slackbotv2", "linux/amd64"), ("linearbot", "linux/amd64")}
+                    ("slackbotv2", "linux/amd64"), ("linearbot", "linux/amd64"),
+                    ("codemode", "linux/amd64"), ("codemode", "linux/arm64")}
         for service, platform in self.all:
-            sources = ["harness"] if service == "agent" else [f"services/{service}", "packages", "pnpm-lock.yaml"]
+            if service in ("codemode", "agent"):
+                sources = ["Cargo.toml", "Cargo.lock", "crates", "connectors"]
+                if service == "agent":
+                    sources.append("harness")
+            else:
+                sources = [f"services/{service}", "packages", "pnpm-lock.yaml"]
             filename = f"{service}-{platform.split('/')[1]}.json"
             (self.directory / filename).write_text(json.dumps({"inputs": sources, "materials": [["base", "digest"]]}))
 
@@ -31,9 +37,17 @@ class ValidationTests(unittest.TestCase):
 
     def test_isolated_shared_and_probe_changes(self):
         self.assertEqual(self.select(["services/slackbotv2/src/user-input.ts"]), {("slackbotv2", "linux/amd64")})
-        self.assertEqual(self.select(["packages/shared/file"]), {p for p in self.all if p[0] != "agent"})
-        self.assertEqual(self.select([planner.PROBE]), {p for p in self.all if p[0] == "agent"})
+        self.assertEqual(self.select(["packages/shared/file"]), {p for p in self.all if p[0] in ("slackbotv2", "linearbot")})
+        self.assertEqual(self.select([planner.images.AGENT_PROBE]), {p for p in self.all if p[0] == "agent"})
         self.assertEqual(self.select(["docs/intro.md"]), set())
+
+    def test_codemode_inputs_on_both_platforms(self):
+        for path in ("Cargo.toml", "Cargo.lock", "crates/centaur-codemode/src/lib.rs",
+                     "crates/centaur-sandbox-core/src/lib.rs", "connectors/example/index.ts"):
+            with self.subTest(path=path):
+                self.assertEqual(self.select([path]), {p for p in self.all if p[0] in ("codemode", "agent")})
+        self.assertEqual(self.select(["services/codemode/Dockerfile"]),
+                         {p for p in self.all if p[0] == "codemode"})
 
     def test_missing_proof_moved_base_and_ignores(self):
         self.assertEqual(self.select([".dockerignore"]), self.all)

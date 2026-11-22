@@ -8,6 +8,7 @@
 //   const turn = await thread.nextTurn()
 //   expect(turn.reply).toBe('Hello.')
 import { randomUUID } from 'node:crypto'
+import { afterAll } from 'bun:test'
 import { SQL } from 'bun'
 import { BOT, CHANNEL, USER, type SlackUser } from '../fakes/slack-fixture'
 
@@ -225,6 +226,24 @@ export const api = {
   }
 }
 
+/**
+ * Stops the file's idle sandboxes once all its tests finish. Call it at the top
+ * level of every test file.
+ *
+ * A thread keeps its sandbox and iron-proxy pod until it idles out (hours),
+ * so without this a run holds two pods for every thread it opened, and the
+ * single kind node runs out of pods. Bun runs files one at a time, so when a
+ * file's tests are done, every idle sandbox is one of its own finished
+ * threads. api-rs leaves sandboxes with a running execution alone.
+ */
+export function releaseSandboxesAfterAll(): void {
+  afterAll(async () => {
+    const report = await api.ok('POST', '/api/sandboxes/drain')
+    if (report.failed.length > 0) throw new Error(`sandbox release failed: ${JSON.stringify(report.failed)}`)
+    console.log(`released ${report.stopped_count} idle sandboxes; ${report.busy_count} busy`)
+  }, 60_000)
+}
+
 export const cluster = {
   /** Runs a shell script in the api-rs pod, optionally feeding it stdin. */
   async exec(script: string, stdin?: string): Promise<string> {
@@ -327,6 +346,11 @@ export const slack = {
     const { message } = await slackApi<{ message: SlackMessage }>(USER, 'reactions.get', { channel: channel.id, timestamp: ts })
     return message
   },
+  /** A channel's top-level messages, newest first. */
+  async history(channel: Channel): Promise<SlackMessage[]> {
+    const { messages } = await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.history', { channel: channel.id })
+    return messages
+  },
   /** Ephemeral messages a user was shown, oldest first. */
   async ephemeral(user: SlackUser): Promise<Array<{ channel: string; text: string }>> {
     const response = await fetch(`${slackUrl}/_e2e/ephemeral?user=${encodeURIComponent(user.id)}`)
@@ -422,6 +446,122 @@ export const ironControl = {
       from principals where slack_user_id = ${user.id}`
     return row
   }
+}
+
+/** A Console scheduled task, with the columns api-rs writes when it runs it. */
+export type ScheduledTask = {
+  id: number
+  oid: string
+  enabled: boolean
+  nextRunAt: Date | null
+  lastEnqueuedAt: Date | null
+  lastRunAt: Date | null
+  lastRunId: string | null
+  lastError: string | null
+}
+
+/** What happened when a Console user pressed "Run now". */
+export type ScheduledTaskRun = { started: true; runId: string } | { started: false; status: number; message: string }
+
+/**
+ * Console's scheduled tasks. Console stores them; api-rs runs them, on their
+ * schedule and when a user runs one now.
+ */
+export const scheduledTasks = {
+  /**
+   * Creates a task as `as`'s Console account would, delivering to `channel`,
+   * which the bot is in. A null `cron` makes a manual task.
+   */
+  async create(options: { prompt: string; channel: Channel; cron: string | null; as?: SlackUser }): Promise<ScheduledTask> {
+    const user = options.as ?? USER
+    const params = JSON.stringify({
+      name: `e2e-${randomUUID().slice(0, 8)}`,
+      prompt: options.prompt,
+      cron: options.cron,
+      email: user.email,
+      user_name: user.displayName,
+      slack_user_id: user.id,
+      team_id: user.teamId,
+      channel: options.channel.id,
+      channel_name: options.channel.name,
+      bot_user_id: BOT.userId
+    })
+    const out = await consoleRunner(`
+      params = JSON.parse(${JSON.stringify(params)})
+      # Concurrent tests share the user and channel; whichever loses the race
+      # to create them finds the winner's rows on retry.
+      attempts = 0
+      begin
+        user = User.find_or_create_by!(email: params["email"]) { |u| u.name = params["user_name"] }
+        user.update!(status: "active") unless user.active?
+        user.user_identities.find_or_create_by!(provider: "slack", subject: params["slack_user_id"]) do |identity|
+          identity.team_id = params["team_id"]
+        end
+        SlackBotChannel.find_or_initialize_by(team_id: params["team_id"], channel_id: params["channel"]).update!(
+          bot_user_id: params["bot_user_id"], name: params["channel_name"], private: false, active: true, archived: false
+        )
+      rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotUnique
+        attempts += 1
+        retry if attempts < 3
+        raise
+      end
+      task = ScheduledTask.create!(author: user, name: params["name"], prompt: params["prompt"],
+                                   delivery_channel: params["channel"], cron_expression: params["cron"])
+      puts "E2E_RESULT " + { id: task.id }.to_json`)
+    const { id } = consoleResult(out)
+    return scheduledTasks.get(id)
+  },
+  async get(id: number): Promise<ScheduledTask> {
+    // Console stores UTC times without a zone.
+    const [row] = await ironControlDb`
+      select id, enabled, next_run_at at time zone 'UTC' as next_run_at,
+        last_enqueued_at at time zone 'UTC' as last_enqueued_at,
+        last_run_at at time zone 'UTC' as last_run_at, last_run_id, last_error
+      from scheduled_tasks where id = ${id}`
+    if (!row) throw new Error(`scheduled task ${id} does not exist`)
+    const oid = consoleResult(await consoleRunner(`puts "E2E_RESULT " + ScheduledTask.find(${id}).oid.to_json`))
+    return {
+      id: Number(row.id),
+      oid,
+      enabled: row.enabled,
+      nextRunAt: row.next_run_at,
+      lastEnqueuedAt: row.last_enqueued_at,
+      lastRunAt: row.last_run_at,
+      lastRunId: row.last_run_id,
+      lastError: row.last_error
+    }
+  },
+  /** Runs the task now, as its author pressing "Run now" in Console. */
+  async runNow(task: ScheduledTask): Promise<ScheduledTaskRun> {
+    const out = await consoleRunner(`
+      task = ScheduledTask.find(${task.id})
+      result =
+        begin
+          { started: true, runId: ScheduledTaskRunner.call(task)["run_id"] }
+        rescue CentaurApiClient::Error => e
+          { started: false, status: e.status, message: e.message }
+        end
+      puts "E2E_RESULT " + result.to_json`)
+    return consoleResult(out)
+  },
+  /** The author turns the task off in Console. */
+  async disable(task: ScheduledTask): Promise<void> {
+    await consoleRunner(`ScheduledTask.find(${task.id}).update!(enabled: false)`)
+  },
+  /** The bot leaves the channel, as Console's channel catalog would record it. */
+  async botLeaves(channel: Channel): Promise<void> {
+    await consoleRunner(`SlackBotChannel.where(channel_id: ${JSON.stringify(channel.id)}).update_all(active: false)`)
+  }
+}
+
+async function consoleRunner(script: string): Promise<string> {
+  return kubectl({}, 'exec', `deploy/${release}-centaur-console`, '--', 'bin/rails', 'runner', script)
+}
+
+function consoleResult(out: string): any {
+  const line = out.split('\n').find(line => line.startsWith('E2E_RESULT '))
+  if (!line) throw new Error(`the console printed no result: ${out}`)
+  return JSON.parse(line.slice('E2E_RESULT '.length))
 }
 
 /** An API client an operator created in the console, with its one dedicated principal. */
@@ -652,6 +792,11 @@ export class Thread {
     })
   }
 
+  /** Every bot message in the conversation so far, oldest first. */
+  async botReplies(): Promise<SlackMessage[]> {
+    return this.repliesTo(0, { untilNextTrigger: false })
+  }
+
   /** Sandboxes that served this thread, in the order they became ready. */
   async sandboxes(): Promise<Array<{ id: string; harness: string }>> {
     return db`
@@ -685,7 +830,7 @@ export class Thread {
   }
 
   /** Bot messages posted after a turn's trigger and before the next turn's trigger. */
-  private async repliesTo(index: number): Promise<SlackMessage[]> {
+  private async repliesTo(index: number, options: { untilNextTrigger?: boolean } = {}): Promise<SlackMessage[]> {
     const { messages } = this.dm && !this.agentView
       ? await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.history', { channel: this.channel.id })
       : await slackApi<{ messages: SlackMessage[] }>(USER, 'conversations.replies', {
@@ -693,7 +838,7 @@ export class Thread {
         ts: this.ts
       })
     messages.sort((a, b) => (a.ts < b.ts ? -1 : 1))
-    const next = this.triggers[index + 1]
+    const next = options.untilNextTrigger === false ? undefined : this.triggers[index + 1]
     return messages.filter(message =>
       message.bot_id === BOT.id && message.ts > this.triggers[index]! && (!next || message.ts < next)
     )

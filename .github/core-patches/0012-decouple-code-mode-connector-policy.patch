@@ -1,0 +1,1193 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 04b144df..f1d48cd7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -611,6 +611,7 @@ version = "0.1.0"
+ dependencies = [
+  "axum",
+  "base64 0.23.1",
++ "centaur-sandbox-core",
+  "clap",
+  "eyre",
+  "flate2",
+diff --git a/crates/centaur-api-server/src/args.rs b/crates/centaur-api-server/src/args.rs
+index 54f50745..23105ffb 100644
+--- a/crates/centaur-api-server/src/args.rs
++++ b/crates/centaur-api-server/src/args.rs
+@@ -3663,6 +3663,7 @@ mod tests {
+                 {"name":"OTEL_SERVICE_NAME","value":"codex"},
+                 {"name":"CODEX_AUTH_MODE","value":"chatgpt"},
+                 {"name":" TOOL_ALLOWLIST ","value":123},
++                {"name":"CENTAUR_CODEMODE_ALLOWLIST","value":""},
+                 {"name":"NULL_VALUE"},
+                 {"name":"  ","value":"skipped"},
+                 {"name":"BAD=NAME","value":"skipped"}
+@@ -3686,6 +3687,7 @@ mod tests {
+         assert_eq!(value("CODEX_AUTH_MODE"), Some("chatgpt"));
+         // Names are trimmed and non-string values use their JSON representation.
+         assert_eq!(value("TOOL_ALLOWLIST"), Some("123"));
++        assert_eq!(value("CENTAUR_CODEMODE_ALLOWLIST"), Some(""));
+         // Null values become empty strings; invalid names are dropped.
+         assert_eq!(value("NULL_VALUE"), Some(""));
+         assert!(!env.iter().any(|(name, _)| name == "BAD=NAME"));
+diff --git a/crates/centaur-api-server/src/mcp.rs b/crates/centaur-api-server/src/mcp.rs
+index 0dc720d0..feaba4b5 100644
+--- a/crates/centaur-api-server/src/mcp.rs
++++ b/crates/centaur-api-server/src/mcp.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::BTreeSet, env, sync::OnceLock};
++use std::{env, sync::OnceLock};
+ 
+ use axum::{
+     Json,
+@@ -480,21 +480,6 @@ fn prewarm_mcp_codemode_policy(state: &AppState, policy: &ToolHostCallPolicy) {
+     }
+ }
+ 
+-// Unset or empty means no restriction, matching the sandbox installer.
+-fn split_tool_list(raw: &str) -> Option<BTreeSet<String>> {
+-    let entries = raw
+-        .split(',')
+-        .map(str::trim)
+-        .filter(|entry| !entry.is_empty())
+-        .map(str::to_owned)
+-        .collect::<BTreeSet<_>>();
+-    if entries.is_empty() {
+-        None
+-    } else {
+-        Some(entries)
+-    }
+-}
+-
+ fn mcp_whoami_result(principal: &McpPrincipal, arguments: Value) -> Result<Value, ApiError> {
+     if !arguments.is_null() && !arguments.as_object().is_some_and(serde_json::Map::is_empty) {
+         return Err(ApiError::BadRequest(
+diff --git a/crates/centaur-api-server/src/mcp/codemode.rs b/crates/centaur-api-server/src/mcp/codemode.rs
+index 7ebd98a7..2ff372f9 100644
+--- a/crates/centaur-api-server/src/mcp/codemode.rs
++++ b/crates/centaur-api-server/src/mcp/codemode.rs
+@@ -46,10 +46,9 @@ fn client() -> &'static reqwest::Client {
+ 
+ /// The deployment tool filter as the sandbox's policy object.
+ fn policy_json(filter: &ToolHostToolFilter) -> Value {
+-    let split = |raw: Option<&str>| raw.and_then(super::split_tool_list);
+     json!({
+-        "allowlist": split(filter.allowlist.as_deref()),
+-        "blocklist": split(filter.blocklist.as_deref()).unwrap_or_default(),
++        "allowlist": filter.allowlist,
++        "blocklist": filter.blocklist.iter().flatten().collect::<Vec<_>>(),
+     })
+ }
+ 
+@@ -391,10 +390,26 @@ mod tests {
+     }
+ 
+     fn policy(allowlist: Option<&str>, blocklist: Option<&str>) -> Value {
+-        policy_json(&ToolHostToolFilter {
+-            allowlist: allowlist.map(str::to_owned),
+-            blocklist: blocklist.map(str::to_owned),
+-        })
++        policy_json(&ToolHostToolFilter::from_env(|name| match name {
++            "TOOL_ALLOWLIST" => allowlist,
++            "TOOL_BLOCKLIST" => blocklist,
++            _ => None,
++        }))
++    }
++
++    #[test]
++    fn mcp_forwards_an_explicit_empty_allowlist_and_both_blocklists() {
++        let filter = ToolHostToolFilter::from_env(|name| match name {
++            "CENTAUR_CODEMODE_ALLOWLIST" => Some("  "),
++            "TOOL_ALLOWLIST" => Some("attio,linear"),
++            "TOOL_BLOCKLIST" => Some("notion"),
++            "CENTAUR_CODEMODE_BLOCKLIST" => Some("slack"),
++            _ => None,
++        });
++        assert_eq!(
++            policy_json(&filter),
++            json!({"allowlist": [], "blocklist": ["notion", "slack"]})
++        );
+     }
+ 
+     fn text(outcome: &McpToolCallOutcome) -> &str {
+diff --git a/crates/centaur-codemode/Cargo.toml b/crates/centaur-codemode/Cargo.toml
+index b813eef6..d911ce53 100644
+--- a/crates/centaur-codemode/Cargo.toml
++++ b/crates/centaur-codemode/Cargo.toml
+@@ -12,6 +12,7 @@ path = "src/main.rs"
+ 
+ [dependencies]
+ axum.workspace = true
++centaur-sandbox-core.workspace = true
+ base64.workspace = true
+ clap.workspace = true
+ flate2 = "1"
+diff --git a/crates/centaur-codemode/README.md b/crates/centaur-codemode/README.md
+index bee98f0b..16806a68 100644
+--- a/crates/centaur-codemode/README.md
++++ b/crates/centaur-codemode/README.md
+@@ -33,10 +33,22 @@ curl -s localhost:8790/search -d '{"query": "search organizations"}'
+ default `connectors`). A root that is not mounted is skipped (logged at `info`), so
+ overlays a principal cannot see do not break startup; loading with no connectors
+ at all is an error. `--tools slack,crunchbase` limits what a cell sees; the HTTP
+-API sends a per-request policy instead. Every CLI command also applies the
+-deployment filter a Centaur sandbox sets, `TOOL_ALLOWLIST` and
+-`TOOL_BLOCKLIST` (comma-separated connector names, as api-rs sends them to
+-`serve`); `--tools` narrows that allowlist and never widens it.
++API sends a per-request policy instead. Set the following comma-separated names under Helm
++`sandbox.extraEnv` to configure both the CLI and per-principal MCP runners.
++
++- `CENTAUR_CODEMODE_ALLOWLIST` selects the connectors available to Code Mode,
++  independently of the Python tool installer. An empty or whitespace-only value
++  allows zero connectors. When absent, `TOOL_ALLOWLIST` applies with its
++  original behavior (absent or empty means unrestricted).
++- `CENTAUR_CODEMODE_BLOCKLIST` and `TOOL_BLOCKLIST` both deny connectors.
++  Either list takes precedence over an allow.
++- CLI `--tools` and MCP request policies can further narrow the deployment
++  policy. The runner applies it to discovery and to host-side invocation,
++  including after a catalog reload.
++
++The CLI reads policy from its launch environment. For callers with shell access,
++credential and outbound access controls belong at the proxy.
++
+ `list`, `search` and `load` are the CLI forms of the MCP tools
+ `centaur_catalog_search` and `centaur_catalog_load`, so a session sandbox finds
+ connectors the same way an MCP client does. Session sandboxes ship the binary
+@@ -106,8 +118,9 @@ through connectors.
+    the point of I/O (method, URL without query string, status, duration), and
+    every socket closes when its call ends. File operations are recorded the
+    same way (operation, path, bytes).
+-5. `invoke` checks every tool against the principal's allowlist; refusals are
+-   recorded.
++5. `invoke` checks every tool against the deployment and request connector
++   policy; refusals are recorded. Nothing in connector policy authorizes a
++   credential: iron-proxy only injects what a principal holds.
+ 6. Time, memory, call count and call concurrency are bounded per cell,
+    including work done inside connectors.
+ 
+diff --git a/crates/centaur-codemode/src/catalog.rs b/crates/centaur-codemode/src/catalog.rs
+index 8d407f6b..905c32b1 100644
+--- a/crates/centaur-codemode/src/catalog.rs
++++ b/crates/centaur-codemode/src/catalog.rs
+@@ -16,6 +16,7 @@ use std::{
+     sync::Arc,
+ };
+ 
++pub use centaur_sandbox_core::ConnectorPolicy as Policy;
+ use eyre::{Result, WrapErr, bail, eyre};
+ use oxc::{
+     allocator::Allocator,
+@@ -96,6 +97,7 @@ pub struct Catalog {
+     pub files: bool,
+     /// One BM25 document per connector function, built with the catalog.
+     search: Index,
++    pub deployment_policy: Policy,
+ }
+ 
+ impl Catalog {
+@@ -212,9 +214,14 @@ impl Catalog {
+             revision,
+             files,
+             search,
++            deployment_policy: Policy::default(),
+         })
+     }
+ 
++    fn allows(&self, name: &str, request: Option<&Policy>) -> bool {
++        self.deployment_policy.allows(name) && request.is_none_or(|policy| policy.allows(name))
++    }
++
+     /// Connectors visible under a policy; no policy means all of them.
+     pub fn visible<'a>(
+         &'a self,
+@@ -222,7 +229,7 @@ impl Catalog {
+     ) -> impl Iterator<Item = &'a Connector> + 'a {
+         self.connectors
+             .values()
+-            .filter(move |connector| policy.is_none_or(|policy| policy.allows(&connector.name)))
++            .filter(move |connector| self.allows(&connector.name, policy))
+     }
+ 
+     /// The connector a request names exactly, when the policy makes it
+@@ -253,7 +260,7 @@ impl Catalog {
+             .ranked(query)
+             .into_iter()
+             .filter_map(|(index, _)| self.search.documents().get(index))
+-            .filter(|document| policy.is_none_or(|policy| policy.allows(&document.connector)))
++            .filter(|document| self.allows(&document.connector, policy))
+             .take(limit)
+             .map(Document::hit)
+             .collect()
+@@ -775,39 +782,6 @@ fn render(
+         .join("\n")
+ }
+ 
+-/// Which connectors a request may see: the deployment-wide tool filter api-rs
+-/// sends with each request. An entry matches a connector only when it equals
+-/// the connector's name exactly, so `google-docs` does not match `google_docs`.
+-/// No policy, or neither list set, means every connector. Nothing here
+-/// authorizes a credential: iron-proxy only injects what a principal holds.
+-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+-pub struct Policy {
+-    #[serde(default)]
+-    pub allowlist: Option<Vec<String>>,
+-    #[serde(default)]
+-    pub blocklist: Option<Vec<String>>,
+-}
+-
+-impl Policy {
+-    /// An allowlist only, from the CLI's `--tools` or the request's `tools`.
+-    pub fn from_allowlist(names: Vec<String>) -> Self {
+-        Self {
+-            allowlist: Some(names),
+-            blocklist: None,
+-        }
+-    }
+-
+-    /// Not blocklisted, and allowlisted when there is an allowlist.
+-    pub fn allows(&self, name: &str) -> bool {
+-        let listed = |entries: &Option<Vec<String>>| {
+-            entries
+-                .as_deref()
+-                .is_some_and(|entries| entries.iter().any(|entry| entry == name))
+-        };
+-        !listed(&self.blocklist) && (self.allowlist.is_none() || listed(&self.allowlist))
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/centaur-codemode/src/engine.rs b/crates/centaur-codemode/src/engine.rs
+index b1aa050a..6809d64e 100644
+--- a/crates/centaur-codemode/src/engine.rs
++++ b/crates/centaur-codemode/src/engine.rs
+@@ -283,8 +283,10 @@ impl Engine {
+     }
+ 
+     /// Swap in a reloaded catalog; cells already running keep their own.
+-    pub fn replace_catalog(&self, catalog: Arc<Catalog>) {
+-        *self.catalog.write().expect("catalog lock") = catalog;
++    pub fn replace_catalog(&self, mut catalog: Catalog) {
++        let mut current = self.catalog.write().expect("catalog lock");
++        catalog.deployment_policy = current.deployment_policy.clone();
++        *current = Arc::new(catalog);
+     }
+ 
+     /// Per-cell state: the catalog snapshot, the connectors the policy makes
+@@ -1916,6 +1918,14 @@ export async function realm(args: {}, ctx: Ctx): Promise<{ marker: string; json:
+     }
+ 
+     fn engine_with(files: bool, write_context: bool) -> (tempfile::TempDir, Engine) {
++        engine_with_policy(files, write_context, Policy::default())
++    }
++
++    fn engine_with_policy(
++        files: bool,
++        write_context: bool,
++        deployment_policy: Policy,
++    ) -> (tempfile::TempDir, Engine) {
+         let dir = tempfile::tempdir().unwrap();
+         let connector = dir.path().join("connectors").join("demo");
+         std::fs::create_dir_all(&connector).unwrap();
+@@ -1928,7 +1938,8 @@ export async function realm(args: {}, ctx: Ctx): Promise<{ marker: string; json:
+             "export const loud = (text: string): string => text.toUpperCase() + \"!\";",
+         )
+         .unwrap();
+-        let catalog = Catalog::load(&[dir.path().join("connectors")], files).unwrap();
++        let mut catalog = Catalog::load(&[dir.path().join("connectors")], files).unwrap();
++        catalog.deployment_policy = deployment_policy;
+         let context_file = dir.path().join("sandbox.json");
+         if write_context {
+             std::fs::write(
+@@ -2684,18 +2695,8 @@ export async function realm(args: {}, ctx: Ctx): Promise<{ marker: string; json:
+         );
+ 
+         // `invoke` itself refuses, whatever JS calls it with.
+-        let cell = Arc::new(Cell {
+-            catalog: engine.catalog(),
+-            allowed: vec!["other".to_owned()],
+-            context: "null".to_owned(),
+-            http: engine.http.clone(),
+-            ws_http: engine.ws_http.clone(),
+-            files: None,
+-            logs: Mutex::new(Vec::new()),
+-            calls: Mutex::new(Vec::new()),
+-            deadline: Deadline::new(Instant::now() + CELL_TIMEOUT),
+-            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CALLS)),
+-        });
++        let policy = Policy::from_allowlist(vec!["other".to_owned()]);
++        let cell = Arc::new(engine.cell(Some(&policy), Instant::now()).await);
+         for tool in ["demo.echo", "demo.nope", "nope", "other.echo"] {
+             let result = cell.clone().invoke(tool.to_owned(), "{}".to_owned()).await;
+             assert!(result.is_err(), "{tool} must be refused");
+@@ -2709,6 +2710,21 @@ export async function realm(args: {}, ctx: Ctx): Promise<{ marker: string; json:
+         );
+     }
+ 
++    #[tokio::test(flavor = "multi_thread")]
++    async fn invoke_enforces_deployment_policy_even_when_request_policy_names_the_tool() {
++        let (_dir, engine) = engine_with_policy(false, true, Policy::from_allowlist(vec![]));
++        let widening = Policy::from_allowlist(vec!["demo".to_owned()]);
++        let cell = Arc::new(engine.cell(Some(&widening), Instant::now()).await);
++        let result = cell
++            .clone()
++            .invoke("demo.echo".to_owned(), r#"{"text":"hi"}"#.to_owned())
++            .await;
++        assert!(result.is_err(), "deployment policy must refuse demo.echo");
++        let calls = cell.finished_calls();
++        assert_eq!(calls.len(), 1);
++        assert!(!calls[0].ok && calls[0].requests.is_empty());
++    }
++
+     #[tokio::test(flavor = "multi_thread")]
+     async fn connectors_read_the_environment_and_everyone_reads_the_context() {
+         let (_dir, engine) = engine();
+@@ -2793,7 +2809,7 @@ export async function realm(args: {}, ctx: Ctx): Promise<{ marker: string; json:
+                 Some(vec!["demo".to_owned()]),
+                 Some(Policy {
+                     allowlist: None,
+-                    blocklist: Some(vec!["demo".to_owned()]),
++                    blocklist: Some(["demo".to_owned()].into()),
+                 }),
+             ))
+             .await;
+diff --git a/crates/centaur-codemode/src/main.rs b/crates/centaur-codemode/src/main.rs
+index 3030818a..2c93e7a5 100644
+--- a/crates/centaur-codemode/src/main.rs
++++ b/crates/centaur-codemode/src/main.rs
+@@ -10,9 +10,8 @@
+ //! centaur-codemode serve                 HTTP API for api-rs
+ //! ```
+ //!
+-//! Every command but `serve` honors the deployment's tool filter from
+-//! `TOOL_ALLOWLIST` and `TOOL_BLOCKLIST` (as a Centaur sandbox sets them), and
+-//! `--tools` narrows it further.
++//! Every command honors the deployment connector policy. The CLI tool filter
++//! and HTTP request policies can narrow it further.
+ 
+ mod catalog;
+ mod engine;
+@@ -75,55 +74,19 @@ struct Common {
+ }
+ 
+ impl Common {
+-    /// The CLI's tool filter, if any; the HTTP API sends a policy per request
+-    /// instead.
++    /// Additional connector filter for CLI commands.
+     fn policy(&self) -> Option<Policy> {
+-        cli_policy(
+-            self.tools.as_deref(),
+-            std::env::var("TOOL_ALLOWLIST").ok().as_deref(),
+-            std::env::var("TOOL_BLOCKLIST").ok().as_deref(),
+-        )
+-    }
+-}
+-
+-/// `--tools` intersected with the deployment's allowlist, minus its
+-/// blocklist. The deployment lists are comma-separated; unset or empty means
+-/// no restriction, as in the sandbox's tool installer and the MCP policy.
+-fn cli_policy(
+-    tools: Option<&[String]>,
+-    allowlist: Option<&str>,
+-    blocklist: Option<&str>,
+-) -> Option<Policy> {
+-    fn split(raw: Option<&str>) -> Option<Vec<String>> {
+-        let entries: Vec<String> = raw?
+-            .split(',')
+-            .map(str::trim)
+-            .filter(|entry| !entry.is_empty())
+-            .map(str::to_owned)
+-            .collect();
+-        (!entries.is_empty()).then_some(entries)
++        self.tools.as_ref().map(|tools| {
++            Policy::from_allowlist(
++                tools
++                    .iter()
++                    .map(|tool| tool.trim())
++                    .filter(|tool| !tool.is_empty())
++                    .map(str::to_owned)
++                    .collect(),
++            )
++        })
+     }
+-    let tools = tools.map(|tools| {
+-        tools
+-            .iter()
+-            .map(|tool| tool.trim().to_owned())
+-            .filter(|tool| !tool.is_empty())
+-            .collect::<Vec<_>>()
+-    });
+-    let allowlist = match (tools, split(allowlist)) {
+-        (Some(tools), Some(allowed)) => Some(
+-            tools
+-                .into_iter()
+-                .filter(|tool| allowed.contains(tool))
+-                .collect(),
+-        ),
+-        (tools, allowed) => tools.or(allowed),
+-    };
+-    let blocklist = split(blocklist);
+-    (allowlist.is_some() || blocklist.is_some()).then_some(Policy {
+-        allowlist,
+-        blocklist,
+-    })
+ }
+ 
+ #[derive(Subcommand)]
+@@ -196,7 +159,11 @@ async fn run(cli: Cli) -> Result<()> {
+     // capability: it backs MCP clients that cannot use them. The CLI shows
+     // the whole catalog, and such a call fails with a clear error instead.
+     let files = !matches!(command, Command::Serve { .. }) || common.files_dir.is_some();
+-    let catalog = Arc::new(Catalog::load(&common.roots, files)?);
++    let mut catalog = Catalog::load(&common.roots, files)?;
++    catalog.deployment_policy = Policy::from_env(|name| {
++        std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
++    });
++    let catalog = Arc::new(catalog);
+     match command {
+         Command::List => {
+             let policy = common.policy();
+@@ -304,39 +271,3 @@ fn engine(common: &Common, catalog: Arc<Catalog>) -> Result<Engine> {
+         common.files_dir.as_deref(),
+     )
+ }
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    fn names(entries: &[&str]) -> Vec<String> {
+-        entries.iter().map(|entry| (*entry).to_owned()).collect()
+-    }
+-
+-    #[test]
+-    fn cli_policy_is_unrestricted_without_filters() {
+-        assert!(cli_policy(None, None, None).is_none());
+-        assert!(cli_policy(None, Some(" , "), Some("")).is_none());
+-    }
+-
+-    #[test]
+-    fn cli_policy_reads_the_deployment_filter() {
+-        let policy = cli_policy(None, Some(" slack, crunchbase,,"), Some(" dune ")).unwrap();
+-        assert_eq!(policy.allowlist, Some(names(&["slack", "crunchbase"])));
+-        assert_eq!(policy.blocklist, Some(names(&["dune"])));
+-        assert!(policy.allows("slack"));
+-        assert!(!policy.allows("dune"));
+-        assert!(!policy.allows("linear"));
+-    }
+-
+-    #[test]
+-    fn cli_tools_narrow_but_never_widen_the_deployment_allowlist() {
+-        let tools = names(&["slack", "linear"]);
+-        let policy = cli_policy(Some(&tools), Some("slack,crunchbase"), None).unwrap();
+-        assert_eq!(policy.allowlist, Some(names(&["slack"])));
+-
+-        let policy = cli_policy(Some(&tools), None, Some("linear")).unwrap();
+-        assert!(policy.allows("slack"));
+-        assert!(!policy.allows("linear"));
+-    }
+-}
+diff --git a/crates/centaur-codemode/src/reload.rs b/crates/centaur-codemode/src/reload.rs
+index 63ee5210..6ab1b58d 100644
+--- a/crates/centaur-codemode/src/reload.rs
++++ b/crates/centaur-codemode/src/reload.rs
+@@ -5,7 +5,7 @@
+ //! changes it loads a new catalog and swaps it in. A failed load keeps the old
+ //! catalog, and cells already running keep the catalog they started with.
+ 
+-use std::{path::PathBuf, sync::Arc, time::Duration};
++use std::{path::PathBuf, time::Duration};
+ 
+ use crate::{catalog, engine::Engine};
+ 
+@@ -48,7 +48,7 @@ impl Reloader {
+                     connectors = catalog.connectors.len(),
+                     "catalog reloaded"
+                 );
+-                engine.replace_catalog(Arc::new(catalog));
++                engine.replace_catalog(catalog);
+                 true
+             }
+             Err(error) => {
+@@ -75,7 +75,7 @@ impl Reloader {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use std::path::Path;
++    use std::{path::Path, sync::Arc};
+ 
+     use super::*;
+ 
+diff --git a/crates/centaur-codemode/src/server.rs b/crates/centaur-codemode/src/server.rs
+index e0aa97ea..31d39f0d 100644
+--- a/crates/centaur-codemode/src/server.rs
++++ b/crates/centaur-codemode/src/server.rs
+@@ -203,7 +203,7 @@ async fn healthz(State(state): State<AppState>) -> Response {
+         "ok": true,
+         "version": env!("CARGO_PKG_VERSION"),
+         "catalog_revision": catalog.revision,
+-        "connectors": catalog.connectors.len(),
++        "connectors": catalog.visible(None).count(),
+     }))
+     .into_response()
+ }
+@@ -349,6 +349,10 @@ export async function wait(args: { ms: number }, ctx: Ctx): Promise<{ waited: nu
+ "#;
+ 
+     fn engine() -> (tempfile::TempDir, Engine) {
++        engine_with_policy(Policy::default())
++    }
++
++    fn engine_with_policy(policy: Policy) -> (tempfile::TempDir, Engine) {
+         let dir = tempfile::tempdir().unwrap();
+         let connector = dir.path().join("connectors").join("demo");
+         std::fs::create_dir_all(&connector).unwrap();
+@@ -358,8 +362,9 @@ export async function wait(args: { ms: number }, ctx: Ctx): Promise<{ waited: nu
+         )
+         .unwrap();
+         std::fs::write(connector.join("index.ts"), CONNECTOR).unwrap();
+-        let catalog =
++        let mut catalog =
+             crate::catalog::Catalog::load(&[dir.path().join("connectors")], false).unwrap();
++        catalog.deployment_policy = policy;
+         let engine = Engine::new(Arc::new(catalog), None, None, None).unwrap();
+         (dir, engine)
+     }
+@@ -446,6 +451,41 @@ export async function wait(args: { ms: number }, ctx: Ctx): Promise<{ waited: nu
+         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+     }
+ 
++    #[tokio::test]
++    async fn request_policy_cannot_widen_deployment_policy_even_after_reload() {
++        let (dir, engine) = engine_with_policy(Policy::from_allowlist(vec![]));
++        let roots = vec![dir.path().join("connectors")];
++        std::fs::write(
++            roots[0].join("demo/index.ts"),
++            format!("{CONNECTOR}\n// reload"),
++        )
++        .unwrap();
++        assert!(crate::reload::Reloader::new(roots, RELOAD_INTERVAL).once(&engine));
++        let app = app(engine);
++        let request = HttpRequest::get("/catalog?tools=demo")
++            .body(Body::empty())
++            .unwrap();
++        let body = json_body(app.clone().oneshot(request).await.unwrap()).await;
++        assert_eq!(body["connectors"], json!([]));
++        assert_eq!(body["brief"], "");
++        let policy = json!({"allowlist": ["demo"]});
++        let request = post("/search", json!({"query": "echo", "policy": policy}));
++        let body = json_body(app.clone().oneshot(request).await.unwrap()).await;
++        assert_eq!(body["results"], json!([]));
++        let request = post("/load", json!({"tool": "demo", "policy": policy}));
++        assert_eq!(
++            app.clone().oneshot(request).await.unwrap().status(),
++            StatusCode::NOT_FOUND
++        );
++        let request = post(
++            "/exec",
++            json!({"code":"return await tools.demo.echo({text:'test'})", "policy": policy}),
++        );
++        let body = json_body(app.oneshot(request).await.unwrap()).await;
++        assert_eq!(body["ok"], false);
++        assert_eq!(body["calls"], json!([]));
++    }
++
+     #[tokio::test]
+     async fn over_the_cell_cap_answers_503_immediately() {
+         let (_dir, engine) = engine();
+diff --git a/crates/centaur-codemode/tests/connector_policy.rs b/crates/centaur-codemode/tests/connector_policy.rs
+new file mode 100644
+index 00000000..6af479b1
+--- /dev/null
++++ b/crates/centaur-codemode/tests/connector_policy.rs
+@@ -0,0 +1,246 @@
++//! Exercise the CLI entry point with an isolated environment and offline connectors.
++
++use std::{
++    collections::BTreeSet,
++    fs,
++    net::TcpListener,
++    process::{Child, Command, Stdio},
++    time::Duration,
++};
++
++use serde_json::{Value, json};
++
++const CONNECTORS: [&str; 5] = ["attio", "linear", "mercator", "slack", "websearch"];
++
++struct ChildGuard(Child);
++
++impl Drop for ChildGuard {
++    fn drop(&mut self) {
++        let _ = self.0.kill();
++        let _ = self.0.wait();
++    }
++}
++
++fn check(env: &[(&str, &str)], expected: &[&str]) {
++    let root = tempfile::tempdir().unwrap();
++    for name in CONNECTORS {
++        let dir = root.path().join(name);
++        fs::create_dir(&dir).unwrap();
++        fs::write(dir.join("connector.toml"), "description = 'Policy fixture'").unwrap();
++        fs::write(dir.join("index.ts"), format!(
++            "/** Echo the connector name. */\nexport async function echo(args: {{}}): Promise<string> {{ return '{name}'; }}"
++        )).unwrap();
++    }
++    let run = |args: &[&str]| {
++        let mut cmd = Command::new(env!("CARGO_BIN_EXE_centaur-codemode"));
++        cmd.env_clear()
++            .envs(env.iter().copied())
++            .arg("--connectors")
++            .arg(root.path());
++        cmd.args(args).output().unwrap()
++    };
++    let listed = run(&["list"]);
++    assert!(
++        listed.status.success(),
++        "{}",
++        String::from_utf8_lossy(&listed.stderr)
++    );
++    let list = String::from_utf8(listed.stdout).unwrap();
++    assert_eq!(
++        list.lines()
++            .map(|line| line.split_once(':').unwrap().0)
++            .collect::<Vec<_>>(),
++        expected
++    );
++
++    if let Some(first) = expected.first() {
++        let narrowed = run(&["--tools", first, "list"]);
++        assert!(narrowed.status.success());
++        let list = String::from_utf8(narrowed.stdout).unwrap();
++        assert_eq!(list.trim_end(), format!("{first}: Policy fixture"));
++    }
++
++    let search = run(&["search", "echo"]);
++    assert!(search.status.success());
++    let hits: Vec<Value> = serde_json::from_slice(&search.stdout).unwrap();
++    assert_eq!(
++        hits.iter()
++            .map(|hit| hit["tool"].as_str().unwrap())
++            .collect::<BTreeSet<_>>(),
++        expected.iter().copied().collect()
++    );
++
++    for name in CONNECTORS {
++        let allowed = expected.contains(&name);
++        let load = run(&["load", name]);
++        assert_eq!(load.status.success(), allowed, "load {name}");
++        let exec = run(&[
++            "--tools",
++            name,
++            "exec",
++            "-e",
++            &format!("return await tools.{name}.echo({{}})"),
++        ]);
++        assert_eq!(
++            exec.status.success(),
++            allowed,
++            "exec {name}: {}",
++            String::from_utf8_lossy(&exec.stderr)
++        );
++        let body: Value = serde_json::from_slice(&exec.stdout).unwrap();
++        assert_eq!(body["ok"], allowed);
++        if allowed {
++            assert_eq!(body["result"], name);
++        } else {
++            assert_eq!(body["calls"], json!([]));
++        }
++    }
++}
++
++#[test]
++fn dedicated_list_replaces_python_packages() {
++    check(
++        &[
++            ("TOOL_ALLOWLIST", "attio,linear,slack"),
++            ("CENTAUR_CODEMODE_ALLOWLIST", "websearch,mercator"),
++        ],
++        &["mercator", "websearch"],
++    );
++}
++
++#[test]
++fn explicitly_empty_dedicated_list_denies_every_connector() {
++    for empty in ["", "  \t "] {
++        check(
++            &[
++                ("TOOL_ALLOWLIST", "attio,linear"),
++                ("CENTAUR_CODEMODE_ALLOWLIST", empty),
++            ],
++            &[],
++        );
++    }
++}
++
++#[test]
++fn legacy_allowlist_retains_its_empty_and_nonempty_behavior() {
++    check(&[], &CONNECTORS);
++    check(&[("TOOL_ALLOWLIST", " , ")], &CONNECTORS);
++    check(
++        &[("TOOL_ALLOWLIST", "attio, linear,")],
++        &["attio", "linear"],
++    );
++}
++
++#[test]
++fn both_blocklists_take_precedence() {
++    check(
++        &[
++            ("CENTAUR_CODEMODE_ALLOWLIST", "websearch,mercator,attio"),
++            ("TOOL_BLOCKLIST", "attio"),
++            ("CENTAUR_CODEMODE_BLOCKLIST", "mercator"),
++        ],
++        &["websearch"],
++    );
++}
++
++#[tokio::test]
++async fn serve_enforces_dedicated_allowlist_from_environment() {
++    let root = tempfile::tempdir().unwrap();
++    for name in CONNECTORS {
++        let dir = root.path().join(name);
++        fs::create_dir(&dir).unwrap();
++        fs::write(dir.join("connector.toml"), "description = 'Policy fixture'").unwrap();
++        fs::write(
++            dir.join("index.ts"),
++            format!(
++                "/** Echo the connector name. */\nexport async function echo(args: {{}}): Promise<string> {{ return '{name}'; }}"
++            ),
++        )
++        .unwrap();
++    }
++    let addr = {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        listener.local_addr().unwrap()
++    };
++    let stderr_path = root.path().join("serve.stderr");
++    let stderr_file = fs::File::create(&stderr_path).unwrap();
++    let child = Command::new(env!("CARGO_BIN_EXE_centaur-codemode"))
++        .env_clear()
++        .env("TOOL_ALLOWLIST", "attio,linear,slack")
++        .env("CENTAUR_CODEMODE_ALLOWLIST", "websearch,mercator")
++        .arg("--connectors")
++        .arg(root.path())
++        .arg("serve")
++        .arg("--listen")
++        .arg(addr.to_string())
++        .stdout(Stdio::null())
++        .stderr(Stdio::from(stderr_file))
++        .spawn()
++        .unwrap();
++    let _guard = ChildGuard(child);
++
++    let client = reqwest::Client::builder().no_proxy().build().unwrap();
++    let base = format!("http://{addr}");
++    let mut ready = false;
++    for _ in 0..200 {
++        if let Ok(resp) = client.get(format!("{base}/healthz")).send().await
++            && resp.status().is_success()
++        {
++            ready = true;
++            break;
++        }
++        tokio::time::sleep(Duration::from_millis(50)).await;
++    }
++    assert!(
++        ready,
++        "centaur-codemode serve did not become healthy; stderr: {}",
++        fs::read_to_string(&stderr_path).unwrap_or_default()
++    );
++
++    let catalog: Value = client
++        .get(format!("{base}/catalog"))
++        .send()
++        .await
++        .unwrap()
++        .json()
++        .await
++        .unwrap();
++    let listed: Vec<&str> = catalog["connectors"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|entry| entry["name"].as_str().unwrap())
++        .collect();
++    assert_eq!(listed, vec!["mercator", "websearch"]);
++
++    let denied_load = client
++        .post(format!("{base}/load"))
++        .json(&json!({"tool": "attio", "policy": {"allowlist": ["attio"]}}))
++        .send()
++        .await
++        .unwrap();
++    assert_eq!(denied_load.status(), reqwest::StatusCode::NOT_FOUND);
++
++    let allowed_load = client
++        .post(format!("{base}/load"))
++        .json(&json!({"tool": "websearch"}))
++        .send()
++        .await
++        .unwrap();
++    assert_eq!(allowed_load.status(), reqwest::StatusCode::OK);
++
++    let denied_exec: Value = client
++        .post(format!("{base}/exec"))
++        .json(&json!({
++            "code": "return await tools.attio.echo({})",
++            "policy": {"allowlist": ["attio"]}
++        }))
++        .send()
++        .await
++        .unwrap()
++        .json()
++        .await
++        .unwrap();
++    assert_eq!(denied_exec["ok"], false);
++    assert_eq!(denied_exec["calls"], json!([]));
++}
+diff --git a/crates/centaur-sandbox-core/src/connector_policy.rs b/crates/centaur-sandbox-core/src/connector_policy.rs
+new file mode 100644
+index 00000000..dd67bf97
+--- /dev/null
++++ b/crates/centaur-sandbox-core/src/connector_policy.rs
+@@ -0,0 +1,100 @@
++//! The connector policy shared by sandbox processes and the MCP control plane.
++//!
++//! Nothing here authorizes a credential: iron-proxy only injects what a principal holds.
++
++use std::collections::BTreeSet;
++
++use serde::{Deserialize, Serialize};
++
++/// Which Code Mode connectors are visible and callable under the deployment or request filter.
++///
++/// An entry matches a connector only when it equals the connector's directory name exactly.
++/// Nothing here authorizes a credential: iron-proxy only injects what a principal holds.
++#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
++pub struct ConnectorPolicy {
++    /// None is unrestricted. An explicitly empty set allows no connectors.
++    pub allowlist: Option<BTreeSet<String>>,
++    pub blocklist: Option<BTreeSet<String>>,
++}
++
++impl ConnectorPolicy {
++    /// Read the same four settings from either the sandbox spec or the runner's environment.
++    pub fn from_env<S: AsRef<str>>(get: impl Fn(&str) -> Option<S>) -> Self {
++        fn names(raw: impl AsRef<str>) -> BTreeSet<String> {
++            raw.as_ref()
++                .split(',')
++                .map(str::trim)
++                .filter(|s| !s.is_empty())
++                .map(str::to_owned)
++                .collect()
++        }
++        let allowlist = get("CENTAUR_CODEMODE_ALLOWLIST").map(names).or_else(|| {
++            get("TOOL_ALLOWLIST")
++                .map(names)
++                .filter(|names| !names.is_empty())
++        });
++        let blocklist: BTreeSet<_> = [get("TOOL_BLOCKLIST"), get("CENTAUR_CODEMODE_BLOCKLIST")]
++            .into_iter()
++            .flatten()
++            .flat_map(names)
++            .collect();
++        Self {
++            allowlist,
++            blocklist: (!blocklist.is_empty()).then_some(blocklist),
++        }
++    }
++
++    pub fn from_allowlist(names: Vec<String>) -> Self {
++        Self {
++            allowlist: Some(names.into_iter().collect()),
++            blocklist: None,
++        }
++    }
++
++    pub fn allows(&self, name: &str) -> bool {
++        self.allowlist.as_ref().is_none_or(|set| set.contains(name))
++            && !self
++                .blocklist
++                .as_ref()
++                .is_some_and(|set| set.contains(name))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn dedicated_allowlist_replaces_legacy_and_preserves_explicit_empty() {
++        for (dedicated, attio, websearch) in [
++            (None, true, false),
++            (Some(" websearch,mercator "), false, true),
++            (Some(""), false, false),
++            (Some(" , "), false, false),
++        ] {
++            let policy = ConnectorPolicy::from_env(|key| match key {
++                "TOOL_ALLOWLIST" => Some("attio,linear"),
++                "CENTAUR_CODEMODE_ALLOWLIST" => dedicated,
++                _ => None,
++            });
++            assert_eq!(policy.allows("attio"), attio);
++            assert_eq!(policy.allows("websearch"), websearch);
++        }
++    }
++
++    #[test]
++    fn blocklists_are_additive_with_or_without_an_allowlist() {
++        for dedicated in [None, Some("attio,slack,websearch")] {
++            let policy = ConnectorPolicy::from_env(|key| match key {
++                "TOOL_ALLOWLIST" => Some(" , "),
++                "CENTAUR_CODEMODE_ALLOWLIST" => dedicated,
++                "TOOL_BLOCKLIST" => Some("attio"),
++                "CENTAUR_CODEMODE_BLOCKLIST" => Some("slack"),
++                _ => None,
++            });
++            assert!(policy.allows("websearch"));
++            assert!(!policy.allows("attio"));
++            assert!(!policy.allows("slack"));
++        }
++    }
++}
+diff --git a/crates/centaur-sandbox-core/src/lib.rs b/crates/centaur-sandbox-core/src/lib.rs
+index 05842fd2..b8042307 100644
+--- a/crates/centaur-sandbox-core/src/lib.rs
++++ b/crates/centaur-sandbox-core/src/lib.rs
+@@ -5,6 +5,7 @@
+ //! generations, and durable execution rows belong in higher-level crates.
+ 
+ mod backend;
++mod connector_policy;
+ mod error;
+ mod io;
+ mod lifecycle;
+@@ -20,7 +21,7 @@ pub const CODEMODE_WORKLOAD: &str = "codemode";
+ /// Label carrying the hashed principal a Code Mode sandbox serves.
+ pub const CODEMODE_PRINCIPAL_LABEL: &str = "centaur.ai/codemode-principal";
+ /// Label carrying the generation a Code Mode sandbox was built for: a hash of
+-/// its engine image, the principal's repo-cache access, and its observability
++/// its engine image, connector policy, the principal's repo-cache access, and observability
+ /// setting. Any change to those yields a new sandbox. The label is the only
+ /// record of the generation: sandbox labels are authoritative.
+ pub const CODEMODE_FINGERPRINT_LABEL: &str = "centaur.ai/codemode-fingerprint";
+@@ -33,6 +34,7 @@ pub const WORKFLOW_RUN_COMPONENT: &str = "workflow-run";
+ pub const WORKFLOW_RUN_ID_LABEL: &str = "centaur.ai/workflow-run-id";
+ 
+ pub use backend::SandboxBackend;
++pub use connector_policy::ConnectorPolicy;
+ pub use error::{BoxedError, SandboxError, SandboxResult};
+ pub use io::{SandboxIo, SandboxIoGuard, SandboxIoParts, SandboxRead, SandboxWrite};
+ pub use lifecycle::{ObservedSandbox, SandboxHandle, SandboxId, SandboxStatus};
+diff --git a/crates/centaur-session-runtime/src/codemode.rs b/crates/centaur-session-runtime/src/codemode.rs
+index fdcb88ab..cadfed3b 100644
+--- a/crates/centaur-session-runtime/src/codemode.rs
++++ b/crates/centaur-session-runtime/src/codemode.rs
+@@ -8,9 +8,8 @@
+ //!   [`CODEMODE_PORT`], so a `Running` observation means the process is serving
+ //!   and the control plane never polls the sandbox.
+ //! - The generation (the `centaur.ai/codemode-fingerprint` label) hashes the
+-//!   Code Mode image and the principal's sandbox capabilities, so a new image or
+-//!   a repo-cache revocation routes to a sandbox built for the new inputs and
+-//!   never to one still holding revoked mounts. Sandboxes of other generations
++//!   image, connector policy and sandbox capabilities. Changed inputs route to
++//!   a sandbox built for the new generation. Sandboxes of other generations
+ //!   are stopped after [`SUPERSEDE_GRACE`] and the reaper removes them.
+ //! - A replica adopts the newest `Running` sandbox of the principal and
+ //!   generation and otherwise creates one; racing replicas or a rolling deploy
+@@ -29,7 +28,7 @@ use centaur_sandbox_core::{
+     is_codemode_workload,
+ };
+ use centaur_sandbox_manager::SandboxManager;
+-use centaur_session_core::{SandboxCapabilities as SessionSandboxCapabilities, ThreadKey};
++use centaur_session_core::ThreadKey;
+ use dashmap::{DashMap, DashSet};
+ use sha2::{Digest, Sha256};
+ use tokio::{
+@@ -60,8 +59,7 @@ pub struct CodemodeEndpoint {
+     pub base_url: String,
+ }
+ 
+-/// Hashed principal and its generation: the Code Mode image plus the principal's
+-/// sandbox capabilities.
++/// Hashed principal and the generation of its image, capabilities and connector policy.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ struct CodemodeIdentity {
+     principal_hash: String,
+@@ -69,17 +67,20 @@ struct CodemodeIdentity {
+ }
+ 
+ impl CodemodeIdentity {
+-    fn derive(principal_id: &str, image: &str, capabilities: &SessionSandboxCapabilities) -> Self {
++    fn derive(image: &str, policy: &ToolHostCallPolicy) -> Self {
++        let capabilities = &policy.sandbox_capabilities;
+         let generation = truncated_sha256_hex(
+             &format!(
+-                "image={image}\nrepo_cache={}\nobservability={}",
++                "image={image}\nrepo_cache={}\nobservability={}\nconnectors={}",
+                 capabilities.repo_cache.as_str(),
+-                capabilities.observability_enabled
++                capabilities.observability_enabled,
++                serde_json::to_string(policy.tool_filter())
++                    .expect("connector policy is serializable"),
+             ),
+             10,
+         );
+         Self {
+-            principal_hash: truncated_sha256_hex(principal_id.trim(), 16),
++            principal_hash: truncated_sha256_hex(policy.principal_id.trim(), 16),
+             generation,
+         }
+     }
+@@ -260,8 +261,7 @@ impl SessionRuntime {
+         let harness = self.default_harness();
+         let base =
+             (self.sandbox_runtime.spec_factory)(&thread_key, CODEMODE_COMPONENT, &harness, None);
+-        let identity =
+-            CodemodeIdentity::derive(principal_id, &state.image, &policy.sandbox_capabilities);
++        let identity = CodemodeIdentity::derive(&state.image, policy);
+         let key = identity.cache_key(principal_id);
+ 
+         let resolving = state.resolving(&key);
+@@ -462,7 +462,9 @@ mod tests {
+         EnvVar, ObservedSandbox, SandboxBackend, SandboxFile, SandboxHandle, SandboxId, SandboxIo,
+         SandboxResult, SandboxSpec, SandboxStatus,
+     };
+-    use centaur_session_core::SandboxRepoCacheAccess;
++    use centaur_session_core::{
++        SandboxCapabilities as SessionSandboxCapabilities, SandboxRepoCacheAccess,
++    };
+     use centaur_session_sqlx::PgSessionStore;
+ 
+     use super::*;
+@@ -593,7 +595,73 @@ mod tests {
+     }
+ 
+     fn identity(principal_id: &str, capabilities: &SessionSandboxCapabilities) -> CodemodeIdentity {
+-        CodemodeIdentity::derive(principal_id, CODEMODE_IMAGE, capabilities)
++        CodemodeIdentity::derive(
++            CODEMODE_IMAGE,
++            &ToolHostCallPolicy {
++                sandbox_capabilities: capabilities.clone(),
++                ..policy(principal_id)
++            },
++        )
++    }
++
++    #[test]
++    fn explicit_empty_connector_policy_changes_the_sandbox_generation() {
++        let mut policy = policy("prn_test");
++        let original = CodemodeIdentity::derive(CODEMODE_IMAGE, &policy);
++        policy.tool_filter = crate::ToolHostToolFilter::from_allowlist(vec![]);
++        let empty = CodemodeIdentity::derive(CODEMODE_IMAGE, &policy);
++        assert_ne!(original, empty);
++
++        let first_order = ToolHostCallPolicy {
++            tool_filter: crate::ToolHostToolFilter::from_env(|key| match key {
++                "CENTAUR_CODEMODE_ALLOWLIST" => Some("websearch, mercator"),
++                "CENTAUR_CODEMODE_BLOCKLIST" => Some("slack, attio"),
++                _ => None,
++            }),
++            ..policy.clone()
++        };
++        let second_order = ToolHostCallPolicy {
++            tool_filter: crate::ToolHostToolFilter::from_env(|key| match key {
++                "CENTAUR_CODEMODE_ALLOWLIST" => Some("mercator,websearch,"),
++                "CENTAUR_CODEMODE_BLOCKLIST" => Some("attio , slack"),
++                _ => None,
++            }),
++            ..policy
++        };
++        let nonempty = CodemodeIdentity::derive(CODEMODE_IMAGE, &first_order);
++        assert_ne!(nonempty, original);
++        assert_ne!(nonempty, empty);
++        assert_eq!(
++            nonempty,
++            CodemodeIdentity::derive(CODEMODE_IMAGE, &second_order)
++        );
++    }
++
++    #[test]
++    fn codemode_sandbox_spec_preserves_connector_policy_env() {
++        let mut spec = base_spec();
++        spec.env.push(EnvVar::new(
++            "CENTAUR_CODEMODE_ALLOWLIST",
++            "websearch,mercator",
++        ));
++        spec.env
++            .push(EnvVar::new("CENTAUR_CODEMODE_BLOCKLIST", "attio"));
++        let policy = policy("prn_test");
++        let identity = CodemodeIdentity::derive(CODEMODE_IMAGE, &policy);
++
++        let built = codemode_sandbox_spec(spec, &policy, &identity, CODEMODE_IMAGE);
++        let env_value = |name: &str| {
++            built
++                .env
++                .iter()
++                .find(|var| var.name == name)
++                .map(|var| var.value.as_str())
++        };
++        assert_eq!(
++            env_value("CENTAUR_CODEMODE_ALLOWLIST"),
++            Some("websearch,mercator")
++        );
++        assert_eq!(env_value("CENTAUR_CODEMODE_BLOCKLIST"), Some("attio"));
+     }
+ 
+     fn observation(
+diff --git a/crates/centaur-session-runtime/src/lib.rs b/crates/centaur-session-runtime/src/lib.rs
+index cdd9b50a..521427f1 100644
+--- a/crates/centaur-session-runtime/src/lib.rs
++++ b/crates/centaur-session-runtime/src/lib.rs
+@@ -526,11 +526,7 @@ pub struct InterruptExecutionOutcome {
+     pub execution_id: Option<String>,
+ }
+ 
+-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+-pub struct ToolHostToolFilter {
+-    pub allowlist: Option<String>,
+-    pub blocklist: Option<String>,
+-}
++pub use centaur_sandbox_core::ConnectorPolicy as ToolHostToolFilter;
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct ToolHostCallPolicy {
+@@ -5800,18 +5796,12 @@ fn tool_host_tool_filter_from_spec(
+     capabilities: &SessionSandboxCapabilities,
+ ) -> ToolHostToolFilter {
+     apply_sandbox_capabilities(&mut spec, capabilities);
+-    ToolHostToolFilter {
+-        allowlist: spec
+-            .env
+-            .iter()
+-            .find(|env| env.name == "TOOL_ALLOWLIST")
+-            .map(|env| env.value.clone()),
+-        blocklist: spec
+-            .env
++    ToolHostToolFilter::from_env(|name| {
++        spec.env
+             .iter()
+-            .find(|env| env.name == "TOOL_BLOCKLIST")
+-            .map(|env| env.value.clone()),
+-    }
++            .find(|env| env.name == name)
++            .map(|env| env.value.as_str())
++    })
+ }
+ 
+ fn scope_repo_cache_mounts_to_public(spec: &mut SandboxSpec) {
+@@ -7357,8 +7347,8 @@ mod tests {
+ 
+         let filter = tool_host_tool_filter_from_spec(spec, &capabilities);
+ 
+-        assert_eq!(filter.allowlist.as_deref(), Some("alpha,beta"));
+-        assert_eq!(filter.blocklist.as_deref(), Some("custom-script"));
++        assert!(filter.allows("alpha") && filter.allows("beta"));
++        assert!(!filter.allows("custom-script"));
+     }
+ 
+     fn test_principal(

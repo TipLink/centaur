@@ -55,6 +55,7 @@ class SlackDeliveryPolicyTest < ActiveSupport::TestCase
 
     assert_equal "U0123456789", policy.slack_user_id
     assert_equal "T0123456789", policy.slack_team_id
+    assert policy.linked_identity_matches?("U0123456789", "T0123456789")
     assert policy.allowed?("C0123456789")
   end
 
@@ -76,5 +77,79 @@ class SlackDeliveryPolicyTest < ActiveSupport::TestCase
     assert_nil policy.slack_team_id
     assert policy.allowed?("C0123456789")
     assert_not policy.allowed?("G9876543210")
+  end
+
+  test "ignores dead or disconnected Slack credentials when resolving live identity" do
+    user = users(:member_user)
+    app = oauth_apps(:acme_slack)
+    app.client_secret = "slack-client-secret"
+    app.update!(labels: app.labels.merge("slack_team_id" => "T0123456789"))
+    BrokerCredential.create!(
+      oauth_app: app,
+      provider_subject: "U1111111111",
+      provider_email: user.email,
+      token_endpoint: app.provider_strategy.token_endpoint,
+      refresh_token: "refresh-disconnected",
+      access_token: "access-disconnected",
+      expires_at: 1.hour.from_now,
+      last_refresh: Time.current,
+      external_user_key: "user-slack-disconnected",
+      dead: true,
+      dead_reason: Oauth::Disconnect::DEAD_REASON,
+      created_by: user
+    )
+    BrokerCredential.create!(
+      oauth_app: app,
+      provider_subject: "U3333333333",
+      provider_email: user.email,
+      token_endpoint: app.provider_strategy.token_endpoint,
+      refresh_token: "refresh-invalid-grant",
+      access_token: "access-invalid-grant",
+      expires_at: 1.hour.from_now,
+      last_refresh: Time.current,
+      external_user_key: "user-slack-invalid-grant",
+      dead: true,
+      dead_reason: "invalid_grant",
+      created_by: user
+    )
+    BrokerCredential.create!(
+      oauth_app: app,
+      provider_subject: "U4444444444",
+      provider_email: user.email,
+      token_endpoint: app.provider_strategy.token_endpoint,
+      refresh_token: "refresh-disconnected-reason",
+      access_token: "access-disconnected-reason",
+      expires_at: 1.hour.from_now,
+      last_refresh: Time.current,
+      external_user_key: "user-slack-disconnected-reason",
+      dead: false,
+      dead_reason: Oauth::Disconnect::DEAD_REASON,
+      created_by: user
+    )
+    BrokerCredential.create!(
+      oauth_app: app,
+      provider_subject: "U2222222222",
+      provider_email: user.email,
+      token_endpoint: app.provider_strategy.token_endpoint,
+      refresh_token: "refresh-live",
+      access_token: "access-live",
+      expires_at: 1.hour.from_now,
+      last_refresh: Time.current,
+      external_user_key: "user-slack-live",
+      created_by: user
+    )
+
+    policy = SlackDeliveryPolicy.new(user)
+
+    assert_equal "U2222222222", policy.slack_user_id
+    assert_equal "T0123456789", policy.slack_team_id
+    assert policy.allowed?("U2222222222")
+    assert_not policy.allowed?("U1111111111")
+    assert_not policy.allowed?("U3333333333")
+    assert_not policy.allowed?("U4444444444")
+    assert policy.linked_identity_matches?("U2222222222", "T0123456789")
+    assert_not policy.linked_identity_matches?("U1111111111", "T0123456789")
+    assert_not policy.linked_identity_matches?("U3333333333", "T0123456789")
+    assert_not policy.linked_identity_matches?("U4444444444", "T0123456789")
   end
 end

@@ -10,7 +10,6 @@ import tempfile
 
 images = importlib.import_module("plan-reviewed-images")
 SNAPSHOT = "pr-image-validation-v1"
-PROBE = "scripts/probe-agent-harness-image.sh"
 UNKNOWN = (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, subprocess.SubprocessError)
 
 
@@ -58,7 +57,7 @@ def matrix(directory, baseline, current):
         paths = None
     for service in images.SERVICES:
         recipe = f"services/{'sandbox' if service == 'agent' else service}/Dockerfile"
-        platforms = images.PLATFORMS if service == "agent" else ("linux/amd64",)
+        platforms = images.PLATFORMS if service in ("agent", "codemode") else ("linux/amd64",)
         for platform in platforms:
             try:
                 images.require(paths is not None, "full validation")
@@ -66,7 +65,7 @@ def matrix(directory, baseline, current):
                 images.require(proof and proof["inputs"] and proof["materials"], "missing validation inputs")
                 inputs = set(proof["inputs"]) | {recipe, recipe + ".dockerignore", ".dockerignore"}
                 if service == "agent":
-                    inputs.add(PROBE)
+                    inputs.add(images.AGENT_PROBE)
                 images.verify_inputs(paths, inputs, proof["materials"])
             except UNKNOWN as error:
                 print(f"{service} {platform}: build ({error})", file=sys.stderr)
