@@ -1,11 +1,28 @@
-use std::{ffi::OsString, io::Write, path::Path, process::Stdio, time::Duration};
+use std::{
+    ffi::OsString,
+    io::Write,
+    path::Path,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
-use tokio::{process::Command, time::timeout};
+use tokio::{
+    process::Command,
+    task,
+    time::{self, timeout, timeout_at},
+};
+use tracing::info;
 
 use crate::errors::rejected;
+
+mod xml_package;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chunk {
@@ -84,13 +101,17 @@ pub async fn extract_pdf_text(
 }
 
 /// Converts a document in one of pandoc's input formats to plain text.
-/// Sandboxed pandoc reads no other files and makes no network requests.
+/// Sandboxed pandoc reads no other files and makes no network requests. The
+/// extraction timeout covers any package repair and pandoc together.
 pub async fn extract_pandoc_text(
     document: Vec<u8>,
     reader: &str,
     extraction_timeout: Duration,
     max_output_bytes: usize,
 ) -> Result<String> {
+    let deadline = Instant::now()
+        .checked_add(extraction_timeout)
+        .context("extraction timeout is too long")?;
     let signature = PANDOC_FORMATS
         .iter()
         .find(|(_, _, known_reader, _)| *known_reader == reader)
@@ -99,11 +120,44 @@ pub async fn extract_pandoc_text(
     if !document.starts_with(signature) {
         return Err(rejected(format!("file is not a {reader} document")));
     }
+    // Office opens packages whose XML parts start with a byte order mark or end
+    // in NUL padding; pandoc rejects them, so such parts are repaired first.
+    let document = if signature == ZIP_SIGNATURE {
+        let format = reader.to_owned();
+        // Stops the blocking repair if this extraction is dropped or times out.
+        let cancel = CancelOnDrop::default();
+        let limit = xml_package::Deadline::new(deadline, cancel.0.clone());
+        let mut repair =
+            task::spawn_blocking(move || match xml_package::repair(&document, &limit) {
+                Some((repaired, parts)) => {
+                    info!(
+                        event = "company_context_package_xml_repaired",
+                        format, parts
+                    );
+                    repaired
+                }
+                None => document,
+            });
+        // Waiting for a free blocking thread counts against the deadline too.
+        match timeout_at(time::Instant::from_std(deadline), &mut repair).await {
+            Ok(repaired) => repaired.context("repair package XML parts")?,
+            Err(_) => {
+                repair.abort();
+                bail!("pandoc timed out before it started");
+            }
+        }
+    } else {
+        document
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("pandoc timed out before it started");
+    }
     convert(
         "pandoc",
         &format!("{reader} document"),
         &document,
-        extraction_timeout,
+        remaining,
         max_output_bytes,
         |input, output| {
             vec![
@@ -123,6 +177,16 @@ pub async fn extract_pandoc_text(
         },
     )
     .await
+}
+
+/// Sets its flag when dropped, telling blocking work that its caller has gone.
+#[derive(Default)]
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Runs a converter from a temporary input file to a temporary output file.
@@ -269,7 +333,10 @@ pub(crate) fn split_long_text(text: &str, max_chars: usize, output: &mut Vec<Str
 }
 
 fn normalize_text(text: &str) -> String {
-    text.replace("\r\n", "\n")
+    // Byte order marks inside a document carry no text, and PostgreSQL text
+    // cannot hold NUL.
+    text.replace(['\u{feff}', '\0'], "")
+        .replace("\r\n", "\n")
         .replace('\r', "\n")
         .lines()
         .map(str::trim_end)
@@ -293,6 +360,14 @@ mod tests {
         assert!(extract_google_doc_text(vec![0xff], 100).is_err());
         assert!(extract_google_doc_text("\u{feff}  \n".into(), 100).is_err());
         assert!(extract_google_doc_text(b"too large".to_vec(), 3).is_err());
+    }
+
+    #[test]
+    fn extracted_text_drops_byte_order_marks_and_nuls() {
+        assert_eq!(
+            normalize_text("\u{feff}Apples\u{feff}\0\0\r\nPears\0"),
+            "Apples\nPears"
+        );
     }
 
     #[test]
@@ -339,6 +414,176 @@ mod tests {
             .await
             .unwrap_err();
         assert!(is_rejected(&error), "{error}");
+    }
+
+    /// The installed pandoc's major and minor version.
+    fn pandoc_version() -> Option<(u32, u32)> {
+        let output = std::process::Command::new("pandoc")
+            .arg("--version")
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let version = stdout.lines().next()?.strip_prefix("pandoc ")?;
+        let mut numbers = version.split('.').map(|number| number.parse().ok());
+        Some((numbers.next()??, numbers.next()??))
+    }
+
+    /// An openpyxl-style workbook: package-absolute relationship targets and
+    /// inline strings, which pandoc reads from 3.14 on.
+    fn workbook(sheet_prefix: &[u8], sheet_suffix: &[u8]) -> Vec<u8> {
+        let sheet = [
+            sheet_prefix,
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Item</t></is></c><c r="B1" t="inlineStr"><is><t>Count</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Apples</t></is></c><c r="B2"><v>3</v></c></row></sheetData></worksheet>"#,
+            sheet_suffix,
+        ]
+        .concat();
+        xml_package::test_package::build(&[
+            (
+                "[Content_Types].xml",
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="/xl/workbook.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="/xl/worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            ("xl/worksheets/sheet1.xml", &sheet),
+        ])
+    }
+
+    #[test]
+    fn the_extraction_timeout_covers_waiting_for_a_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Occupy the only blocking thread for longer than the timeout.
+            let (started, running) = tokio::sync::oneshot::channel();
+            let _busy = task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(3));
+            });
+            running.await.unwrap();
+            let began = Instant::now();
+            let error = extract_pandoc_text(
+                workbook(b"", b"\0\0"),
+                "xlsx",
+                Duration::from_millis(100),
+                1_000,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                began.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                began.elapsed()
+            );
+            assert!(!is_rejected(&error), "{error}");
+            assert_eq!(error.to_string(), "pandoc timed out before it started");
+        });
+        runtime.shutdown_background();
+    }
+
+    #[tokio::test]
+    async fn the_extraction_timeout_covers_the_package_repair() {
+        let error = extract_pandoc_text(workbook(b"", b"\0\0"), "xlsx", Duration::ZERO, 1_000)
+            .await
+            .unwrap_err();
+        // The repair used up the deadline, so pandoc never started; a timeout
+        // is retried, unlike a rejected document.
+        assert!(!is_rejected(&error), "{error}");
+        assert_eq!(error.to_string(), "pandoc timed out before it started");
+    }
+
+    #[tokio::test]
+    async fn documents_with_whitespace_before_the_root_and_nul_padding_are_converted() {
+        let directory = tempfile::tempdir().unwrap();
+        let docx = directory.path().join("report.docx");
+        let Ok(status) = std::process::Command::new("pandoc")
+            .args(["--from", "markdown", "--output"])
+            .arg(&docx)
+            .stdin(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"# Quarterly report\n\nRevenue grew **12%**.\n")?;
+                child.wait()
+            })
+        else {
+            eprintln!("skipping: install pandoc to test Office document conversion");
+            return;
+        };
+        assert!(status.success());
+        let parts: Vec<(String, Vec<u8>)> =
+            xml_package::test_package::parts(&std::fs::read(&docx).unwrap())
+                .into_iter()
+                .map(|(name, contents)| {
+                    if name == "word/document.xml" {
+                        let whitespace = [&b"\r\n"[..], &[b' '; 8_192]].concat();
+                        (name, [&whitespace[..], &contents, b"\0\0\0"].concat())
+                    } else {
+                        (name, contents)
+                    }
+                })
+                .collect();
+        let parts: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.as_slice()))
+            .collect();
+        let text = extract_pandoc_text(
+            xml_package::test_package::build(&parts),
+            "docx",
+            Duration::from_secs(30),
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "Quarterly report\n\nRevenue grew 12%.");
+    }
+
+    #[tokio::test]
+    async fn spreadsheets_with_bom_or_nul_padded_parts_are_converted() {
+        // Older releases cannot read the openpyxl-style workbook at all.
+        match pandoc_version() {
+            Some(version) if version >= (3, 14) => {}
+            found => {
+                eprintln!("skipping: spreadsheet conversion needs pandoc 3.14, found {found:?}");
+                return;
+            }
+        }
+        let timeout = Duration::from_secs(30);
+        for (prefix, suffix) in [
+            (&b""[..], &b""[..]),
+            (b"\xEF\xBB\xBF", b""),
+            (b"", b"\n\0\0\0\0"),
+        ] {
+            let text = extract_pandoc_text(workbook(prefix, suffix), "xlsx", timeout, 1_000)
+                .await
+                .unwrap();
+            let words: Vec<&str> = text.split_whitespace().collect();
+            assert!(
+                words.windows(2).any(|pair| pair == ["Apples", "3"]),
+                "{text:?}"
+            );
+            assert!(words.contains(&"Item"), "{text:?}");
+        }
     }
 
     #[test]

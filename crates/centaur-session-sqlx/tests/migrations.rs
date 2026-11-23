@@ -280,6 +280,166 @@ async fn databases_keep_their_text_search_backend() -> Result<(), Box<dyn Error>
     server.drop_database(database, result).await
 }
 
+/// Core version that indexes Absurd tasks with a cancellation policy.
+const ABSURD_CANCELLATION_INDEX_VERSION: i64 = 64;
+
+#[tokio::test]
+async fn absurd_cancellation_sweeps_use_the_cancellation_index() -> Result<(), Box<dyn Error>> {
+    let Some(server) = TestServer::connect().await? else {
+        return Ok(());
+    };
+    let backend = TextSearchBackend::Postgres;
+    let mut database = server.create_database().await?;
+    let result = AssertUnwindSafe(async {
+        let earlier = migration_list(backend)
+            .into_iter()
+            .filter(|migration| migration.version < ABSURD_CANCELLATION_INDEX_VERSION)
+            .collect();
+        run_list(&mut database.conn, earlier).await?;
+        database
+            .conn
+            .execute("select absurd.create_queue('existing')")
+            .await?;
+        migrate(&mut database.conn, backend).await?;
+        database
+            .conn
+            .execute("select absurd.create_queue('new')")
+            .await?;
+        for queue in ["existing", "new"] {
+            let definition: Option<String> = sqlx::query_scalar(
+                "select indexdef from pg_indexes where schemaname = 'absurd' and indexname = $1",
+            )
+            .bind(format!("t_{queue}_ci"))
+            .fetch_optional(&mut database.conn)
+            .await?;
+            assert_eq!(
+                definition.as_deref(),
+                Some(
+                    format!(
+                        "CREATE INDEX t_{queue}_ci ON absurd.t_{queue} USING btree (task_id) \
+                         WHERE (cancellation IS NOT NULL)"
+                    )
+                    .as_str()
+                ),
+                "queue {queue} has no cancellation index"
+            );
+        }
+
+        database.conn.execute("set enable_seqscan = off").await?;
+        database
+            .conn
+            .execute("select * from absurd.claim_task('existing', 'worker')")
+            .await?;
+        database
+            .conn
+            .execute("select pg_stat_force_next_flush()")
+            .await?;
+        let scans: i64 = sqlx::query_scalar(
+            "select idx_scan from pg_stat_user_indexes where indexrelname = 't_existing_ci'",
+        )
+        .fetch_one(&mut database.conn)
+        .await?;
+        assert_eq!(scans, 1, "claim_task does not read t_existing_ci");
+        Ok::<_, Box<dyn Error>>(())
+    })
+    .catch_unwind()
+    .await;
+    server.drop_database(database, result).await
+}
+
+/// A queue created while the cancellation index migration runs still gets the
+/// index, whether its creation commits while the migration waits or starts
+/// while the migration is uncommitted.
+#[tokio::test]
+async fn queues_created_during_the_cancellation_index_migration_are_indexed()
+-> Result<(), Box<dyn Error>> {
+    let Some(server) = TestServer::connect().await? else {
+        return Ok(());
+    };
+    let backend = TextSearchBackend::Postgres;
+    let mut database = server.create_database().await?;
+    let result = AssertUnwindSafe(async {
+        let (earlier, index): (Vec<_>, Vec<_>) = migration_list(backend)
+            .into_iter()
+            .filter(|migration| migration.version <= ABSURD_CANCELLATION_INDEX_VERSION)
+            .partition(|migration| migration.version < ABSURD_CANCELLATION_INDEX_VERSION);
+        run_list(&mut database.conn, earlier).await?;
+        let sql = index[0].sql.to_string();
+        let options = PgConnectOptions::from_str(&server.database_url)?.database(&database.name);
+        let mut creator = PgConnection::connect_with(&options).await?;
+        let mut migrator = PgConnection::connect_with(&options).await?;
+
+        creator.execute("begin").await?;
+        creator
+            .execute("select absurd.create_queue('before')")
+            .await?;
+        let migrator_pid = backend_pid(&mut migrator).await?;
+        let migration = tokio::spawn(async move {
+            migrator.execute("begin").await?;
+            migrator.execute(sql.as_str()).await?;
+            Ok::<_, sqlx::Error>(migrator)
+        });
+        wait_for_lock(&mut database.conn, migrator_pid).await?;
+        creator.execute("commit").await?;
+        let mut migrator = migration.await??;
+
+        let creator_pid = backend_pid(&mut creator).await?;
+        let creation = tokio::spawn(async move {
+            creator
+                .execute("select absurd.create_queue('during')")
+                .await?;
+            Ok::<_, sqlx::Error>(creator)
+        });
+        wait_for_lock(&mut database.conn, creator_pid).await?;
+        migrator.execute("commit").await?;
+        let creator = creation.await??;
+        creator.close().await?;
+        migrator.close().await?;
+
+        let unindexed: Vec<String> = sqlx::query_scalar(
+            "select queue_name from absurd.queues q where not exists (
+                select 1 from pg_indexes
+                where schemaname = 'absurd' and indexname = 't_' || q.queue_name || '_ci'
+            ) order by 1",
+        )
+        .fetch_all(&mut database.conn)
+        .await?;
+        assert_eq!(
+            unindexed,
+            Vec::<String>::new(),
+            "queues without a cancellation index"
+        );
+        Ok::<_, Box<dyn Error>>(())
+    })
+    .catch_unwind()
+    .await;
+    server.drop_database(database, result).await
+}
+
+async fn backend_pid(conn: &mut PgConnection) -> Result<i32, sqlx::Error> {
+    sqlx::query_scalar("select pg_backend_pid()")
+        .fetch_one(conn)
+        .await
+}
+
+/// Waits up to five seconds for a backend to block on a lock. A backend that
+/// never blocks lets the caller go on, so the test fails on its outcome.
+async fn wait_for_lock(conn: &mut PgConnection, pid: i32) -> Result<(), sqlx::Error> {
+    for _ in 0..500 {
+        let waiting: bool = sqlx::query_scalar(
+            "select coalesce(bool_or(wait_event_type = 'Lock'), false) from pg_stat_activity where pid = $1",
+        )
+        .bind(pid)
+        .fetch_one(&mut *conn)
+        .await?;
+        if waiting {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
 async fn has_keyword_index(
     conn: &mut PgConnection,
     backend: TextSearchBackend,

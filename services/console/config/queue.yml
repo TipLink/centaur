@@ -11,6 +11,14 @@ default: &default
       threads: 1
       processes: 1
       polling_interval: 0.1
+    # Recurring tasks configured with `command:` run as SolidQueue::RecurringJob
+    # on its own solid_queue_recurring queue, which no other worker claims. One
+    # thread runs those cleanups one at a time: a busy default queue cannot
+    # starve them, and their batch deletes cannot deadlock each other.
+    - queues: solid_queue_recurring
+      threads: 1
+      processes: 1
+      polling_interval: 1
 
 development:
   <<: *default
