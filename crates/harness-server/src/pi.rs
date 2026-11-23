@@ -329,7 +329,11 @@ impl HarnessServer for PiHarness {
         check_model(model)
     }
 
-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>> {
+    fn stdin_for_turn(
+        &self,
+        _normalizer: &mut Self::EventNormalizer,
+        input: &[UserInput],
+    ) -> Result<Vec<u8>> {
         command_line(json!({"type": "prompt", "message": message_text(input)}))
     }
 

@@ -7,6 +7,7 @@ import {
 import {
   CodexAppServerRendererEventMapper,
   INTERRUPTED_TEXT,
+  boundedErrorText,
   type CodexAppServerToChatStreamOptions
 } from './codex-app-server'
 import type {
@@ -177,7 +178,8 @@ export class NanocodexRendererEventMapper
       {
         type: 'renderer.done',
         answerMarkdown: this.answer || undefined,
-        error,
+        // Bounded as the Codex mapper's is: a failure can quote its payload.
+        error: boundedErrorText(error),
         streamFinalUpdates: true,
         threadId: this.requestId || undefined
       }

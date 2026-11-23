@@ -95,7 +95,13 @@ pub trait HarnessServer {
     fn validate_model(&self, _model: &str) -> std::result::Result<(), String> {
         Ok(())
     }
-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>>;
+    /// Stdin that starts a native turn. The normalizer lets the harness track
+    /// a prompt it must see taken in before the turn may end.
+    fn stdin_for_turn(
+        &self,
+        normalizer: &mut Self::EventNormalizer,
+        input: &[UserInput],
+    ) -> Result<Vec<u8>>;
     /// Whether a steer is written to the running harness as it arrives
     /// (`stdin_for_steer`), for the harness to fold into its work and answer
     /// within its native turn. Otherwise the steer waits for the native turn
@@ -107,10 +113,10 @@ pub trait HarnessServer {
     /// harness track a steer it must see answered before the turn may end.
     fn stdin_for_steer(
         &self,
-        _normalizer: &mut Self::EventNormalizer,
+        normalizer: &mut Self::EventNormalizer,
         input: &[UserInput],
     ) -> Result<Vec<u8>> {
-        self.stdin_for_turn(input)
+        self.stdin_for_turn(normalizer, input)
     }
     /// Normalizes a requested reasoning effort to a level this harness applies
     /// per turn, or `None` to run its configured default. No control by default.
@@ -130,6 +136,13 @@ pub trait HarnessServer {
         _line: &str,
     ) -> Result<Option<crate::user_input::UserInputControl>> {
         Ok(None)
+    }
+    /// Whether a blocking user-input request belongs to the active turn.
+    /// Harnesses gating stdout until the current prompt is acknowledged return
+    /// `false` before that acknowledgement so stale requests are rejected
+    /// without surfacing to the user.
+    fn accepts_user_input_request(&self, _normalizer: &Self::EventNormalizer) -> bool {
+        true
     }
     fn stdin_for_user_input_response(
         &self,
@@ -272,6 +285,20 @@ impl NormalizedEvent {
 
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(self, Self::Result { .. } | Self::Error { .. })
+    }
+
+    /// Bounds the error text a harness reports itself (its error `result`,
+    /// its `error` event), which can be as long as whatever it failed on.
+    pub(crate) fn with_bounded_error(self) -> Self {
+        match self {
+            Self::Result { error: Some(error) } => Self::Result {
+                error: Some(crate::error::bounded_message(&error)),
+            },
+            Self::Error { message } => Self::Error {
+                message: crate::error::bounded_message(&message),
+            },
+            event => event,
+        }
     }
 
     pub(crate) fn token_usage(&self) -> Option<&NormalizedTokenUsage> {

@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::amp::AmpHarness;
 use crate::claude::ClaudeCodeHarness;
 use crate::codex::CodexHarnessServer;
+use crate::error::{bounded_message, json_error_diagnostic};
 use crate::omp::OmpHarness;
 use crate::otel::{TraceContext, TurnStatus as TelemetryTurnStatus, TurnTelemetry};
 use crate::pi::PiHarness;
@@ -252,7 +253,10 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
             let message = match serde_json::from_str::<JSONRPCMessage>(trimmed) {
                 Ok(message) => message,
                 Err(error) => {
-                    eprintln!("invalid JSON-RPC message: {error}");
+                    eprintln!(
+                        "invalid JSON-RPC message: {}",
+                        json_error_diagnostic(&error)
+                    );
                     continue;
                 }
             };
@@ -528,7 +532,7 @@ pub(crate) fn parse_blocks_line_with_state(
 ) -> Result<BlocksCommand> {
     let parsed: BlocksLine =
         serde_json::from_str(line).map_err(|source| HarnessServerError::InvalidBlocksInput {
-            message: source.to_string(),
+            message: json_error_diagnostic(&source),
         })?;
 
     match parsed.kind.as_str() {
@@ -1334,7 +1338,7 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
         }
         Err(error) => {
             telemetry.observe_normalized(&NormalizedEvent::Error {
-                message: error.to_string(),
+                message: error.client_message(),
             });
             telemetry.finish(TelemetryTurnStatus::Failed);
             state.process = None;
@@ -1364,7 +1368,7 @@ fn finish_turn_with_error<W: Write>(
     stdout: &mut W,
     error: HarnessServerError,
 ) -> Result<()> {
-    let message = error.to_string();
+    let message = error.client_message();
     let normalized = NormalizedEvent::Error {
         message: message.clone(),
     };
@@ -1392,6 +1396,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     execution_id: Option<&str>,
 ) -> Result<Option<Turn>> {
     ensure_harness_process(harness, state)?;
+    let mut event_normalizer = H::EventNormalizer::default();
     {
         let process = state
             .process
@@ -1402,15 +1407,13 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
         // late `result` (and trailing rate-limit noise) behind, which would
         // otherwise read as this turn's instant terminal.
         while process.stdout.try_recv().is_ok() {}
-        if process.reasoning_effort != state.reasoning_effort {
-            let effort = state.reasoning_effort.as_deref();
-            process
-                .stdin
-                .write_all(&harness.stdin_for_reasoning_effort(effort)?)?;
-            process.reasoning_effort = state.reasoning_effort.clone();
-        }
-        process.stdin.write_all(&harness.stdin_for_turn(input)?)?;
-        process.stdin.flush()?;
+        write_turn_prompt_with_effort(
+            harness,
+            process,
+            state.reasoning_effort.as_deref(),
+            &mut event_normalizer,
+            input,
+        )?;
     }
 
     let settle_window = harness.terminal_assistant_stop_settle();
@@ -1422,7 +1425,6 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     // Armed while the harness holds the turn for a background follow-up that
     // has not started; any output pushes it back.
     let mut hold_deadline: Option<Instant> = None;
-    let mut event_normalizer = H::EventNormalizer::default();
     let mut completed_turn = None;
     let suggestion_window = state
         .supports_prompt_suggestions
@@ -1517,6 +1519,20 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 if let Some(control) = harness.user_input_control(trimmed)? {
                     match control {
                         UserInputControl::Request(request) => {
+                            if !harness.accepts_user_input_request(&event_normalizer) {
+                                eprintln!(
+                                    "native user input request rejected: prompt not yet acknowledged"
+                                );
+                                let process = state
+                                    .process
+                                    .as_mut()
+                                    .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
+                                process.stdin.write_all(
+                                    &harness.stdin_for_user_input_rejection(&request)?,
+                                )?;
+                                process.stdin.flush()?;
+                                continue;
+                            }
                             match questions.register(
                                 request.clone(),
                                 normalizer.thread_id(),
@@ -1578,10 +1594,16 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                         continue;
                     }
                     // A held turn still owes output after a terminal stop (for
-                    // example the answer to a steer), so the stop must not arm
-                    // the fallback completion.
-                    let terminal_stop =
-                        progress.assistant_stop && progress.hold == TurnHold::Released;
+                    // example the answer to a steer, or the follow-up to a
+                    // background task started after the stop), so the stop
+                    // neither arms the fallback completion nor keeps one
+                    // armed before the hold began: left armed, it would end
+                    // the turn on the first quiet moment of the wait.
+                    let released = progress.hold == TurnHold::Released;
+                    let terminal_stop = progress.assistant_stop && released;
+                    if !released {
+                        settle_deadline = None;
+                    }
                     if questions.is_pending() {
                         settle_deadline = None;
                         hold_deadline = None;
@@ -1591,7 +1613,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                                 terminal = true;
                             }
                             Some(window)
-                                if !terminal && (terminal_stop || settle_deadline.is_some()) =>
+                                if !terminal
+                                    && released
+                                    && (terminal_stop || settle_deadline.is_some()) =>
                             {
                                 settle_deadline = Some(Instant::now() + window);
                             }
@@ -1638,7 +1662,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                         kind: harness.kind(),
                     });
                 }
-                terminal = settle_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+                // A steer just written holds the turn too.
+                terminal = harness.turn_hold(&event_normalizer) == TurnHold::Released
+                    && settle_deadline.is_some_and(|deadline| Instant::now() >= deadline);
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let status = state
@@ -1649,8 +1675,11 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     .wait()?;
                 // A clean exit while waiting out the settle window means the
                 // native result is never coming: the terminal stop already
-                // seen ends the turn.
-                if settle_deadline.is_some() && status.success() {
+                // seen ends the turn, unless the harness still owed it output.
+                if settle_deadline.is_some()
+                    && harness.turn_hold(&event_normalizer) == TurnHold::Released
+                    && status.success()
+                {
                     state.process = None;
                     terminal = true;
                 } else {
@@ -1692,10 +1721,16 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 // Drop the finished turn's trailing output before continuing.
                 while process.stdout.try_recv().is_ok() {}
                 // One native turn at a time, so every held steer's answer lands
-                // before the turn's final terminal.
+                // before the turn's final terminal. A process started just
+                // now for the steer has yet to be given the turn's effort.
                 let input = held_steers.remove(0);
-                process.stdin.write_all(&harness.stdin_for_turn(&input)?)?;
-                process.stdin.flush()?;
+                write_turn_prompt_with_effort(
+                    harness,
+                    process,
+                    state.reasoning_effort.as_deref(),
+                    &mut event_normalizer,
+                    &input,
+                )?;
                 settle_deadline = None;
                 hold_deadline = None;
                 native_turn_may_have_ended = false;
@@ -1729,6 +1764,31 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     Ok(completed_turn)
 }
 
+/// Writes a native turn's prompt to the harness, first switching the process
+/// to the turn's reasoning effort when it runs another. A process keeps the
+/// effort it was last given, and one just started runs its configured default,
+/// so every prompt goes through here: the turn's first and each held steer
+/// that continues it, which can land on a process started for that steer.
+fn write_turn_prompt_with_effort<H: HarnessServer>(
+    harness: &H,
+    process: &mut HarnessChild,
+    reasoning_effort: Option<&str>,
+    event_normalizer: &mut H::EventNormalizer,
+    input: &[UserInput],
+) -> Result<()> {
+    if process.reasoning_effort.as_deref() != reasoning_effort {
+        process
+            .stdin
+            .write_all(&harness.stdin_for_reasoning_effort(reasoning_effort)?)?;
+        process.reasoning_effort = reasoning_effort.map(str::to_owned);
+    }
+    process
+        .stdin
+        .write_all(&harness.stdin_for_turn(event_normalizer, input)?)?;
+    process.stdin.flush()?;
+    Ok(())
+}
+
 struct StdoutProgress {
     successful_result: bool,
     terminal: bool,
@@ -1755,6 +1815,8 @@ fn handle_stdout_line<H: HarnessServer, W: Write>(
     let mut assistant_stop = false;
     let mut successful_result = false;
     for normalized in normalized_events {
+        // The harness's own error text is bounded before anything records it.
+        let normalized = normalized.with_bounded_error();
         telemetry.observe_normalized(&normalized);
         if let Some(session_id) = normalized.session_id() {
             state.harness_session_id = Some(session_id.to_string());
@@ -1971,7 +2033,7 @@ pub(crate) fn write_blocks_error<W: Write>(
             "method": "error",
             "params": {
                 "error": {
-                    "message": message,
+                    "message": bounded_message(&message),
                     "codexErrorInfo": null,
                     "additionalDetails": null
                 },

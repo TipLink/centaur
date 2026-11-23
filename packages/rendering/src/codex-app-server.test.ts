@@ -891,6 +891,194 @@ describe('CodexAppServerRendererEventMapper', () => {
     })
   })
 
+  /** Every place a failure's text leaves the mapper. */
+  function reportedFailure(events: RendererEvent[]) {
+    const task = events.find(
+      event => event.type === 'renderer.task.update' && event.task.id === 'execution-error'
+    )
+    const done = events.at(-1)
+    if (task?.type !== 'renderer.task.update' || done?.type !== 'renderer.done') {
+      throw new Error(`expected an error task and a terminal event: ${JSON.stringify(events)}`)
+    }
+    return {
+      details: task.task.details,
+      streamed: events
+        .flatMap(event => (event.type === 'renderer.message.delta' ? [event.delta] : []))
+        .join(''),
+      answerMarkdown: done.answerMarkdown,
+      error: done.error
+    }
+  }
+
+  it('bounds a long failure everywhere it is reported', () => {
+    // A crash reports its whole stderr. All 19,479 characters used to reach
+    // `renderer.done`, and from there the closed session and the chat.
+    const error = `sandbox exited with status 137\n${'  at frame (internal detail)\n'.repeat(671)}`
+    expect(error.length).toBeGreaterThan(19_000)
+    const shown = `${error.replace(/\s+/g, ' ').slice(0, 497)}...`
+    expect(shown).toHaveLength(500)
+
+    for (const source of [
+      { eventKind: 'session.execution_failed', data: { error } },
+      { eventKind: 'session.stream_error', data: { error } },
+      { type: 'turn.completed', turn: { id: 'turn-1', status: 'failed', error: { message: error } } },
+      { method: 'error', params: { error: { message: error }, willRetry: false } }
+    ]) {
+      const events = new CodexAppServerRendererEventMapper().process(source)
+      expect(reportedFailure(events)).toEqual({
+        details: [{ type: 'text', text: shown }],
+        streamed: `Execution failed: ${shown}`,
+        answerMarkdown: `Execution failed: ${shown}`,
+        error: shown
+      })
+      expect(JSON.stringify(events).length).toBeLessThan(4_000)
+    }
+  })
+
+  it('bounds the details a failure adds to its message', () => {
+    const events = new CodexAppServerRendererEventMapper().process({
+      method: 'error',
+      params: {
+        error: { message: 'Reconnecting... 5/5', additionalDetails: 'provider error '.repeat(2_000) },
+        willRetry: false
+      }
+    })
+
+    const failure = reportedFailure(events)
+    const error = failure.error ?? ''
+    expect(error).toHaveLength(500)
+    expect(error.startsWith('Reconnecting... 5/5: provider error provider error')).toBe(true)
+    expect(failure.details).toEqual([{ type: 'text', text: error }])
+    expect(failure.answerMarkdown).toBe(`Execution failed: ${error}`)
+  })
+
+  it('reports nothing of the value a parse failure quotes', () => {
+    // harness-server no longer sends this text, but one still running in an
+    // older sandbox does: serde quotes the whole value it rejected, and a cut
+    // to any length keeps the start of it.
+    const value = `START-SECRET<task-notification>\n${'  <summary>internal detail</summary>\n'.repeat(700)}</task-notification>END-SECRET`
+    for (const error of [
+      `JSON error: invalid type: string ${JSON.stringify(value)}, expected a sequence at line 1 column 25265`,
+      // As an earlier harness-server cut it: the start and the end.
+      `JSON error: invalid type: string "${value.slice(0, 362)} ... (truncated) ... ${value.slice(-63)}", expected struct AnthropicMessage`,
+      // Within the bound, where nothing is cut.
+      'JSON error: invalid type: string "START-SECRET token END-SECRET", expected a sequence',
+      'JSON error: invalid value: string "START-SECRET token END-SECRET", expected a known role'
+    ]) {
+      const events = new CodexAppServerRendererEventMapper().process({
+        eventKind: 'session.execution_failed',
+        data: { error }
+      })
+
+      const shown = error.includes('invalid value')
+        ? 'JSON error: invalid value: string [redacted]'
+        : 'JSON error: invalid type: string [redacted]'
+      expect(reportedFailure(events)).toEqual({
+        details: [{ type: 'text', text: shown }],
+        streamed: `Execution failed: ${shown}`,
+        answerMarkdown: `Execution failed: ${shown}`,
+        error: shown
+      })
+      const reported = JSON.stringify(events)
+      for (const leaked of ['START-SECRET', 'END-SECRET', 'task-notification', 'internal detail']) {
+        expect(reported).not.toContain(leaked)
+      }
+    }
+  })
+
+  it('cuts a long failure between characters, not inside one', () => {
+    const events = new CodexAppServerRendererEventMapper().process({
+      eventKind: 'session.execution_failed',
+      // Each of these is two UTF-16 code units, so the cut falls inside one.
+      data: { error: '🙂'.repeat(600) }
+    })
+
+    const failure = reportedFailure(events)
+    const error = failure.error ?? ''
+    expect(error).toBe(`${'🙂'.repeat(248)}...`)
+    expect(error.length).toBeLessThanOrEqual(500)
+    expect(() => encodeURIComponent(`${error}${failure.answerMarkdown}`)).not.toThrow()
+  })
+
+  it('bounds the notice of a cancelled session', async () => {
+    const chunks = await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          { eventKind: 'session.execution_cancelled', data: { error: 'cancelled: '.repeat(2_000) } }
+        ])
+      )
+    )
+
+    const text = chunks.flatMap(chunk => (chunk.type === 'markdown_text' ? [chunk.text] : [])).join('')
+    expect(text).toHaveLength(500)
+    expect(text.startsWith('cancelled: cancelled: ')).toBe(true)
+  })
+
+  it('closes the session with the bounded error', async () => {
+    const closed: unknown[] = []
+    await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          { eventKind: 'session.execution_failed', data: { error: 'boom '.repeat(4_000) } }
+        ]),
+        {
+          onOutput: output => {
+            if (output.type === 'chat.session.closed') closed.push(output.message)
+          }
+        }
+      )
+    )
+
+    const shown = `${'boom '.repeat(100).slice(0, 497)}...`
+    expect(closed).toEqual([{ text: `Execution failed: ${shown}`, error: shown }])
+  })
+
+  it('shows an error within the bound as it was reported', () => {
+    for (const error of ['sandbox exited\n  with status 137', 'x'.repeat(500)]) {
+      const mapper = new CodexAppServerRendererEventMapper()
+      const events = mapper.process({
+        eventKind: 'session.execution_failed',
+        data: { error }
+      })
+
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: 'renderer.task.update',
+          task: expect.objectContaining({
+            id: 'execution-error',
+            details: [{ type: 'text', text: error }]
+          })
+        })
+      )
+      expect(events.at(-1)).toMatchObject({
+        type: 'renderer.done',
+        answerMarkdown: `Execution failed: ${error}`,
+        error
+      })
+    }
+  })
+
+  it('keeps an ordinary failure with details as it was reported', () => {
+    const events = new CodexAppServerRendererEventMapper().process({
+      method: 'error',
+      params: {
+        error: {
+          message: 'Reconnecting... 2/5',
+          additionalDetails: 'unexpected status 502 Bad Gateway'
+        },
+        willRetry: false
+      }
+    })
+
+    const error = 'Reconnecting... 2/5: unexpected status 502 Bad Gateway'
+    expect(reportedFailure(events)).toEqual({
+      details: [{ type: 'text', text: error }],
+      streamed: `Execution failed: ${error}`,
+      answerMarkdown: `Execution failed: ${error}`,
+      error
+    })
+  })
+
   it('emits interrupted final text for cancelled Rust sessions', async () => {
     const chunks = await collect(
       codexAppServerToChatSdkStream(

@@ -1,0 +1,3283 @@
+diff --git a/crates/harness-server/src/amp.rs b/crates/harness-server/src/amp.rs
+index 53ae047d..f9212802 100644
+--- a/crates/harness-server/src/amp.rs
++++ b/crates/harness-server/src/amp.rs
+@@ -146,7 +146,11 @@ impl HarnessServer for AmpHarness {
+         command
+     }
+ 
+-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>> {
++    fn stdin_for_turn(
++        &self,
++        _normalizer: &mut Self::EventNormalizer,
++        input: &[UserInput],
++    ) -> Result<Vec<u8>> {
+         amp_user_stdin(input, false)
+     }
+ 
+@@ -234,10 +238,13 @@ mod tests {
+     #[test]
+     fn turn_stdin_is_plain_user_message() {
+         let bytes = AmpHarness
+-            .stdin_for_turn(&[UserInput::Text {
+-                text: "hello".to_string(),
+-                text_elements: Vec::new(),
+-            }])
++            .stdin_for_turn(
++                &mut Default::default(),
++                &[UserInput::Text {
++                    text: "hello".to_string(),
++                    text_elements: Vec::new(),
++                }],
++            )
+             .unwrap();
+         let value: Value = serde_json::from_slice(&bytes).unwrap();
+ 
+diff --git a/crates/harness-server/src/anthropic.rs b/crates/harness-server/src/anthropic.rs
+index 8ddf3c07..b3354440 100644
+--- a/crates/harness-server/src/anthropic.rs
++++ b/crates/harness-server/src/anthropic.rs
+@@ -59,11 +59,194 @@ pub enum AnthropicStreamEvent {
+     Unknown,
+ }
+ 
++/// The two top-level fields that classify a line without parsing its body.
++#[derive(Debug, Default, PartialEq, Eq)]
++pub(crate) struct TopLevelEnvelope {
++    pub kind: Option<String>,
++    /// Present and not `null`.
++    pub has_parent_tool_use_id: bool,
++}
++
++/// Scans only the top-level keys of a JSON object without recursion or
++/// allocating a `Value` tree, so deeply nested or unreadable bodies on
++/// non-matching lines (such as subagent sidechains) never trip `serde_json`'s
++/// recursion limit or typed validation. Returns `None` if the line is not a
++/// syntactically balanced top-level JSON object, letting callers fall through
++/// to full `serde_json` parsing for error reporting.
++pub(crate) fn scan_top_level_envelope(line: &str) -> Option<TopLevelEnvelope> {
++    let bytes = line.as_bytes();
++    let mut i = skip_json_ws(bytes, 0);
++    if bytes.get(i) != Some(&b'{') {
++        return None;
++    }
++    i += 1;
++    let mut envelope = TopLevelEnvelope::default();
++    let mut first = true;
++    loop {
++        i = skip_json_ws(bytes, i);
++        if bytes.get(i) == Some(&b'}') {
++            i = skip_json_ws(bytes, i + 1);
++            return (i == bytes.len()).then_some(envelope);
++        }
++        if !first {
++            if bytes.get(i) != Some(&b',') {
++                return None;
++            }
++            i = skip_json_ws(bytes, i + 1);
++        }
++        first = false;
++
++        let key_start = i;
++        let key_end = scan_json_string(bytes, key_start)?;
++        i = skip_json_ws(bytes, key_end);
++        if bytes.get(i) != Some(&b':') {
++            return None;
++        }
++        let val_start = skip_json_ws(bytes, i + 1);
++        let val_end = scan_json_value(line, val_start)?;
++        i = val_end;
++
++        let key_slice = &line[key_start..key_end];
++        let val_slice = &line[val_start..val_end];
++        let matched_key = if key_slice == "\"type\"" {
++            Some("type")
++        } else if key_slice == "\"parent_tool_use_id\"" {
++            Some("parent_tool_use_id")
++        } else if key_slice.contains('\\') {
++            match serde_json::from_str::<String>(key_slice).ok()?.as_str() {
++                "type" => Some("type"),
++                "parent_tool_use_id" => Some("parent_tool_use_id"),
++                _ => None,
++            }
++        } else {
++            None
++        };
++        match matched_key {
++            Some("type") => {
++                envelope.kind = if val_slice.starts_with('"') {
++                    serde_json::from_str::<String>(val_slice).ok()
++                } else {
++                    None
++                };
++            }
++            Some("parent_tool_use_id") => {
++                envelope.has_parent_tool_use_id = val_slice != "null";
++            }
++            _ => {}
++        }
++    }
++}
++
++fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
++    while let Some(&b) = bytes.get(i) {
++        if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
++            i += 1;
++        } else {
++            break;
++        }
++    }
++    i
++}
++
++fn scan_json_string(bytes: &[u8], start: usize) -> Option<usize> {
++    if bytes.get(start) != Some(&b'"') {
++        return None;
++    }
++    let mut i = start + 1;
++    while let Some(&b) = bytes.get(i) {
++        match b {
++            b'"' => return Some(i + 1),
++            b'\\' => {
++                if i + 1 >= bytes.len() {
++                    return None;
++                }
++                i += 2;
++            }
++            0x00..=0x1f => return None,
++            _ => i += 1,
++        }
++    }
++    None
++}
++
++fn scan_json_value(line: &str, start: usize) -> Option<usize> {
++    let bytes = line.as_bytes();
++    match *bytes.get(start)? {
++        b'"' => scan_json_string(bytes, start),
++        b'{' | b'[' => scan_json_container(bytes, start),
++        _ => {
++            let mut i = start;
++            while let Some(&b) = bytes.get(i) {
++                if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b',' | b'}' | b']') {
++                    break;
++                }
++                i += 1;
++            }
++            if i == start {
++                return None;
++            }
++            let token = &line[start..i];
++            let valid = matches!(token, "null" | "true" | "false")
++                || serde_json::from_str::<serde_json::Number>(token).is_ok();
++            valid.then_some(i)
++        }
++    }
++}
++
++fn scan_json_container(bytes: &[u8], start: usize) -> Option<usize> {
++    let opener = *bytes.get(start)?;
++    let mut stack = vec![if opener == b'{' { b'}' } else { b']' }];
++    let mut i = start + 1;
++    while !stack.is_empty() {
++        let &b = bytes.get(i)?;
++        match b {
++            b'"' => i = scan_json_string(bytes, i)?,
++            b'{' => {
++                stack.push(b'}');
++                i += 1;
++            }
++            b'[' => {
++                stack.push(b']');
++                i += 1;
++            }
++            b'}' | b']' => {
++                if stack.pop() != Some(b) {
++                    return None;
++                }
++                i += 1;
++            }
++            _ => i += 1,
++        }
++    }
++    Some(i)
++}
++
+ impl AnthropicStreamEvent {
+     pub fn parse_json_line(line: &str) -> Result<Self> {
+         Ok(serde_json::from_str(line)?)
+     }
+ 
++    /// Parses a line of the main chain, and reads a subagent sidechain's no
++    /// further than its envelope: it becomes `Unknown`, which every consumer
++    /// ignores. A sidechain's messages never reach the turn (its report
++    /// arrives as the main chain's Task tool result), so a body this parser
++    /// cannot read — including deeply nested tool input — must not fail the
++    /// parent turn. Only the event types that carry `parent_tool_use_id` (see
++    /// `Self::parent_tool_use_id`) are skipped. Every main-chain line is still
++    /// parsed and validated in full.
++    pub fn parse_main_chain_json_line(line: &str) -> Result<Self> {
++        if let Some(envelope) = scan_top_level_envelope(line) {
++            let owned_by_a_chain = matches!(
++                envelope.kind.as_deref(),
++                Some("assistant" | "user" | "stream_event")
++            );
++            if owned_by_a_chain && envelope.has_parent_tool_use_id {
++                return Ok(Self::Unknown);
++            }
++        }
++        Self::parse_json_line(line)
++    }
++
+     /// The authoritative end-of-message stop reason, carried by the raw
+     /// `message_delta` stream event (`tool_use`, `end_turn`, ...). The per-block
+     /// `assistant` events leave `stop_reason` null, so this is the only in-stream
+@@ -320,12 +503,19 @@ impl AnthropicEventNormalizer {
+                 ..
+             } => {
+                 let tool_use_result = tool_use_result.as_ref();
+-                let results = message
++                let results: Vec<_> = message
+                     .content
+                     .into_iter()
+                     .filter_map(|block| block.into_tool_result(tool_use_result))
+                     .collect();
+-                NormalizedEvent::ToolResults(results)
++                // A user message without tool results (plain text, a background
++                // task's `<task-notification>`) is not a tool boundary: reported
++                // as one, it would settle pending agent text as commentary.
++                if results.is_empty() {
++                    NormalizedEvent::Ignored
++                } else {
++                    NormalizedEvent::ToolResults(results)
++                }
+             }
+             AnthropicStreamEvent::Result {
+                 subtype,
+@@ -364,11 +554,70 @@ pub struct AnthropicMessage {
+     pub model: Option<String>,
+     pub stop_reason: Option<String>,
+     pub usage: Option<Value>,
+-    #[serde(default)]
++    #[serde(default, deserialize_with = "deserialize_message_content")]
+     pub content: Vec<AnthropicContentBlock>,
+ }
+ 
++/// Message `content` is a list of blocks, or the Messages API's shorthand of a
++/// plain string for a single text block. Claude Code uses the shorthand for
++/// user messages it writes itself, such as a background task's
++/// `<task-notification>`, and echoes them under `--replay-user-messages`
++/// (observed with 2.1.325). A string reads as one text block and `null` as no
++/// blocks, instead of failing the line and with it the turn.
++fn deserialize_message_content<'de, D>(
++    deserializer: D,
++) -> std::result::Result<Vec<AnthropicContentBlock>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++{
++    struct ContentVisitor;
++
++    impl<'de> serde::de::Visitor<'de> for ContentVisitor {
++        type Value = Vec<AnthropicContentBlock>;
++
++        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++            formatter.write_str("a string, null or a sequence of content blocks")
++        }
++
++        fn visit_str<E>(self, text: &str) -> std::result::Result<Self::Value, E> {
++            Ok(vec![AnthropicContentBlock::Text {
++                text: text.to_string(),
++            }])
++        }
++
++        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
++            Ok(Vec::new())
++        }
++
++        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
++            Ok(Vec::new())
++        }
++
++        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
++        where
++            D: serde::Deserializer<'de>,
++        {
++            deserializer.deserialize_any(self)
++        }
++
++        fn visit_seq<A>(self, blocks: A) -> std::result::Result<Self::Value, A::Error>
++        where
++            A: serde::de::SeqAccess<'de>,
++        {
++            Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(blocks))
++        }
++    }
++
++    deserializer.deserialize_any(ContentVisitor)
++}
++
+ impl AnthropicMessage {
++    /// Claude Code attributes text it wrote without calling the model (an API
++    /// error notice, "No response requested.") to this model name.
++    pub fn is_synthetic(&self) -> bool {
++        self.model.as_deref() == Some("<synthetic>")
++    }
++
+     fn into_normalized_content(self) -> Vec<NormalizedContent> {
+         let message_id = assistant_item_id(self.id.as_deref());
+         self.content
+@@ -640,6 +889,8 @@ fn exit_code_from_prefix(content: &str) -> Option<i32> {
+ 
+ #[cfg(test)]
+ mod tests {
++    use serde_json::json;
++
+     use super::*;
+ 
+     #[test]
+@@ -670,4 +921,205 @@ mod tests {
+         assert_eq!(usage.output_tokens, Some(17));
+         assert_eq!(usage.total_tokens, Some(41));
+     }
++
++    fn user_message(content: Value) -> AnthropicMessage {
++        match serde_json::from_value(json!({"type": "user", "message": content})) {
++            Ok(AnthropicStreamEvent::User { message, .. }) => message,
++            other => panic!("expected a user event, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn message_content_reads_blocks_a_plain_string_null_and_absence() {
++        let blocks = user_message(json!({"content": [
++            {"type": "text", "text": "hi"},
++            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
++            {"type": "from_a_newer_cli"},
++        ]}));
++        assert!(matches!(
++            blocks.content.as_slice(),
++            [
++                AnthropicContentBlock::Text { text },
++                AnthropicContentBlock::ToolResult { .. },
++                AnthropicContentBlock::Unknown,
++            ] if text == "hi"
++        ));
++
++        let notification = "<task-notification>\n<task-id>a1</task-id>\n</task-notification>";
++        let string = user_message(json!({"role": "user", "content": notification}));
++        assert!(matches!(
++            string.content.as_slice(),
++            [AnthropicContentBlock::Text { text }] if text == notification
++        ));
++
++        assert!(user_message(json!({"content": null})).content.is_empty());
++        assert!(user_message(json!({"role": "user"})).content.is_empty());
++    }
++
++    /// The line that failed a production turn: Claude Code 2.1.325 echoing a
++    /// background task's notification under `--replay-user-messages`.
++    #[test]
++    fn replayed_task_notification_with_string_content_parses() {
++        let event = AnthropicStreamEvent::parse_json_line(
++            r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a1b2</task-id>\n<status>completed</status>\n</task-notification>"},"parent_tool_use_id":null,"session_id":"s1","uuid":"7d0e","isReplay":true}"#,
++        )
++        .expect("string content parses");
++        assert!(matches!(
++            event,
++            AnthropicStreamEvent::User { is_replay: true, uuid: Some(uuid), .. } if uuid == "7d0e"
++        ));
++    }
++
++    #[test]
++    fn message_content_of_another_type_still_fails_the_line() {
++        let error = AnthropicStreamEvent::parse_json_line(
++            r#"{"type":"user","message":{"content":{"type":"text","text":"hi"}}}"#,
++        )
++        .expect_err("an object is not message content");
++        // What reaches a client says nothing of the value. (An event's body
++        // is checked after serde has buffered it to find the `type` tag, so
++        // such an error has no position to report either.)
++        assert_eq!(error.to_string(), "JSON error: invalid data");
++        let crate::HarnessServerError::Json(source) = error else {
++            panic!("expected a JSON error, got {error:?}");
++        };
++        assert!(
++            source
++                .to_string()
++                .contains("expected a string, null or a sequence of content blocks"),
++            "{source}"
++        );
++    }
++
++    /// Bodies the typed parser rejects: a message that is a string, a content
++    /// block that is a number, a stream event with no index.
++    fn malformed_events(parent_tool_use_id: Option<Value>) -> Vec<String> {
++        [
++            json!({"type": "assistant", "message": "SECRET-BODY not a message"}),
++            json!({"type": "user", "message": {"role": "user", "content": [7, "SECRET-BODY"]}}),
++            json!({"type": "stream_event", "event": {"type": "content_block_delta", "delta": "SECRET-BODY"}}),
++        ]
++        .into_iter()
++        .map(|mut event| {
++            if let Some(parent) = &parent_tool_use_id {
++                event["parent_tool_use_id"] = parent.clone();
++            }
++            event.to_string()
++        })
++        .collect()
++    }
++
++    #[test]
++    fn sidechain_events_are_not_read_past_their_envelope() {
++        // A subagent's event with a body this parser cannot read used to fail
++        // the parent turn, although sidechain events are dropped anyway.
++        for parent in [json!("toolu_task_1"), json!(""), json!({"id": 1})] {
++            for line in malformed_events(Some(parent)) {
++                assert!(
++                    AnthropicStreamEvent::parse_json_line(&line).is_err(),
++                    "the fixture must be unreadable in full: {line}"
++                );
++                let event = AnthropicStreamEvent::parse_main_chain_json_line(&line)
++                    .unwrap_or_else(|error| panic!("{error}: {line}"));
++                assert!(matches!(event, AnthropicStreamEvent::Unknown), "{line}");
++                assert!(matches!(
++                    NormalizedEvent::from(event),
++                    NormalizedEvent::Ignored
++                ));
++            }
++        }
++        // A well-formed sidechain event is skipped the same way.
++        let event = AnthropicStreamEvent::parse_main_chain_json_line(
++            r#"{"type":"assistant","parent_tool_use_id":"toolu_task_1","message":{"id":"msg_s","stop_reason":"end_turn","content":[{"type":"text","text":"subagent"}]}}"#,
++        )
++        .expect("sidechain event");
++        assert!(matches!(event, AnthropicStreamEvent::Unknown));
++
++        // Valid JSON nested deeper than serde_json's recursion limit (128) on
++        // a sidechain body must also be skipped without failing the line.
++        let deep = format!("{}0{}", r#"{"a":"#.repeat(200), "}".repeat(200));
++        let deep_sidechain = format!(
++            r#"{{"type":"assistant","parent_tool_use_id":"toolu_task_1","message":{{"id":"msg_deep","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{deep}}}]}}}}"#
++        );
++        assert!(
++            AnthropicStreamEvent::parse_json_line(&deep_sidechain).is_err(),
++            "deeply nested fixture should exceed serde_json recursion limit"
++        );
++        let event = AnthropicStreamEvent::parse_main_chain_json_line(&deep_sidechain)
++            .expect("deeply nested sidechain event");
++        assert!(matches!(event, AnthropicStreamEvent::Unknown));
++    }
++
++    #[test]
++    fn main_chain_events_are_still_parsed_and_validated_in_full() {
++        for parent in [None, Some(Value::Null)] {
++            for line in malformed_events(parent) {
++                let error = AnthropicStreamEvent::parse_main_chain_json_line(&line)
++                    .expect_err("a malformed main-chain event fails the line");
++                assert_eq!(error.to_string(), "JSON error: invalid data", "{line}");
++            }
++        }
++        let event = AnthropicStreamEvent::parse_main_chain_json_line(
++            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"id":"msg_1","content":[{"type":"text","text":"main"}]}}"#,
++        )
++        .expect("main-chain event");
++        assert!(matches!(event, AnthropicStreamEvent::Assistant { .. }));
++
++        // `system` and `result` lines carry no chain of their own: a field of
++        // that name on one does not hide it.
++        let event = AnthropicStreamEvent::parse_main_chain_json_line(
++            r#"{"type":"system","subtype":"init","session_id":"s1","parent_tool_use_id":"toolu_task_1"}"#,
++        )
++        .expect("system event");
++        assert!(matches!(
++            NormalizedEvent::from(event),
++            NormalizedEvent::SessionStarted { session_id: Some(session_id) } if session_id == "s1"
++        ));
++        let event = AnthropicStreamEvent::parse_main_chain_json_line(
++            r#"{"type":"result","subtype":"success","parent_tool_use_id":"toolu_task_1"}"#,
++        )
++        .expect("result event");
++        assert!(matches!(event, AnthropicStreamEvent::Result { .. }));
++
++        // A line that is not JSON at all fails without quoting itself.
++        let error = AnthropicStreamEvent::parse_main_chain_json_line("SECRET-BODY {")
++            .expect_err("not JSON");
++        assert_eq!(
++            error.to_string(),
++            "JSON error: invalid syntax at line 1, column 1"
++        );
++    }
++
++    #[test]
++    fn user_messages_without_tool_results_are_ignored() {
++        for content in [
++            json!("<task-notification>done</task-notification>"),
++            json!([{"type": "text", "text": "plain text"}]),
++            json!([]),
++            Value::Null,
++        ] {
++            let event = serde_json::from_value::<AnthropicStreamEvent>(
++                json!({"type": "user", "message": {"role": "user", "content": content}}),
++            )
++            .expect("user event");
++            assert!(matches!(
++                NormalizedEvent::from(event),
++                NormalizedEvent::Ignored
++            ));
++        }
++
++        let event = serde_json::from_value::<AnthropicStreamEvent>(json!({
++            "type": "user",
++            "message": {"content": [
++                {"type": "text", "text": "and a note"},
++                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
++            ]},
++        }))
++        .expect("user event");
++        assert!(matches!(
++            NormalizedEvent::from(event),
++            NormalizedEvent::ToolResults(results)
++                if results.len() == 1 && results[0].tool_use_id == "toolu_1"
++        ));
++    }
+ }
+diff --git a/crates/harness-server/src/claude.rs b/crates/harness-server/src/claude.rs
+index 3cc6d220..806d4406 100644
+--- a/crates/harness-server/src/claude.rs
++++ b/crates/harness-server/src/claude.rs
+@@ -51,6 +51,22 @@ const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"]
+ /// message as it takes it in, keeping the `uuid` it was sent with, so a
+ /// steer not yet echoed when `result` arrives is owed a follow-up, which this
+ /// turn waits for.
++///
++/// The turn's own prompt is tracked the same way. A resumed session first
++/// settles what its previous process left behind (tool calls cut short, the
++/// `<task-notification>` of each background task that died with it) and can
++/// end that with a `result` of its own before it dequeues the prompt
++/// (observed with 2.1.325). Read as the turn's end, that `result` would
++/// complete the turn empty while Claude Code went on to answer nobody.
++///
++/// Claude Code started with `--replay-user-messages` echoes the prompt as it
++/// takes it in, so until that echo nothing it writes is this turn's: messages,
++/// stream events, tool results and task events are dropped, and a successful
++/// `result` is swallowed whatever text it carries. Only the session id and a
++/// failure get through. A command that replaces the CLI may not echo
++/// (`expects_prompt_replay`); there the model's own output also shows the
++/// prompt was taken in, and what Claude Code writes itself (model
++/// `<synthetic>`) is still dropped.
+ #[derive(Debug, Default)]
+ pub struct ClaudeEventNormalizer {
+     inner: AnthropicEventNormalizer,
+@@ -68,6 +84,18 @@ pub struct ClaudeEventNormalizer {
+     result_held: bool,
+     /// Steers written to Claude Code that it has not echoed yet, by uuid.
+     outstanding_steers: HashSet<String>,
++    /// The uuid of this turn's prompt until Claude Code takes the prompt in.
++    pending_turn_prompt: Option<String>,
++    /// Claude Code echoes every prompt, so only the echo of the pending one
++    /// shows it was taken in (see `expects_prompt_replay`).
++    expect_prompt_replay: bool,
++    /// Claude Code wrote a message of its own while the prompt was pending;
++    /// the `result` after it closes that message, whatever text it repeats.
++    pre_prompt_message: bool,
++    /// The stream is inside a message Claude Code wrote itself: its
++    /// `message_start` named the model `<synthetic>` and its `message_stop`
++    /// has not arrived.
++    in_synthetic_message: bool,
+ }
+ 
+ #[derive(Debug)]
+@@ -104,9 +132,50 @@ impl ClaudeEventNormalizer {
+         self.outstanding_steers.insert(uuid);
+     }
+ 
++    /// Notes this turn's prompt, sent with `uuid`. A `result` cannot answer
++    /// it before Claude Code has taken it in. With `expect_replay`, only
++    /// Claude Code's echo of `uuid` shows that it has.
++    pub fn turn_prompt_sent(&mut self, uuid: String, expect_replay: bool) {
++        self.pending_turn_prompt = Some(uuid);
++        self.expect_prompt_replay = expect_replay;
++        self.pre_prompt_message = false;
++        self.result_held = false;
++    }
++
++    fn turn_prompt_taken_in(&mut self) {
++        self.pending_turn_prompt = None;
++        self.pre_prompt_message = false;
++        // A `result` swallowed while the prompt waited was not this turn's.
++        self.result_held = false;
++    }
++
++    pub fn awaiting_prompt_replay(&self) -> bool {
++        self.pending_turn_prompt.is_some() && self.expect_prompt_replay
++    }
++
++    /// Whether `event` is part of a message Claude Code wrote itself, by the
++    /// message's own model or, for a stream event, by the `message_start`
++    /// that opened the message it belongs to.
++    fn written_by_claude_code(&mut self, event: &AnthropicStreamEvent) -> bool {
++        match event {
++            AnthropicStreamEvent::Assistant { message, .. } => message.is_synthetic(),
++            AnthropicStreamEvent::StreamEvent { event, .. } => match event {
++                AnthropicRawStreamEvent::MessageStart { message } => {
++                    self.in_synthetic_message = message.is_synthetic();
++                    self.in_synthetic_message
++                }
++                AnthropicRawStreamEvent::MessageStop => {
++                    std::mem::take(&mut self.in_synthetic_message)
++                }
++                _ => self.in_synthetic_message,
++            },
++            _ => false,
++        }
++    }
++
+     pub fn normalize(&mut self, event: AnthropicStreamEvent) -> Vec<NormalizedEvent> {
+         // An echoed user message carries no output of its own; it only tells
+-        // which steers Claude Code has taken in.
++        // which prompt and steers Claude Code has taken in.
+         if let AnthropicStreamEvent::User {
+             is_replay: true,
+             uuid,
+@@ -115,15 +184,69 @@ impl ClaudeEventNormalizer {
+         {
+             if let Some(uuid) = uuid {
+                 self.outstanding_steers.remove(uuid);
++                if self.pending_turn_prompt.as_ref() == Some(uuid) {
++                    self.turn_prompt_taken_in();
++                }
+             }
+             return Vec::new();
+         }
++        let synthetic = self.written_by_claude_code(&event);
++        let mut pre_prompt_result = false;
++        if self.pending_turn_prompt.is_some() && self.expect_prompt_replay {
++            match &event {
++                // The session id is the process's, whichever turn it runs.
++                AnthropicStreamEvent::System { subtype, .. }
++                    if subtype.as_deref() == Some("init") => {}
++                // A failure ends the turn now: Claude Code that cannot start
++                // or authenticate never echoes anything.
++                AnthropicStreamEvent::Error { .. } => {}
++                // A `result` that succeeded closes a turn Claude Code ran on
++                // its own, whatever text it carries; one that failed is let
++                // through (below) like any failure.
++                AnthropicStreamEvent::Result { .. } => pre_prompt_result = true,
++                // Everything else was written before Claude Code read the
++                // prompt, so none of it answers the prompt: what the resumed
++                // session says on its own, output cut off with its previous
++                // process, the task events of work that died with it.
++                _ => return Vec::new(),
++            }
++        } else if self.pending_turn_prompt.is_some() {
++            match &event {
++                // What Claude Code says on its own about the session it
++                // resumed ("No response requested.") is no answer to a prompt
++                // it has not read yet, and neither is any part of that
++                // message's stream.
++                AnthropicStreamEvent::StreamEvent { .. }
++                | AnthropicStreamEvent::Assistant { .. }
++                    if synthetic =>
++                {
++                    self.pre_prompt_message = true;
++                    return Vec::new();
++                }
++                // The model only answers a prompt Claude Code has taken in,
++                // which is the sign from a CLI that does not echo its input.
++                AnthropicStreamEvent::StreamEvent { .. }
++                | AnthropicStreamEvent::Assistant { .. } => self.turn_prompt_taken_in(),
++                // A `result` with no text of its own answers nothing. One
++                // that carries text and follows no message at all is left to
++                // end the turn, as from a CLI that reports only its result.
++                AnthropicStreamEvent::Result { result, .. } => {
++                    pre_prompt_result = self.pre_prompt_message
++                        || result.as_deref().is_none_or(|text| text.trim().is_empty());
++                }
++                _ => {}
++            }
++        }
+         let token_usage = event.token_usage();
+         let message_stop_reason = event.message_stop_reason().map(str::to_string);
+         let mut out = Vec::new();
+         self.track_background_tasks(&event, &mut out);
+         let normalized = self.inner.normalize(event);
+-        if let Some(usage) = token_usage {
++        // Claude Code ended a turn of its own before reading the prompt.
++        let pre_prompt_result =
++            pre_prompt_result && matches!(normalized, NormalizedEvent::Result { error: None });
++        // What that turn used is not what this one did.
++        if let Some(usage) = token_usage.filter(|_| !pre_prompt_result) {
+             out.push(NormalizedEvent::TokenUsage { usage });
+         }
+         if let Some(stop_reason) = message_stop_reason {
+@@ -144,6 +267,10 @@ impl ClaudeEventNormalizer {
+                 self.flush_pending(Some("tool_use".to_string()), &mut out);
+                 out.push(NormalizedEvent::ToolResults(results));
+             }
++            NormalizedEvent::Result { error: None } if pre_prompt_result => {
++                self.pre_prompt_message = false;
++                self.result_held = true;
++            }
+             NormalizedEvent::Result { error: None } if self.holding_turn() => {
+                 self.flush_pending(Some("tool_use".to_string()), &mut out);
+                 self.result_held = true;
+@@ -265,7 +392,16 @@ impl ClaudeEventNormalizer {
+     }
+ 
+     fn holding_turn(&self) -> bool {
+-        self.holding_for_background_work() || !self.outstanding_steers.is_empty()
++        self.holding_for_background_work()
++            || !self.outstanding_steers.is_empty()
++            || self.holding_for_turn_prompt()
++    }
++
++    /// Claude Code ended a turn of its own and still owes the prompt an
++    /// answer. The hold is bounded (`TurnHold::Idle`), so a CLI that never
++    /// takes the prompt in fails the turn instead of hanging it.
++    fn holding_for_turn_prompt(&self) -> bool {
++        self.result_held && self.pending_turn_prompt.is_some()
+     }
+ 
+     fn holding_for_background_work(&self) -> bool {
+@@ -454,7 +590,7 @@ impl HarnessServer for ClaudeCodeHarness {
+     }
+ 
+     fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand {
+-        if let Some(command) = command_from_override("CENTAUR_CLAUDE_APP_BRIDGE_COMMAND") {
++        if let Some(command) = command_from_override(BRIDGE_COMMAND_ENV) {
+             return command;
+         }
+ 
+@@ -503,14 +639,23 @@ impl HarnessServer for ClaudeCodeHarness {
+         command
+     }
+ 
+-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>> {
++    /// The prompt carries a `uuid`, as a steer does, so the turn can tell
++    /// when Claude Code has taken it in.
++    fn stdin_for_turn(
++        &self,
++        normalizer: &mut Self::EventNormalizer,
++        input: &[UserInput],
++    ) -> Result<Vec<u8>> {
++        let uuid = Uuid::new_v4().to_string();
+         let payload = json!({
+             "type": "user",
++            "uuid": uuid,
+             "message": {
+                 "role": "user",
+                 "content": user_input_to_anthropic_content(input),
+             },
+         });
++        normalizer.turn_prompt_sent(uuid, expects_prompt_replay());
+         let mut bytes = serde_json::to_vec(&payload)?;
+         bytes.push(b'\n');
+         Ok(bytes)
+@@ -566,11 +711,26 @@ impl HarnessServer for ClaudeCodeHarness {
+         Ok(bytes)
+     }
+ 
++    /// A subagent sidechain's event is not read past its envelope, so a body
++    /// this server cannot read does not fail the parent turn.
+     fn parse_stdout_line(&self, line: &str) -> Result<Self::Event> {
+-        AnthropicStreamEvent::parse_json_line(line)
++        AnthropicStreamEvent::parse_main_chain_json_line(line)
+     }
+ 
+     fn user_input_control(&self, line: &str) -> Result<Option<UserInputControl>> {
++        // Inspect only the top-level envelope before deserializing `Value` so
++        // ordinary stream events (including deeply nested subagent sidechains)
++        // never pay full `Value` parsing or hit `serde_json` recursion limits
++        // ahead of `parse_stdout_line`'s sidechain filter.
++        let Some(envelope) = crate::anthropic::scan_top_level_envelope(line) else {
++            return Ok(None);
++        };
++        if !matches!(
++            envelope.kind.as_deref(),
++            Some("control_request" | "control_cancel_request")
++        ) {
++            return Ok(None);
++        }
+         let value: Value = serde_json::from_str(line)?;
+         if value["type"] == "control_cancel_request" {
+             return Ok(Some(UserInputControl::Cancel(value["request_id"].clone())));
+@@ -654,6 +814,10 @@ impl HarnessServer for ClaudeCodeHarness {
+         Ok(bytes)
+     }
+ 
++    fn accepts_user_input_request(&self, normalizer: &Self::EventNormalizer) -> bool {
++        !normalizer.awaiting_prompt_replay()
++    }
++
+     fn normalize_events(
+         &self,
+         normalizer: &mut Self::EventNormalizer,
+@@ -707,6 +871,34 @@ impl HarnessServer for ClaudeCodeHarness {
+     }
+ }
+ 
++/// Replaces the Claude Code command (tests, a bridge to another runtime).
++const BRIDGE_COMMAND_ENV: &str = "CENTAUR_CLAUDE_APP_BRIDGE_COMMAND";
++/// States whether the command echoes each prompt it takes in: `1` or `true`
++/// that it does, `0` or `false` that it does not.
++const EXPECT_USER_REPLAY_ENV: &str = "CENTAUR_CLAUDE_EXPECT_USER_REPLAY";
++
++/// Whether the Claude Code this server runs echoes each prompt it takes in,
++/// so that nothing before the echo can be the prompt's answer.
++fn expects_prompt_replay() -> bool {
++    prompt_replay_expected(
++        env::var(BRIDGE_COMMAND_ENV).ok().as_deref(),
++        env::var(EXPECT_USER_REPLAY_ENV).ok().as_deref(),
++    )
++}
++
++/// The native CLI echoes: `command_for_turn` starts it with
++/// `--replay-user-messages`. A command that replaces it is not known to, so
++/// the model's output is its sign there unless it states that it echoes.
++/// Stating that the CLI does not echo restores that reading for the native
++/// CLI too.
++fn prompt_replay_expected(bridge_command: Option<&str>, expect_user_replay: Option<&str>) -> bool {
++    match expect_user_replay.map(str::trim) {
++        Some("1" | "true") => true,
++        Some("0" | "false") => false,
++        _ => bridge_command.is_none_or(|command| command.trim().is_empty()),
++    }
++}
++
+ fn rejected_question_control(native_id: Value) -> Result<UserInputControl> {
+     Ok(UserInputControl::Reply(json_line(
+         &json!({"type":"control_response","response":{
+@@ -728,7 +920,9 @@ mod tests {
+         anthropic::AnthropicStreamEvent,
+     };
+ 
+-    use super::{ClaudeCodeHarness, ClaudeEventNormalizer, FOLLOW_UP_IDLE_TIMEOUT};
++    use super::{
++        ClaudeCodeHarness, ClaudeEventNormalizer, FOLLOW_UP_IDLE_TIMEOUT, prompt_replay_expected,
++    };
+     use crate::user_input::UserInputControl;
+ 
+     #[test]
+@@ -854,6 +1048,44 @@ mod tests {
+         assert_eq!(response["response"]["response"]["behavior"], "deny");
+     }
+ 
++    #[test]
++    fn user_input_control_skips_deeply_nested_non_control_events() {
++        let deep = format!("{}0{}", r#"{"a":"#.repeat(200), "}".repeat(200));
++        let sidechain = format!(
++            r#"{{"type":"assistant","parent_tool_use_id":"toolu_task","message":{{"id":"m1","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{deep}}}]}}}}"#
++        );
++        assert!(
++            ClaudeCodeHarness
++                .user_input_control(&sidechain)
++                .expect("non-control line must not fail control scan")
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn strict_prompt_replay_gates_user_input_requests_until_prompt_echo() {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        normalizer.turn_prompt_sent("prompt-1".to_string(), true);
++        assert!(!ClaudeCodeHarness.accepts_user_input_request(&normalizer));
++        // Foreign replay does not open the gate.
++        normalize(
++            &mut normalizer,
++            json!({"type":"user","isReplay":true,"uuid":"other","message":{"role":"user","content":[]}}),
++        );
++        assert!(!ClaudeCodeHarness.accepts_user_input_request(&normalizer));
++        // Matching echo opens the gate.
++        normalize(
++            &mut normalizer,
++            json!({"type":"user","isReplay":true,"uuid":"prompt-1","message":{"role":"user","content":[]}}),
++        );
++        assert!(ClaudeCodeHarness.accepts_user_input_request(&normalizer));
++
++        // No-echo compatibility mode keeps questions open.
++        let mut compat = ClaudeEventNormalizer::default();
++        compat.turn_prompt_sent("prompt-2".to_string(), false);
++        assert!(ClaudeCodeHarness.accepts_user_input_request(&compat));
++    }
++
+     fn normalize(normalizer: &mut ClaudeEventNormalizer, event: Value) -> Vec<NormalizedEvent> {
+         normalizer.normalize(serde_json::from_value(event).unwrap())
+     }
+@@ -1597,6 +1829,577 @@ mod tests {
+         assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+     }
+ 
++    /// A prompt sent to a CLI that is not known to echo it: the model's
++    /// output also shows the prompt was taken in.
++    fn prompt(normalizer: &mut ClaudeEventNormalizer) -> String {
++        prompt_sent(normalizer, false)
++    }
++
++    /// A prompt sent to Claude Code started with `--replay-user-messages`:
++    /// nothing but its echo shows the prompt was taken in.
++    fn echoed_prompt(normalizer: &mut ClaudeEventNormalizer) -> String {
++        prompt_sent(normalizer, true)
++    }
++
++    fn prompt_sent(normalizer: &mut ClaudeEventNormalizer, expect_replay: bool) -> String {
++        let uuid = uuid::Uuid::new_v4().to_string();
++        normalizer.turn_prompt_sent(uuid.clone(), expect_replay);
++        uuid
++    }
++
++    fn message_start(id: &str) -> Value {
++        json!({"type": "stream_event", "event": {"type": "message_start", "message": {"id": id, "model": "claude-fable-5", "content": []}}})
++    }
++
++    fn stream(event: Value) -> Value {
++        json!({"type": "stream_event", "event": event})
++    }
++
++    /// The whole stream of a message Claude Code wrote itself.
++    fn synthetic_stream(text: &str) -> Vec<Value> {
++        vec![
++            stream(
++                json!({"type": "message_start", "message": {"id": "synthetic-1", "model": "<synthetic>", "content": []}}),
++            ),
++            stream(
++                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
++            ),
++            stream(
++                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
++            ),
++            synthetic(text),
++            stream(json!({"type": "content_block_stop", "index": 0})),
++            stream(json!({"type": "message_delta", "delta": {"stop_reason": "stop_sequence"}})),
++            stream(json!({"type": "message_stop"})),
++        ]
++    }
++
++    /// The model's answer as Claude Code streams it.
++    fn answer_stream(id: &str, text: &str) -> Vec<Value> {
++        vec![
++            message_start(id),
++            stream(
++                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
++            ),
++            stream(
++                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
++            ),
++            json!({"type": "assistant", "message": {"id": id, "model": "claude-fable-5", "stop_reason": null, "content": [{"type": "text", "text": text}]}}),
++            stream(json!({"type": "content_block_stop", "index": 0})),
++            stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
++            stream(json!({"type": "message_stop"})),
++        ]
++    }
++
++    fn normalize_all(
++        normalizer: &mut ClaudeEventNormalizer,
++        events: Vec<Value>,
++    ) -> Vec<NormalizedEvent> {
++        events
++            .into_iter()
++            .flat_map(|event| normalize(normalizer, event))
++            .collect()
++    }
++
++    fn answer(id: &str, text: &str) -> Value {
++        json!({"type": "assistant", "message": {"id": id, "model": "claude-fable-5", "stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}})
++    }
++
++    fn synthetic(text: &str) -> Value {
++        json!({"type": "assistant", "message": {"id": "synthetic-1", "model": "<synthetic>", "stop_reason": "stop_sequence", "content": [{"type": "text", "text": text}]}})
++    }
++
++    #[test]
++    fn turn_stdin_carries_a_uuid_the_turn_waits_to_see_taken_in() {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        let bytes = ClaudeCodeHarness
++            .stdin_for_turn(
++                &mut normalizer,
++                &[UserInput::Text {
++                    text: "hello".to_string(),
++                    text_elements: Vec::new(),
++                }],
++            )
++            .unwrap();
++        assert_eq!(bytes.last(), Some(&b'\n'));
++        let value: Value = serde_json::from_slice(&bytes).unwrap();
++
++        assert_eq!(value["type"], "user");
++        assert_eq!(value["message"]["role"], "user");
++        assert_eq!(value["message"]["content"][0]["text"], "hello");
++        let uuid = value["uuid"].as_str().expect("prompt uuid").to_string();
++        assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
++        // An unanswered prompt alone holds nothing: only a `result` that
++        // comes before it is taken in does.
++        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++        let bytes = ClaudeCodeHarness
++            .stdin_for_turn(&mut normalizer, &[])
++            .unwrap();
++        let next: Value = serde_json::from_slice(&bytes).unwrap();
++        assert_ne!(next["uuid"], uuid, "each prompt has its own uuid");
++        assert_eq!(
++            normalizer.pending_turn_prompt.as_deref(),
++            next["uuid"].as_str()
++        );
++    }
++
++    #[test]
++    fn only_a_command_that_replaces_the_cli_is_not_expected_to_echo_the_prompt() {
++        // The native CLI is started with `--replay-user-messages`.
++        assert!(prompt_replay_expected(None, None));
++        assert!(prompt_replay_expected(Some("  "), None));
++        assert!(prompt_replay_expected(None, Some("unrecognised")));
++        // A command that replaces it is not known to echo...
++        assert!(!prompt_replay_expected(Some("exec fake-claude"), None));
++        assert!(!prompt_replay_expected(Some("exec fake-claude"), Some("")));
++        // ...unless it says it does.
++        for stated in ["1", "true", " 1 "] {
++            assert!(prompt_replay_expected(
++                Some("exec fake-claude"),
++                Some(stated)
++            ));
++        }
++        // Stating that the CLI does not echo applies to the native CLI too.
++        for stated in ["0", "false"] {
++            assert!(!prompt_replay_expected(None, Some(stated)));
++            assert!(!prompt_replay_expected(
++                Some("exec fake-claude"),
++                Some(stated)
++            ));
++        }
++    }
++
++    /// The stream of a production turn (Claude Code 2.1.325): the previous
++    /// process died with background agents running, and the resumed session
++    /// closed that out with a `result` of its own 55ms before it dequeued the
++    /// prompt. The turn completed empty while Claude Code ran on unheard.
++    #[test]
++    fn result_of_a_resumed_session_before_it_takes_the_prompt_in_does_not_end_the_turn() {
++        for expect_replay in [false, true] {
++            resumed_session_result_does_not_end_the_turn(expect_replay);
++        }
++    }
++
++    fn resumed_session_result_does_not_end_the_turn(expect_replay: bool) {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        let uuid = prompt_sent(&mut normalizer, expect_replay);
++
++        assert!(matches!(
++            normalize(
++                &mut normalizer,
++                json!({"type": "system", "subtype": "init", "session_id": "s1"})
++            )
++            .as_slice(),
++            [NormalizedEvent::SessionStarted { .. }]
++        ));
++        // The orphaned notification is echoed under another uuid.
++        assert!(
++            normalize(
++                &mut normalizer,
++                json!({"type": "user", "isReplay": true, "uuid": "orphan", "message": {"role": "user", "content": "<task-notification>\n<task-id>a1</task-id>\n<status>stopped</status>\n</task-notification>"}}),
++            )
++            .is_empty()
++        );
++        for result in [
++            json!({"type": "result", "subtype": "success", "is_error": false, "usage": {"input_tokens": 0, "output_tokens": 0}}),
++            json!({"type": "result", "subtype": "success", "result": ""}),
++            json!({"type": "result", "subtype": "success", "result": " \n"}),
++        ] {
++            // Not even its token usage: that turn was not this one.
++            let events = normalize(&mut normalizer, result);
++            assert!(events.is_empty(), "{events:?}");
++            // Bounded, so a prompt that is never taken in fails the turn.
++            assert_eq!(
++                normalizer.turn_hold(),
++                TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
++            );
++        }
++
++        assert!(normalize(&mut normalizer, replay(&uuid)).is_empty());
++        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++        normalize(&mut normalizer, message_start("msg_1"));
++        let events = normalize(&mut normalizer, answer("msg_1", "Here is what changed."));
++        assert_eq!(
++            agent_texts(&events),
++            vec![(
++                Some("end_turn".to_string()),
++                "Here is what changed.".to_string()
++            )]
++        );
++        let events = normalize(
++            &mut normalizer,
++            json!({"type": "result", "subtype": "success", "result": "Here is what changed."}),
++        );
++        assert!(events.iter().any(NormalizedEvent::is_terminal));
++        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++    }
++
++    #[test]
++    fn model_output_takes_the_prompt_as_read_for_a_cli_that_does_not_echo_it() {
++        for first in [
++            message_start("msg_1"),
++            json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}}),
++            answer("msg_1", "done"),
++            json!({"type": "assistant", "is_partial": true, "message": {"id": "msg_1", "content": [{"type": "text", "text": "do"}]}}),
++            json!({"type": "assistant", "message": {"id": "msg_1", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]}}),
++        ] {
++            let mut normalizer = ClaudeEventNormalizer::default();
++            prompt(&mut normalizer);
++            normalize(&mut normalizer, first.clone());
++            assert_eq!(normalizer.pending_turn_prompt, None, "{first}");
++            // Even a `result` without text now ends the turn.
++            let events = normalize(
++                &mut normalizer,
++                json!({"type": "result", "subtype": "success"}),
++            );
++            assert!(events.iter().any(NormalizedEvent::is_terminal), "{first}");
++            assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++        }
++    }
++
++    #[test]
++    fn nothing_before_the_echo_answers_a_prompt_that_claude_code_echoes() {
++        let stale = [
++            // The model's own output, cut off with the previous process or
++            // answering a prompt that process never finished.
++            answer_stream("msg_stale", "A stale answer."),
++            vec![answer("msg_stale", "A stale answer.")],
++            vec![
++                json!({"type": "assistant", "is_partial": true, "message": {"id": "msg_stale", "content": [{"type": "text", "text": "A stale"}]}}),
++            ],
++            vec![
++                json!({"type": "assistant", "message": {"id": "msg_stale", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]}}),
++                json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "stale output"}]}}),
++            ],
++            // A delta with no message around it.
++            vec![stream(
++                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "stale"}}),
++            )],
++            // Work that died with the previous process.
++            vec![
++                json!({"type": "system", "subtype": "task_started", "task_id": "a1", "task_type": "local_agent", "is_backgrounded": true}),
++                json!({"type": "system", "subtype": "task_notification", "task_id": "a1", "status": "stopped", "summary": "stale"}),
++            ],
++            synthetic_stream("No response requested."),
++        ];
++        for events in stale {
++            for result in [
++                json!({"type": "result", "subtype": "success"}),
++                json!({"type": "result", "subtype": "success", "result": "A stale answer.", "usage": {"input_tokens": 9, "output_tokens": 9}}),
++            ] {
++                let mut normalizer = ClaudeEventNormalizer::default();
++                let uuid = echoed_prompt(&mut normalizer);
++
++                let out = normalize_all(&mut normalizer, events.clone());
++                assert!(out.is_empty(), "{events:?}: {out:?}");
++                assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
++                // Nothing dropped holds the turn or arms the stop fallback.
++                assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++
++                // The `result` of that turn is not ours, even with text.
++                let out = normalize(&mut normalizer, result.clone());
++                assert!(out.is_empty(), "{result}: {out:?}");
++                assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
++                assert_eq!(
++                    normalizer.turn_hold(),
++                    TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
++                );
++
++                // The echo of another message is not the prompt's.
++                assert!(normalize(&mut normalizer, replay("another-uuid")).is_empty());
++                assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
++                let out = normalize_all(&mut normalizer, answer_stream("msg_late", "Still stale."));
++                assert!(out.is_empty(), "{out:?}");
++
++                assert!(normalize(&mut normalizer, replay(&uuid)).is_empty());
++                assert_eq!(normalizer.pending_turn_prompt, None);
++                assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++                let mut out =
++                    normalize_all(&mut normalizer, answer_stream("msg_1", "The real answer."));
++                out.extend(normalize(
++                    &mut normalizer,
++                    json!({"type": "result", "subtype": "success", "result": "The real answer."}),
++                ));
++                assert_eq!(
++                    agent_texts(&out),
++                    vec![(Some("end_turn".to_string()), "The real answer.".to_string())]
++                );
++                assert_eq!(
++                    out.iter().filter(|event| event.is_terminal()).count(),
++                    1,
++                    "{out:?}"
++                );
++                assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++            }
++        }
++    }
++
++    #[test]
++    fn the_session_id_and_a_failure_get_through_before_the_echo() {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        echoed_prompt(&mut normalizer);
++        assert!(matches!(
++            normalize(
++                &mut normalizer,
++                json!({"type": "system", "subtype": "init", "session_id": "s1"})
++            )
++            .as_slice(),
++            [NormalizedEvent::SessionStarted { session_id: Some(session_id) }] if session_id == "s1"
++        ));
++
++        // Claude Code that cannot start or authenticate echoes nothing: the
++        // turn must fail on what it reports instead of waiting for an echo.
++        for (failure, expected) in [
++            (
++                json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "result": "Invalid API key"}),
++                "Invalid API key",
++            ),
++            (
++                json!({"type": "result", "subtype": "success", "is_error": true, "result": "API Error: 529 Overloaded"}),
++                "API Error: 529 Overloaded",
++            ),
++            (json!({"type": "error", "message": "boom"}), "boom"),
++        ] {
++            let mut normalizer = ClaudeEventNormalizer::default();
++            echoed_prompt(&mut normalizer);
++            let out = normalize(&mut normalizer, failure.clone());
++            assert!(
++                matches!(
++                    out.last(),
++                    Some(NormalizedEvent::Result { error: Some(error) } | NormalizedEvent::Error { message: error })
++                        if error == expected
++                ),
++                "{failure}: {out:?}"
++            );
++            assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++        }
++    }
++
++    #[test]
++    fn claude_codes_own_stream_does_not_take_the_prompt_as_read_for_a_cli_that_does_not_echo_it() {
++        for result in [
++            json!({"type": "result", "subtype": "success"}),
++            json!({"type": "result", "subtype": "success", "result": "No response requested."}),
++        ] {
++            let mut normalizer = ClaudeEventNormalizer::default();
++            let uuid = prompt(&mut normalizer);
++
++            // Each event alone must leave the prompt pending: read as model
++            // output, the `message_start` used to release the turn, which
++            // then ended on this message's `result`.
++            for event in synthetic_stream("No response requested.") {
++                let out = normalize(&mut normalizer, event.clone());
++                assert!(out.is_empty(), "{event}: {out:?}");
++                assert_eq!(
++                    normalizer.pending_turn_prompt.as_deref(),
++                    Some(&*uuid),
++                    "{event}"
++                );
++                assert_eq!(normalizer.turn_hold(), TurnHold::Released, "{event}");
++            }
++            let out = normalize(&mut normalizer, result.clone());
++            assert!(out.is_empty(), "{result}: {out:?}");
++            assert_eq!(
++                normalizer.turn_hold(),
++                TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
++            );
++            assert!(normalize(&mut normalizer, replay("another-uuid")).is_empty());
++            assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
++
++            // The model's own message is what takes the prompt in here.
++            let mut out =
++                normalize_all(&mut normalizer, answer_stream("msg_1", "The real answer."));
++            assert_eq!(normalizer.pending_turn_prompt, None);
++            out.extend(normalize(
++                &mut normalizer,
++                json!({"type": "result", "subtype": "success", "result": "The real answer."}),
++            ));
++            assert_eq!(
++                agent_texts(&out),
++                vec![(Some("end_turn".to_string()), "The real answer.".to_string())]
++            );
++            assert_eq!(out.iter().filter(|event| event.is_terminal()).count(), 1);
++        }
++    }
++
++    #[test]
++    fn claude_codes_own_stream_after_the_prompt_is_taken_in_is_delivered() {
++        for expect_replay in [false, true] {
++            let mut normalizer = ClaudeEventNormalizer::default();
++            let uuid = prompt_sent(&mut normalizer, expect_replay);
++            normalize(&mut normalizer, replay(&uuid));
++
++            let out = normalize_all(
++                &mut normalizer,
++                synthetic_stream("API Error: 529 Overloaded"),
++            );
++            assert_eq!(
++                agent_texts(&out),
++                vec![(
++                    Some("stop_sequence".to_string()),
++                    "API Error: 529 Overloaded".to_string()
++                )]
++            );
++        }
++    }
++
++    #[test]
++    fn claude_codes_own_message_before_the_prompt_is_taken_in_is_not_the_answer() {
++        for expect_replay in [false, true] {
++            own_message_before_the_prompt_is_not_the_answer(expect_replay);
++        }
++    }
++
++    fn own_message_before_the_prompt_is_not_the_answer(expect_replay: bool) {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        let uuid = prompt_sent(&mut normalizer, expect_replay);
++
++        // Shown as the answer, its terminal stop would also complete the
++        // turn by the stop fallback.
++        assert!(normalize(&mut normalizer, synthetic("No response requested.")).is_empty());
++        assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
++        // The `result` repeats that message's text and is still not ours.
++        let events = normalize(
++            &mut normalizer,
++            json!({"type": "result", "subtype": "success", "result": "No response requested."}),
++        );
++        assert!(events.is_empty(), "{events:?}");
++        assert_eq!(
++            normalizer.turn_hold(),
++            TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
++        );
++
++        normalize(&mut normalizer, replay(&uuid));
++        normalize(&mut normalizer, message_start("msg_1"));
++        let mut events = normalize(&mut normalizer, answer("msg_1", "The real answer."));
++        events.extend(normalize(
++            &mut normalizer,
++            json!({"type": "result", "subtype": "success", "result": "The real answer."}),
++        ));
++        assert_eq!(
++            agent_texts(&events),
++            vec![(Some("end_turn".to_string()), "The real answer.".to_string())]
++        );
++        assert!(events.iter().any(NormalizedEvent::is_terminal));
++    }
++
++    #[test]
++    fn claude_codes_own_message_after_the_prompt_is_taken_in_is_delivered() {
++        for expect_replay in [false, true] {
++            own_message_after_the_prompt_is_delivered(expect_replay);
++        }
++    }
++
++    fn own_message_after_the_prompt_is_delivered(expect_replay: bool) {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        let uuid = prompt_sent(&mut normalizer, expect_replay);
++        normalize(&mut normalizer, replay(&uuid));
++
++        // An API failure is reported this way, with an error `result`.
++        let events = normalize(&mut normalizer, synthetic("API Error: 529 Overloaded"));
++        assert_eq!(
++            agent_texts(&events),
++            vec![(
++                Some("stop_sequence".to_string()),
++                "API Error: 529 Overloaded".to_string()
++            )]
++        );
++        let events = normalize(
++            &mut normalizer,
++            json!({"type": "result", "subtype": "success", "is_error": true, "result": "API Error: 529 Overloaded"}),
++        );
++        assert!(matches!(
++            events.last(),
++            Some(NormalizedEvent::Result { error: Some(error) }) if error == "API Error: 529 Overloaded"
++        ));
++    }
++
++    #[test]
++    fn result_with_text_and_no_message_ends_the_turn_of_a_cli_that_reports_only_that() {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        prompt(&mut normalizer);
++        let events = normalize(
++            &mut normalizer,
++            json!({"type": "result", "subtype": "success", "result": "final answer"}),
++        );
++        assert!(events.iter().any(NormalizedEvent::is_terminal));
++        // Nothing is held, so the process is kept for the next turn.
++        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++    }
++
++    #[test]
++    fn failed_result_before_the_prompt_is_taken_in_ends_the_turn() {
++        let failed =
++            json!({"type": "result", "subtype": "error_during_execution", "is_error": true});
++
++        for expect_replay in [false, true] {
++            let mut normalizer = ClaudeEventNormalizer::default();
++            prompt_sent(&mut normalizer, expect_replay);
++            let events = normalize(&mut normalizer, failed.clone());
++            assert!(events.iter().any(NormalizedEvent::is_terminal));
++            assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++
++            // After a swallowed `result` the prompt is still queued in Claude
++            // Code, so the server stops the process with the turn.
++            let mut normalizer = ClaudeEventNormalizer::default();
++            prompt_sent(&mut normalizer, expect_replay);
++            normalize(
++                &mut normalizer,
++                json!({"type": "result", "subtype": "success"}),
++            );
++            let events = normalize(&mut normalizer, failed.clone());
++            assert!(events.iter().any(NormalizedEvent::is_terminal));
++            assert_ne!(normalizer.turn_hold(), TurnHold::Released);
++        }
++    }
++
++    #[test]
++    fn a_new_prompt_starts_its_own_wait() {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        prompt(&mut normalizer);
++        normalize(&mut normalizer, synthetic("No response requested."));
++        normalize(
++            &mut normalizer,
++            json!({"type": "result", "subtype": "success"}),
++        );
++        assert_ne!(normalizer.turn_hold(), TurnHold::Released);
++
++        // A held steer continues the turn as the next prompt.
++        prompt(&mut normalizer);
++        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++        assert!(!normalizer.pre_prompt_message);
++        let events = normalize(
++            &mut normalizer,
++            json!({"type": "result", "subtype": "success", "result": "only a result"}),
++        );
++        assert!(events.iter().any(NormalizedEvent::is_terminal));
++        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
++    }
++
++    #[test]
++    fn task_notification_user_message_does_not_settle_the_answer_as_commentary() {
++        let mut normalizer = ClaudeEventNormalizer::default();
++        normalize(
++            &mut normalizer,
++            json!({"type": "assistant", "message": {"id": "msg_1", "stop_reason": null, "content": [{"type": "text", "text": "final answer"}]}}),
++        );
++        // Not a replay and no tool result: nothing the answer waits on.
++        let events = normalize(
++            &mut normalizer,
++            json!({"type": "user", "message": {"role": "user", "content": "<task-notification>\n<task-id>a1</task-id>\n</task-notification>"}}),
++        );
++        assert!(events.is_empty(), "{events:?}");
++
++        let events = normalize(
++            &mut normalizer,
++            json!({"type": "result", "subtype": "success", "result": "final answer"}),
++        );
++        assert_eq!(
++            agent_texts(&events),
++            vec![(Some("end_turn".to_string()), "final answer".to_string())]
++        );
++    }
++
+     #[test]
+     fn normalizes_claude_code_effort_levels() {
+         assert_eq!(
+diff --git a/crates/harness-server/src/error.rs b/crates/harness-server/src/error.rs
+index 1c5a803f..3921ad95 100644
+--- a/crates/harness-server/src/error.rs
++++ b/crates/harness-server/src/error.rs
+@@ -12,11 +12,11 @@ pub type Result<T> = std::result::Result<T, HarnessServerError>;
+ pub enum HarnessServerError {
+     #[error("I/O error: {0}")]
+     Io(#[from] io::Error),
+-    #[error("JSON error: {0}")]
++    #[error("JSON error: {}", json_error_diagnostic(.0))]
+     Json(#[from] serde_json::Error),
+     #[error("Codex App Server protocol conversion failed: {0}")]
+     Protocol(String),
+-    #[error("invalid request params: {source}")]
++    #[error("invalid request params: {}", json_error_diagnostic(.source))]
+     InvalidParams {
+         #[source]
+         source: serde_json::Error,
+@@ -72,3 +72,161 @@ pub enum HarnessServerError {
+     #[error("codex app-server exited with status {status}")]
+     CodexExited { status: ExitStatus },
+ }
++
++/// Longest error text sent to a client, in characters.
++const MAX_CLIENT_MESSAGE_CHARS: usize = 512;
++/// How much of a longer message's end is kept: an error often names its cause
++/// last (an exit status, what a command expected).
++const CLIENT_MESSAGE_TAIL_CHARS: usize = 96;
++const TRUNCATION_MARK: &str = " ... (truncated) ... ";
++
++impl HarnessServerError {
++    /// The error text for clients: the wire, the turn's failure and telemetry.
++    pub(crate) fn client_message(&self) -> String {
++        bounded_message(&self.to_string())
++    }
++}
++
++/// What a JSON error may say outside this process: its kind and position.
++/// `serde_json`'s own text quotes the value it rejected (`invalid type: string
++/// "<the whole value>", expected ...`), and that value is harness output or
++/// user input: a prompt, a file, a secret. No character of it is copied here,
++/// so nothing downstream (the wire, the stored turn error, telemetry, the
++/// reply shown to the user) can carry it, however the text is cut later.
++pub(crate) fn json_error_diagnostic(error: &serde_json::Error) -> String {
++    use serde_json::error::Category;
++
++    let kind = match error.classify() {
++        Category::Io => "I/O failure",
++        Category::Syntax => "invalid syntax",
++        Category::Data => "invalid data",
++        Category::Eof => "unexpected end of input",
++    };
++    // A value that was not parsed from text has no position.
++    if error.line() == 0 {
++        kind.to_string()
++    } else {
++        format!("{kind} at line {}, column {}", error.line(), error.column())
++    }
++}
++
++/// Bounds an error message on its way to a client. An error can quote what it
++/// failed on (a harness's stderr, the text of its own error result), which
++/// would otherwise put that whole payload in the turn's error, and from there
++/// in the execution record and in front of the user.
++pub(crate) fn bounded_message(message: &str) -> String {
++    if message.chars().nth(MAX_CLIENT_MESSAGE_CHARS).is_none() {
++        return message.to_string();
++    }
++    let head_chars = MAX_CLIENT_MESSAGE_CHARS - CLIENT_MESSAGE_TAIL_CHARS - TRUNCATION_MARK.len();
++    let mut boundaries = message.char_indices().map(|(index, _)| index);
++    let head_end = boundaries.nth(head_chars).unwrap_or(message.len());
++    let tail_start = boundaries
++        .nth_back(CLIENT_MESSAGE_TAIL_CHARS - 1)
++        .unwrap_or(head_end);
++    format!(
++        "{}{TRUNCATION_MARK}{}",
++        &message[..head_end],
++        &message[tail_start..]
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn messages_within_the_bound_are_unchanged() {
++        for message in [
++            String::new(),
++            "boom".to_string(),
++            "é".repeat(MAX_CLIENT_MESSAGE_CHARS),
++        ] {
++            assert_eq!(bounded_message(&message), message);
++        }
++    }
++
++    #[test]
++    fn long_messages_keep_their_start_and_end_on_character_boundaries() {
++        // Multi-byte characters put every cut inside a character if cuts
++        // were made on bytes.
++        let message = format!("start {} end", "日本語🙂".repeat(5_000));
++        let bounded = bounded_message(&message);
++
++        assert_eq!(bounded.chars().count(), MAX_CLIENT_MESSAGE_CHARS);
++        assert!(bounded.starts_with("start 日本語🙂"));
++        assert!(bounded.contains(TRUNCATION_MARK));
++        assert!(bounded.ends_with("日本語🙂 end"));
++        assert_eq!(
++            bounded_message(&"x".repeat(MAX_CLIENT_MESSAGE_CHARS + 1))
++                .chars()
++                .count(),
++            MAX_CLIENT_MESSAGE_CHARS
++        );
++    }
++
++    /// Markers at both ends of a rejected string: a cut that keeps the start
++    /// or the end of an error's text would keep one of them.
++    const START_MARKER: &str = "START-SECRET-7f3a";
++    const END_MARKER: &str = "END-SECRET-9c1e";
++
++    fn rejected_payload() -> String {
++        format!(
++            "{START_MARKER}<task-notification>{}</task-notification>{END_MARKER}",
++            "internal ".repeat(2_500)
++        )
++    }
++
++    #[test]
++    fn a_parse_failure_reports_no_character_of_the_rejected_value() {
++        let line =
++            serde_json::json!({"type": "assistant", "message": rejected_payload()}).to_string();
++        let source = serde_json::from_str::<crate::anthropic::AnthropicStreamEvent>(&line)
++            .expect_err("a string is not a message");
++        // What serde_json would have said, and what used to reach the client.
++        assert!(source.to_string().contains(START_MARKER));
++        assert!(source.to_string().contains(END_MARKER));
++
++        let error = HarnessServerError::from(source);
++        // An event's body is checked after serde has buffered it to find the
++        // `type` tag, so this error has no position to report.
++        assert_eq!(error.to_string(), "JSON error: invalid data");
++        assert_eq!(error.client_message(), "JSON error: invalid data");
++        for text in [error.to_string(), error.client_message()] {
++            for leaked in [
++                START_MARKER,
++                END_MARKER,
++                "task-notification",
++                "internal",
++                "\"",
++            ] {
++                assert!(!text.contains(leaked), "{leaked:?} in {text}");
++            }
++        }
++    }
++
++    #[test]
++    fn json_diagnostics_name_the_kind_and_position_only() {
++        let diagnostic = |text: &str| {
++            json_error_diagnostic(&serde_json::from_str::<serde_json::Value>(text).unwrap_err())
++        };
++        assert_eq!(
++            diagnostic("{\"secret\": tru"),
++            "unexpected end of input at line 1, column 14"
++        );
++        assert_eq!(
++            diagnostic("{\"a\": 1}\nsecret"),
++            "invalid syntax at line 2, column 1"
++        );
++        assert_eq!(
++            json_error_diagnostic(&serde_json::from_str::<Vec<u8>>("\n  \"secret\"").unwrap_err()),
++            "invalid data at line 2, column 10"
++        );
++        // A value converted without text to point into has no position.
++        let params = HarnessServerError::InvalidParams {
++            source: serde_json::from_value::<Vec<u8>>(serde_json::json!({"secret": "value"}))
++                .unwrap_err(),
++        };
++        assert_eq!(params.to_string(), "invalid request params: invalid data");
++    }
++}
+diff --git a/crates/harness-server/src/nanocodex.rs b/crates/harness-server/src/nanocodex.rs
+index e6ddc5ad..c0658cbb 100644
+--- a/crates/harness-server/src/nanocodex.rs
++++ b/crates/harness-server/src/nanocodex.rs
+@@ -275,7 +275,7 @@ struct BlocksMessage {
+ fn parse_blocks_line(line: &str, staged: &mut HashMap<String, PathBuf>) -> Result<BlocksCommand> {
+     let parsed: BlocksLine =
+         serde_json::from_str(line).map_err(|source| HarnessServerError::InvalidBlocksInput {
+-            message: source.to_string(),
++            message: crate::error::json_error_diagnostic(&source),
+         })?;
+     match parsed.kind.as_str() {
+         "user" => {
+diff --git a/crates/harness-server/src/omp.rs b/crates/harness-server/src/omp.rs
+index 08e0a3d5..98eed0bd 100644
+--- a/crates/harness-server/src/omp.rs
++++ b/crates/harness-server/src/omp.rs
+@@ -147,7 +147,11 @@ impl HarnessServer for OmpHarness {
+         })
+     }
+ 
+-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>> {
++    fn stdin_for_turn(
++        &self,
++        _normalizer: &mut Self::EventNormalizer,
++        input: &[UserInput],
++    ) -> Result<Vec<u8>> {
+         prompt_command("prompt", input)
+     }
+     /// OMP takes the steer into the running prompt and answers it before the
+diff --git a/crates/harness-server/src/otel.rs b/crates/harness-server/src/otel.rs
+index 15c36392..717706b0 100644
+--- a/crates/harness-server/src/otel.rs
++++ b/crates/harness-server/src/otel.rs
+@@ -2010,6 +2010,101 @@ mod tests {
+         );
+     }
+ 
++    fn observed_usage() -> NormalizedEvent {
++        NormalizedEvent::TokenUsage {
++            usage: crate::NormalizedTokenUsage {
++                input_tokens: Some(1),
++                ..Default::default()
++            },
++        }
++    }
++
++    #[test]
++    fn a_failed_turn_records_no_part_of_a_line_the_harness_could_not_parse() {
++        use crate::HarnessServer;
++
++        let (exporter, provider, tracer) = test_telemetry();
++        let mut turn = test_turn_with_capture(tracer, true, true);
++        let line = json!({
++            "type": "assistant",
++            "message": format!("START-SECRET-7f3a{}END-SECRET-9c1e", "internal ".repeat(2_500)),
++        })
++        .to_string();
++        let error = crate::claude::ClaudeCodeHarness
++            .parse_stdout_line(&line)
++            .expect_err("a string is not a message");
++        // The turn's span is exported once the turn has usage to report.
++        turn.observe_normalized(&observed_usage());
++        // As a failed turn is recorded.
++        turn.observe_normalized(&NormalizedEvent::Error {
++            message: error.client_message(),
++        });
++        turn.finish(TurnStatus::Failed);
++        provider.force_flush().expect("flush");
++
++        let spans = exporter.get_finished_spans().expect("spans");
++        let span = spans
++            .iter()
++            .find(|span| span.name == "codex.session_task.turn")
++            .expect("turn span");
++        assert_eq!(
++            attribute(span, "output.value").as_deref(),
++            Some("JSON error: invalid data")
++        );
++        for span in &spans {
++            let recorded = format!("{span:?}");
++            for leaked in ["START-SECRET-7f3a", "END-SECRET-9c1e", "internal internal"] {
++                assert!(!recorded.contains(leaked), "{leaked:?} in {}", span.name);
++            }
++        }
++    }
++
++    #[test]
++    fn a_harness_error_is_bounded_before_it_is_recorded() {
++        let (exporter, provider, tracer) = test_telemetry();
++        let mut turn = test_turn_with_capture(tracer, true, true);
++        turn.observe_normalized(&observed_usage());
++        let reported = format!("start {} end", "日本語🙂".repeat(5_000));
++        for event in [
++            NormalizedEvent::Result {
++                error: Some(reported.clone()),
++            },
++            NormalizedEvent::Error {
++                message: reported.clone(),
++            },
++        ] {
++            let bounded = event.with_bounded_error();
++            let (NormalizedEvent::Result { error: Some(text) }
++            | NormalizedEvent::Error { message: text }) = &bounded
++            else {
++                panic!("expected an error, got {bounded:?}");
++            };
++            assert_eq!(text.chars().count(), 512);
++            assert!(text.starts_with("start 日本語🙂"), "{text}");
++            assert!(text.ends_with("日本語🙂 end"), "{text}");
++            turn.observe_normalized(&bounded);
++        }
++        // Anything else passes through untouched.
++        assert!(matches!(
++            NormalizedEvent::Result { error: None }.with_bounded_error(),
++            NormalizedEvent::Result { error: None }
++        ));
++        assert!(matches!(
++            NormalizedEvent::Error { message: "boom".to_owned() }.with_bounded_error(),
++            NormalizedEvent::Error { message } if message == "boom"
++        ));
++        turn.finish(TurnStatus::Failed);
++        provider.force_flush().expect("flush");
++
++        let spans = exporter.get_finished_spans().expect("spans");
++        let span = spans
++            .iter()
++            .find(|span| span.name == "codex.session_task.turn")
++            .expect("turn span");
++        let output = attribute(span, "output.value").expect("recorded error");
++        assert_eq!(output.chars().count(), 512);
++    }
++
+     #[test]
+     fn transcript_capture_accepts_only_explicit_truthy_values() {
+         for value in ["1", "true", "TRUE", "yes", "on"] {
+diff --git a/crates/harness-server/src/pi.rs b/crates/harness-server/src/pi.rs
+index 8cbcd0b7..86c7d58d 100644
+--- a/crates/harness-server/src/pi.rs
++++ b/crates/harness-server/src/pi.rs
+@@ -329,7 +329,11 @@ impl HarnessServer for PiHarness {
+         check_model(model)
+     }
+ 
+-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>> {
++    fn stdin_for_turn(
++        &self,
++        _normalizer: &mut Self::EventNormalizer,
++        input: &[UserInput],
++    ) -> Result<Vec<u8>> {
+         command_line(json!({"type": "prompt", "message": message_text(input)}))
+     }
+ 
+diff --git a/crates/harness-server/src/server.rs b/crates/harness-server/src/server.rs
+index 64354b7e..1c5eca26 100644
+--- a/crates/harness-server/src/server.rs
++++ b/crates/harness-server/src/server.rs
+@@ -23,6 +23,7 @@ use uuid::Uuid;
+ use crate::amp::AmpHarness;
+ use crate::claude::ClaudeCodeHarness;
+ use crate::codex::CodexHarnessServer;
++use crate::error::{bounded_message, json_error_diagnostic};
+ use crate::omp::OmpHarness;
+ use crate::otel::{TraceContext, TurnStatus as TelemetryTurnStatus, TurnTelemetry};
+ use crate::pi::PiHarness;
+@@ -252,7 +253,10 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
+             let message = match serde_json::from_str::<JSONRPCMessage>(trimmed) {
+                 Ok(message) => message,
+                 Err(error) => {
+-                    eprintln!("invalid JSON-RPC message: {error}");
++                    eprintln!(
++                        "invalid JSON-RPC message: {}",
++                        json_error_diagnostic(&error)
++                    );
+                     continue;
+                 }
+             };
+@@ -528,7 +532,7 @@ pub(crate) fn parse_blocks_line_with_state(
+ ) -> Result<BlocksCommand> {
+     let parsed: BlocksLine =
+         serde_json::from_str(line).map_err(|source| HarnessServerError::InvalidBlocksInput {
+-            message: source.to_string(),
++            message: json_error_diagnostic(&source),
+         })?;
+ 
+     match parsed.kind.as_str() {
+@@ -1334,7 +1338,7 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
+         }
+         Err(error) => {
+             telemetry.observe_normalized(&NormalizedEvent::Error {
+-                message: error.to_string(),
++                message: error.client_message(),
+             });
+             telemetry.finish(TelemetryTurnStatus::Failed);
+             state.process = None;
+@@ -1364,7 +1368,7 @@ fn finish_turn_with_error<W: Write>(
+     stdout: &mut W,
+     error: HarnessServerError,
+ ) -> Result<()> {
+-    let message = error.to_string();
++    let message = error.client_message();
+     let normalized = NormalizedEvent::Error {
+         message: message.clone(),
+     };
+@@ -1392,6 +1396,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+     execution_id: Option<&str>,
+ ) -> Result<Option<Turn>> {
+     ensure_harness_process(harness, state)?;
++    let mut event_normalizer = H::EventNormalizer::default();
+     {
+         let process = state
+             .process
+@@ -1402,15 +1407,13 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+         // late `result` (and trailing rate-limit noise) behind, which would
+         // otherwise read as this turn's instant terminal.
+         while process.stdout.try_recv().is_ok() {}
+-        if process.reasoning_effort != state.reasoning_effort {
+-            let effort = state.reasoning_effort.as_deref();
+-            process
+-                .stdin
+-                .write_all(&harness.stdin_for_reasoning_effort(effort)?)?;
+-            process.reasoning_effort = state.reasoning_effort.clone();
+-        }
+-        process.stdin.write_all(&harness.stdin_for_turn(input)?)?;
+-        process.stdin.flush()?;
++        write_turn_prompt_with_effort(
++            harness,
++            process,
++            state.reasoning_effort.as_deref(),
++            &mut event_normalizer,
++            input,
++        )?;
+     }
+ 
+     let settle_window = harness.terminal_assistant_stop_settle();
+@@ -1422,7 +1425,6 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+     // Armed while the harness holds the turn for a background follow-up that
+     // has not started; any output pushes it back.
+     let mut hold_deadline: Option<Instant> = None;
+-    let mut event_normalizer = H::EventNormalizer::default();
+     let mut completed_turn = None;
+     let suggestion_window = state
+         .supports_prompt_suggestions
+@@ -1517,6 +1519,20 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                 if let Some(control) = harness.user_input_control(trimmed)? {
+                     match control {
+                         UserInputControl::Request(request) => {
++                            if !harness.accepts_user_input_request(&event_normalizer) {
++                                eprintln!(
++                                    "native user input request rejected: prompt not yet acknowledged"
++                                );
++                                let process = state
++                                    .process
++                                    .as_mut()
++                                    .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
++                                process.stdin.write_all(
++                                    &harness.stdin_for_user_input_rejection(&request)?,
++                                )?;
++                                process.stdin.flush()?;
++                                continue;
++                            }
+                             match questions.register(
+                                 request.clone(),
+                                 normalizer.thread_id(),
+@@ -1578,10 +1594,16 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                         continue;
+                     }
+                     // A held turn still owes output after a terminal stop (for
+-                    // example the answer to a steer), so the stop must not arm
+-                    // the fallback completion.
+-                    let terminal_stop =
+-                        progress.assistant_stop && progress.hold == TurnHold::Released;
++                    // example the answer to a steer, or the follow-up to a
++                    // background task started after the stop), so the stop
++                    // neither arms the fallback completion nor keeps one
++                    // armed before the hold began: left armed, it would end
++                    // the turn on the first quiet moment of the wait.
++                    let released = progress.hold == TurnHold::Released;
++                    let terminal_stop = progress.assistant_stop && released;
++                    if !released {
++                        settle_deadline = None;
++                    }
+                     if questions.is_pending() {
+                         settle_deadline = None;
+                         hold_deadline = None;
+@@ -1591,7 +1613,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                                 terminal = true;
+                             }
+                             Some(window)
+-                                if !terminal && (terminal_stop || settle_deadline.is_some()) =>
++                                if !terminal
++                                    && released
++                                    && (terminal_stop || settle_deadline.is_some()) =>
+                             {
+                                 settle_deadline = Some(Instant::now() + window);
+                             }
+@@ -1638,7 +1662,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                         kind: harness.kind(),
+                     });
+                 }
+-                terminal = settle_deadline.is_some_and(|deadline| Instant::now() >= deadline);
++                // A steer just written holds the turn too.
++                terminal = harness.turn_hold(&event_normalizer) == TurnHold::Released
++                    && settle_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+             }
+             Err(RecvTimeoutError::Disconnected) => {
+                 let status = state
+@@ -1649,8 +1675,11 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                     .wait()?;
+                 // A clean exit while waiting out the settle window means the
+                 // native result is never coming: the terminal stop already
+-                // seen ends the turn.
+-                if settle_deadline.is_some() && status.success() {
++                // seen ends the turn, unless the harness still owed it output.
++                if settle_deadline.is_some()
++                    && harness.turn_hold(&event_normalizer) == TurnHold::Released
++                    && status.success()
++                {
+                     state.process = None;
+                     terminal = true;
+                 } else {
+@@ -1692,10 +1721,16 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+                 // Drop the finished turn's trailing output before continuing.
+                 while process.stdout.try_recv().is_ok() {}
+                 // One native turn at a time, so every held steer's answer lands
+-                // before the turn's final terminal.
++                // before the turn's final terminal. A process started just
++                // now for the steer has yet to be given the turn's effort.
+                 let input = held_steers.remove(0);
+-                process.stdin.write_all(&harness.stdin_for_turn(&input)?)?;
+-                process.stdin.flush()?;
++                write_turn_prompt_with_effort(
++                    harness,
++                    process,
++                    state.reasoning_effort.as_deref(),
++                    &mut event_normalizer,
++                    &input,
++                )?;
+                 settle_deadline = None;
+                 hold_deadline = None;
+                 native_turn_may_have_ended = false;
+@@ -1729,6 +1764,31 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
+     Ok(completed_turn)
+ }
+ 
++/// Writes a native turn's prompt to the harness, first switching the process
++/// to the turn's reasoning effort when it runs another. A process keeps the
++/// effort it was last given, and one just started runs its configured default,
++/// so every prompt goes through here: the turn's first and each held steer
++/// that continues it, which can land on a process started for that steer.
++fn write_turn_prompt_with_effort<H: HarnessServer>(
++    harness: &H,
++    process: &mut HarnessChild,
++    reasoning_effort: Option<&str>,
++    event_normalizer: &mut H::EventNormalizer,
++    input: &[UserInput],
++) -> Result<()> {
++    if process.reasoning_effort.as_deref() != reasoning_effort {
++        process
++            .stdin
++            .write_all(&harness.stdin_for_reasoning_effort(reasoning_effort)?)?;
++        process.reasoning_effort = reasoning_effort.map(str::to_owned);
++    }
++    process
++        .stdin
++        .write_all(&harness.stdin_for_turn(event_normalizer, input)?)?;
++    process.stdin.flush()?;
++    Ok(())
++}
++
+ struct StdoutProgress {
+     successful_result: bool,
+     terminal: bool,
+@@ -1755,6 +1815,8 @@ fn handle_stdout_line<H: HarnessServer, W: Write>(
+     let mut assistant_stop = false;
+     let mut successful_result = false;
+     for normalized in normalized_events {
++        // The harness's own error text is bounded before anything records it.
++        let normalized = normalized.with_bounded_error();
+         telemetry.observe_normalized(&normalized);
+         if let Some(session_id) = normalized.session_id() {
+             state.harness_session_id = Some(session_id.to_string());
+@@ -1971,7 +2033,7 @@ pub(crate) fn write_blocks_error<W: Write>(
+             "method": "error",
+             "params": {
+                 "error": {
+-                    "message": message,
++                    "message": bounded_message(&message),
+                     "codexErrorInfo": null,
+                     "additionalDetails": null
+                 },
+diff --git a/crates/harness-server/src/traits.rs b/crates/harness-server/src/traits.rs
+index ef513e61..03f5907a 100644
+--- a/crates/harness-server/src/traits.rs
++++ b/crates/harness-server/src/traits.rs
+@@ -95,7 +95,13 @@ pub trait HarnessServer {
+     fn validate_model(&self, _model: &str) -> std::result::Result<(), String> {
+         Ok(())
+     }
+-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>>;
++    /// Stdin that starts a native turn. The normalizer lets the harness track
++    /// a prompt it must see taken in before the turn may end.
++    fn stdin_for_turn(
++        &self,
++        normalizer: &mut Self::EventNormalizer,
++        input: &[UserInput],
++    ) -> Result<Vec<u8>>;
+     /// Whether a steer is written to the running harness as it arrives
+     /// (`stdin_for_steer`), for the harness to fold into its work and answer
+     /// within its native turn. Otherwise the steer waits for the native turn
+@@ -107,10 +113,10 @@ pub trait HarnessServer {
+     /// harness track a steer it must see answered before the turn may end.
+     fn stdin_for_steer(
+         &self,
+-        _normalizer: &mut Self::EventNormalizer,
++        normalizer: &mut Self::EventNormalizer,
+         input: &[UserInput],
+     ) -> Result<Vec<u8>> {
+-        self.stdin_for_turn(input)
++        self.stdin_for_turn(normalizer, input)
+     }
+     /// Normalizes a requested reasoning effort to a level this harness applies
+     /// per turn, or `None` to run its configured default. No control by default.
+@@ -131,6 +137,13 @@ pub trait HarnessServer {
+     ) -> Result<Option<crate::user_input::UserInputControl>> {
+         Ok(None)
+     }
++    /// Whether a blocking user-input request belongs to the active turn.
++    /// Harnesses gating stdout until the current prompt is acknowledged return
++    /// `false` before that acknowledgement so stale requests are rejected
++    /// without surfacing to the user.
++    fn accepts_user_input_request(&self, _normalizer: &Self::EventNormalizer) -> bool {
++        true
++    }
+     fn stdin_for_user_input_response(
+         &self,
+         _request: &crate::user_input::NativeUserInputRequest,
+@@ -274,6 +287,20 @@ impl NormalizedEvent {
+         matches!(self, Self::Result { .. } | Self::Error { .. })
+     }
+ 
++    /// Bounds the error text a harness reports itself (its error `result`,
++    /// its `error` event), which can be as long as whatever it failed on.
++    pub(crate) fn with_bounded_error(self) -> Self {
++        match self {
++            Self::Result { error: Some(error) } => Self::Result {
++                error: Some(crate::error::bounded_message(&error)),
++            },
++            Self::Error { message } => Self::Error {
++                message: crate::error::bounded_message(&message),
++            },
++            event => event,
++        }
++    }
++
+     pub(crate) fn token_usage(&self) -> Option<&NormalizedTokenUsage> {
+         match self {
+             Self::TokenUsage { usage } => Some(usage),
+diff --git a/crates/harness-server/tests/app_server_stdio.rs b/crates/harness-server/tests/app_server_stdio.rs
+index a385fcae..08a33e65 100644
+--- a/crates/harness-server/tests/app_server_stdio.rs
++++ b/crates/harness-server/tests/app_server_stdio.rs
+@@ -693,6 +693,633 @@ fn fake_claude_subagent_sidechain_stop_does_not_complete_the_turn() {
+     assert_codex_v2_turn(&run.turn);
+ }
+ 
++/// A fake Claude Code 2.1.325 that echoes each prompt it takes in and answers
++/// `Answer <prompt>`. The prompt text picks what else it does:
++/// - `notification`: delivers a background task's notification mid-answer;
++/// - `resumed`, `synthetic`, `synthetic-stream`, `synthetic-stream-text`,
++///   `stale-answer`: first settles the session it resumed, ending in a
++///   `result` of its own (and a suggestion for it) before it dequeues the
++///   prompt, then echoes another message before the prompt's;
++/// - `slow`: leaves time for a steer between its answer and its `result`;
++/// - `unparseable`: writes a main-chain line the server cannot read;
++/// - `sidechain`: writes subagent lines the server cannot read;
++/// - `failing`: ends with an error `result` as long as what it failed on.
++const RESUMED_SESSION_CLI: &str = r#"#!/usr/bin/env python3
++import json, os, sys, time
++START, END = 'START-SECRET-7f3a', 'END-SECRET-9c1e'
++NOTIFICATION = START + '<task-notification>\n<task-id>a1</task-id>\n<status>stopped</status>\n<summary>' + 'internal ' * 2500 + '</summary>\n</task-notification>' + END
++SETTLES_FIRST = ('resumed', 'synthetic', 'synthetic-stream', 'synthetic-stream-text', 'stale-answer')
++with open(os.environ['FAKE_RESUMED_STARTS'], 'a') as starts:
++    starts.write('start\n')
++if os.environ.get('FAKE_RESUMED_ARGV'):
++    with open(os.environ['FAKE_RESUMED_ARGV'], 'w') as argv:
++        json.dump(sys.argv[1:], argv)
++def emit(value):
++    print(json.dumps(value), flush=True)
++def stream(event, **fields):
++    emit({'type':'stream_event','event':event,**fields})
++def notification(**fields):
++    emit({'type':'user','message':{'role':'user','content':NOTIFICATION},'parent_tool_use_id':None,**fields})
++def streamed_message(ident, model, text, stop):
++    head = {'id':ident,'model':model}
++    stream({'type':'message_start','message':{**head,'content':[]}})
++    stream({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})
++    stream({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':text}})
++    emit({'type':'assistant','message':{**head,'stop_reason':None,'content':[{'type':'text','text':text}]}})
++    stream({'type':'content_block_stop','index':0})
++    stream({'type':'message_delta','delta':{'stop_reason':stop}})
++    stream({'type':'message_stop'})
++def own_result(text):
++    result = {'type':'result','subtype':'success','is_error':False}
++    if text:
++        result['result'] = text
++    emit(result)
++    emit({'type':'prompt_suggestion','session_id':'resumed-session','suggestion':'Stale suggestion'})
++turn = 0
++for raw in sys.stdin:
++    prompt = json.loads(raw)
++    if prompt.get('type') != 'user':
++        continue
++    turn += 1
++    mode = prompt['message']['content'][0]['text']
++    emit({'type':'system','subtype':'init','session_id':'resumed-session'})
++    if mode in SETTLES_FIRST:
++        notification(isReplay=True, uuid='orphaned-notification')
++        if mode == 'synthetic':
++            emit({'type':'assistant','message':{'id':'synthetic','model':'<synthetic>','stop_reason':'stop_sequence','content':[{'type':'text','text':'No response requested.'}]}})
++            own_result('No response requested.')
++        elif mode.startswith('synthetic-stream'):
++            streamed_message('synthetic', '<synthetic>', 'No response requested.', 'stop_sequence')
++            own_result('No response requested.' if mode.endswith('-text') else None)
++        elif mode == 'stale-answer':
++            streamed_message('stale', 'claude-fable-5', 'Stale answer', 'end_turn')
++            own_result('Stale answer')
++        else:
++            own_result(None)
++        emit({'type':'user','isReplay':True,'uuid':'another-message','message':prompt['message']})
++        time.sleep(0.3)
++    # Claude Code gives a message sent without a uuid one of its own.
++    emit({'type':'user','isReplay':True,'uuid':prompt.get('uuid', 'assigned-'+str(turn)),'message':prompt['message']})
++    if mode == 'unparseable':
++        emit({'type':'assistant','message':NOTIFICATION})
++        continue
++    if mode == 'failing':
++        emit({'type':'result','subtype':'error_during_execution','is_error':True,'result':NOTIFICATION})
++        continue
++    if mode == 'sidechain':
++        deep = '{"a":' * 200 + '0' + '}' * 200
++        print('{"type":"assistant","parent_tool_use_id":"toolu_task","message":{"id":"msg_deep","content":[{"type":"tool_use","id":"t1","name":"Bash","input":' + deep + '}]}}', flush=True)
++        emit({'type':'assistant','parent_tool_use_id':'toolu_task','message':NOTIFICATION})
++        emit({'type':'user','parent_tool_use_id':'toolu_task','message':{'role':'user','content':[7, NOTIFICATION]}})
++        stream({'type':'content_block_delta','delta':NOTIFICATION}, parent_tool_use_id='toolu_task')
++    message = {'id':'answer-'+str(turn),'model':'claude-fable-5','content':[]}
++    emit({'type':'stream_event','event':{'type':'message_start','message':message}})
++    emit({'type':'assistant','message':{**message,'stop_reason':None,'content':[{'type':'text','text':'Answer '+mode}]}})
++    if mode == 'notification':
++        notification(isReplay=True, uuid='notification-1')
++        notification()
++        emit({'type':'user','message':{'role':'user','content':None}})
++    emit({'type':'stream_event','event':{'type':'message_delta','delta':{'stop_reason':'end_turn'}}})
++    if mode == 'slow':
++        time.sleep(1)
++    emit({'type':'result','subtype':'success','result':'Answer '+mode})
++    emit({'type':'prompt_suggestion','session_id':'resumed-session','suggestion':'After '+mode})
++"#;
++
++/// Markers at each end of the fake's unreadable payload.
++const REJECTED_PAYLOAD_MARKERS: [&str; 2] = ["START-SECRET-7f3a", "END-SECRET-9c1e"];
++
++/// How the server is told to read the fake Claude Code's stream.
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum PromptReplay {
++    /// As a command that replaces the CLI: not known to echo the prompt, so
++    /// the model's output also shows the prompt was taken in.
++    NotExpected,
++    /// As the native CLI (`--replay-user-messages`): nothing before the echo
++    /// of the prompt is the prompt's answer.
++    Expected,
++}
++
++fn resumed_session_bridge(blocks: bool, replay: PromptReplay) -> (BridgeProcess, PathBuf, PathBuf) {
++    let script = temp_path("resumed-session-cli.py");
++    let starts = temp_path("resumed-session-starts.log");
++    std::fs::write(&script, RESUMED_SESSION_CLI).unwrap();
++    let command = Some(format!("exec python3 {}", script.display()));
++    let env = Some(("FAKE_RESUMED_STARTS", starts.to_str().unwrap()));
++    let expect_replay: &[(&str, &str)] = match replay {
++        PromptReplay::NotExpected => &[],
++        PromptReplay::Expected => &[("CENTAUR_CLAUDE_EXPECT_USER_REPLAY", "1")],
++    };
++    let args = if blocks {
++        Harness::ClaudeCode.blocks_args()
++    } else {
++        Harness::ClaudeCode.args()
++    };
++    let bridge = BridgeProcess::spawn_harness_with_args(
++        Harness::ClaudeCode,
++        args,
++        command,
++        env,
++        expect_replay,
++    );
++    (bridge, script, starts)
++}
++
++fn agent_message_phases(lines: &[String]) -> Vec<(String, String)> {
++    lines
++        .iter()
++        .filter_map(|line| {
++            let value: Value = serde_json::from_str(line).unwrap();
++            let item = &value["params"]["item"];
++            (value["method"] == "item/completed" && item["type"] == "agentMessage").then(|| {
++                (
++                    item["text"].as_str().unwrap().to_string(),
++                    item["phase"].as_str().unwrap_or_default().to_string(),
++                )
++            })
++        })
++        .collect()
++}
++
++#[test]
++fn fake_claude_task_notification_with_string_content_does_not_fail_the_turn() {
++    // Claude Code 2.1.325 delivers a background task's notification as a user
++    // message whose `content` is a plain string. The line used to fail to
++    // parse, which failed the turn and stopped the process.
++    for replay in [PromptReplay::NotExpected, PromptReplay::Expected] {
++        let (mut bridge, script, starts) = resumed_session_bridge(false, replay);
++        let timeout = Duration::from_secs(10);
++        let thread_id = bridge.initialize_and_start_thread(Harness::ClaudeCode, timeout);
++        let turn = bridge.run_turn(&thread_id, 3, "notification", None, timeout);
++        let lines = bridge.finish_successfully();
++
++        assert_completed_turn(&turn);
++        assert_eq!(turn.text_from_deltas, "Answer notification");
++        assert_codex_v2_turn(&turn);
++        assert!(
++            !turn.methods.contains(&"error".to_string()),
++            "{:?}",
++            turn.methods
++        );
++        // The notification is not a tool boundary: the text before it is still
++        // the final answer, not commentary.
++        assert_eq!(
++            agent_message_phases(&lines),
++            [(
++                "Answer notification".to_string(),
++                "final_answer".to_string()
++            )]
++        );
++        assert!(lines.iter().all(|line| !line.contains("task-notification")));
++        let _ = std::fs::remove_file(script);
++        let _ = std::fs::remove_file(starts);
++    }
++}
++
++/// The previous process died with background tasks running. The resumed
++/// session settles that with a `result` of its own, and only then dequeues
++/// the prompt. Read as the turn's end, that `result` completed the turn empty
++/// (and opened the suggestion window, which discards the answer); so did
++/// Claude Code's own "No response requested." message read as the answer.
++fn resumed_session_answers_the_prompt_once(replay: PromptReplay, suggestions: bool) {
++    let mut modes = vec![
++        "resumed",
++        "synthetic",
++        "synthetic-stream",
++        "synthetic-stream-text",
++    ];
++    if replay == PromptReplay::Expected {
++        // Only the echo tells the model's stale output from its answer.
++        modes.push("stale-answer");
++    }
++    for mode in modes {
++        let context = format!("{mode} {replay:?} suggestions={suggestions}");
++        let (mut bridge, script, starts) = resumed_session_bridge(true, replay);
++        let mut turns = Vec::new();
++        for prompt in [mode, "plain"] {
++            let mut user = suggestion_user(prompt, suggestions);
++            user["trace_metadata"]["execution_id"] = json!(format!("execution-{prompt}"));
++            turns.push(bridge.run_blocks_user_line(user, Duration::from_secs(10)));
++        }
++        let lines = bridge.finish_successfully();
++
++        for (turn, prompt) in turns.iter().zip([mode, "plain"]) {
++            assert_completed_turn(turn);
++            assert_eq!(
++                turn.text_from_deltas,
++                format!("Answer {prompt}"),
++                "{context}"
++            );
++            assert_eq!(turn.turn_completed_count, 1, "{context}");
++        }
++        assert_eq!(
++            agent_message_phases(&lines),
++            [
++                (format!("Answer {mode}"), "final_answer".to_string()),
++                ("Answer plain".to_string(), "final_answer".to_string()),
++            ],
++            "{context}"
++        );
++        // Each suggestion follows its own answer's `result`: the earlier
++        // `result` opened no suggestion window.
++        let suggested: Vec<(String, String)> = suggestion_notifications(&lines)
++            .iter()
++            .map(|suggestion| {
++                (
++                    suggestion["params"]["turnId"].as_str().unwrap().to_string(),
++                    suggestion["params"]["suggestion"]
++                        .as_str()
++                        .unwrap()
++                        .to_string(),
++                )
++            })
++            .collect();
++        let expected = if suggestions {
++            vec![
++                (turns[0].turn_id.clone(), format!("After {mode}")),
++                (turns[1].turn_id.clone(), "After plain".to_string()),
++            ]
++        } else {
++            Vec::new()
++        };
++        assert_eq!(suggested, expected, "{context}");
++        for stale in ["No response requested", "Stale answer", "Stale suggestion"] {
++            assert!(
++                lines.iter().all(|line| !line.contains(stale)),
++                "{context}: {stale:?} reached the client"
++            );
++        }
++        // The process answered the prompt, so it is kept for the next turn.
++        assert_eq!(
++            std::fs::read_to_string(&starts).unwrap(),
++            "start\n",
++            "{context}"
++        );
++        let _ = std::fs::remove_file(script);
++        let _ = std::fs::remove_file(starts);
++    }
++}
++
++#[test]
++fn fake_claude_result_of_a_resumed_session_before_its_prompt_does_not_complete_the_turn() {
++    resumed_session_answers_the_prompt_once(PromptReplay::Expected, true);
++}
++
++#[test]
++fn fake_claude_result_of_a_resumed_session_opens_no_suggestion_window_when_disabled() {
++    resumed_session_answers_the_prompt_once(PromptReplay::Expected, false);
++}
++
++#[test]
++fn fake_claude_own_message_of_a_resumed_session_is_not_the_answer_of_a_cli_that_does_not_echo() {
++    resumed_session_answers_the_prompt_once(PromptReplay::NotExpected, true);
++}
++
++#[test]
++fn fake_claude_own_message_of_a_resumed_session_is_not_the_answer_without_suggestions() {
++    resumed_session_answers_the_prompt_once(PromptReplay::NotExpected, false);
++}
++
++#[test]
++fn fake_claude_started_as_the_native_cli_must_echo_the_prompt_before_anything_answers_it() {
++    // No command replaces the CLI here: the server starts `CLAUDE_BIN` with
++    // its own arguments, as it starts Claude Code in a sandbox. That CLI
++    // echoes each prompt, so the echo is required without being asked for.
++    use std::os::unix::fs::PermissionsExt;
++
++    let script = temp_path("native-claude-cli.py");
++    let starts = temp_path("native-claude-starts.log");
++    let argv_log = temp_path("native-claude-argv.json");
++    std::fs::write(&script, RESUMED_SESSION_CLI).unwrap();
++    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
++    let mut bridge = BridgeProcess::spawn_harness_with_args(
++        Harness::ClaudeCode,
++        Harness::ClaudeCode.blocks_args(),
++        None,
++        Some(("CLAUDE_BIN", script.to_str().unwrap())),
++        &[
++            ("FAKE_RESUMED_STARTS", starts.to_str().unwrap()),
++            ("FAKE_RESUMED_ARGV", argv_log.to_str().unwrap()),
++        ],
++    );
++    // The model's own stale output comes before the echo; only a server that
++    // waits for the echo can tell it from the answer.
++    let turn = bridge.run_blocks_user_line(
++        suggestion_user("stale-answer", true),
++        Duration::from_secs(10),
++    );
++    let lines = bridge.finish_successfully();
++
++    assert_completed_turn(&turn);
++    assert_eq!(turn.text_from_deltas, "Answer stale-answer");
++    assert_eq!(
++        agent_message_phases(&lines),
++        [(
++            "Answer stale-answer".to_string(),
++            "final_answer".to_string()
++        )]
++    );
++    let suggestions = suggestion_notifications(&lines);
++    assert_eq!(suggestions.len(), 1, "{suggestions:?}");
++    assert_eq!(suggestions[0]["params"]["suggestion"], "After stale-answer");
++    // The flag that makes the CLI echo is what the requirement rests on.
++    let argv: Vec<String> =
++        serde_json::from_str(&std::fs::read_to_string(&argv_log).unwrap()).unwrap();
++    let _ = std::fs::remove_file(argv_log);
++    assert!(
++        argv.iter().any(|arg| arg == "--replay-user-messages"),
++        "{argv:?}"
++    );
++    let _ = std::fs::remove_file(script);
++    let _ = std::fs::remove_file(starts);
++}
++
++#[test]
++fn fake_claude_held_steer_is_not_completed_by_a_result_before_it_is_taken_in() {
++    // A steer that arrives after the final message continues the turn as the
++    // next prompt, which must be taken in before a `result` can answer it.
++    for (replay, steer_mode) in [
++        (PromptReplay::NotExpected, "resumed"),
++        (PromptReplay::Expected, "resumed"),
++        (PromptReplay::Expected, "stale-answer"),
++    ] {
++        let context = format!("{steer_mode} {replay:?}");
++        let (mut bridge, script, starts) = resumed_session_bridge(true, replay);
++        bridge.send(suggestion_user("slow", false));
++        let first = read_final_suggestion_answer(&mut bridge);
++        let mut steer = suggestion_user(steer_mode, false);
++        steer["trace_metadata"]["action"] = json!("steer_active_execution");
++        steer["client_user_message_id"] = json!("steer-message-1");
++        bridge.send(steer);
++        let second = read_final_suggestion_answer(&mut bridge);
++        let done = read_question_method(&mut bridge, "turn/completed");
++        let lines = bridge.finish_successfully();
++
++        assert_eq!(first["params"]["item"]["text"], "Answer slow", "{context}");
++        assert_eq!(
++            second["params"]["item"]["text"],
++            format!("Answer {steer_mode}"),
++            "{context}"
++        );
++        assert_eq!(second["params"]["turnId"], first["params"]["turnId"]);
++        assert_eq!(done["params"]["turn"]["id"], first["params"]["turnId"]);
++        assert_eq!(done["params"]["turn"]["status"], "completed", "{context}");
++        let completed = lines
++            .iter()
++            .filter(|line| {
++                serde_json::from_str::<Value>(line).unwrap()["method"] == "turn/completed"
++            })
++            .count();
++        assert_eq!(completed, 1, "the steer's answer belongs to its turn");
++        assert_eq!(std::fs::read_to_string(&starts).unwrap(), "start\n");
++        let _ = std::fs::remove_file(script);
++        let _ = std::fs::remove_file(starts);
++    }
++}
++
++fn error_notifications(lines: &[String]) -> Vec<String> {
++    lines
++        .iter()
++        .filter_map(|line| {
++            let value: Value = serde_json::from_str(line).unwrap();
++            (value["method"] == "error").then(|| {
++                value["params"]["error"]["message"]
++                    .as_str()
++                    .unwrap()
++                    .to_string()
++            })
++        })
++        .collect()
++}
++
++#[test]
++fn fake_claude_unparseable_line_fails_the_turn_without_quoting_it() {
++    // A parse error quotes the value it failed on. The whole 20 KB line used
++    // to become the turn's error, and from there the reply to the user; cut
++    // to a bound, it still carried the start and the end of that value.
++    for blocks in [false, true] {
++        let (mut bridge, script, starts) = resumed_session_bridge(blocks, PromptReplay::Expected);
++        let timeout = Duration::from_secs(10);
++        let turn = if blocks {
++            bridge.run_blocks_user_line(suggestion_user("unparseable", false), timeout)
++        } else {
++            let thread_id = bridge.initialize_and_start_thread(Harness::ClaudeCode, timeout);
++            bridge.run_turn(&thread_id, 3, "unparseable", None, timeout)
++        };
++        let (lines, stderr) = bridge.finish_with_stderr();
++
++        assert_eq!(turn.terminal_status.as_deref(), Some("failed"));
++        let mut errors = error_notifications(&lines);
++        assert_eq!(errors.len(), 1, "{errors:?}");
++        errors.push(turn.terminal_error.clone().expect("turn error"));
++        for error in errors {
++            assert_eq!(error, "JSON error: invalid data");
++        }
++        // Nothing of the rejected value is written anywhere: not on the wire,
++        // and not in the server's own log.
++        for output in lines.iter().chain([&stderr]) {
++            for leaked in REJECTED_PAYLOAD_MARKERS
++                .into_iter()
++                .chain(["task-notification", "internal"])
++            {
++                assert!(!output.contains(leaked), "{leaked:?} in {output}");
++            }
++        }
++        assert!(lines.iter().all(|line| line.len() < 2_000));
++        let _ = std::fs::remove_file(script);
++        let _ = std::fs::remove_file(starts);
++    }
++}
++
++#[test]
++fn fake_claude_error_result_text_is_bounded() {
++    // Claude Code's own error `result` can be as long as what it failed on.
++    let (mut bridge, script, starts) = resumed_session_bridge(true, PromptReplay::Expected);
++    let turn =
++        bridge.run_blocks_user_line(suggestion_user("failing", false), Duration::from_secs(10));
++    let lines = bridge.finish_successfully();
++
++    assert_eq!(turn.terminal_status.as_deref(), Some("failed"));
++    let error = turn.terminal_error.clone().expect("turn error");
++    assert_eq!(error.chars().count(), 512, "{error}");
++    assert!(error.contains(" ... (truncated) ... "), "{error}");
++    assert!(lines.iter().all(|line| line.len() < 2_000));
++    let _ = std::fs::remove_file(script);
++    let _ = std::fs::remove_file(starts);
++}
++
++#[test]
++fn fake_claude_malformed_sidechain_event_does_not_fail_the_turn() {
++    // A subagent's events are dropped, so one this server cannot read must
++    // not fail the turn that launched the subagent.
++    for replay in [PromptReplay::NotExpected, PromptReplay::Expected] {
++        let (mut bridge, script, starts) = resumed_session_bridge(false, replay);
++        let timeout = Duration::from_secs(10);
++        let thread_id = bridge.initialize_and_start_thread(Harness::ClaudeCode, timeout);
++        let turn = bridge.run_turn(&thread_id, 3, "sidechain", None, timeout);
++        let lines = bridge.finish_successfully();
++
++        assert_completed_turn(&turn);
++        assert_eq!(turn.text_from_deltas, "Answer sidechain", "{replay:?}");
++        assert_codex_v2_turn(&turn);
++        assert!(error_notifications(&lines).is_empty(), "{replay:?}");
++        for marker in REJECTED_PAYLOAD_MARKERS {
++            assert!(lines.iter().all(|line| !line.contains(marker)));
++        }
++        let _ = std::fs::remove_file(script);
++        let _ = std::fs::remove_file(starts);
++    }
++}
++
++#[test]
++fn fake_claude_pre_replay_question_is_rejected_without_reaching_the_turn() {
++    let script = temp_path("pre-replay-question-cli.py");
++    let log = temp_path("pre-replay-question-control.jsonl");
++    let cli = r#"#!/usr/bin/env python3
++import json, os, sys
++def emit(value):
++    print(json.dumps(value), flush=True)
++def question_control(req_id, tool_id, prompt):
++    return {
++        'type': 'control_request',
++        'request_id': req_id,
++        'request': {
++            'subtype': 'can_use_tool',
++            'tool_name': 'AskUserQuestion',
++            'tool_use_id': tool_id,
++            'input': {
++                'questions': [{
++                    'header': 'Scope',
++                    'question': prompt,
++                    'options': [
++                        {'label': 'Alpha', 'description': 'First'},
++                        {'label': 'Beta', 'description': 'Second'},
++                    ],
++                    'multiSelect': False,
++                }]
++            },
++        },
++    }
++prompt = None
++for raw in sys.stdin:
++    msg = json.loads(raw)
++    if msg.get('type') == 'user':
++        prompt = msg
++        emit({'type': 'system', 'subtype': 'init', 'session_id': 'q-session'})
++        # Stale question before the new prompt's uuid is echoed.
++        emit(question_control('stale-q', 'tool-stale', 'Stale question?'))
++        break
++for raw in sys.stdin:
++    msg = json.loads(raw)
++    if msg.get('type') == 'control_response':
++        with open(os.environ['FAKE_PRE_REPLAY_LOG'], 'a') as f:
++            f.write(json.dumps(msg) + '\n')
++        req_id = msg['response']['request_id']
++        if req_id == 'stale-q':
++            # Now acknowledge the real prompt and ask a real question.
++            emit({'type': 'user', 'isReplay': True, 'uuid': prompt['uuid'], 'message': prompt['message']})
++            emit(question_control('real-q', 'tool-real', 'Real question?'))
++        elif req_id == 'real-q':
++            emit({'type': 'assistant', 'message': {'id': 'a1', 'model': 'claude-fable-5', 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'Answered real question'}]}})
++            emit({'type': 'result', 'subtype': 'success', 'result': 'Answered real question'})
++            break
++"#;
++    std::fs::write(&script, cli).unwrap();
++    let mut bridge = BridgeProcess::spawn_harness_with_args(
++        Harness::ClaudeCode,
++        Harness::ClaudeCode.blocks_args(),
++        Some(format!("exec python3 {}", script.display())),
++        Some(("FAKE_PRE_REPLAY_LOG", log.to_str().unwrap())),
++        &[("CENTAUR_CLAUDE_EXPECT_USER_REPLAY", "1")],
++    );
++    bridge.send(json!({
++        "type": "user",
++        "text": "continue",
++        "trace_metadata": {
++            "execution_id": "exec-pre-replay-q",
++            "supports_user_input": true,
++        },
++    }));
++    // The first (and only) question surfaced to the client must be the post-echo one.
++    let request = read_question_method(&mut bridge, "item/tool/requestUserInput");
++    assert_eq!(request["params"]["itemId"], "tool-real");
++    assert_eq!(
++        request["params"]["questions"][0]["question"],
++        "Real question?"
++    );
++    let qid = request["params"]["questions"][0]["id"].as_str().unwrap();
++    bridge.send(json!({
++        "type": "user_input_response",
++        "request_id": request["id"],
++        "execution_id": "exec-pre-replay-q",
++        "answers": { qid: { "answers": ["Alpha"] } },
++    }));
++    let done = read_question_method(&mut bridge, "turn/completed");
++    assert_eq!(done["params"]["turn"]["status"], "completed");
++    let lines = bridge.finish_successfully();
++    let question_events: Vec<Value> = lines
++        .iter()
++        .map(|l| serde_json::from_str::<Value>(l).unwrap())
++        .filter(|v| v["method"] == "item/tool/requestUserInput")
++        .collect();
++    assert_eq!(question_events.len(), 1, "{question_events:?}");
++
++    let responses: Vec<Value> = std::fs::read_to_string(&log)
++        .unwrap()
++        .lines()
++        .map(|l| serde_json::from_str(l).unwrap())
++        .collect();
++    assert_eq!(responses.len(), 2, "{responses:?}");
++    assert_eq!(responses[0]["response"]["request_id"], "stale-q");
++    assert_eq!(responses[0]["response"]["response"]["behavior"], "deny");
++    assert_eq!(responses[1]["response"]["request_id"], "real-q");
++    assert_eq!(responses[1]["response"]["response"]["behavior"], "allow");
++
++    let _ = std::fs::remove_file(script);
++    let _ = std::fs::remove_file(log);
++}
++
++#[test]
++fn fake_claude_background_task_started_after_the_final_stop_keeps_the_turn_open() {
++    // The message that launched a background agent stops (`end_turn`) before
++    // Claude Code reports the agent started. The stop armed the fallback
++    // completion, which stayed armed while the turn was held for the agent
++    // and ended the turn 2s into the wait, dropping the follow-up's answer.
++    let fake_claude = concat!(
++        "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}'; ",
++        "IFS= read -r _; ",
++        "printf '%s\\n' ",
++        "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"Started research.\"}]}}' ",
++        "'{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"description\":\"Research\",\"is_backgrounded\":true,\"task_type\":\"local_agent\"}' ",
++        "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Started research.\"}'; ",
++        "sleep 2.8; printf '%s\\n' ",
++        "'{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"a1\",\"status\":\"completed\",\"summary\":\"found it\"}' ",
++        "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"content\":[]}}}' ",
++        "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_2\",\"content\":[{\"type\":\"text\",\"text\":\"The answer.\"}]}}' ",
++        "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}}' ",
++        "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"The answer.\"}'; ",
++        "sleep 60"
++    );
++
++    let started = Instant::now();
++    let run = run_bridge_turn(BridgeTurnConfig {
++        harness: Harness::ClaudeCode,
++        command_override: Some(fake_claude.to_string()),
++        prompt: "research".to_string(),
++        timeout: Duration::from_secs(15),
++    });
++
++    assert_completed_turn(&run.turn);
++    assert_eq!(run.turn.text_from_deltas, "Started research.The answer.");
++    assert_eq!(run.turn.turn_completed_count, 1);
++    assert!(
++        started.elapsed() >= Duration::from_millis(2_800),
++        "the turn ended before the follow-up: {:?}",
++        started.elapsed()
++    );
++    assert_codex_v2_turn(&run.turn);
++}
++
+ #[test]
+ fn fake_codex_blocks_mode_uses_openrouter_provider_when_model_is_configured() {
+     let fake_codex = temp_path("fake-openrouter-codex.sh");
+@@ -1897,6 +2524,87 @@ fn fake_claude_blocks_mode_resets_turn_state_when_a_held_steer_respawns_the_proc
+     let _ = std::fs::remove_file(log);
+ }
+ 
++#[test]
++fn fake_claude_blocks_mode_gives_a_process_respawned_for_a_held_steer_the_turns_effort() {
++    // Effort is applied in-band and a new process runs its default. A held
++    // steer that continues the turn on a replacement process used to be
++    // written to it without the turn's effort.
++    let log = temp_path("fake-claude-held-steer-effort-stdin.jsonl");
++    let fake_claude = format!(
++        concat!(
++            "printf '%s\\n' '{{\"type\":\"spawn\"}}' >> '{log}'; ",
++            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}}'; ",
++            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; ",
++            "case \"$line\" in ",
++            "*'\"text\":\"steer one\"'*) ",
++            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"first part\"}}]}}}}'; ",
++            "sleep 1; ",
++            "printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"boom\"}}';; ",
++            "*'\"text\":\"steer two\"'*) ",
++            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered\"}}]}}}}'; ",
++            "printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"steered\"}}';; ",
++            "esac; done"
++        ),
++        log = log.display(),
++    );
++    let mut bridge =
++        BridgeProcess::spawn_harness_blocks(Harness::ClaudeCode, Some(fake_claude), None);
++    bridge.send(json!({
++        "type": "user",
++        "thread_key": "slack:C123:123.456",
++        "trace_metadata": {"source": "slackbotv2", "action": "execute"},
++        "reasoning": "max",
++        "message": {"role": "user", "content": [{"type": "text", "text": "start"}]},
++    }));
++    let steer = |text: &str, client_id: &str| {
++        json!({
++            "type": "user",
++            "thread_key": "slack:C123:123.456",
++            "trace_metadata": {"source": "session.append_messages", "action": "steer_active_execution"},
++            "client_user_message_id": client_id,
++            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
++        })
++    };
++    // The first steer is native and is never echoed, so the process cannot be
++    // reused. The second arrives after Claude Code's final assistant message
++    // and is held for the next native turn, on a new process.
++    bridge.send(steer("steer one", "steer-message-1"));
++    let first = read_final_suggestion_answer(&mut bridge);
++    assert_eq!(first["params"]["item"]["text"], "first part");
++    bridge.send(steer("steer two", "steer-message-2"));
++    let second = read_final_suggestion_answer(&mut bridge);
++    assert_eq!(second["params"]["item"]["text"], "steered");
++    let done = read_question_method(&mut bridge, "turn/completed");
++    bridge.finish_successfully();
++
++    assert_eq!(done["params"]["turn"]["id"], first["params"]["turnId"]);
++    assert_eq!(done["params"]["turn"]["status"], "failed");
++    assert_eq!(done["params"]["turn"]["error"]["message"], "boom");
++    let effort = json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": "max"}});
++    let stdin: Vec<Value> = logged_lines(&log)
++        .iter()
++        .map(|line| match line["type"].as_str() {
++            Some("spawn") => json!("spawn"),
++            Some("control_request") => line["request"].clone(),
++            _ => line["message"]["content"][0]["text"].clone(),
++        })
++        .collect();
++    assert_eq!(
++        stdin,
++        vec![
++            json!("spawn"),
++            effort.clone(),
++            json!("start"),
++            json!("steer one"),
++            // The replacement process: effort first, then its prompt.
++            json!("spawn"),
++            effort,
++            json!("steer two"),
++        ]
++    );
++    let _ = std::fs::remove_file(log);
++}
++
+ #[test]
+ fn fake_amp_blocks_mode_continues_the_turn_with_a_held_steer() {
+     // Amp's turn ends at its terminal stop, so a steer waits for it and is
+@@ -2595,6 +3303,7 @@ impl BridgeProcess {
+ 
+         for env_key in [
+             "CENTAUR_CLAUDE_APP_BRIDGE_COMMAND",
++            "CENTAUR_CLAUDE_EXPECT_USER_REPLAY",
+             "CENTAUR_AMP_APP_BRIDGE_COMMAND",
+             "CENTAUR_COMPOSE_SYSTEM_PROMPT_BIN",
+             "CENTAUR_OVERLAY_REPO_DIRS",
+@@ -3190,7 +3899,12 @@ impl BridgeProcess {
+         }
+     }
+ 
+-    fn finish_successfully(mut self) -> Vec<String> {
++    fn finish_successfully(self) -> Vec<String> {
++        self.finish_with_stderr().0
++    }
++
++    /// The server's stdout lines and everything it wrote to stderr.
++    fn finish_with_stderr(mut self) -> (Vec<String>, String) {
+         let _ = self.stdin.take();
+         let status = self.child.wait().expect("wait app-server process");
+         self.stdout_reader.join().expect("join stdout reader");
+@@ -3203,7 +3917,7 @@ impl BridgeProcess {
+         if !stderr.trim().is_empty() {
+             eprintln!("stderr:\n{stderr}");
+         }
+-        self.stdout_lines
++        (self.stdout_lines, stderr)
+     }
+ }
+ 
+diff --git a/packages/rendering/src/codex-app-server.test.ts b/packages/rendering/src/codex-app-server.test.ts
+index b619cbff..c6fcaacb 100644
+--- a/packages/rendering/src/codex-app-server.test.ts
++++ b/packages/rendering/src/codex-app-server.test.ts
+@@ -891,6 +891,194 @@ describe('CodexAppServerRendererEventMapper', () => {
+     })
+   })
+ 
++  /** Every place a failure's text leaves the mapper. */
++  function reportedFailure(events: RendererEvent[]) {
++    const task = events.find(
++      event => event.type === 'renderer.task.update' && event.task.id === 'execution-error'
++    )
++    const done = events.at(-1)
++    if (task?.type !== 'renderer.task.update' || done?.type !== 'renderer.done') {
++      throw new Error(`expected an error task and a terminal event: ${JSON.stringify(events)}`)
++    }
++    return {
++      details: task.task.details,
++      streamed: events
++        .flatMap(event => (event.type === 'renderer.message.delta' ? [event.delta] : []))
++        .join(''),
++      answerMarkdown: done.answerMarkdown,
++      error: done.error
++    }
++  }
++
++  it('bounds a long failure everywhere it is reported', () => {
++    // A crash reports its whole stderr. All 19,479 characters used to reach
++    // `renderer.done`, and from there the closed session and the chat.
++    const error = `sandbox exited with status 137\n${'  at frame (internal detail)\n'.repeat(671)}`
++    expect(error.length).toBeGreaterThan(19_000)
++    const shown = `${error.replace(/\s+/g, ' ').slice(0, 497)}...`
++    expect(shown).toHaveLength(500)
++
++    for (const source of [
++      { eventKind: 'session.execution_failed', data: { error } },
++      { eventKind: 'session.stream_error', data: { error } },
++      { type: 'turn.completed', turn: { id: 'turn-1', status: 'failed', error: { message: error } } },
++      { method: 'error', params: { error: { message: error }, willRetry: false } }
++    ]) {
++      const events = new CodexAppServerRendererEventMapper().process(source)
++      expect(reportedFailure(events)).toEqual({
++        details: [{ type: 'text', text: shown }],
++        streamed: `Execution failed: ${shown}`,
++        answerMarkdown: `Execution failed: ${shown}`,
++        error: shown
++      })
++      expect(JSON.stringify(events).length).toBeLessThan(4_000)
++    }
++  })
++
++  it('bounds the details a failure adds to its message', () => {
++    const events = new CodexAppServerRendererEventMapper().process({
++      method: 'error',
++      params: {
++        error: { message: 'Reconnecting... 5/5', additionalDetails: 'provider error '.repeat(2_000) },
++        willRetry: false
++      }
++    })
++
++    const failure = reportedFailure(events)
++    const error = failure.error ?? ''
++    expect(error).toHaveLength(500)
++    expect(error.startsWith('Reconnecting... 5/5: provider error provider error')).toBe(true)
++    expect(failure.details).toEqual([{ type: 'text', text: error }])
++    expect(failure.answerMarkdown).toBe(`Execution failed: ${error}`)
++  })
++
++  it('reports nothing of the value a parse failure quotes', () => {
++    // harness-server no longer sends this text, but one still running in an
++    // older sandbox does: serde quotes the whole value it rejected, and a cut
++    // to any length keeps the start of it.
++    const value = `START-SECRET<task-notification>\n${'  <summary>internal detail</summary>\n'.repeat(700)}</task-notification>END-SECRET`
++    for (const error of [
++      `JSON error: invalid type: string ${JSON.stringify(value)}, expected a sequence at line 1 column 25265`,
++      // As an earlier harness-server cut it: the start and the end.
++      `JSON error: invalid type: string "${value.slice(0, 362)} ... (truncated) ... ${value.slice(-63)}", expected struct AnthropicMessage`,
++      // Within the bound, where nothing is cut.
++      'JSON error: invalid type: string "START-SECRET token END-SECRET", expected a sequence',
++      'JSON error: invalid value: string "START-SECRET token END-SECRET", expected a known role'
++    ]) {
++      const events = new CodexAppServerRendererEventMapper().process({
++        eventKind: 'session.execution_failed',
++        data: { error }
++      })
++
++      const shown = error.includes('invalid value')
++        ? 'JSON error: invalid value: string [redacted]'
++        : 'JSON error: invalid type: string [redacted]'
++      expect(reportedFailure(events)).toEqual({
++        details: [{ type: 'text', text: shown }],
++        streamed: `Execution failed: ${shown}`,
++        answerMarkdown: `Execution failed: ${shown}`,
++        error: shown
++      })
++      const reported = JSON.stringify(events)
++      for (const leaked of ['START-SECRET', 'END-SECRET', 'task-notification', 'internal detail']) {
++        expect(reported).not.toContain(leaked)
++      }
++    }
++  })
++
++  it('cuts a long failure between characters, not inside one', () => {
++    const events = new CodexAppServerRendererEventMapper().process({
++      eventKind: 'session.execution_failed',
++      // Each of these is two UTF-16 code units, so the cut falls inside one.
++      data: { error: '🙂'.repeat(600) }
++    })
++
++    const failure = reportedFailure(events)
++    const error = failure.error ?? ''
++    expect(error).toBe(`${'🙂'.repeat(248)}...`)
++    expect(error.length).toBeLessThanOrEqual(500)
++    expect(() => encodeURIComponent(`${error}${failure.answerMarkdown}`)).not.toThrow()
++  })
++
++  it('bounds the notice of a cancelled session', async () => {
++    const chunks = await collect(
++      codexAppServerToChatSdkStream(
++        toAsyncIterable([
++          { eventKind: 'session.execution_cancelled', data: { error: 'cancelled: '.repeat(2_000) } }
++        ])
++      )
++    )
++
++    const text = chunks.flatMap(chunk => (chunk.type === 'markdown_text' ? [chunk.text] : [])).join('')
++    expect(text).toHaveLength(500)
++    expect(text.startsWith('cancelled: cancelled: ')).toBe(true)
++  })
++
++  it('closes the session with the bounded error', async () => {
++    const closed: unknown[] = []
++    await collect(
++      codexAppServerToChatSdkStream(
++        toAsyncIterable([
++          { eventKind: 'session.execution_failed', data: { error: 'boom '.repeat(4_000) } }
++        ]),
++        {
++          onOutput: output => {
++            if (output.type === 'chat.session.closed') closed.push(output.message)
++          }
++        }
++      )
++    )
++
++    const shown = `${'boom '.repeat(100).slice(0, 497)}...`
++    expect(closed).toEqual([{ text: `Execution failed: ${shown}`, error: shown }])
++  })
++
++  it('shows an error within the bound as it was reported', () => {
++    for (const error of ['sandbox exited\n  with status 137', 'x'.repeat(500)]) {
++      const mapper = new CodexAppServerRendererEventMapper()
++      const events = mapper.process({
++        eventKind: 'session.execution_failed',
++        data: { error }
++      })
++
++      expect(events).toContainEqual(
++        expect.objectContaining({
++          type: 'renderer.task.update',
++          task: expect.objectContaining({
++            id: 'execution-error',
++            details: [{ type: 'text', text: error }]
++          })
++        })
++      )
++      expect(events.at(-1)).toMatchObject({
++        type: 'renderer.done',
++        answerMarkdown: `Execution failed: ${error}`,
++        error
++      })
++    }
++  })
++
++  it('keeps an ordinary failure with details as it was reported', () => {
++    const events = new CodexAppServerRendererEventMapper().process({
++      method: 'error',
++      params: {
++        error: {
++          message: 'Reconnecting... 2/5',
++          additionalDetails: 'unexpected status 502 Bad Gateway'
++        },
++        willRetry: false
++      }
++    })
++
++    const error = 'Reconnecting... 2/5: unexpected status 502 Bad Gateway'
++    expect(reportedFailure(events)).toEqual({
++      details: [{ type: 'text', text: error }],
++      streamed: `Execution failed: ${error}`,
++      answerMarkdown: `Execution failed: ${error}`,
++      error
++    })
++  })
++
+   it('emits interrupted final text for cancelled Rust sessions', async () => {
+     const chunks = await collect(
+       codexAppServerToChatSdkStream(
+diff --git a/packages/rendering/src/codex-app-server.ts b/packages/rendering/src/codex-app-server.ts
+index ad1a2968..d19bc240 100644
+--- a/packages/rendering/src/codex-app-server.ts
++++ b/packages/rendering/src/codex-app-server.ts
+@@ -24,7 +24,8 @@ const limits = {
+   },
+   finalPlan: {
+     taskTitleChars: 140
+-  }
++  },
++  errorChars: 500
+ } as const
+ 
+ type AgentMessagePhase = 'commentary' | 'final_answer'
+@@ -357,9 +358,13 @@ export class CodexAppServerRendererEventMapper
+     return out
+   }
+ 
+-  private fail(error: string): RendererEvent[] {
++  private fail(reported: string): RendererEvent[] {
+     if (this.state.done) return []
+     this.state.done = true
++    // One bounded text for every place the failure goes: the error task, the
++    // answer shown to the user and the terminal event.
++    const error = boundedErrorText(reported)
++    const shownError = error || 'Execution failed'
+     const out: RendererEvent[] = []
+     let hadOpenTask = false
+     for (const [id, task] of this.state.taskByUseId) {
+@@ -372,12 +377,12 @@ export class CodexAppServerRendererEventMapper
+         id: 'execution-error',
+         title: 'Execution failed',
+         status: 'error',
+-        details: [section([text(error || 'Execution failed')])],
++        details: [section([text(shownError)])],
+         output: []
+       })
+     }
+     if (!this.state.answerText.trim()) {
+-      this.state.harnessAnswerText += `Execution failed: ${error || 'Execution failed'}`
++      this.state.harnessAnswerText += `Execution failed: ${shownError}`
+       recomposeBuffers(this.state)
+     }
+     this.emitActivitySummary(out, { final: true })
+@@ -705,7 +710,7 @@ export function rustSessionEventToServerNotification(source: unknown): RustSessi
+     return {
+       kind: 'cancelled',
+       ...(resultText ? { resultText } : {}),
+-      notice: String(data.error ?? INTERRUPTED_TEXT).trim() || INTERRUPTED_TEXT
++      notice: boundedErrorText(String(data.error ?? INTERRUPTED_TEXT).trim()) || INTERRUPTED_TEXT
+     }
+   }
+ 
+@@ -1552,6 +1557,41 @@ function languageFromContent(value: string): string {
+   return 'text'
+ }
+ 
++/**
++ * The text of a failure as it leaves the renderer: in the error task, in the
++ * answer shown to the user and in `renderer.done` (from there the closed
++ * session and the chat). A parser or runtime failure can quote the whole
++ * payload it failed on, so a longer error is flattened and cut, and the value
++ * a parse failure quotes is taken out whatever its length. An error within
++ * the bound that quotes nothing is passed on as it was reported.
++ */
++export function boundedErrorText(error: string): string {
++  const text = withoutRejectedValue(error)
++  if (text.length <= limits.errorChars) return text
++  const flat = text.replace(/\s+/g, ' ').trim()
++  if (flat.length <= limits.errorChars) return flat
++  let end = limits.errorChars - 3
++  // Never half of a character outside the Basic Multilingual Plane.
++  const last = flat.charCodeAt(end - 1)
++  if (last >= 0xd800 && last <= 0xdbff) end -= 1
++  return `${flat.slice(0, end)}...`
++}
++
++const REJECTED_VALUE = /\binvalid (?:type|value): string "/
++
++/**
++ * serde reports a string it rejected by quoting all of it (`invalid type:
++ * string "<the value>", expected ...`), and the value is harness output or
++ * user input. harness-server no longer sends that text; an older one still
++ * running in a sandbox does. Everything from the quote on is dropped: where
++ * the value ends cannot be told from the value itself.
++ */
++function withoutRejectedValue(error: string): string {
++  const quoted = REJECTED_VALUE.exec(error)
++  if (!quoted) return error
++  return `${error.slice(0, quoted.index + quoted[0].length - 1)}[redacted]`
++}
++
+ function oneLine(value: string, max: number = limits.finalPlan.taskTitleChars): string {
+   const normalized = value.replace(/\s+/g, ' ').trim()
+   return normalized.length > max ? `${normalized.slice(0, max - 3)}...` : normalized
+diff --git a/packages/rendering/src/nanocodex.test.ts b/packages/rendering/src/nanocodex.test.ts
+index 52e6700f..377f83bc 100644
+--- a/packages/rendering/src/nanocodex.test.ts
++++ b/packages/rendering/src/nanocodex.test.ts
+@@ -169,6 +169,84 @@ describe('NanocodexRendererEventMapper', () => {
+     ])
+   })
+ 
++  test('bounds the error of a failed run and of a failed session', () => {
++    // All 19,479 characters of a failure used to reach `renderer.done`.
++    const error = `proxy refused\n${'  at frame (internal detail)\n'.repeat(671)}`
++    expect(error.length).toBeGreaterThan(19_000)
++    const shown = `${error.replace(/\s+/g, ' ').slice(0, 497)}...`
++    expect(shown).toHaveLength(500)
++
++    const failedRun = new NanocodexRendererEventMapper()
++    expect(failedRun.process(native('run.error', { message: error }))).toEqual([])
++    expect(failedRun.process(native('run.failed', {}, 2))).toEqual([
++      {
++        type: 'renderer.done',
++        // No answer was given, and none is made up from the error.
++        answerMarkdown: undefined,
++        error: shown,
++        streamFinalUpdates: true,
++        threadId: 'nano-session'
++      }
++    ])
++
++    for (const eventKind of [
++      'session.execution_failed',
++      'session.stream_error',
++      'session.stdout_pump_failed'
++    ]) {
++      const failedSession = new NanocodexRendererEventMapper()
++      failedSession.process(native('assistant.delta', { text: 'partial' }))
++      expect(failedSession.process({ eventKind, data: { error } })).toEqual([
++        {
++          type: 'renderer.done',
++          answerMarkdown: 'partial',
++          error: shown,
++          streamFinalUpdates: true,
++          threadId: 'nano-session'
++        }
++      ])
++    }
++  })
++
++  test('reports nothing of the value a parse failure quotes', () => {
++    const mapper = new NanocodexRendererEventMapper()
++    const events = mapper.process({
++      eventKind: 'session.execution_failed',
++      data: {
++        error: `JSON error: invalid type: string "START-SECRET${' internal detail'.repeat(1_200)}END-SECRET", expected a sequence`
++      }
++    })
++
++    expect(events).toEqual([
++      {
++        type: 'renderer.done',
++        answerMarkdown: undefined,
++        error: 'JSON error: invalid type: string [redacted]',
++        streamFinalUpdates: true,
++        threadId: undefined
++      }
++    ])
++  })
++
++  test('closes the session with the bounded error', async () => {
++    const closed: unknown[] = []
++    const sources = (async function* () {
++      yield native('run.error', { message: 'boom '.repeat(4_000) })
++      yield native('run.failed', {}, 2)
++    })()
++    for await (const _ of harnessToChatSdkStream(sources, {
++      onOutput: output => {
++        if (output.type === 'chat.session.closed') closed.push(output.message)
++      }
++    })) {
++      // Only the closing output matters here.
++    }
++
++    expect(closed).toEqual([
++      { text: undefined, error: `${'boom '.repeat(100).slice(0, 497)}...` }
++    ])
++  })
++
+   test('ends a cancelled run without a notice when silentInterrupt is set', () => {
+     const mapper = new NanocodexRendererEventMapper({ silentInterrupt: true })
+     expect(mapper.process(native('run.failed', { status: 'cancelled' }, 2))).toEqual([
+diff --git a/packages/rendering/src/nanocodex.ts b/packages/rendering/src/nanocodex.ts
+index 5ef8586d..7dac7586 100644
+--- a/packages/rendering/src/nanocodex.ts
++++ b/packages/rendering/src/nanocodex.ts
+@@ -7,6 +7,7 @@ import {
+ import {
+   CodexAppServerRendererEventMapper,
+   INTERRUPTED_TEXT,
++  boundedErrorText,
+   type CodexAppServerToChatStreamOptions
+ } from './codex-app-server'
+ import type {
+@@ -177,7 +178,8 @@ export class NanocodexRendererEventMapper
+       {
+         type: 'renderer.done',
+         answerMarkdown: this.answer || undefined,
+-        error,
++        // Bounded as the Codex mapper's is: a failure can quote its payload.
++        error: boundedErrorText(error),
+         streamFinalUpdates: true,
+         threadId: this.requestId || undefined
+       }
