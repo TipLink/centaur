@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "70467ca5d310f23ffb9fa8a5bb890bce7178aaab",
-  "result_tree": "d9ab8f885e04558cc975cb3ffbe8cff629fff0af",
+  "result_tree": "84fc0904d1fea862c907c5e6edaf36213b75ca58",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -55,6 +55,18 @@
     {
       "file": "0013-add-per-request-redirect-policy-to-code-mode-fetch.patch",
       "sha256": "a7bda276a35ef6dc82a94167156c42701806a022b7940cccb22a1af29ba492d2"
+    },
+    {
+      "file": "0014-console-solid-queue-recurring-worker.patch",
+      "sha256": "a668a02dade1881f8146f6ae1ab402c4b57bb0513b7946f8d87790cf2244cc52"
+    },
+    {
+      "file": "0015-absurd-cancellation-sweep-index.patch",
+      "sha256": "f59a96725b0fa099183b6fd98acf09635a47be04484641ed8c6c600432f9537b"
+    },
+    {
+      "file": "0016-company-context-pandoc-3-14-and-package-xml-repair.patch",
+      "sha256": "7316bab25721b2c164a45d5c15fd3aad5e44cd36017a3d75736136cd16dbffec"
     }
   ]
 }

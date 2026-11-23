@@ -31,7 +31,7 @@ Documents are exposed to retrieval only through the query endpoints; no other da
 
 - Postgres with the existing Absurd schema and the `vector` extension available. The `pg_search` extension is needed only for the `paradedb` text-search backend.
 - `pdftotext` from Poppler (for PDF sources).
-- `pandoc` 3.8.3 or later (for Office, OpenDocument, RTF, and EPUB Slack files).
+- `pandoc` 3.14 or later (for Office, OpenDocument, RTF, and EPUB Slack files; earlier releases cannot read workbooks written by openpyxl or pandas).
 - A Rails Console database containing live per-user Google and Granola OAuth broker credentials.
 - The Active Record encryption primary key and derivation salt used by Rails Console.
 - An embeddings API key supplied through a Kubernetes Secret.
