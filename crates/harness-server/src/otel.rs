@@ -2010,6 +2010,101 @@ mod tests {
         );
     }
 
+    fn observed_usage() -> NormalizedEvent {
+        NormalizedEvent::TokenUsage {
+            usage: crate::NormalizedTokenUsage {
+                input_tokens: Some(1),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_failed_turn_records_no_part_of_a_line_the_harness_could_not_parse() {
+        use crate::HarnessServer;
+
+        let (exporter, provider, tracer) = test_telemetry();
+        let mut turn = test_turn_with_capture(tracer, true, true);
+        let line = json!({
+            "type": "assistant",
+            "message": format!("START-SECRET-7f3a{}END-SECRET-9c1e", "internal ".repeat(2_500)),
+        })
+        .to_string();
+        let error = crate::claude::ClaudeCodeHarness
+            .parse_stdout_line(&line)
+            .expect_err("a string is not a message");
+        // The turn's span is exported once the turn has usage to report.
+        turn.observe_normalized(&observed_usage());
+        // As a failed turn is recorded.
+        turn.observe_normalized(&NormalizedEvent::Error {
+            message: error.client_message(),
+        });
+        turn.finish(TurnStatus::Failed);
+        provider.force_flush().expect("flush");
+
+        let spans = exporter.get_finished_spans().expect("spans");
+        let span = spans
+            .iter()
+            .find(|span| span.name == "codex.session_task.turn")
+            .expect("turn span");
+        assert_eq!(
+            attribute(span, "output.value").as_deref(),
+            Some("JSON error: invalid data")
+        );
+        for span in &spans {
+            let recorded = format!("{span:?}");
+            for leaked in ["START-SECRET-7f3a", "END-SECRET-9c1e", "internal internal"] {
+                assert!(!recorded.contains(leaked), "{leaked:?} in {}", span.name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_harness_error_is_bounded_before_it_is_recorded() {
+        let (exporter, provider, tracer) = test_telemetry();
+        let mut turn = test_turn_with_capture(tracer, true, true);
+        turn.observe_normalized(&observed_usage());
+        let reported = format!("start {} end", "日本語🙂".repeat(5_000));
+        for event in [
+            NormalizedEvent::Result {
+                error: Some(reported.clone()),
+            },
+            NormalizedEvent::Error {
+                message: reported.clone(),
+            },
+        ] {
+            let bounded = event.with_bounded_error();
+            let (NormalizedEvent::Result { error: Some(text) }
+            | NormalizedEvent::Error { message: text }) = &bounded
+            else {
+                panic!("expected an error, got {bounded:?}");
+            };
+            assert_eq!(text.chars().count(), 512);
+            assert!(text.starts_with("start 日本語🙂"), "{text}");
+            assert!(text.ends_with("日本語🙂 end"), "{text}");
+            turn.observe_normalized(&bounded);
+        }
+        // Anything else passes through untouched.
+        assert!(matches!(
+            NormalizedEvent::Result { error: None }.with_bounded_error(),
+            NormalizedEvent::Result { error: None }
+        ));
+        assert!(matches!(
+            NormalizedEvent::Error { message: "boom".to_owned() }.with_bounded_error(),
+            NormalizedEvent::Error { message } if message == "boom"
+        ));
+        turn.finish(TurnStatus::Failed);
+        provider.force_flush().expect("flush");
+
+        let spans = exporter.get_finished_spans().expect("spans");
+        let span = spans
+            .iter()
+            .find(|span| span.name == "codex.session_task.turn")
+            .expect("turn span");
+        let output = attribute(span, "output.value").expect("recorded error");
+        assert_eq!(output.chars().count(), 512);
+    }
+
     #[test]
     fn transcript_capture_accepts_only_explicit_truthy_values() {
         for value in ["1", "true", "TRUE", "yes", "on"] {

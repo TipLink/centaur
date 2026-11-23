@@ -693,6 +693,633 @@ fn fake_claude_subagent_sidechain_stop_does_not_complete_the_turn() {
     assert_codex_v2_turn(&run.turn);
 }
 
+/// A fake Claude Code 2.1.325 that echoes each prompt it takes in and answers
+/// `Answer <prompt>`. The prompt text picks what else it does:
+/// - `notification`: delivers a background task's notification mid-answer;
+/// - `resumed`, `synthetic`, `synthetic-stream`, `synthetic-stream-text`,
+///   `stale-answer`: first settles the session it resumed, ending in a
+///   `result` of its own (and a suggestion for it) before it dequeues the
+///   prompt, then echoes another message before the prompt's;
+/// - `slow`: leaves time for a steer between its answer and its `result`;
+/// - `unparseable`: writes a main-chain line the server cannot read;
+/// - `sidechain`: writes subagent lines the server cannot read;
+/// - `failing`: ends with an error `result` as long as what it failed on.
+const RESUMED_SESSION_CLI: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+START, END = 'START-SECRET-7f3a', 'END-SECRET-9c1e'
+NOTIFICATION = START + '<task-notification>\n<task-id>a1</task-id>\n<status>stopped</status>\n<summary>' + 'internal ' * 2500 + '</summary>\n</task-notification>' + END
+SETTLES_FIRST = ('resumed', 'synthetic', 'synthetic-stream', 'synthetic-stream-text', 'stale-answer')
+with open(os.environ['FAKE_RESUMED_STARTS'], 'a') as starts:
+    starts.write('start\n')
+if os.environ.get('FAKE_RESUMED_ARGV'):
+    with open(os.environ['FAKE_RESUMED_ARGV'], 'w') as argv:
+        json.dump(sys.argv[1:], argv)
+def emit(value):
+    print(json.dumps(value), flush=True)
+def stream(event, **fields):
+    emit({'type':'stream_event','event':event,**fields})
+def notification(**fields):
+    emit({'type':'user','message':{'role':'user','content':NOTIFICATION},'parent_tool_use_id':None,**fields})
+def streamed_message(ident, model, text, stop):
+    head = {'id':ident,'model':model}
+    stream({'type':'message_start','message':{**head,'content':[]}})
+    stream({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})
+    stream({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':text}})
+    emit({'type':'assistant','message':{**head,'stop_reason':None,'content':[{'type':'text','text':text}]}})
+    stream({'type':'content_block_stop','index':0})
+    stream({'type':'message_delta','delta':{'stop_reason':stop}})
+    stream({'type':'message_stop'})
+def own_result(text):
+    result = {'type':'result','subtype':'success','is_error':False}
+    if text:
+        result['result'] = text
+    emit(result)
+    emit({'type':'prompt_suggestion','session_id':'resumed-session','suggestion':'Stale suggestion'})
+turn = 0
+for raw in sys.stdin:
+    prompt = json.loads(raw)
+    if prompt.get('type') != 'user':
+        continue
+    turn += 1
+    mode = prompt['message']['content'][0]['text']
+    emit({'type':'system','subtype':'init','session_id':'resumed-session'})
+    if mode in SETTLES_FIRST:
+        notification(isReplay=True, uuid='orphaned-notification')
+        if mode == 'synthetic':
+            emit({'type':'assistant','message':{'id':'synthetic','model':'<synthetic>','stop_reason':'stop_sequence','content':[{'type':'text','text':'No response requested.'}]}})
+            own_result('No response requested.')
+        elif mode.startswith('synthetic-stream'):
+            streamed_message('synthetic', '<synthetic>', 'No response requested.', 'stop_sequence')
+            own_result('No response requested.' if mode.endswith('-text') else None)
+        elif mode == 'stale-answer':
+            streamed_message('stale', 'claude-fable-5', 'Stale answer', 'end_turn')
+            own_result('Stale answer')
+        else:
+            own_result(None)
+        emit({'type':'user','isReplay':True,'uuid':'another-message','message':prompt['message']})
+        time.sleep(0.3)
+    # Claude Code gives a message sent without a uuid one of its own.
+    emit({'type':'user','isReplay':True,'uuid':prompt.get('uuid', 'assigned-'+str(turn)),'message':prompt['message']})
+    if mode == 'unparseable':
+        emit({'type':'assistant','message':NOTIFICATION})
+        continue
+    if mode == 'failing':
+        emit({'type':'result','subtype':'error_during_execution','is_error':True,'result':NOTIFICATION})
+        continue
+    if mode == 'sidechain':
+        deep = '{"a":' * 200 + '0' + '}' * 200
+        print('{"type":"assistant","parent_tool_use_id":"toolu_task","message":{"id":"msg_deep","content":[{"type":"tool_use","id":"t1","name":"Bash","input":' + deep + '}]}}', flush=True)
+        emit({'type':'assistant','parent_tool_use_id':'toolu_task','message':NOTIFICATION})
+        emit({'type':'user','parent_tool_use_id':'toolu_task','message':{'role':'user','content':[7, NOTIFICATION]}})
+        stream({'type':'content_block_delta','delta':NOTIFICATION}, parent_tool_use_id='toolu_task')
+    message = {'id':'answer-'+str(turn),'model':'claude-fable-5','content':[]}
+    emit({'type':'stream_event','event':{'type':'message_start','message':message}})
+    emit({'type':'assistant','message':{**message,'stop_reason':None,'content':[{'type':'text','text':'Answer '+mode}]}})
+    if mode == 'notification':
+        notification(isReplay=True, uuid='notification-1')
+        notification()
+        emit({'type':'user','message':{'role':'user','content':None}})
+    emit({'type':'stream_event','event':{'type':'message_delta','delta':{'stop_reason':'end_turn'}}})
+    if mode == 'slow':
+        time.sleep(1)
+    emit({'type':'result','subtype':'success','result':'Answer '+mode})
+    emit({'type':'prompt_suggestion','session_id':'resumed-session','suggestion':'After '+mode})
+"#;
+
+/// Markers at each end of the fake's unreadable payload.
+const REJECTED_PAYLOAD_MARKERS: [&str; 2] = ["START-SECRET-7f3a", "END-SECRET-9c1e"];
+
+/// How the server is told to read the fake Claude Code's stream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PromptReplay {
+    /// As a command that replaces the CLI: not known to echo the prompt, so
+    /// the model's output also shows the prompt was taken in.
+    NotExpected,
+    /// As the native CLI (`--replay-user-messages`): nothing before the echo
+    /// of the prompt is the prompt's answer.
+    Expected,
+}
+
+fn resumed_session_bridge(blocks: bool, replay: PromptReplay) -> (BridgeProcess, PathBuf, PathBuf) {
+    let script = temp_path("resumed-session-cli.py");
+    let starts = temp_path("resumed-session-starts.log");
+    std::fs::write(&script, RESUMED_SESSION_CLI).unwrap();
+    let command = Some(format!("exec python3 {}", script.display()));
+    let env = Some(("FAKE_RESUMED_STARTS", starts.to_str().unwrap()));
+    let expect_replay: &[(&str, &str)] = match replay {
+        PromptReplay::NotExpected => &[],
+        PromptReplay::Expected => &[("CENTAUR_CLAUDE_EXPECT_USER_REPLAY", "1")],
+    };
+    let args = if blocks {
+        Harness::ClaudeCode.blocks_args()
+    } else {
+        Harness::ClaudeCode.args()
+    };
+    let bridge = BridgeProcess::spawn_harness_with_args(
+        Harness::ClaudeCode,
+        args,
+        command,
+        env,
+        expect_replay,
+    );
+    (bridge, script, starts)
+}
+
+fn agent_message_phases(lines: &[String]) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line).unwrap();
+            let item = &value["params"]["item"];
+            (value["method"] == "item/completed" && item["type"] == "agentMessage").then(|| {
+                (
+                    item["text"].as_str().unwrap().to_string(),
+                    item["phase"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn fake_claude_task_notification_with_string_content_does_not_fail_the_turn() {
+    // Claude Code 2.1.325 delivers a background task's notification as a user
+    // message whose `content` is a plain string. The line used to fail to
+    // parse, which failed the turn and stopped the process.
+    for replay in [PromptReplay::NotExpected, PromptReplay::Expected] {
+        let (mut bridge, script, starts) = resumed_session_bridge(false, replay);
+        let timeout = Duration::from_secs(10);
+        let thread_id = bridge.initialize_and_start_thread(Harness::ClaudeCode, timeout);
+        let turn = bridge.run_turn(&thread_id, 3, "notification", None, timeout);
+        let lines = bridge.finish_successfully();
+
+        assert_completed_turn(&turn);
+        assert_eq!(turn.text_from_deltas, "Answer notification");
+        assert_codex_v2_turn(&turn);
+        assert!(
+            !turn.methods.contains(&"error".to_string()),
+            "{:?}",
+            turn.methods
+        );
+        // The notification is not a tool boundary: the text before it is still
+        // the final answer, not commentary.
+        assert_eq!(
+            agent_message_phases(&lines),
+            [(
+                "Answer notification".to_string(),
+                "final_answer".to_string()
+            )]
+        );
+        assert!(lines.iter().all(|line| !line.contains("task-notification")));
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(starts);
+    }
+}
+
+/// The previous process died with background tasks running. The resumed
+/// session settles that with a `result` of its own, and only then dequeues
+/// the prompt. Read as the turn's end, that `result` completed the turn empty
+/// (and opened the suggestion window, which discards the answer); so did
+/// Claude Code's own "No response requested." message read as the answer.
+fn resumed_session_answers_the_prompt_once(replay: PromptReplay, suggestions: bool) {
+    let mut modes = vec![
+        "resumed",
+        "synthetic",
+        "synthetic-stream",
+        "synthetic-stream-text",
+    ];
+    if replay == PromptReplay::Expected {
+        // Only the echo tells the model's stale output from its answer.
+        modes.push("stale-answer");
+    }
+    for mode in modes {
+        let context = format!("{mode} {replay:?} suggestions={suggestions}");
+        let (mut bridge, script, starts) = resumed_session_bridge(true, replay);
+        let mut turns = Vec::new();
+        for prompt in [mode, "plain"] {
+            let mut user = suggestion_user(prompt, suggestions);
+            user["trace_metadata"]["execution_id"] = json!(format!("execution-{prompt}"));
+            turns.push(bridge.run_blocks_user_line(user, Duration::from_secs(10)));
+        }
+        let lines = bridge.finish_successfully();
+
+        for (turn, prompt) in turns.iter().zip([mode, "plain"]) {
+            assert_completed_turn(turn);
+            assert_eq!(
+                turn.text_from_deltas,
+                format!("Answer {prompt}"),
+                "{context}"
+            );
+            assert_eq!(turn.turn_completed_count, 1, "{context}");
+        }
+        assert_eq!(
+            agent_message_phases(&lines),
+            [
+                (format!("Answer {mode}"), "final_answer".to_string()),
+                ("Answer plain".to_string(), "final_answer".to_string()),
+            ],
+            "{context}"
+        );
+        // Each suggestion follows its own answer's `result`: the earlier
+        // `result` opened no suggestion window.
+        let suggested: Vec<(String, String)> = suggestion_notifications(&lines)
+            .iter()
+            .map(|suggestion| {
+                (
+                    suggestion["params"]["turnId"].as_str().unwrap().to_string(),
+                    suggestion["params"]["suggestion"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+        let expected = if suggestions {
+            vec![
+                (turns[0].turn_id.clone(), format!("After {mode}")),
+                (turns[1].turn_id.clone(), "After plain".to_string()),
+            ]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(suggested, expected, "{context}");
+        for stale in ["No response requested", "Stale answer", "Stale suggestion"] {
+            assert!(
+                lines.iter().all(|line| !line.contains(stale)),
+                "{context}: {stale:?} reached the client"
+            );
+        }
+        // The process answered the prompt, so it is kept for the next turn.
+        assert_eq!(
+            std::fs::read_to_string(&starts).unwrap(),
+            "start\n",
+            "{context}"
+        );
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(starts);
+    }
+}
+
+#[test]
+fn fake_claude_result_of_a_resumed_session_before_its_prompt_does_not_complete_the_turn() {
+    resumed_session_answers_the_prompt_once(PromptReplay::Expected, true);
+}
+
+#[test]
+fn fake_claude_result_of_a_resumed_session_opens_no_suggestion_window_when_disabled() {
+    resumed_session_answers_the_prompt_once(PromptReplay::Expected, false);
+}
+
+#[test]
+fn fake_claude_own_message_of_a_resumed_session_is_not_the_answer_of_a_cli_that_does_not_echo() {
+    resumed_session_answers_the_prompt_once(PromptReplay::NotExpected, true);
+}
+
+#[test]
+fn fake_claude_own_message_of_a_resumed_session_is_not_the_answer_without_suggestions() {
+    resumed_session_answers_the_prompt_once(PromptReplay::NotExpected, false);
+}
+
+#[test]
+fn fake_claude_started_as_the_native_cli_must_echo_the_prompt_before_anything_answers_it() {
+    // No command replaces the CLI here: the server starts `CLAUDE_BIN` with
+    // its own arguments, as it starts Claude Code in a sandbox. That CLI
+    // echoes each prompt, so the echo is required without being asked for.
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = temp_path("native-claude-cli.py");
+    let starts = temp_path("native-claude-starts.log");
+    let argv_log = temp_path("native-claude-argv.json");
+    std::fs::write(&script, RESUMED_SESSION_CLI).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut bridge = BridgeProcess::spawn_harness_with_args(
+        Harness::ClaudeCode,
+        Harness::ClaudeCode.blocks_args(),
+        None,
+        Some(("CLAUDE_BIN", script.to_str().unwrap())),
+        &[
+            ("FAKE_RESUMED_STARTS", starts.to_str().unwrap()),
+            ("FAKE_RESUMED_ARGV", argv_log.to_str().unwrap()),
+        ],
+    );
+    // The model's own stale output comes before the echo; only a server that
+    // waits for the echo can tell it from the answer.
+    let turn = bridge.run_blocks_user_line(
+        suggestion_user("stale-answer", true),
+        Duration::from_secs(10),
+    );
+    let lines = bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "Answer stale-answer");
+    assert_eq!(
+        agent_message_phases(&lines),
+        [(
+            "Answer stale-answer".to_string(),
+            "final_answer".to_string()
+        )]
+    );
+    let suggestions = suggestion_notifications(&lines);
+    assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+    assert_eq!(suggestions[0]["params"]["suggestion"], "After stale-answer");
+    // The flag that makes the CLI echo is what the requirement rests on.
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&argv_log).unwrap()).unwrap();
+    let _ = std::fs::remove_file(argv_log);
+    assert!(
+        argv.iter().any(|arg| arg == "--replay-user-messages"),
+        "{argv:?}"
+    );
+    let _ = std::fs::remove_file(script);
+    let _ = std::fs::remove_file(starts);
+}
+
+#[test]
+fn fake_claude_held_steer_is_not_completed_by_a_result_before_it_is_taken_in() {
+    // A steer that arrives after the final message continues the turn as the
+    // next prompt, which must be taken in before a `result` can answer it.
+    for (replay, steer_mode) in [
+        (PromptReplay::NotExpected, "resumed"),
+        (PromptReplay::Expected, "resumed"),
+        (PromptReplay::Expected, "stale-answer"),
+    ] {
+        let context = format!("{steer_mode} {replay:?}");
+        let (mut bridge, script, starts) = resumed_session_bridge(true, replay);
+        bridge.send(suggestion_user("slow", false));
+        let first = read_final_suggestion_answer(&mut bridge);
+        let mut steer = suggestion_user(steer_mode, false);
+        steer["trace_metadata"]["action"] = json!("steer_active_execution");
+        steer["client_user_message_id"] = json!("steer-message-1");
+        bridge.send(steer);
+        let second = read_final_suggestion_answer(&mut bridge);
+        let done = read_question_method(&mut bridge, "turn/completed");
+        let lines = bridge.finish_successfully();
+
+        assert_eq!(first["params"]["item"]["text"], "Answer slow", "{context}");
+        assert_eq!(
+            second["params"]["item"]["text"],
+            format!("Answer {steer_mode}"),
+            "{context}"
+        );
+        assert_eq!(second["params"]["turnId"], first["params"]["turnId"]);
+        assert_eq!(done["params"]["turn"]["id"], first["params"]["turnId"]);
+        assert_eq!(done["params"]["turn"]["status"], "completed", "{context}");
+        let completed = lines
+            .iter()
+            .filter(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["method"] == "turn/completed"
+            })
+            .count();
+        assert_eq!(completed, 1, "the steer's answer belongs to its turn");
+        assert_eq!(std::fs::read_to_string(&starts).unwrap(), "start\n");
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(starts);
+    }
+}
+
+fn error_notifications(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line).unwrap();
+            (value["method"] == "error").then(|| {
+                value["params"]["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn fake_claude_unparseable_line_fails_the_turn_without_quoting_it() {
+    // A parse error quotes the value it failed on. The whole 20 KB line used
+    // to become the turn's error, and from there the reply to the user; cut
+    // to a bound, it still carried the start and the end of that value.
+    for blocks in [false, true] {
+        let (mut bridge, script, starts) = resumed_session_bridge(blocks, PromptReplay::Expected);
+        let timeout = Duration::from_secs(10);
+        let turn = if blocks {
+            bridge.run_blocks_user_line(suggestion_user("unparseable", false), timeout)
+        } else {
+            let thread_id = bridge.initialize_and_start_thread(Harness::ClaudeCode, timeout);
+            bridge.run_turn(&thread_id, 3, "unparseable", None, timeout)
+        };
+        let (lines, stderr) = bridge.finish_with_stderr();
+
+        assert_eq!(turn.terminal_status.as_deref(), Some("failed"));
+        let mut errors = error_notifications(&lines);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        errors.push(turn.terminal_error.clone().expect("turn error"));
+        for error in errors {
+            assert_eq!(error, "JSON error: invalid data");
+        }
+        // Nothing of the rejected value is written anywhere: not on the wire,
+        // and not in the server's own log.
+        for output in lines.iter().chain([&stderr]) {
+            for leaked in REJECTED_PAYLOAD_MARKERS
+                .into_iter()
+                .chain(["task-notification", "internal"])
+            {
+                assert!(!output.contains(leaked), "{leaked:?} in {output}");
+            }
+        }
+        assert!(lines.iter().all(|line| line.len() < 2_000));
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(starts);
+    }
+}
+
+#[test]
+fn fake_claude_error_result_text_is_bounded() {
+    // Claude Code's own error `result` can be as long as what it failed on.
+    let (mut bridge, script, starts) = resumed_session_bridge(true, PromptReplay::Expected);
+    let turn =
+        bridge.run_blocks_user_line(suggestion_user("failing", false), Duration::from_secs(10));
+    let lines = bridge.finish_successfully();
+
+    assert_eq!(turn.terminal_status.as_deref(), Some("failed"));
+    let error = turn.terminal_error.clone().expect("turn error");
+    assert_eq!(error.chars().count(), 512, "{error}");
+    assert!(error.contains(" ... (truncated) ... "), "{error}");
+    assert!(lines.iter().all(|line| line.len() < 2_000));
+    let _ = std::fs::remove_file(script);
+    let _ = std::fs::remove_file(starts);
+}
+
+#[test]
+fn fake_claude_malformed_sidechain_event_does_not_fail_the_turn() {
+    // A subagent's events are dropped, so one this server cannot read must
+    // not fail the turn that launched the subagent.
+    for replay in [PromptReplay::NotExpected, PromptReplay::Expected] {
+        let (mut bridge, script, starts) = resumed_session_bridge(false, replay);
+        let timeout = Duration::from_secs(10);
+        let thread_id = bridge.initialize_and_start_thread(Harness::ClaudeCode, timeout);
+        let turn = bridge.run_turn(&thread_id, 3, "sidechain", None, timeout);
+        let lines = bridge.finish_successfully();
+
+        assert_completed_turn(&turn);
+        assert_eq!(turn.text_from_deltas, "Answer sidechain", "{replay:?}");
+        assert_codex_v2_turn(&turn);
+        assert!(error_notifications(&lines).is_empty(), "{replay:?}");
+        for marker in REJECTED_PAYLOAD_MARKERS {
+            assert!(lines.iter().all(|line| !line.contains(marker)));
+        }
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(starts);
+    }
+}
+
+#[test]
+fn fake_claude_pre_replay_question_is_rejected_without_reaching_the_turn() {
+    let script = temp_path("pre-replay-question-cli.py");
+    let log = temp_path("pre-replay-question-control.jsonl");
+    let cli = r#"#!/usr/bin/env python3
+import json, os, sys
+def emit(value):
+    print(json.dumps(value), flush=True)
+def question_control(req_id, tool_id, prompt):
+    return {
+        'type': 'control_request',
+        'request_id': req_id,
+        'request': {
+            'subtype': 'can_use_tool',
+            'tool_name': 'AskUserQuestion',
+            'tool_use_id': tool_id,
+            'input': {
+                'questions': [{
+                    'header': 'Scope',
+                    'question': prompt,
+                    'options': [
+                        {'label': 'Alpha', 'description': 'First'},
+                        {'label': 'Beta', 'description': 'Second'},
+                    ],
+                    'multiSelect': False,
+                }]
+            },
+        },
+    }
+prompt = None
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    if msg.get('type') == 'user':
+        prompt = msg
+        emit({'type': 'system', 'subtype': 'init', 'session_id': 'q-session'})
+        # Stale question before the new prompt's uuid is echoed.
+        emit(question_control('stale-q', 'tool-stale', 'Stale question?'))
+        break
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    if msg.get('type') == 'control_response':
+        with open(os.environ['FAKE_PRE_REPLAY_LOG'], 'a') as f:
+            f.write(json.dumps(msg) + '\n')
+        req_id = msg['response']['request_id']
+        if req_id == 'stale-q':
+            # Now acknowledge the real prompt and ask a real question.
+            emit({'type': 'user', 'isReplay': True, 'uuid': prompt['uuid'], 'message': prompt['message']})
+            emit(question_control('real-q', 'tool-real', 'Real question?'))
+        elif req_id == 'real-q':
+            emit({'type': 'assistant', 'message': {'id': 'a1', 'model': 'claude-fable-5', 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'Answered real question'}]}})
+            emit({'type': 'result', 'subtype': 'success', 'result': 'Answered real question'})
+            break
+"#;
+    std::fs::write(&script, cli).unwrap();
+    let mut bridge = BridgeProcess::spawn_harness_with_args(
+        Harness::ClaudeCode,
+        Harness::ClaudeCode.blocks_args(),
+        Some(format!("exec python3 {}", script.display())),
+        Some(("FAKE_PRE_REPLAY_LOG", log.to_str().unwrap())),
+        &[("CENTAUR_CLAUDE_EXPECT_USER_REPLAY", "1")],
+    );
+    bridge.send(json!({
+        "type": "user",
+        "text": "continue",
+        "trace_metadata": {
+            "execution_id": "exec-pre-replay-q",
+            "supports_user_input": true,
+        },
+    }));
+    // The first (and only) question surfaced to the client must be the post-echo one.
+    let request = read_question_method(&mut bridge, "item/tool/requestUserInput");
+    assert_eq!(request["params"]["itemId"], "tool-real");
+    assert_eq!(
+        request["params"]["questions"][0]["question"],
+        "Real question?"
+    );
+    let qid = request["params"]["questions"][0]["id"].as_str().unwrap();
+    bridge.send(json!({
+        "type": "user_input_response",
+        "request_id": request["id"],
+        "execution_id": "exec-pre-replay-q",
+        "answers": { qid: { "answers": ["Alpha"] } },
+    }));
+    let done = read_question_method(&mut bridge, "turn/completed");
+    assert_eq!(done["params"]["turn"]["status"], "completed");
+    let lines = bridge.finish_successfully();
+    let question_events: Vec<Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["method"] == "item/tool/requestUserInput")
+        .collect();
+    assert_eq!(question_events.len(), 1, "{question_events:?}");
+
+    let responses: Vec<Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 2, "{responses:?}");
+    assert_eq!(responses[0]["response"]["request_id"], "stale-q");
+    assert_eq!(responses[0]["response"]["response"]["behavior"], "deny");
+    assert_eq!(responses[1]["response"]["request_id"], "real-q");
+    assert_eq!(responses[1]["response"]["response"]["behavior"], "allow");
+
+    let _ = std::fs::remove_file(script);
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn fake_claude_background_task_started_after_the_final_stop_keeps_the_turn_open() {
+    // The message that launched a background agent stops (`end_turn`) before
+    // Claude Code reports the agent started. The stop armed the fallback
+    // completion, which stayed armed while the turn was held for the agent
+    // and ended the turn 2s into the wait, dropping the follow-up's answer.
+    let fake_claude = concat!(
+        "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}'; ",
+        "IFS= read -r _; ",
+        "printf '%s\\n' ",
+        "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"Started research.\"}]}}' ",
+        "'{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"a1\",\"description\":\"Research\",\"is_backgrounded\":true,\"task_type\":\"local_agent\"}' ",
+        "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Started research.\"}'; ",
+        "sleep 2.8; printf '%s\\n' ",
+        "'{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"a1\",\"status\":\"completed\",\"summary\":\"found it\"}' ",
+        "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"content\":[]}}}' ",
+        "'{\"type\":\"assistant\",\"message\":{\"id\":\"msg_2\",\"content\":[{\"type\":\"text\",\"text\":\"The answer.\"}]}}' ",
+        "'{\"type\":\"stream_event\",\"event\":{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}}' ",
+        "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"The answer.\"}'; ",
+        "sleep 60"
+    );
+
+    let started = Instant::now();
+    let run = run_bridge_turn(BridgeTurnConfig {
+        harness: Harness::ClaudeCode,
+        command_override: Some(fake_claude.to_string()),
+        prompt: "research".to_string(),
+        timeout: Duration::from_secs(15),
+    });
+
+    assert_completed_turn(&run.turn);
+    assert_eq!(run.turn.text_from_deltas, "Started research.The answer.");
+    assert_eq!(run.turn.turn_completed_count, 1);
+    assert!(
+        started.elapsed() >= Duration::from_millis(2_800),
+        "the turn ended before the follow-up: {:?}",
+        started.elapsed()
+    );
+    assert_codex_v2_turn(&run.turn);
+}
+
 #[test]
 fn fake_codex_blocks_mode_uses_openrouter_provider_when_model_is_configured() {
     let fake_codex = temp_path("fake-openrouter-codex.sh");
@@ -1898,6 +2525,87 @@ fn fake_claude_blocks_mode_resets_turn_state_when_a_held_steer_respawns_the_proc
 }
 
 #[test]
+fn fake_claude_blocks_mode_gives_a_process_respawned_for_a_held_steer_the_turns_effort() {
+    // Effort is applied in-band and a new process runs its default. A held
+    // steer that continues the turn on a replacement process used to be
+    // written to it without the turn's effort.
+    let log = temp_path("fake-claude-held-steer-effort-stdin.jsonl");
+    let fake_claude = format!(
+        concat!(
+            "printf '%s\\n' '{{\"type\":\"spawn\"}}' >> '{log}'; ",
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}}'; ",
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{log}'; ",
+            "case \"$line\" in ",
+            "*'\"text\":\"steer one\"'*) ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_1\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"first part\"}}]}}}}'; ",
+            "sleep 1; ",
+            "printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"boom\"}}';; ",
+            "*'\"text\":\"steer two\"'*) ",
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"is_partial\":false,\"message\":{{\"id\":\"msg_2\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"steered\"}}]}}}}'; ",
+            "printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"steered\"}}';; ",
+            "esac; done"
+        ),
+        log = log.display(),
+    );
+    let mut bridge =
+        BridgeProcess::spawn_harness_blocks(Harness::ClaudeCode, Some(fake_claude), None);
+    bridge.send(json!({
+        "type": "user",
+        "thread_key": "slack:C123:123.456",
+        "trace_metadata": {"source": "slackbotv2", "action": "execute"},
+        "reasoning": "max",
+        "message": {"role": "user", "content": [{"type": "text", "text": "start"}]},
+    }));
+    let steer = |text: &str, client_id: &str| {
+        json!({
+            "type": "user",
+            "thread_key": "slack:C123:123.456",
+            "trace_metadata": {"source": "session.append_messages", "action": "steer_active_execution"},
+            "client_user_message_id": client_id,
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        })
+    };
+    // The first steer is native and is never echoed, so the process cannot be
+    // reused. The second arrives after Claude Code's final assistant message
+    // and is held for the next native turn, on a new process.
+    bridge.send(steer("steer one", "steer-message-1"));
+    let first = read_final_suggestion_answer(&mut bridge);
+    assert_eq!(first["params"]["item"]["text"], "first part");
+    bridge.send(steer("steer two", "steer-message-2"));
+    let second = read_final_suggestion_answer(&mut bridge);
+    assert_eq!(second["params"]["item"]["text"], "steered");
+    let done = read_question_method(&mut bridge, "turn/completed");
+    bridge.finish_successfully();
+
+    assert_eq!(done["params"]["turn"]["id"], first["params"]["turnId"]);
+    assert_eq!(done["params"]["turn"]["status"], "failed");
+    assert_eq!(done["params"]["turn"]["error"]["message"], "boom");
+    let effort = json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": "max"}});
+    let stdin: Vec<Value> = logged_lines(&log)
+        .iter()
+        .map(|line| match line["type"].as_str() {
+            Some("spawn") => json!("spawn"),
+            Some("control_request") => line["request"].clone(),
+            _ => line["message"]["content"][0]["text"].clone(),
+        })
+        .collect();
+    assert_eq!(
+        stdin,
+        vec![
+            json!("spawn"),
+            effort.clone(),
+            json!("start"),
+            json!("steer one"),
+            // The replacement process: effort first, then its prompt.
+            json!("spawn"),
+            effort,
+            json!("steer two"),
+        ]
+    );
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
 fn fake_amp_blocks_mode_continues_the_turn_with_a_held_steer() {
     // Amp's turn ends at its terminal stop, so a steer waits for it and is
     // sent as Amp's next native turn, which this turn continues into.
@@ -2595,6 +3303,7 @@ impl BridgeProcess {
 
         for env_key in [
             "CENTAUR_CLAUDE_APP_BRIDGE_COMMAND",
+            "CENTAUR_CLAUDE_EXPECT_USER_REPLAY",
             "CENTAUR_AMP_APP_BRIDGE_COMMAND",
             "CENTAUR_COMPOSE_SYSTEM_PROMPT_BIN",
             "CENTAUR_OVERLAY_REPO_DIRS",
@@ -3190,7 +3899,12 @@ impl BridgeProcess {
         }
     }
 
-    fn finish_successfully(mut self) -> Vec<String> {
+    fn finish_successfully(self) -> Vec<String> {
+        self.finish_with_stderr().0
+    }
+
+    /// The server's stdout lines and everything it wrote to stderr.
+    fn finish_with_stderr(mut self) -> (Vec<String>, String) {
         let _ = self.stdin.take();
         let status = self.child.wait().expect("wait app-server process");
         self.stdout_reader.join().expect("join stdout reader");
@@ -3203,7 +3917,7 @@ impl BridgeProcess {
         if !stderr.trim().is_empty() {
             eprintln!("stderr:\n{stderr}");
         }
-        self.stdout_lines
+        (self.stdout_lines, stderr)
     }
 }
 

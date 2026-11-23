@@ -538,6 +538,38 @@ describe('Slack display text fallback', () => {
     expect(context?.text).toContain('Do not recover this destination with Slack search.')
   })
 
+  test('uses SLACKBOTV2_CODE_MODE_UPLOAD_TOOL when configured and falls back on invalid values', async () => {
+    const previous = process.env.SLACKBOTV2_CODE_MODE_UPLOAD_TOOL
+    try {
+      process.env.SLACKBOTV2_CODE_MODE_UPLOAD_TOOL = 'tools.fineas_slack.upload'
+      const custom = fakeApi()
+      await forwardToSessionApi(options(custom.fetchFn), forwardInput(apiMessage('make an image')))
+      const customContext = lineContent(executeLine(custom.requests)).find(part =>
+        typeof part.text === 'string' && part.text.includes('# Slack Session Context')
+      )
+      expect(customContext?.text).toContain(
+        'Example (Code Mode): tools.fineas_slack.upload({ channel: "C1", thread_ts: "1700000000.000100"'
+      )
+      expect(customContext?.text).not.toContain('tools.slack.upload_file(')
+
+      process.env.SLACKBOTV2_CODE_MODE_UPLOAD_TOOL = 'tools.bad;injection()'
+      const invalid = fakeApi()
+      await forwardToSessionApi(options(invalid.fetchFn), forwardInput(apiMessage('make an image')))
+      const invalidContext = lineContent(executeLine(invalid.requests)).find(part =>
+        typeof part.text === 'string' && part.text.includes('# Slack Session Context')
+      )
+      expect(invalidContext?.text).toContain(
+        'Example (Code Mode): tools.slack.upload_file({ channel: "C1", thread_ts: "1700000000.000100"'
+      )
+    } finally {
+      if (previous === undefined) {
+        delete process.env.SLACKBOTV2_CODE_MODE_UPLOAD_TOOL
+      } else {
+        process.env.SLACKBOTV2_CODE_MODE_UPLOAD_TOOL = previous
+      }
+    }
+  })
+
   test('includes team id for team-qualified Slack thread keys', async () => {
     const { fetchFn, requests } = fakeApi()
     await forwardToSessionApi(

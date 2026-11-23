@@ -24,7 +24,8 @@ const limits = {
   },
   finalPlan: {
     taskTitleChars: 140
-  }
+  },
+  errorChars: 500
 } as const
 
 type AgentMessagePhase = 'commentary' | 'final_answer'
@@ -357,9 +358,13 @@ export class CodexAppServerRendererEventMapper
     return out
   }
 
-  private fail(error: string): RendererEvent[] {
+  private fail(reported: string): RendererEvent[] {
     if (this.state.done) return []
     this.state.done = true
+    // One bounded text for every place the failure goes: the error task, the
+    // answer shown to the user and the terminal event.
+    const error = boundedErrorText(reported)
+    const shownError = error || 'Execution failed'
     const out: RendererEvent[] = []
     let hadOpenTask = false
     for (const [id, task] of this.state.taskByUseId) {
@@ -372,12 +377,12 @@ export class CodexAppServerRendererEventMapper
         id: 'execution-error',
         title: 'Execution failed',
         status: 'error',
-        details: [section([text(error || 'Execution failed')])],
+        details: [section([text(shownError)])],
         output: []
       })
     }
     if (!this.state.answerText.trim()) {
-      this.state.harnessAnswerText += `Execution failed: ${error || 'Execution failed'}`
+      this.state.harnessAnswerText += `Execution failed: ${shownError}`
       recomposeBuffers(this.state)
     }
     this.emitActivitySummary(out, { final: true })
@@ -705,7 +710,7 @@ export function rustSessionEventToServerNotification(source: unknown): RustSessi
     return {
       kind: 'cancelled',
       ...(resultText ? { resultText } : {}),
-      notice: String(data.error ?? INTERRUPTED_TEXT).trim() || INTERRUPTED_TEXT
+      notice: boundedErrorText(String(data.error ?? INTERRUPTED_TEXT).trim()) || INTERRUPTED_TEXT
     }
   }
 
@@ -1550,6 +1555,41 @@ function languageFromContent(value: string): string {
     return 'ts'
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) return 'json'
   return 'text'
+}
+
+/**
+ * The text of a failure as it leaves the renderer: in the error task, in the
+ * answer shown to the user and in `renderer.done` (from there the closed
+ * session and the chat). A parser or runtime failure can quote the whole
+ * payload it failed on, so a longer error is flattened and cut, and the value
+ * a parse failure quotes is taken out whatever its length. An error within
+ * the bound that quotes nothing is passed on as it was reported.
+ */
+export function boundedErrorText(error: string): string {
+  const text = withoutRejectedValue(error)
+  if (text.length <= limits.errorChars) return text
+  const flat = text.replace(/\s+/g, ' ').trim()
+  if (flat.length <= limits.errorChars) return flat
+  let end = limits.errorChars - 3
+  // Never half of a character outside the Basic Multilingual Plane.
+  const last = flat.charCodeAt(end - 1)
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1
+  return `${flat.slice(0, end)}...`
+}
+
+const REJECTED_VALUE = /\binvalid (?:type|value): string "/
+
+/**
+ * serde reports a string it rejected by quoting all of it (`invalid type:
+ * string "<the value>", expected ...`), and the value is harness output or
+ * user input. harness-server no longer sends that text; an older one still
+ * running in a sandbox does. Everything from the quote on is dropped: where
+ * the value ends cannot be told from the value itself.
+ */
+function withoutRejectedValue(error: string): string {
+  const quoted = REJECTED_VALUE.exec(error)
+  if (!quoted) return error
+  return `${error.slice(0, quoted.index + quoted[0].length - 1)}[redacted]`
 }
 
 function oneLine(value: string, max: number = limits.finalPlan.taskTitleChars): string {

@@ -169,6 +169,84 @@ describe('NanocodexRendererEventMapper', () => {
     ])
   })
 
+  test('bounds the error of a failed run and of a failed session', () => {
+    // All 19,479 characters of a failure used to reach `renderer.done`.
+    const error = `proxy refused\n${'  at frame (internal detail)\n'.repeat(671)}`
+    expect(error.length).toBeGreaterThan(19_000)
+    const shown = `${error.replace(/\s+/g, ' ').slice(0, 497)}...`
+    expect(shown).toHaveLength(500)
+
+    const failedRun = new NanocodexRendererEventMapper()
+    expect(failedRun.process(native('run.error', { message: error }))).toEqual([])
+    expect(failedRun.process(native('run.failed', {}, 2))).toEqual([
+      {
+        type: 'renderer.done',
+        // No answer was given, and none is made up from the error.
+        answerMarkdown: undefined,
+        error: shown,
+        streamFinalUpdates: true,
+        threadId: 'nano-session'
+      }
+    ])
+
+    for (const eventKind of [
+      'session.execution_failed',
+      'session.stream_error',
+      'session.stdout_pump_failed'
+    ]) {
+      const failedSession = new NanocodexRendererEventMapper()
+      failedSession.process(native('assistant.delta', { text: 'partial' }))
+      expect(failedSession.process({ eventKind, data: { error } })).toEqual([
+        {
+          type: 'renderer.done',
+          answerMarkdown: 'partial',
+          error: shown,
+          streamFinalUpdates: true,
+          threadId: 'nano-session'
+        }
+      ])
+    }
+  })
+
+  test('reports nothing of the value a parse failure quotes', () => {
+    const mapper = new NanocodexRendererEventMapper()
+    const events = mapper.process({
+      eventKind: 'session.execution_failed',
+      data: {
+        error: `JSON error: invalid type: string "START-SECRET${' internal detail'.repeat(1_200)}END-SECRET", expected a sequence`
+      }
+    })
+
+    expect(events).toEqual([
+      {
+        type: 'renderer.done',
+        answerMarkdown: undefined,
+        error: 'JSON error: invalid type: string [redacted]',
+        streamFinalUpdates: true,
+        threadId: undefined
+      }
+    ])
+  })
+
+  test('closes the session with the bounded error', async () => {
+    const closed: unknown[] = []
+    const sources = (async function* () {
+      yield native('run.error', { message: 'boom '.repeat(4_000) })
+      yield native('run.failed', {}, 2)
+    })()
+    for await (const _ of harnessToChatSdkStream(sources, {
+      onOutput: output => {
+        if (output.type === 'chat.session.closed') closed.push(output.message)
+      }
+    })) {
+      // Only the closing output matters here.
+    }
+
+    expect(closed).toEqual([
+      { text: undefined, error: `${'boom '.repeat(100).slice(0, 497)}...` }
+    ])
+  })
+
   test('ends a cancelled run without a notice when silentInterrupt is set', () => {
     const mapper = new NanocodexRendererEventMapper({ silentInterrupt: true })
     expect(mapper.process(native('run.failed', { status: 'cancelled' }, 2))).toEqual([

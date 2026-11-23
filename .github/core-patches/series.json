@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_repository": "paradigmxyz/centaur",
   "upstream_revision": "70467ca5d310f23ffb9fa8a5bb890bce7178aaab",
-  "result_tree": "84fc0904d1fea862c907c5e6edaf36213b75ca58",
+  "result_tree": "4f08d4d6a21c927a1a57dd983d40283f134dec00",
   "patches": [
     {
       "file": "0001-workflow-approvals.patch",
@@ -67,6 +67,14 @@
     {
       "file": "0016-company-context-pandoc-3-14-and-package-xml-repair.patch",
       "sha256": "7316bab25721b2c164a45d5c15fd3aad5e44cd36017a3d75736136cd16dbffec"
+    },
+    {
+      "file": "0017-slack-upload-code-mode-example.patch",
+      "sha256": "c491aab43458393617195a977547588e91972c5e85842d8c80100e32d41bcdf0"
+    },
+    {
+      "file": "0018-claude-string-content-resume-guard-and-bounded-errors.patch",
+      "sha256": "c3366f15c87421bda8ad0116d4d2bd4816f6697e1caa31456376bbcf7f062bec"
     }
   ]
 }

@@ -2079,6 +2079,16 @@ type SlackThreadDestination = {
   threadTs: string
 }
 
+const DEFAULT_SLACK_UPLOAD_CODE_MODE_TOOL = 'tools.slack.upload_file'
+const CODE_MODE_UPLOAD_TOOL_PATTERN = /^tools\.[a-z0-9_]+\.[a-z0-9_]+$/
+
+function slackUploadCodeModeTool(): string {
+  const configured = nonEmptyString(process.env.SLACKBOTV2_CODE_MODE_UPLOAD_TOOL)
+  return configured && CODE_MODE_UPLOAD_TOOL_PATTERN.test(configured)
+    ? configured
+    : DEFAULT_SLACK_UPLOAD_CODE_MODE_TOOL
+}
+
 function slackUploadSessionContext(threadId: string): string | undefined {
   const destination = slackThreadDestination(threadId)
   if (!destination) return undefined
@@ -2093,7 +2103,7 @@ function slackUploadSessionContext(threadId: string): string | undefined {
     `- thread_key: ${threadId}`,
     '',
     'Use these exact IDs for Slack file uploads in this thread.',
-    `Example (Code Mode): tools.slack.upload_file({ channel: "${destination.channelId}", thread_ts: "${destination.threadTs}", path: "<file under the home directory>" })`,
+    `Example (Code Mode): ${slackUploadCodeModeTool()}({ channel: "${destination.channelId}", thread_ts: "${destination.threadTs}", path: "<file under the home directory>" })`,
     'Do not recover this destination with Slack search.',
     '---'
   ]

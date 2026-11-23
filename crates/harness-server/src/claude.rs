@@ -51,6 +51,22 @@ const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"]
 /// message as it takes it in, keeping the `uuid` it was sent with, so a
 /// steer not yet echoed when `result` arrives is owed a follow-up, which this
 /// turn waits for.
+///
+/// The turn's own prompt is tracked the same way. A resumed session first
+/// settles what its previous process left behind (tool calls cut short, the
+/// `<task-notification>` of each background task that died with it) and can
+/// end that with a `result` of its own before it dequeues the prompt
+/// (observed with 2.1.325). Read as the turn's end, that `result` would
+/// complete the turn empty while Claude Code went on to answer nobody.
+///
+/// Claude Code started with `--replay-user-messages` echoes the prompt as it
+/// takes it in, so until that echo nothing it writes is this turn's: messages,
+/// stream events, tool results and task events are dropped, and a successful
+/// `result` is swallowed whatever text it carries. Only the session id and a
+/// failure get through. A command that replaces the CLI may not echo
+/// (`expects_prompt_replay`); there the model's own output also shows the
+/// prompt was taken in, and what Claude Code writes itself (model
+/// `<synthetic>`) is still dropped.
 #[derive(Debug, Default)]
 pub struct ClaudeEventNormalizer {
     inner: AnthropicEventNormalizer,
@@ -68,6 +84,18 @@ pub struct ClaudeEventNormalizer {
     result_held: bool,
     /// Steers written to Claude Code that it has not echoed yet, by uuid.
     outstanding_steers: HashSet<String>,
+    /// The uuid of this turn's prompt until Claude Code takes the prompt in.
+    pending_turn_prompt: Option<String>,
+    /// Claude Code echoes every prompt, so only the echo of the pending one
+    /// shows it was taken in (see `expects_prompt_replay`).
+    expect_prompt_replay: bool,
+    /// Claude Code wrote a message of its own while the prompt was pending;
+    /// the `result` after it closes that message, whatever text it repeats.
+    pre_prompt_message: bool,
+    /// The stream is inside a message Claude Code wrote itself: its
+    /// `message_start` named the model `<synthetic>` and its `message_stop`
+    /// has not arrived.
+    in_synthetic_message: bool,
 }
 
 #[derive(Debug)]
@@ -104,9 +132,50 @@ impl ClaudeEventNormalizer {
         self.outstanding_steers.insert(uuid);
     }
 
+    /// Notes this turn's prompt, sent with `uuid`. A `result` cannot answer
+    /// it before Claude Code has taken it in. With `expect_replay`, only
+    /// Claude Code's echo of `uuid` shows that it has.
+    pub fn turn_prompt_sent(&mut self, uuid: String, expect_replay: bool) {
+        self.pending_turn_prompt = Some(uuid);
+        self.expect_prompt_replay = expect_replay;
+        self.pre_prompt_message = false;
+        self.result_held = false;
+    }
+
+    fn turn_prompt_taken_in(&mut self) {
+        self.pending_turn_prompt = None;
+        self.pre_prompt_message = false;
+        // A `result` swallowed while the prompt waited was not this turn's.
+        self.result_held = false;
+    }
+
+    pub fn awaiting_prompt_replay(&self) -> bool {
+        self.pending_turn_prompt.is_some() && self.expect_prompt_replay
+    }
+
+    /// Whether `event` is part of a message Claude Code wrote itself, by the
+    /// message's own model or, for a stream event, by the `message_start`
+    /// that opened the message it belongs to.
+    fn written_by_claude_code(&mut self, event: &AnthropicStreamEvent) -> bool {
+        match event {
+            AnthropicStreamEvent::Assistant { message, .. } => message.is_synthetic(),
+            AnthropicStreamEvent::StreamEvent { event, .. } => match event {
+                AnthropicRawStreamEvent::MessageStart { message } => {
+                    self.in_synthetic_message = message.is_synthetic();
+                    self.in_synthetic_message
+                }
+                AnthropicRawStreamEvent::MessageStop => {
+                    std::mem::take(&mut self.in_synthetic_message)
+                }
+                _ => self.in_synthetic_message,
+            },
+            _ => false,
+        }
+    }
+
     pub fn normalize(&mut self, event: AnthropicStreamEvent) -> Vec<NormalizedEvent> {
         // An echoed user message carries no output of its own; it only tells
-        // which steers Claude Code has taken in.
+        // which prompt and steers Claude Code has taken in.
         if let AnthropicStreamEvent::User {
             is_replay: true,
             uuid,
@@ -115,15 +184,69 @@ impl ClaudeEventNormalizer {
         {
             if let Some(uuid) = uuid {
                 self.outstanding_steers.remove(uuid);
+                if self.pending_turn_prompt.as_ref() == Some(uuid) {
+                    self.turn_prompt_taken_in();
+                }
             }
             return Vec::new();
+        }
+        let synthetic = self.written_by_claude_code(&event);
+        let mut pre_prompt_result = false;
+        if self.pending_turn_prompt.is_some() && self.expect_prompt_replay {
+            match &event {
+                // The session id is the process's, whichever turn it runs.
+                AnthropicStreamEvent::System { subtype, .. }
+                    if subtype.as_deref() == Some("init") => {}
+                // A failure ends the turn now: Claude Code that cannot start
+                // or authenticate never echoes anything.
+                AnthropicStreamEvent::Error { .. } => {}
+                // A `result` that succeeded closes a turn Claude Code ran on
+                // its own, whatever text it carries; one that failed is let
+                // through (below) like any failure.
+                AnthropicStreamEvent::Result { .. } => pre_prompt_result = true,
+                // Everything else was written before Claude Code read the
+                // prompt, so none of it answers the prompt: what the resumed
+                // session says on its own, output cut off with its previous
+                // process, the task events of work that died with it.
+                _ => return Vec::new(),
+            }
+        } else if self.pending_turn_prompt.is_some() {
+            match &event {
+                // What Claude Code says on its own about the session it
+                // resumed ("No response requested.") is no answer to a prompt
+                // it has not read yet, and neither is any part of that
+                // message's stream.
+                AnthropicStreamEvent::StreamEvent { .. }
+                | AnthropicStreamEvent::Assistant { .. }
+                    if synthetic =>
+                {
+                    self.pre_prompt_message = true;
+                    return Vec::new();
+                }
+                // The model only answers a prompt Claude Code has taken in,
+                // which is the sign from a CLI that does not echo its input.
+                AnthropicStreamEvent::StreamEvent { .. }
+                | AnthropicStreamEvent::Assistant { .. } => self.turn_prompt_taken_in(),
+                // A `result` with no text of its own answers nothing. One
+                // that carries text and follows no message at all is left to
+                // end the turn, as from a CLI that reports only its result.
+                AnthropicStreamEvent::Result { result, .. } => {
+                    pre_prompt_result = self.pre_prompt_message
+                        || result.as_deref().is_none_or(|text| text.trim().is_empty());
+                }
+                _ => {}
+            }
         }
         let token_usage = event.token_usage();
         let message_stop_reason = event.message_stop_reason().map(str::to_string);
         let mut out = Vec::new();
         self.track_background_tasks(&event, &mut out);
         let normalized = self.inner.normalize(event);
-        if let Some(usage) = token_usage {
+        // Claude Code ended a turn of its own before reading the prompt.
+        let pre_prompt_result =
+            pre_prompt_result && matches!(normalized, NormalizedEvent::Result { error: None });
+        // What that turn used is not what this one did.
+        if let Some(usage) = token_usage.filter(|_| !pre_prompt_result) {
             out.push(NormalizedEvent::TokenUsage { usage });
         }
         if let Some(stop_reason) = message_stop_reason {
@@ -143,6 +266,10 @@ impl ClaudeEventNormalizer {
             NormalizedEvent::ToolResults(results) => {
                 self.flush_pending(Some("tool_use".to_string()), &mut out);
                 out.push(NormalizedEvent::ToolResults(results));
+            }
+            NormalizedEvent::Result { error: None } if pre_prompt_result => {
+                self.pre_prompt_message = false;
+                self.result_held = true;
             }
             NormalizedEvent::Result { error: None } if self.holding_turn() => {
                 self.flush_pending(Some("tool_use".to_string()), &mut out);
@@ -265,7 +392,16 @@ impl ClaudeEventNormalizer {
     }
 
     fn holding_turn(&self) -> bool {
-        self.holding_for_background_work() || !self.outstanding_steers.is_empty()
+        self.holding_for_background_work()
+            || !self.outstanding_steers.is_empty()
+            || self.holding_for_turn_prompt()
+    }
+
+    /// Claude Code ended a turn of its own and still owes the prompt an
+    /// answer. The hold is bounded (`TurnHold::Idle`), so a CLI that never
+    /// takes the prompt in fails the turn instead of hanging it.
+    fn holding_for_turn_prompt(&self) -> bool {
+        self.result_held && self.pending_turn_prompt.is_some()
     }
 
     fn holding_for_background_work(&self) -> bool {
@@ -454,7 +590,7 @@ impl HarnessServer for ClaudeCodeHarness {
     }
 
     fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand {
-        if let Some(command) = command_from_override("CENTAUR_CLAUDE_APP_BRIDGE_COMMAND") {
+        if let Some(command) = command_from_override(BRIDGE_COMMAND_ENV) {
             return command;
         }
 
@@ -503,14 +639,23 @@ impl HarnessServer for ClaudeCodeHarness {
         command
     }
 
-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>> {
+    /// The prompt carries a `uuid`, as a steer does, so the turn can tell
+    /// when Claude Code has taken it in.
+    fn stdin_for_turn(
+        &self,
+        normalizer: &mut Self::EventNormalizer,
+        input: &[UserInput],
+    ) -> Result<Vec<u8>> {
+        let uuid = Uuid::new_v4().to_string();
         let payload = json!({
             "type": "user",
+            "uuid": uuid,
             "message": {
                 "role": "user",
                 "content": user_input_to_anthropic_content(input),
             },
         });
+        normalizer.turn_prompt_sent(uuid, expects_prompt_replay());
         let mut bytes = serde_json::to_vec(&payload)?;
         bytes.push(b'\n');
         Ok(bytes)
@@ -566,11 +711,26 @@ impl HarnessServer for ClaudeCodeHarness {
         Ok(bytes)
     }
 
+    /// A subagent sidechain's event is not read past its envelope, so a body
+    /// this server cannot read does not fail the parent turn.
     fn parse_stdout_line(&self, line: &str) -> Result<Self::Event> {
-        AnthropicStreamEvent::parse_json_line(line)
+        AnthropicStreamEvent::parse_main_chain_json_line(line)
     }
 
     fn user_input_control(&self, line: &str) -> Result<Option<UserInputControl>> {
+        // Inspect only the top-level envelope before deserializing `Value` so
+        // ordinary stream events (including deeply nested subagent sidechains)
+        // never pay full `Value` parsing or hit `serde_json` recursion limits
+        // ahead of `parse_stdout_line`'s sidechain filter.
+        let Some(envelope) = crate::anthropic::scan_top_level_envelope(line) else {
+            return Ok(None);
+        };
+        if !matches!(
+            envelope.kind.as_deref(),
+            Some("control_request" | "control_cancel_request")
+        ) {
+            return Ok(None);
+        }
         let value: Value = serde_json::from_str(line)?;
         if value["type"] == "control_cancel_request" {
             return Ok(Some(UserInputControl::Cancel(value["request_id"].clone())));
@@ -654,6 +814,10 @@ impl HarnessServer for ClaudeCodeHarness {
         Ok(bytes)
     }
 
+    fn accepts_user_input_request(&self, normalizer: &Self::EventNormalizer) -> bool {
+        !normalizer.awaiting_prompt_replay()
+    }
+
     fn normalize_events(
         &self,
         normalizer: &mut Self::EventNormalizer,
@@ -707,6 +871,34 @@ impl HarnessServer for ClaudeCodeHarness {
     }
 }
 
+/// Replaces the Claude Code command (tests, a bridge to another runtime).
+const BRIDGE_COMMAND_ENV: &str = "CENTAUR_CLAUDE_APP_BRIDGE_COMMAND";
+/// States whether the command echoes each prompt it takes in: `1` or `true`
+/// that it does, `0` or `false` that it does not.
+const EXPECT_USER_REPLAY_ENV: &str = "CENTAUR_CLAUDE_EXPECT_USER_REPLAY";
+
+/// Whether the Claude Code this server runs echoes each prompt it takes in,
+/// so that nothing before the echo can be the prompt's answer.
+fn expects_prompt_replay() -> bool {
+    prompt_replay_expected(
+        env::var(BRIDGE_COMMAND_ENV).ok().as_deref(),
+        env::var(EXPECT_USER_REPLAY_ENV).ok().as_deref(),
+    )
+}
+
+/// The native CLI echoes: `command_for_turn` starts it with
+/// `--replay-user-messages`. A command that replaces it is not known to, so
+/// the model's output is its sign there unless it states that it echoes.
+/// Stating that the CLI does not echo restores that reading for the native
+/// CLI too.
+fn prompt_replay_expected(bridge_command: Option<&str>, expect_user_replay: Option<&str>) -> bool {
+    match expect_user_replay.map(str::trim) {
+        Some("1" | "true") => true,
+        Some("0" | "false") => false,
+        _ => bridge_command.is_none_or(|command| command.trim().is_empty()),
+    }
+}
+
 fn rejected_question_control(native_id: Value) -> Result<UserInputControl> {
     Ok(UserInputControl::Reply(json_line(
         &json!({"type":"control_response","response":{
@@ -728,7 +920,9 @@ mod tests {
         anthropic::AnthropicStreamEvent,
     };
 
-    use super::{ClaudeCodeHarness, ClaudeEventNormalizer, FOLLOW_UP_IDLE_TIMEOUT};
+    use super::{
+        ClaudeCodeHarness, ClaudeEventNormalizer, FOLLOW_UP_IDLE_TIMEOUT, prompt_replay_expected,
+    };
     use crate::user_input::UserInputControl;
 
     #[test]
@@ -852,6 +1046,44 @@ mod tests {
         };
         let response: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(response["response"]["response"]["behavior"], "deny");
+    }
+
+    #[test]
+    fn user_input_control_skips_deeply_nested_non_control_events() {
+        let deep = format!("{}0{}", r#"{"a":"#.repeat(200), "}".repeat(200));
+        let sidechain = format!(
+            r#"{{"type":"assistant","parent_tool_use_id":"toolu_task","message":{{"id":"m1","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{deep}}}]}}}}"#
+        );
+        assert!(
+            ClaudeCodeHarness
+                .user_input_control(&sidechain)
+                .expect("non-control line must not fail control scan")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn strict_prompt_replay_gates_user_input_requests_until_prompt_echo() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        normalizer.turn_prompt_sent("prompt-1".to_string(), true);
+        assert!(!ClaudeCodeHarness.accepts_user_input_request(&normalizer));
+        // Foreign replay does not open the gate.
+        normalize(
+            &mut normalizer,
+            json!({"type":"user","isReplay":true,"uuid":"other","message":{"role":"user","content":[]}}),
+        );
+        assert!(!ClaudeCodeHarness.accepts_user_input_request(&normalizer));
+        // Matching echo opens the gate.
+        normalize(
+            &mut normalizer,
+            json!({"type":"user","isReplay":true,"uuid":"prompt-1","message":{"role":"user","content":[]}}),
+        );
+        assert!(ClaudeCodeHarness.accepts_user_input_request(&normalizer));
+
+        // No-echo compatibility mode keeps questions open.
+        let mut compat = ClaudeEventNormalizer::default();
+        compat.turn_prompt_sent("prompt-2".to_string(), false);
+        assert!(ClaudeCodeHarness.accepts_user_input_request(&compat));
     }
 
     fn normalize(normalizer: &mut ClaudeEventNormalizer, event: Value) -> Vec<NormalizedEvent> {
@@ -1595,6 +1827,577 @@ mod tests {
         let events = normalize(&mut normalizer, replay("not-a-steer"));
         assert!(events.is_empty());
         assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+    }
+
+    /// A prompt sent to a CLI that is not known to echo it: the model's
+    /// output also shows the prompt was taken in.
+    fn prompt(normalizer: &mut ClaudeEventNormalizer) -> String {
+        prompt_sent(normalizer, false)
+    }
+
+    /// A prompt sent to Claude Code started with `--replay-user-messages`:
+    /// nothing but its echo shows the prompt was taken in.
+    fn echoed_prompt(normalizer: &mut ClaudeEventNormalizer) -> String {
+        prompt_sent(normalizer, true)
+    }
+
+    fn prompt_sent(normalizer: &mut ClaudeEventNormalizer, expect_replay: bool) -> String {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        normalizer.turn_prompt_sent(uuid.clone(), expect_replay);
+        uuid
+    }
+
+    fn message_start(id: &str) -> Value {
+        json!({"type": "stream_event", "event": {"type": "message_start", "message": {"id": id, "model": "claude-fable-5", "content": []}}})
+    }
+
+    fn stream(event: Value) -> Value {
+        json!({"type": "stream_event", "event": event})
+    }
+
+    /// The whole stream of a message Claude Code wrote itself.
+    fn synthetic_stream(text: &str) -> Vec<Value> {
+        vec![
+            stream(
+                json!({"type": "message_start", "message": {"id": "synthetic-1", "model": "<synthetic>", "content": []}}),
+            ),
+            stream(
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            stream(
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+            ),
+            synthetic(text),
+            stream(json!({"type": "content_block_stop", "index": 0})),
+            stream(json!({"type": "message_delta", "delta": {"stop_reason": "stop_sequence"}})),
+            stream(json!({"type": "message_stop"})),
+        ]
+    }
+
+    /// The model's answer as Claude Code streams it.
+    fn answer_stream(id: &str, text: &str) -> Vec<Value> {
+        vec![
+            message_start(id),
+            stream(
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            stream(
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+            ),
+            json!({"type": "assistant", "message": {"id": id, "model": "claude-fable-5", "stop_reason": null, "content": [{"type": "text", "text": text}]}}),
+            stream(json!({"type": "content_block_stop", "index": 0})),
+            stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            stream(json!({"type": "message_stop"})),
+        ]
+    }
+
+    fn normalize_all(
+        normalizer: &mut ClaudeEventNormalizer,
+        events: Vec<Value>,
+    ) -> Vec<NormalizedEvent> {
+        events
+            .into_iter()
+            .flat_map(|event| normalize(normalizer, event))
+            .collect()
+    }
+
+    fn answer(id: &str, text: &str) -> Value {
+        json!({"type": "assistant", "message": {"id": id, "model": "claude-fable-5", "stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}})
+    }
+
+    fn synthetic(text: &str) -> Value {
+        json!({"type": "assistant", "message": {"id": "synthetic-1", "model": "<synthetic>", "stop_reason": "stop_sequence", "content": [{"type": "text", "text": text}]}})
+    }
+
+    #[test]
+    fn turn_stdin_carries_a_uuid_the_turn_waits_to_see_taken_in() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        let bytes = ClaudeCodeHarness
+            .stdin_for_turn(
+                &mut normalizer,
+                &[UserInput::Text {
+                    text: "hello".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(value["type"], "user");
+        assert_eq!(value["message"]["role"], "user");
+        assert_eq!(value["message"]["content"][0]["text"], "hello");
+        let uuid = value["uuid"].as_str().expect("prompt uuid").to_string();
+        assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
+        // An unanswered prompt alone holds nothing: only a `result` that
+        // comes before it is taken in does.
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+        let bytes = ClaudeCodeHarness
+            .stdin_for_turn(&mut normalizer, &[])
+            .unwrap();
+        let next: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_ne!(next["uuid"], uuid, "each prompt has its own uuid");
+        assert_eq!(
+            normalizer.pending_turn_prompt.as_deref(),
+            next["uuid"].as_str()
+        );
+    }
+
+    #[test]
+    fn only_a_command_that_replaces_the_cli_is_not_expected_to_echo_the_prompt() {
+        // The native CLI is started with `--replay-user-messages`.
+        assert!(prompt_replay_expected(None, None));
+        assert!(prompt_replay_expected(Some("  "), None));
+        assert!(prompt_replay_expected(None, Some("unrecognised")));
+        // A command that replaces it is not known to echo...
+        assert!(!prompt_replay_expected(Some("exec fake-claude"), None));
+        assert!(!prompt_replay_expected(Some("exec fake-claude"), Some("")));
+        // ...unless it says it does.
+        for stated in ["1", "true", " 1 "] {
+            assert!(prompt_replay_expected(
+                Some("exec fake-claude"),
+                Some(stated)
+            ));
+        }
+        // Stating that the CLI does not echo applies to the native CLI too.
+        for stated in ["0", "false"] {
+            assert!(!prompt_replay_expected(None, Some(stated)));
+            assert!(!prompt_replay_expected(
+                Some("exec fake-claude"),
+                Some(stated)
+            ));
+        }
+    }
+
+    /// The stream of a production turn (Claude Code 2.1.325): the previous
+    /// process died with background agents running, and the resumed session
+    /// closed that out with a `result` of its own 55ms before it dequeued the
+    /// prompt. The turn completed empty while Claude Code ran on unheard.
+    #[test]
+    fn result_of_a_resumed_session_before_it_takes_the_prompt_in_does_not_end_the_turn() {
+        for expect_replay in [false, true] {
+            resumed_session_result_does_not_end_the_turn(expect_replay);
+        }
+    }
+
+    fn resumed_session_result_does_not_end_the_turn(expect_replay: bool) {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        let uuid = prompt_sent(&mut normalizer, expect_replay);
+
+        assert!(matches!(
+            normalize(
+                &mut normalizer,
+                json!({"type": "system", "subtype": "init", "session_id": "s1"})
+            )
+            .as_slice(),
+            [NormalizedEvent::SessionStarted { .. }]
+        ));
+        // The orphaned notification is echoed under another uuid.
+        assert!(
+            normalize(
+                &mut normalizer,
+                json!({"type": "user", "isReplay": true, "uuid": "orphan", "message": {"role": "user", "content": "<task-notification>\n<task-id>a1</task-id>\n<status>stopped</status>\n</task-notification>"}}),
+            )
+            .is_empty()
+        );
+        for result in [
+            json!({"type": "result", "subtype": "success", "is_error": false, "usage": {"input_tokens": 0, "output_tokens": 0}}),
+            json!({"type": "result", "subtype": "success", "result": ""}),
+            json!({"type": "result", "subtype": "success", "result": " \n"}),
+        ] {
+            // Not even its token usage: that turn was not this one.
+            let events = normalize(&mut normalizer, result);
+            assert!(events.is_empty(), "{events:?}");
+            // Bounded, so a prompt that is never taken in fails the turn.
+            assert_eq!(
+                normalizer.turn_hold(),
+                TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
+            );
+        }
+
+        assert!(normalize(&mut normalizer, replay(&uuid)).is_empty());
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+        normalize(&mut normalizer, message_start("msg_1"));
+        let events = normalize(&mut normalizer, answer("msg_1", "Here is what changed."));
+        assert_eq!(
+            agent_texts(&events),
+            vec![(
+                Some("end_turn".to_string()),
+                "Here is what changed.".to_string()
+            )]
+        );
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "result": "Here is what changed."}),
+        );
+        assert!(events.iter().any(NormalizedEvent::is_terminal));
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+    }
+
+    #[test]
+    fn model_output_takes_the_prompt_as_read_for_a_cli_that_does_not_echo_it() {
+        for first in [
+            message_start("msg_1"),
+            json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}}),
+            answer("msg_1", "done"),
+            json!({"type": "assistant", "is_partial": true, "message": {"id": "msg_1", "content": [{"type": "text", "text": "do"}]}}),
+            json!({"type": "assistant", "message": {"id": "msg_1", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]}}),
+        ] {
+            let mut normalizer = ClaudeEventNormalizer::default();
+            prompt(&mut normalizer);
+            normalize(&mut normalizer, first.clone());
+            assert_eq!(normalizer.pending_turn_prompt, None, "{first}");
+            // Even a `result` without text now ends the turn.
+            let events = normalize(
+                &mut normalizer,
+                json!({"type": "result", "subtype": "success"}),
+            );
+            assert!(events.iter().any(NormalizedEvent::is_terminal), "{first}");
+            assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+        }
+    }
+
+    #[test]
+    fn nothing_before_the_echo_answers_a_prompt_that_claude_code_echoes() {
+        let stale = [
+            // The model's own output, cut off with the previous process or
+            // answering a prompt that process never finished.
+            answer_stream("msg_stale", "A stale answer."),
+            vec![answer("msg_stale", "A stale answer.")],
+            vec![
+                json!({"type": "assistant", "is_partial": true, "message": {"id": "msg_stale", "content": [{"type": "text", "text": "A stale"}]}}),
+            ],
+            vec![
+                json!({"type": "assistant", "message": {"id": "msg_stale", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]}}),
+                json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "stale output"}]}}),
+            ],
+            // A delta with no message around it.
+            vec![stream(
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "stale"}}),
+            )],
+            // Work that died with the previous process.
+            vec![
+                json!({"type": "system", "subtype": "task_started", "task_id": "a1", "task_type": "local_agent", "is_backgrounded": true}),
+                json!({"type": "system", "subtype": "task_notification", "task_id": "a1", "status": "stopped", "summary": "stale"}),
+            ],
+            synthetic_stream("No response requested."),
+        ];
+        for events in stale {
+            for result in [
+                json!({"type": "result", "subtype": "success"}),
+                json!({"type": "result", "subtype": "success", "result": "A stale answer.", "usage": {"input_tokens": 9, "output_tokens": 9}}),
+            ] {
+                let mut normalizer = ClaudeEventNormalizer::default();
+                let uuid = echoed_prompt(&mut normalizer);
+
+                let out = normalize_all(&mut normalizer, events.clone());
+                assert!(out.is_empty(), "{events:?}: {out:?}");
+                assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
+                // Nothing dropped holds the turn or arms the stop fallback.
+                assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+
+                // The `result` of that turn is not ours, even with text.
+                let out = normalize(&mut normalizer, result.clone());
+                assert!(out.is_empty(), "{result}: {out:?}");
+                assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
+                assert_eq!(
+                    normalizer.turn_hold(),
+                    TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
+                );
+
+                // The echo of another message is not the prompt's.
+                assert!(normalize(&mut normalizer, replay("another-uuid")).is_empty());
+                assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
+                let out = normalize_all(&mut normalizer, answer_stream("msg_late", "Still stale."));
+                assert!(out.is_empty(), "{out:?}");
+
+                assert!(normalize(&mut normalizer, replay(&uuid)).is_empty());
+                assert_eq!(normalizer.pending_turn_prompt, None);
+                assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+                let mut out =
+                    normalize_all(&mut normalizer, answer_stream("msg_1", "The real answer."));
+                out.extend(normalize(
+                    &mut normalizer,
+                    json!({"type": "result", "subtype": "success", "result": "The real answer."}),
+                ));
+                assert_eq!(
+                    agent_texts(&out),
+                    vec![(Some("end_turn".to_string()), "The real answer.".to_string())]
+                );
+                assert_eq!(
+                    out.iter().filter(|event| event.is_terminal()).count(),
+                    1,
+                    "{out:?}"
+                );
+                assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+            }
+        }
+    }
+
+    #[test]
+    fn the_session_id_and_a_failure_get_through_before_the_echo() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        echoed_prompt(&mut normalizer);
+        assert!(matches!(
+            normalize(
+                &mut normalizer,
+                json!({"type": "system", "subtype": "init", "session_id": "s1"})
+            )
+            .as_slice(),
+            [NormalizedEvent::SessionStarted { session_id: Some(session_id) }] if session_id == "s1"
+        ));
+
+        // Claude Code that cannot start or authenticate echoes nothing: the
+        // turn must fail on what it reports instead of waiting for an echo.
+        for (failure, expected) in [
+            (
+                json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "result": "Invalid API key"}),
+                "Invalid API key",
+            ),
+            (
+                json!({"type": "result", "subtype": "success", "is_error": true, "result": "API Error: 529 Overloaded"}),
+                "API Error: 529 Overloaded",
+            ),
+            (json!({"type": "error", "message": "boom"}), "boom"),
+        ] {
+            let mut normalizer = ClaudeEventNormalizer::default();
+            echoed_prompt(&mut normalizer);
+            let out = normalize(&mut normalizer, failure.clone());
+            assert!(
+                matches!(
+                    out.last(),
+                    Some(NormalizedEvent::Result { error: Some(error) } | NormalizedEvent::Error { message: error })
+                        if error == expected
+                ),
+                "{failure}: {out:?}"
+            );
+            assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+        }
+    }
+
+    #[test]
+    fn claude_codes_own_stream_does_not_take_the_prompt_as_read_for_a_cli_that_does_not_echo_it() {
+        for result in [
+            json!({"type": "result", "subtype": "success"}),
+            json!({"type": "result", "subtype": "success", "result": "No response requested."}),
+        ] {
+            let mut normalizer = ClaudeEventNormalizer::default();
+            let uuid = prompt(&mut normalizer);
+
+            // Each event alone must leave the prompt pending: read as model
+            // output, the `message_start` used to release the turn, which
+            // then ended on this message's `result`.
+            for event in synthetic_stream("No response requested.") {
+                let out = normalize(&mut normalizer, event.clone());
+                assert!(out.is_empty(), "{event}: {out:?}");
+                assert_eq!(
+                    normalizer.pending_turn_prompt.as_deref(),
+                    Some(&*uuid),
+                    "{event}"
+                );
+                assert_eq!(normalizer.turn_hold(), TurnHold::Released, "{event}");
+            }
+            let out = normalize(&mut normalizer, result.clone());
+            assert!(out.is_empty(), "{result}: {out:?}");
+            assert_eq!(
+                normalizer.turn_hold(),
+                TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
+            );
+            assert!(normalize(&mut normalizer, replay("another-uuid")).is_empty());
+            assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
+
+            // The model's own message is what takes the prompt in here.
+            let mut out =
+                normalize_all(&mut normalizer, answer_stream("msg_1", "The real answer."));
+            assert_eq!(normalizer.pending_turn_prompt, None);
+            out.extend(normalize(
+                &mut normalizer,
+                json!({"type": "result", "subtype": "success", "result": "The real answer."}),
+            ));
+            assert_eq!(
+                agent_texts(&out),
+                vec![(Some("end_turn".to_string()), "The real answer.".to_string())]
+            );
+            assert_eq!(out.iter().filter(|event| event.is_terminal()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn claude_codes_own_stream_after_the_prompt_is_taken_in_is_delivered() {
+        for expect_replay in [false, true] {
+            let mut normalizer = ClaudeEventNormalizer::default();
+            let uuid = prompt_sent(&mut normalizer, expect_replay);
+            normalize(&mut normalizer, replay(&uuid));
+
+            let out = normalize_all(
+                &mut normalizer,
+                synthetic_stream("API Error: 529 Overloaded"),
+            );
+            assert_eq!(
+                agent_texts(&out),
+                vec![(
+                    Some("stop_sequence".to_string()),
+                    "API Error: 529 Overloaded".to_string()
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_codes_own_message_before_the_prompt_is_taken_in_is_not_the_answer() {
+        for expect_replay in [false, true] {
+            own_message_before_the_prompt_is_not_the_answer(expect_replay);
+        }
+    }
+
+    fn own_message_before_the_prompt_is_not_the_answer(expect_replay: bool) {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        let uuid = prompt_sent(&mut normalizer, expect_replay);
+
+        // Shown as the answer, its terminal stop would also complete the
+        // turn by the stop fallback.
+        assert!(normalize(&mut normalizer, synthetic("No response requested.")).is_empty());
+        assert_eq!(normalizer.pending_turn_prompt.as_deref(), Some(&*uuid));
+        // The `result` repeats that message's text and is still not ours.
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "result": "No response requested."}),
+        );
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(
+            normalizer.turn_hold(),
+            TurnHold::Idle(FOLLOW_UP_IDLE_TIMEOUT)
+        );
+
+        normalize(&mut normalizer, replay(&uuid));
+        normalize(&mut normalizer, message_start("msg_1"));
+        let mut events = normalize(&mut normalizer, answer("msg_1", "The real answer."));
+        events.extend(normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "result": "The real answer."}),
+        ));
+        assert_eq!(
+            agent_texts(&events),
+            vec![(Some("end_turn".to_string()), "The real answer.".to_string())]
+        );
+        assert!(events.iter().any(NormalizedEvent::is_terminal));
+    }
+
+    #[test]
+    fn claude_codes_own_message_after_the_prompt_is_taken_in_is_delivered() {
+        for expect_replay in [false, true] {
+            own_message_after_the_prompt_is_delivered(expect_replay);
+        }
+    }
+
+    fn own_message_after_the_prompt_is_delivered(expect_replay: bool) {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        let uuid = prompt_sent(&mut normalizer, expect_replay);
+        normalize(&mut normalizer, replay(&uuid));
+
+        // An API failure is reported this way, with an error `result`.
+        let events = normalize(&mut normalizer, synthetic("API Error: 529 Overloaded"));
+        assert_eq!(
+            agent_texts(&events),
+            vec![(
+                Some("stop_sequence".to_string()),
+                "API Error: 529 Overloaded".to_string()
+            )]
+        );
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "is_error": true, "result": "API Error: 529 Overloaded"}),
+        );
+        assert!(matches!(
+            events.last(),
+            Some(NormalizedEvent::Result { error: Some(error) }) if error == "API Error: 529 Overloaded"
+        ));
+    }
+
+    #[test]
+    fn result_with_text_and_no_message_ends_the_turn_of_a_cli_that_reports_only_that() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        prompt(&mut normalizer);
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "result": "final answer"}),
+        );
+        assert!(events.iter().any(NormalizedEvent::is_terminal));
+        // Nothing is held, so the process is kept for the next turn.
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+    }
+
+    #[test]
+    fn failed_result_before_the_prompt_is_taken_in_ends_the_turn() {
+        let failed =
+            json!({"type": "result", "subtype": "error_during_execution", "is_error": true});
+
+        for expect_replay in [false, true] {
+            let mut normalizer = ClaudeEventNormalizer::default();
+            prompt_sent(&mut normalizer, expect_replay);
+            let events = normalize(&mut normalizer, failed.clone());
+            assert!(events.iter().any(NormalizedEvent::is_terminal));
+            assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+
+            // After a swallowed `result` the prompt is still queued in Claude
+            // Code, so the server stops the process with the turn.
+            let mut normalizer = ClaudeEventNormalizer::default();
+            prompt_sent(&mut normalizer, expect_replay);
+            normalize(
+                &mut normalizer,
+                json!({"type": "result", "subtype": "success"}),
+            );
+            let events = normalize(&mut normalizer, failed.clone());
+            assert!(events.iter().any(NormalizedEvent::is_terminal));
+            assert_ne!(normalizer.turn_hold(), TurnHold::Released);
+        }
+    }
+
+    #[test]
+    fn a_new_prompt_starts_its_own_wait() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        prompt(&mut normalizer);
+        normalize(&mut normalizer, synthetic("No response requested."));
+        normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success"}),
+        );
+        assert_ne!(normalizer.turn_hold(), TurnHold::Released);
+
+        // A held steer continues the turn as the next prompt.
+        prompt(&mut normalizer);
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+        assert!(!normalizer.pre_prompt_message);
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "result": "only a result"}),
+        );
+        assert!(events.iter().any(NormalizedEvent::is_terminal));
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+    }
+
+    #[test]
+    fn task_notification_user_message_does_not_settle_the_answer_as_commentary() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        normalize(
+            &mut normalizer,
+            json!({"type": "assistant", "message": {"id": "msg_1", "stop_reason": null, "content": [{"type": "text", "text": "final answer"}]}}),
+        );
+        // Not a replay and no tool result: nothing the answer waits on.
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "user", "message": {"role": "user", "content": "<task-notification>\n<task-id>a1</task-id>\n</task-notification>"}}),
+        );
+        assert!(events.is_empty(), "{events:?}");
+
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "result": "final answer"}),
+        );
+        assert_eq!(
+            agent_texts(&events),
+            vec![(Some("end_turn".to_string()), "final answer".to_string())]
+        );
     }
 
     #[test]

@@ -275,7 +275,7 @@ struct BlocksMessage {
 fn parse_blocks_line(line: &str, staged: &mut HashMap<String, PathBuf>) -> Result<BlocksCommand> {
     let parsed: BlocksLine =
         serde_json::from_str(line).map_err(|source| HarnessServerError::InvalidBlocksInput {
-            message: source.to_string(),
+            message: crate::error::json_error_diagnostic(&source),
         })?;
     match parsed.kind.as_str() {
         "user" => {

@@ -147,7 +147,11 @@ impl HarnessServer for OmpHarness {
         })
     }
 
-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>> {
+    fn stdin_for_turn(
+        &self,
+        _normalizer: &mut Self::EventNormalizer,
+        input: &[UserInput],
+    ) -> Result<Vec<u8>> {
         prompt_command("prompt", input)
     }
     /// OMP takes the steer into the running prompt and answers it before the

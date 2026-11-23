@@ -146,7 +146,11 @@ impl HarnessServer for AmpHarness {
         command
     }
 
-    fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>> {
+    fn stdin_for_turn(
+        &self,
+        _normalizer: &mut Self::EventNormalizer,
+        input: &[UserInput],
+    ) -> Result<Vec<u8>> {
         amp_user_stdin(input, false)
     }
 
@@ -234,10 +238,13 @@ mod tests {
     #[test]
     fn turn_stdin_is_plain_user_message() {
         let bytes = AmpHarness
-            .stdin_for_turn(&[UserInput::Text {
-                text: "hello".to_string(),
-                text_elements: Vec::new(),
-            }])
+            .stdin_for_turn(
+                &mut Default::default(),
+                &[UserInput::Text {
+                    text: "hello".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            )
             .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 

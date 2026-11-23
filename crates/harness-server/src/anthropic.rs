@@ -59,9 +59,192 @@ pub enum AnthropicStreamEvent {
     Unknown,
 }
 
+/// The two top-level fields that classify a line without parsing its body.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TopLevelEnvelope {
+    pub kind: Option<String>,
+    /// Present and not `null`.
+    pub has_parent_tool_use_id: bool,
+}
+
+/// Scans only the top-level keys of a JSON object without recursion or
+/// allocating a `Value` tree, so deeply nested or unreadable bodies on
+/// non-matching lines (such as subagent sidechains) never trip `serde_json`'s
+/// recursion limit or typed validation. Returns `None` if the line is not a
+/// syntactically balanced top-level JSON object, letting callers fall through
+/// to full `serde_json` parsing for error reporting.
+pub(crate) fn scan_top_level_envelope(line: &str) -> Option<TopLevelEnvelope> {
+    let bytes = line.as_bytes();
+    let mut i = skip_json_ws(bytes, 0);
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    let mut envelope = TopLevelEnvelope::default();
+    let mut first = true;
+    loop {
+        i = skip_json_ws(bytes, i);
+        if bytes.get(i) == Some(&b'}') {
+            i = skip_json_ws(bytes, i + 1);
+            return (i == bytes.len()).then_some(envelope);
+        }
+        if !first {
+            if bytes.get(i) != Some(&b',') {
+                return None;
+            }
+            i = skip_json_ws(bytes, i + 1);
+        }
+        first = false;
+
+        let key_start = i;
+        let key_end = scan_json_string(bytes, key_start)?;
+        i = skip_json_ws(bytes, key_end);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        let val_start = skip_json_ws(bytes, i + 1);
+        let val_end = scan_json_value(line, val_start)?;
+        i = val_end;
+
+        let key_slice = &line[key_start..key_end];
+        let val_slice = &line[val_start..val_end];
+        let matched_key = if key_slice == "\"type\"" {
+            Some("type")
+        } else if key_slice == "\"parent_tool_use_id\"" {
+            Some("parent_tool_use_id")
+        } else if key_slice.contains('\\') {
+            match serde_json::from_str::<String>(key_slice).ok()?.as_str() {
+                "type" => Some("type"),
+                "parent_tool_use_id" => Some("parent_tool_use_id"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match matched_key {
+            Some("type") => {
+                envelope.kind = if val_slice.starts_with('"') {
+                    serde_json::from_str::<String>(val_slice).ok()
+                } else {
+                    None
+                };
+            }
+            Some("parent_tool_use_id") => {
+                envelope.has_parent_tool_use_id = val_slice != "null";
+            }
+            _ => {}
+        }
+    }
+}
+
+fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
+    while let Some(&b) = bytes.get(i) {
+        if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+fn scan_json_string(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start + 1;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'"' => return Some(i + 1),
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return None;
+                }
+                i += 2;
+            }
+            0x00..=0x1f => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn scan_json_value(line: &str, start: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    match *bytes.get(start)? {
+        b'"' => scan_json_string(bytes, start),
+        b'{' | b'[' => scan_json_container(bytes, start),
+        _ => {
+            let mut i = start;
+            while let Some(&b) = bytes.get(i) {
+                if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b',' | b'}' | b']') {
+                    break;
+                }
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            let token = &line[start..i];
+            let valid = matches!(token, "null" | "true" | "false")
+                || serde_json::from_str::<serde_json::Number>(token).is_ok();
+            valid.then_some(i)
+        }
+    }
+}
+
+fn scan_json_container(bytes: &[u8], start: usize) -> Option<usize> {
+    let opener = *bytes.get(start)?;
+    let mut stack = vec![if opener == b'{' { b'}' } else { b']' }];
+    let mut i = start + 1;
+    while !stack.is_empty() {
+        let &b = bytes.get(i)?;
+        match b {
+            b'"' => i = scan_json_string(bytes, i)?,
+            b'{' => {
+                stack.push(b'}');
+                i += 1;
+            }
+            b'[' => {
+                stack.push(b']');
+                i += 1;
+            }
+            b'}' | b']' => {
+                if stack.pop() != Some(b) {
+                    return None;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Some(i)
+}
+
 impl AnthropicStreamEvent {
     pub fn parse_json_line(line: &str) -> Result<Self> {
         Ok(serde_json::from_str(line)?)
+    }
+
+    /// Parses a line of the main chain, and reads a subagent sidechain's no
+    /// further than its envelope: it becomes `Unknown`, which every consumer
+    /// ignores. A sidechain's messages never reach the turn (its report
+    /// arrives as the main chain's Task tool result), so a body this parser
+    /// cannot read — including deeply nested tool input — must not fail the
+    /// parent turn. Only the event types that carry `parent_tool_use_id` (see
+    /// `Self::parent_tool_use_id`) are skipped. Every main-chain line is still
+    /// parsed and validated in full.
+    pub fn parse_main_chain_json_line(line: &str) -> Result<Self> {
+        if let Some(envelope) = scan_top_level_envelope(line) {
+            let owned_by_a_chain = matches!(
+                envelope.kind.as_deref(),
+                Some("assistant" | "user" | "stream_event")
+            );
+            if owned_by_a_chain && envelope.has_parent_tool_use_id {
+                return Ok(Self::Unknown);
+            }
+        }
+        Self::parse_json_line(line)
     }
 
     /// The authoritative end-of-message stop reason, carried by the raw
@@ -320,12 +503,19 @@ impl AnthropicEventNormalizer {
                 ..
             } => {
                 let tool_use_result = tool_use_result.as_ref();
-                let results = message
+                let results: Vec<_> = message
                     .content
                     .into_iter()
                     .filter_map(|block| block.into_tool_result(tool_use_result))
                     .collect();
-                NormalizedEvent::ToolResults(results)
+                // A user message without tool results (plain text, a background
+                // task's `<task-notification>`) is not a tool boundary: reported
+                // as one, it would settle pending agent text as commentary.
+                if results.is_empty() {
+                    NormalizedEvent::Ignored
+                } else {
+                    NormalizedEvent::ToolResults(results)
+                }
             }
             AnthropicStreamEvent::Result {
                 subtype,
@@ -364,11 +554,70 @@ pub struct AnthropicMessage {
     pub model: Option<String>,
     pub stop_reason: Option<String>,
     pub usage: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_message_content")]
     pub content: Vec<AnthropicContentBlock>,
 }
 
+/// Message `content` is a list of blocks, or the Messages API's shorthand of a
+/// plain string for a single text block. Claude Code uses the shorthand for
+/// user messages it writes itself, such as a background task's
+/// `<task-notification>`, and echoes them under `--replay-user-messages`
+/// (observed with 2.1.325). A string reads as one text block and `null` as no
+/// blocks, instead of failing the line and with it the turn.
+fn deserialize_message_content<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<AnthropicContentBlock>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ContentVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ContentVisitor {
+        type Value = Vec<AnthropicContentBlock>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string, null or a sequence of content blocks")
+        }
+
+        fn visit_str<E>(self, text: &str) -> std::result::Result<Self::Value, E> {
+            Ok(vec![AnthropicContentBlock::Text {
+                text: text.to_string(),
+            }])
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_seq<A>(self, blocks: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(blocks))
+        }
+    }
+
+    deserializer.deserialize_any(ContentVisitor)
+}
+
 impl AnthropicMessage {
+    /// Claude Code attributes text it wrote without calling the model (an API
+    /// error notice, "No response requested.") to this model name.
+    pub fn is_synthetic(&self) -> bool {
+        self.model.as_deref() == Some("<synthetic>")
+    }
+
     fn into_normalized_content(self) -> Vec<NormalizedContent> {
         let message_id = assistant_item_id(self.id.as_deref());
         self.content
@@ -640,6 +889,8 @@ fn exit_code_from_prefix(content: &str) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -669,5 +920,206 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, Some(13));
         assert_eq!(usage.output_tokens, Some(17));
         assert_eq!(usage.total_tokens, Some(41));
+    }
+
+    fn user_message(content: Value) -> AnthropicMessage {
+        match serde_json::from_value(json!({"type": "user", "message": content})) {
+            Ok(AnthropicStreamEvent::User { message, .. }) => message,
+            other => panic!("expected a user event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_content_reads_blocks_a_plain_string_null_and_absence() {
+        let blocks = user_message(json!({"content": [
+            {"type": "text", "text": "hi"},
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
+            {"type": "from_a_newer_cli"},
+        ]}));
+        assert!(matches!(
+            blocks.content.as_slice(),
+            [
+                AnthropicContentBlock::Text { text },
+                AnthropicContentBlock::ToolResult { .. },
+                AnthropicContentBlock::Unknown,
+            ] if text == "hi"
+        ));
+
+        let notification = "<task-notification>\n<task-id>a1</task-id>\n</task-notification>";
+        let string = user_message(json!({"role": "user", "content": notification}));
+        assert!(matches!(
+            string.content.as_slice(),
+            [AnthropicContentBlock::Text { text }] if text == notification
+        ));
+
+        assert!(user_message(json!({"content": null})).content.is_empty());
+        assert!(user_message(json!({"role": "user"})).content.is_empty());
+    }
+
+    /// The line that failed a production turn: Claude Code 2.1.325 echoing a
+    /// background task's notification under `--replay-user-messages`.
+    #[test]
+    fn replayed_task_notification_with_string_content_parses() {
+        let event = AnthropicStreamEvent::parse_json_line(
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a1b2</task-id>\n<status>completed</status>\n</task-notification>"},"parent_tool_use_id":null,"session_id":"s1","uuid":"7d0e","isReplay":true}"#,
+        )
+        .expect("string content parses");
+        assert!(matches!(
+            event,
+            AnthropicStreamEvent::User { is_replay: true, uuid: Some(uuid), .. } if uuid == "7d0e"
+        ));
+    }
+
+    #[test]
+    fn message_content_of_another_type_still_fails_the_line() {
+        let error = AnthropicStreamEvent::parse_json_line(
+            r#"{"type":"user","message":{"content":{"type":"text","text":"hi"}}}"#,
+        )
+        .expect_err("an object is not message content");
+        // What reaches a client says nothing of the value. (An event's body
+        // is checked after serde has buffered it to find the `type` tag, so
+        // such an error has no position to report either.)
+        assert_eq!(error.to_string(), "JSON error: invalid data");
+        let crate::HarnessServerError::Json(source) = error else {
+            panic!("expected a JSON error, got {error:?}");
+        };
+        assert!(
+            source
+                .to_string()
+                .contains("expected a string, null or a sequence of content blocks"),
+            "{source}"
+        );
+    }
+
+    /// Bodies the typed parser rejects: a message that is a string, a content
+    /// block that is a number, a stream event with no index.
+    fn malformed_events(parent_tool_use_id: Option<Value>) -> Vec<String> {
+        [
+            json!({"type": "assistant", "message": "SECRET-BODY not a message"}),
+            json!({"type": "user", "message": {"role": "user", "content": [7, "SECRET-BODY"]}}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta", "delta": "SECRET-BODY"}}),
+        ]
+        .into_iter()
+        .map(|mut event| {
+            if let Some(parent) = &parent_tool_use_id {
+                event["parent_tool_use_id"] = parent.clone();
+            }
+            event.to_string()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn sidechain_events_are_not_read_past_their_envelope() {
+        // A subagent's event with a body this parser cannot read used to fail
+        // the parent turn, although sidechain events are dropped anyway.
+        for parent in [json!("toolu_task_1"), json!(""), json!({"id": 1})] {
+            for line in malformed_events(Some(parent)) {
+                assert!(
+                    AnthropicStreamEvent::parse_json_line(&line).is_err(),
+                    "the fixture must be unreadable in full: {line}"
+                );
+                let event = AnthropicStreamEvent::parse_main_chain_json_line(&line)
+                    .unwrap_or_else(|error| panic!("{error}: {line}"));
+                assert!(matches!(event, AnthropicStreamEvent::Unknown), "{line}");
+                assert!(matches!(
+                    NormalizedEvent::from(event),
+                    NormalizedEvent::Ignored
+                ));
+            }
+        }
+        // A well-formed sidechain event is skipped the same way.
+        let event = AnthropicStreamEvent::parse_main_chain_json_line(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_task_1","message":{"id":"msg_s","stop_reason":"end_turn","content":[{"type":"text","text":"subagent"}]}}"#,
+        )
+        .expect("sidechain event");
+        assert!(matches!(event, AnthropicStreamEvent::Unknown));
+
+        // Valid JSON nested deeper than serde_json's recursion limit (128) on
+        // a sidechain body must also be skipped without failing the line.
+        let deep = format!("{}0{}", r#"{"a":"#.repeat(200), "}".repeat(200));
+        let deep_sidechain = format!(
+            r#"{{"type":"assistant","parent_tool_use_id":"toolu_task_1","message":{{"id":"msg_deep","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{deep}}}]}}}}"#
+        );
+        assert!(
+            AnthropicStreamEvent::parse_json_line(&deep_sidechain).is_err(),
+            "deeply nested fixture should exceed serde_json recursion limit"
+        );
+        let event = AnthropicStreamEvent::parse_main_chain_json_line(&deep_sidechain)
+            .expect("deeply nested sidechain event");
+        assert!(matches!(event, AnthropicStreamEvent::Unknown));
+    }
+
+    #[test]
+    fn main_chain_events_are_still_parsed_and_validated_in_full() {
+        for parent in [None, Some(Value::Null)] {
+            for line in malformed_events(parent) {
+                let error = AnthropicStreamEvent::parse_main_chain_json_line(&line)
+                    .expect_err("a malformed main-chain event fails the line");
+                assert_eq!(error.to_string(), "JSON error: invalid data", "{line}");
+            }
+        }
+        let event = AnthropicStreamEvent::parse_main_chain_json_line(
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"id":"msg_1","content":[{"type":"text","text":"main"}]}}"#,
+        )
+        .expect("main-chain event");
+        assert!(matches!(event, AnthropicStreamEvent::Assistant { .. }));
+
+        // `system` and `result` lines carry no chain of their own: a field of
+        // that name on one does not hide it.
+        let event = AnthropicStreamEvent::parse_main_chain_json_line(
+            r#"{"type":"system","subtype":"init","session_id":"s1","parent_tool_use_id":"toolu_task_1"}"#,
+        )
+        .expect("system event");
+        assert!(matches!(
+            NormalizedEvent::from(event),
+            NormalizedEvent::SessionStarted { session_id: Some(session_id) } if session_id == "s1"
+        ));
+        let event = AnthropicStreamEvent::parse_main_chain_json_line(
+            r#"{"type":"result","subtype":"success","parent_tool_use_id":"toolu_task_1"}"#,
+        )
+        .expect("result event");
+        assert!(matches!(event, AnthropicStreamEvent::Result { .. }));
+
+        // A line that is not JSON at all fails without quoting itself.
+        let error = AnthropicStreamEvent::parse_main_chain_json_line("SECRET-BODY {")
+            .expect_err("not JSON");
+        assert_eq!(
+            error.to_string(),
+            "JSON error: invalid syntax at line 1, column 1"
+        );
+    }
+
+    #[test]
+    fn user_messages_without_tool_results_are_ignored() {
+        for content in [
+            json!("<task-notification>done</task-notification>"),
+            json!([{"type": "text", "text": "plain text"}]),
+            json!([]),
+            Value::Null,
+        ] {
+            let event = serde_json::from_value::<AnthropicStreamEvent>(
+                json!({"type": "user", "message": {"role": "user", "content": content}}),
+            )
+            .expect("user event");
+            assert!(matches!(
+                NormalizedEvent::from(event),
+                NormalizedEvent::Ignored
+            ));
+        }
+
+        let event = serde_json::from_value::<AnthropicStreamEvent>(json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "text", "text": "and a note"},
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
+            ]},
+        }))
+        .expect("user event");
+        assert!(matches!(
+            NormalizedEvent::from(event),
+            NormalizedEvent::ToolResults(results)
+                if results.len() == 1 && results[0].tool_use_id == "toolu_1"
+        ));
     }
 }
